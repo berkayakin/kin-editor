@@ -247,6 +247,7 @@ impl GitPanel {
             div()
                 .id((if staged { "staged" } else { "unstaged" }, ix))
                 .group(group.clone())
+                .relative()
                 .w_full()
                 .flex()
                 .items_center()
@@ -269,18 +270,43 @@ impl GitPanel {
                     cx.notify();
                 }))
                 .child(icon)
-                .child(
+                // The name gives way only when the sidebar is too narrow for it
+                // (the folder goes first); the full path is in its tooltip.
+                .child({
+                    let path: SharedString = file.rel.clone().into();
                     div()
-                        .flex_shrink_0()
+                        .id(("name", (staged as usize) * 100_000 + ix))
+                        .min_w_0()
+                        .truncate()
                         .text_color(color)
                         .when(deleted, |el| el.line_through())
-                        .child(name),
-                )
+                        .when(path.contains('/'), |el| el.tooltip(move |_, cx| tooltip_view(path.clone(), cx)))
+                        .child(name)
+                })
                 .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_dim).child(dir))
-                // Row actions appear on hover.
                 .child(
                     div()
+                        .w(px(14.))
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(color)
+                        .child(change.letter()),
+                )
+                // Row actions float over the row's right end on hover, so they
+                // never take width from the file name.
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(1.))
+                        .right(px(2.))
                         .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(theme.elevated)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_sm()
                         .invisible()
                         .group_hover(group.clone(), |s| s.visible())
                         .when(!staged && !conflicted, |el| {
@@ -323,15 +349,6 @@ impl GitPanel {
                                     cx.emit(GitPanelEvent::Run(op));
                                 }))
                         }),
-                )
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_shrink_0()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(color)
-                        .child(change.letter()),
                 ),
         )
     }
