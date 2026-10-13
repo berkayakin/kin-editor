@@ -18,6 +18,8 @@ gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 # Image dimensions for previews (GPUI already depends on it, with its formats).
 image = { version = "0.25", default-features = false }
 ignore = "0.4.33"
+# Checks that an update's manifest was signed by the release workflow.
+minisign-verify = "0.3"
 nucleo-matcher = "0.3.1"
 oxc_allocator = "0.139.0"
 oxc_ast = "0.139.0"
@@ -31,6 +33,7 @@ ropey = "1.6"
 rumdl = { version = "0.2.79", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 similar = "3.2.0"
 trash = "5"
 tree-sitter = "0.27.1"

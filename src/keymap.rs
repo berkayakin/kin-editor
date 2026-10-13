@@ -24,7 +24,7 @@ use crate::{
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
-        ToggleAutoSave, ToggleSidebar,
+        ToggleAutoSave, ToggleSidebar, CheckForUpdates,
     },
 };
 
@@ -353,6 +353,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Soft-Wrap", ToggleSoftWrap),
         a("Settings…", OpenSettings),
         a("Preferences…", OpenSettings),
+        a("Check for Updates…", CheckForUpdates),
         a("Open settings.json", OpenSettingsFile),
         a("Open keymap.json", OpenKeymap),
         a("Increase Font Size", IncreaseFontSize),

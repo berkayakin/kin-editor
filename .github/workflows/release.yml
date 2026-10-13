@@ -1,0 +1,177 @@
+# Builds Kin for macOS, Windows and Linux when a version tag is pushed
+# (`git tag v0.2.0 && git push origin v0.2.0`) and publishes a GitHub Release.
+#
+# The release stays a draft while the builds upload. Then `publish` writes
+# `latest.json` (version, archive names and SHA-256s), signs it with minisign
+# (repository secret MINISIGN_SECRET_KEY) and publishes the release. Kin's
+# updater (src/updater.rs) only installs what that signature vouches for.
+# A platform whose build fails is left out of the release; the rest ship.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Turns on the updater; builds from source don't update themselves.
+  KIN_RELEASE: "1"
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Check the tag against Cargo.toml
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG doesn't match the version in Cargo.toml ($version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Create a draft release
+        run: |
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --draft --verify-tag --generate-notes --title "Kin ${TAG#v}" $prerelease
+
+  macos:
+    needs: create
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.create.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - run: cargo install cargo-bundle --locked
+      - name: Build both architectures
+        run: |
+          cargo bundle --release --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Make a universal Kin.app
+        run: |
+          app=target/aarch64-apple-darwin/release/bundle/osx/Kin.app
+          lipo -create -output "$app/Contents/MacOS/kin" \
+            target/aarch64-apple-darwin/release/kin target/x86_64-apple-darwin/release/kin
+          # Ad-hoc signature: Apple Silicon refuses unsigned code. Without a
+          # Developer ID, the first launch of a downloaded copy needs Open Anyway
+          # (Privacy & Security); updates, fetched by Kin itself, don't.
+          codesign --force --deep --sign - "$app"
+          mkdir -p dist dmg
+          ditto -c -k --keepParent "$app" "dist/Kin-$VERSION-macos.zip"
+          cp -R "$app" dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname Kin -srcfolder dmg -format UDZO -ov "dist/Kin-$VERSION-macos.dmg"
+      - run: gh release upload "$TAG" dist/* --clobber
+
+  windows:
+    needs: create
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.create.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist pkg
+          cp target/release/kin.exe LICENSE-MIT LICENSE-APACHE pkg/
+          (cd pkg && 7z a -tzip "../dist/kin-$VERSION-windows-x86_64.zip" .)
+      - run: gh release upload "$TAG" dist/* --clobber
+
+  linux:
+    needs: create
+    # The oldest supported runner, so the binary runs on older glibc versions too.
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.create.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GPUI's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir -p dist pkg
+          cp target/release/kin LICENSE-MIT LICENSE-APACHE pkg/
+          tar -czf "dist/kin-$VERSION-linux-x86_64.tar.gz" -C pkg .
+      - run: gh release upload "$TAG" dist/* --clobber
+
+  publish:
+    needs: [create, macos, windows, linux]
+    if: ${{ !cancelled() && needs.create.result == 'success' }}
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.create.outputs.version }}
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    steps:
+      - name: Download the uploaded archives
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+      - name: Write latest.json and SHA256SUMS
+        working-directory: dist
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, sys
+          version = os.environ["VERSION"]
+          # Platform keys match `platform()` in src/updater.rs.
+          names = {
+              "macos": f"Kin-{version}-macos.zip",
+              "windows-x86_64": f"kin-{version}-windows-x86_64.zip",
+              "linux-x86_64": f"kin-{version}-linux-x86_64.tar.gz",
+          }
+          def sha256(name):
+              with open(name, "rb") as f:
+                  return hashlib.sha256(f.read()).hexdigest()
+          assets = {key: {"name": name, "sha256": sha256(name)} for key, name in names.items() if os.path.exists(name)}
+          if not assets:
+              sys.exit("No archives were uploaded; every build failed.")
+          with open("latest.json", "w") as f:
+              json.dump({"version": version, "assets": assets}, f, indent=2)
+          with open("SHA256SUMS", "w") as f:
+              for name in sorted(os.listdir(".")):
+                  if name not in ("latest.json", "SHA256SUMS"):
+                      f.write(f"{sha256(name)}  {name}\n")
+          EOF
+          cat latest.json
+      - name: Sign latest.json
+        working-directory: dist
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::Add the MINISIGN_SECRET_KEY repository secret (the contents of ~/.minisign/kin-release.key)"
+            exit 1
+          fi
+          sudo apt-get install -y minisign
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/kin.key"
+          minisign -S -s "$RUNNER_TEMP/kin.key" -m latest.json -t "Kin $VERSION"
+          rm "$RUNNER_TEMP/kin.key"
+      - name: Publish the release
+        run: |
+          cd dist
+          gh release upload "$TAG" latest.json latest.json.minisig SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"

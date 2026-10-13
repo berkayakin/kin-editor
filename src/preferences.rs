@@ -45,10 +45,12 @@ pub enum Page {
     Languages,
     Keymap,
     Terminal,
+    Updates,
 }
 
 impl Page {
-    const ALL: [Page; 6] = [Page::Appearance, Page::Editor, Page::Saving, Page::Languages, Page::Keymap, Page::Terminal];
+    const ALL: [Page; 7] =
+        [Page::Appearance, Page::Editor, Page::Saving, Page::Languages, Page::Keymap, Page::Terminal, Page::Updates];
 
     fn title(self) -> &'static str {
         match self {
@@ -58,6 +60,7 @@ impl Page {
             Page::Languages => "Languages",
             Page::Keymap => "Keymap",
             Page::Terminal => "Terminal & Run",
+            Page::Updates => "Updates",
         }
     }
 
@@ -69,6 +72,7 @@ impl Page {
             Page::Languages => "Per-language options, language servers and formatters",
             Page::Keymap => "Shortcuts for every action, on top of the JetBrains keymap",
             Page::Terminal => "The terminal's shell and your own Run configurations",
+            Page::Updates => "Getting new versions of Kin",
         }
     }
 
@@ -80,6 +84,7 @@ impl Page {
             Page::Languages => Icon::Braces,
             Page::Keymap => Icon::Keyboard,
             Page::Terminal => Icon::Terminal,
+            Page::Updates => Icon::Download,
         }
     }
 }
@@ -102,10 +107,11 @@ enum Setting {
     FinalNewline,
     Shell,
     RunConfigurations,
+    AutoUpdate,
 }
 
 impl Setting {
-    const ALL: [Setting; 14] = [
+    const ALL: [Setting; 15] = [
         Setting::Theme,
         Setting::FontFamily,
         Setting::FontSize,
@@ -120,6 +126,7 @@ impl Setting {
         Setting::FinalNewline,
         Setting::Shell,
         Setting::RunConfigurations,
+        Setting::AutoUpdate,
     ];
 
     fn page(self) -> Page {
@@ -133,6 +140,7 @@ impl Setting {
             | Setting::TrimWhitespace
             | Setting::FinalNewline => Page::Saving,
             Setting::Shell | Setting::RunConfigurations => Page::Terminal,
+            Setting::AutoUpdate => Page::Updates,
         }
     }
 
@@ -146,6 +154,7 @@ impl Setting {
             Setting::FormatOnSave | Setting::TrimWhitespace | Setting::FinalNewline => "On save",
             Setting::Shell => "Terminal",
             Setting::RunConfigurations => "Run configurations",
+            Setting::AutoUpdate => "Updates",
         }
     }
 
@@ -165,6 +174,7 @@ impl Setting {
             Setting::FinalNewline => "Insert final newline",
             Setting::Shell => "Shell",
             Setting::RunConfigurations => "Run configurations",
+            Setting::AutoUpdate => "Update automatically",
         }
     }
 
@@ -184,6 +194,7 @@ impl Setting {
             Setting::FinalNewline => "End every file with a line break.",
             Setting::Shell => "Program and arguments for new terminals. Empty uses your login shell.",
             Setting::RunConfigurations => "Commands for Run… next to the detected ones (cargo, npm scripts, go, make, pytest).",
+            Setting::AutoUpdate => "Download new versions from GitHub in the background. Restart to Update in the status bar installs them.",
         }
     }
 
@@ -204,6 +215,7 @@ impl Setting {
             Setting::FinalNewline => "newline end of file eof",
             Setting::Shell => "terminal bash zsh fish powershell",
             Setting::RunConfigurations => "run tasks commands scripts",
+            Setting::AutoUpdate => "update upgrade version release download",
         }
     }
 
@@ -1126,6 +1138,7 @@ impl Preferences {
             Setting::HardTabs => self.bool_switch("pref-hard-tabs", "hard_tabs", settings.editor.hard_tabs, cx),
             Setting::SoftWrap => self.bool_switch("pref-soft-wrap", "soft_wrap", settings.editor.soft_wrap, cx),
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
+            Setting::AutoUpdate => self.switch_with_default("pref-auto-update", "auto_update", settings.auto_update, true, cx),
             Setting::TrimWhitespace => {
                 self.bool_switch("pref-trim", "trim_trailing_whitespace", settings.editor.trim_trailing_whitespace, cx)
             }
@@ -1162,13 +1175,24 @@ impl Preferences {
     }
 
     fn bool_switch(&self, id: &'static str, key: &'static str, value: Option<bool>, cx: &mut Context<Self>) -> AnyElement {
+        self.switch_with_default(id, key, value, false, cx)
+    }
+
+    fn switch_with_default(
+        &self,
+        id: &'static str,
+        key: &'static str,
+        value: Option<bool>,
+        default: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::get(cx).clone();
-        let on = value.unwrap_or(false);
+        let on = value.unwrap_or(default);
         div()
             .id(id)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.set_or_default(key, json!(!on), json!(false), cx);
+                this.set_or_default(key, json!(!on), json!(default), cx);
             }))
             .child(switch(on, &theme))
             .into_any_element()
@@ -1785,6 +1809,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::TrimWhitespace => "trim_trailing_whitespace",
         Setting::FinalNewline => "insert_final_newline",
         Setting::Shell => "terminal_shell",
+        Setting::AutoUpdate => "auto_update",
     }
 }
 

@@ -49,6 +49,7 @@ use crate::{
     preferences::{self, Preferences, PreferencesEvent},
     theme_picker::{ThemePicker, ThemePickerEvent},
     ui::{binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
+    updater,
 };
 
 actions!(
@@ -115,6 +116,7 @@ actions!(
         GitInit,
         OpenRemote,
         ToggleAutoSave,
+        CheckForUpdates,
     ]
 );
 
@@ -493,6 +495,8 @@ impl Workspace {
             }
             cx.notify();
         });
+        // An update finished downloading: show Restart to Update.
+        let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -571,7 +575,7 @@ impl Workspace {
             session_task: None,
             lsp,
             preferences_page: preferences::Page::Appearance,
-            _subscriptions: vec![find_subscription, git_subscription, log_subscription, activation, quit, settings_observer, lsp_subscription, lsp_observer],
+            _subscriptions: vec![find_subscription, git_subscription, log_subscription, activation, quit, settings_observer, updater_observer, lsp_subscription, lsp_observer],
         };
         // Problems with settings.json / keymap.json found at startup.
         if let Some(problems) = cx.try_global::<StartupProblems>().map(|p| p.0.clone()) {
@@ -1466,6 +1470,33 @@ impl Workspace {
         } else {
             self.auto_save_all(cx);
             self.toast(ToastKind::Success, "Auto-save on", None, cx);
+        }
+    }
+
+    fn check_for_updates(&mut self, _: &CheckForUpdates, _: &mut Window, cx: &mut Context<Self>) {
+        let check = updater::check(cx);
+        cx.spawn(async move |this, cx| {
+            let result = check.await;
+            this.update(cx, |ws, cx| match result {
+                Ok(updater::Check::UpToDate) => {
+                    ws.toast(ToastKind::Success, format!("Kin {} is up to date", env!("CARGO_PKG_VERSION")), None, cx)
+                }
+                Ok(updater::Check::Ready(version)) => ws.toast(
+                    ToastKind::Success,
+                    format!("Kin {version} is ready"),
+                    Some("Restart to Update in the status bar installs it.".into()),
+                    cx,
+                ),
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't check for updates", Some(err), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn restart_to_update(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = updater::restart(cx) {
+            self.toast(ToastKind::Error, "Couldn't install the update", Some(err), cx);
         }
     }
 
@@ -5213,6 +5244,25 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
+            .when_some(updater::pending_version(cx).map(|v| format!("Kin {v} is downloaded")), |el, tip| {
+                el.child(
+                    div()
+                        .id("restart-to-update")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .h(px(22.))
+                        .px_2()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .text_color(theme.text)
+                        .hover(|s| s.bg(theme.hover))
+                        .on_click(cx.listener(|ws, _, _, cx| ws.restart_to_update(cx)))
+                        .child(icon_el(Icon::Download, px(13.), theme.accent.into()))
+                        .child("Restart to Update")
+                        .tooltip(move |_, cx| tooltip_view(tip.clone(), cx)),
+                )
+            })
             .children(right)
             .when(self.repo.is_some(), |el| {
                 el.child(
@@ -5345,6 +5395,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_init))
             .on_action(cx.listener(Self::open_remote))
             .on_action(cx.listener(Self::toggle_auto_save))
+            .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))

@@ -33,6 +33,7 @@ mod terminal;
 mod theme;
 mod theme_picker;
 mod ui;
+mod updater;
 mod workspace;
 mod wrap;
 
@@ -43,7 +44,7 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings,
+        CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings,
         ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
@@ -58,6 +59,7 @@ fn menus() -> Vec<Menu> {
             name: "Kin".into(),
             items: vec![
                 MenuItem::action("About Kin", about::About),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
@@ -220,6 +222,7 @@ fn main() {
             let problems = settings::init(cx);
             cx.set_global(settings::StartupProblems(problems));
             theme::init(cx);
+            updater::init(cx);
             cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));
             cx.on_action(|_: &DecreaseFontSize, cx| theme::zoom(Some(-1.), cx));
             cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));

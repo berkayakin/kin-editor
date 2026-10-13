@@ -82,6 +82,32 @@ The icon (a white Vidaloka "F" on black) lives in [`assets/app-icon/`](assets/ap
   `~/.local/share/icons/hicolor/` and `linux/dev.kin.editor.desktop` into
   `~/.local/share/applications/`.
 
+## Releases and updates
+
+Pushing a version tag builds and publishes a GitHub Release
+([`.github/workflows/release.yml`](.github/workflows/release.yml)):
+
+```bash
+# bump `version` in Cargo.toml first; the tag must match it
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release gets a universal macOS `Kin.app` (`.dmg` and `.zip`), a Windows `.zip` and a
+Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
+[minisign](https://jedisct1.github.io/minisign/) using the `MINISIGN_SECRET_KEY` repository
+secret. Tags with a hyphen (`v0.3.0-beta.1`) become pre-releases, which the updater skips.
+
+Released builds check for updates shortly after launch and every few hours (unless
+`auto_update` is `false`; **Check for Updates…** works either way), download in the background
+and show **Restart to Update** in the status bar. They only install an update whose
+`latest.json` carries a valid signature from the key in `src/updater.rs`. Builds from source
+don't update themselves.
+
+The macOS app is only ad-hoc signed (no Apple Developer ID), so macOS blocks the first launch
+of a downloaded copy: allow it under System Settings → Privacy & Security → **Open Anyway**, or
+run `xattr -dr com.apple.quarantine /Applications/Kin.app`. Updates don't need this.
+
 ## Key bindings
 
 Kin follows the JetBrains IDE keymaps: the macOS keymap on macOS and the
@@ -290,6 +316,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
+| `auto_update` | `true` | download new releases in the background; see [Releases and updates](#releases-and-updates) |
 
 ```jsonc
 {

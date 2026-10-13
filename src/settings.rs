@@ -50,6 +50,8 @@ pub struct Settings {
     /// Extra entries for Run…: a name, a shell command and an optional
     /// folder relative to the project.
     pub run_configurations: Vec<RunConfiguration>,
+    /// Download new versions from GitHub in the background (on by default).
+    pub auto_update: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -146,6 +148,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "formatters",
     "terminal_shell",
     "run_configurations",
+    "auto_update",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -276,6 +279,7 @@ impl Settings {
             "format_on_save" => self.editor.format_on_save.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
+            "auto_update" => self.auto_update.is_some(),
             _ => false,
         }
     }
@@ -493,7 +497,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // make and pytest).
   // "run_configurations": [
   //   { "name": "Serve docs", "command": "mkdocs serve", "cwd": "docs" }
-  // ]
+  // ],
+
+  // Download new versions in the background; Restart to Update installs them.
+  // "auto_update": true
 }
 "#;
 
