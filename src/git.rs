@@ -649,12 +649,26 @@ pub struct Hunk {
     pub old_text: String,
 }
 
+/// Lines as git counts them: split after each `\n` only. (`similar`'s own
+/// line diff also splits at a lone `\r`, which binary files and old Mac
+/// text are full of, so its line numbers wouldn't match these.)
+pub fn split_lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n').collect()
+}
+
+/// Git's test for binary content: a NUL byte near the start.
+pub fn is_binary(text: &str) -> bool {
+    let end = text.len().min(8000);
+    text.as_bytes()[..end].contains(&0)
+}
+
 pub fn diff_hunks(base: &str, current: &str) -> Vec<Hunk> {
     use similar::DiffOp;
+    let old_lines = split_lines(base);
+    let new_lines = split_lines(current);
     let diff = similar::TextDiff::configure()
         .timeout(Duration::from_millis(200))
-        .diff_lines(base, current);
-    let old_lines: Vec<&str> = base.split_inclusive('\n').collect();
+        .diff_slices(&old_lines, &new_lines);
     let text = |r: Range<usize>| old_lines[r.start.min(old_lines.len())..r.end.min(old_lines.len())].concat();
     diff.ops()
         .iter()
@@ -804,9 +818,10 @@ fn word_emphasis(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>)
 
 pub fn diff_document(base: &str, current: &str, context: usize) -> DiffDocument {
     use similar::DiffOp;
-    let diff = similar::TextDiff::configure().timeout(Duration::from_secs(2)).diff_lines(base, current);
-    let old_lines: Vec<String> = base.split_inclusive('\n').map(expand_tabs).collect();
-    let new_lines: Vec<String> = current.split_inclusive('\n').map(expand_tabs).collect();
+    let (old_raw, new_raw) = (split_lines(base), split_lines(current));
+    let diff = similar::TextDiff::configure().timeout(Duration::from_secs(2)).diff_slices(&old_raw, &new_raw);
+    let old_lines: Vec<String> = old_raw.iter().map(|l| expand_tabs(l)).collect();
+    let new_lines: Vec<String> = new_raw.iter().map(|l| expand_tabs(l)).collect();
     let mut doc = DiffDocument::default();
     let mut shown_until = 0; // old-line index after the last shown line
     let skipped = |n: usize| format!("{n} unchanged line{}", if n == 1 { "" } else { "s" });
@@ -909,8 +924,8 @@ pub fn rows_touch(a: &Range<usize>, b: &Range<usize>) -> bool {
 
 /// `base` with the hunks of `base → target` that `pick` selects applied.
 pub fn apply_hunks(base: &str, target: &str, pick: impl Fn(&Hunk) -> bool) -> String {
-    let base_lines: Vec<&str> = base.split_inclusive('\n').collect();
-    let target_lines: Vec<&str> = target.split_inclusive('\n').collect();
+    let base_lines = split_lines(base);
+    let target_lines = split_lines(target);
     let mut out = String::with_capacity(base.len().max(target.len()));
     let mut at = 0;
     for hunk in diff_hunks(base, target).iter().filter(|h| pick(h)) {
@@ -1326,6 +1341,19 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         assert_eq!((old, new), (vec![20..21], vec![20..21]));
         // Unrelated lines get no emphasis: the whole line changed.
         assert_eq!(word_emphasis("fn main() {", "# heading").0, Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn diffs_binary_and_cr_text_without_panicking() {
+        // Bytes like an image's: lone \r and NUL bytes among others.
+        let bytes = |seed: u32| (0..4000u32).map(|i| (i * seed % 256) as u8).collect::<Vec<u8>>();
+        let png = String::from_utf8_lossy(&bytes(37)).into_owned();
+        let other = String::from_utf8_lossy(&bytes(53)).into_owned();
+        assert!(is_binary(&png) && !is_binary("plain\ntext\n"));
+        diff_document(&png, &other, 3);
+        diff_document("", &png, 3);
+        diff_document("a\rb\rc\n", "a\rB\rc\n", 3);
+        diff_hunks(&png, &other);
     }
 
     #[test]

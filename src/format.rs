@@ -138,9 +138,9 @@ impl Formatter {
 /// ranges of `old`.
 pub fn line_edits(old: &str, new: &str) -> Vec<(Range<usize>, String)> {
     use similar::DiffOp;
-    let diff = similar::TextDiff::configure().timeout(Duration::from_millis(500)).diff_lines(old, new);
-    let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
-    let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+    let old_lines = crate::git::split_lines(old);
+    let new_lines = crate::git::split_lines(new);
+    let diff = similar::TextDiff::configure().timeout(Duration::from_millis(500)).diff_slices(&old_lines, &new_lines);
     let mut starts = Vec::with_capacity(old_lines.len() + 1);
     let mut offset = 0;
     for line in &old_lines {

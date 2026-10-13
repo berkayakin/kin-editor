@@ -44,6 +44,8 @@ pub enum DiffSource {
 type LineSpans = Vec<Vec<(Range<usize>, Highlight)>>;
 
 struct Loaded {
+    /// Binary content has no meaningful text diff.
+    binary: bool,
     doc: DiffDocument,
     old_spans: LineSpans,
     new_spans: LineSpans,
@@ -104,7 +106,9 @@ impl DiffView {
                             } else {
                                 git::index_text(&repo, &file.rel).unwrap_or_default()
                             };
-                            let current = buffer.clone().or_else(|| std::fs::read_to_string(&file.path).ok()).unwrap_or_default();
+                            // Read bytes, not UTF-8 text, so binary files are detected rather than empty.
+                            let read = || std::fs::read(&file.path).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+                            let current = buffer.clone().or_else(read).unwrap_or_default();
                             (base, current, file.path.clone())
                         }
                         DiffSource::Commit { sha, file, .. } => {
@@ -112,8 +116,18 @@ impl DiffView {
                             (base, current, repo.join(&file.rel))
                         }
                     };
+                    if git::is_binary(&base) || git::is_binary(&current) {
+                        return Loaded {
+                            binary: true,
+                            doc: DiffDocument::default(),
+                            old_spans: Vec::new(),
+                            new_spans: Vec::new(),
+                            current: current.into(),
+                        };
+                    }
                     let language = Language::from_path(&path);
                     Loaded {
+                        binary: false,
                         doc: git::diff_document(&base, &current, context),
                         old_spans: line_spans(language, &base),
                         new_spans: line_spans(language, &current),
@@ -290,6 +304,8 @@ impl Render for DiffView {
         let (path, rel, change) = self.file_label();
         let file_icon = crate::ui::file_icon(&path, px(16.), &theme);
         let (added, removed) = self.loaded.as_ref().map_or((0, 0), |l| (l.doc.added, l.doc.removed));
+        // Line counts and layouts mean nothing for a binary file.
+        let binary = self.loaded.as_ref().is_some_and(|l| l.binary);
         let deleted = change == Change::Deleted;
         let icon_button = |id: &'static str, icon: Icon, tip: &'static str| {
             div()
@@ -347,10 +363,12 @@ impl Render for DiffView {
                     .text_color(change_color(&theme, change))
                     .child(badge),
             )
-            .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.git_added).child(format!("+{added}")))
-            .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.git_deleted).child(format!("−{removed}")))
+            .when(!binary, |el| {
+                el.child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.git_added).child(format!("+{added}")))
+                    .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.git_deleted).child(format!("−{removed}")))
+            })
             .child(div().flex_1())
-            .child(
+            .when(!binary, |el| el.child(
                 div()
                     .flex()
                     .flex_shrink_0()
@@ -360,7 +378,7 @@ impl Render for DiffView {
                     .bg(theme.panel)
                     .child(segment("diff-split", "Side by Side", self.side_by_side).on_click(cx.listener(|this, _, _, cx| this.set_side_by_side(true, cx))))
                     .child(segment("diff-unified", "Unified", !self.side_by_side).on_click(cx.listener(|this, _, _, cx| this.set_side_by_side(false, cx)))),
-            )
+            ))
             .when_some(
                 match &self.source {
                     DiffSource::Working { file, staged, .. } => Some((file.clone(), *staged)),
@@ -391,6 +409,12 @@ impl Render for DiffView {
         let rows = self.rows_len();
         let body = match self.loaded.clone() {
             None => div().flex_1().p_4().text_color(theme.text_dim).child("Loading diff…").into_any_element(),
+            Some(loaded) if loaded.binary => div()
+                .flex_1()
+                .p_4()
+                .text_color(theme.text_dim)
+                .child("Binary file: there's no text diff to show")
+                .into_any_element(),
             Some(loaded) if loaded.doc.changes.is_empty() => {
                 div().flex_1().p_4().text_color(theme.text_dim).child("No differences").into_any_element()
             }
