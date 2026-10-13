@@ -44,7 +44,7 @@ platform-native text rendering (CoreText / DirectWrite).
   highlighted, a log with a branch graph and file history, merge/rebase with conflict resolution in
   the editor, branches, pull and fetch
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
-- 11 built-in themes (9 dark, 2 light) and JSON user themes with live preview
+- 31 built-in themes (24 dark, 7 light) and JSON user themes with live preview
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste; shell keys like Ctrl+R reach the shell
@@ -384,8 +384,10 @@ Action). Moving through the list previews each theme live; Enter keeps it
 (saved to `settings.json`), Escape restores the previous one.
 
 Built in: Clay Black (default; near-black with neutral grays), Clay Dark, One Dark, Dracula, Nord, Tokyo Night, Gruvbox Dark,
-Catppuccin Mocha, Rosé Pine, and the light themes Clay Light and GitHub Light. Their
-sources in [`assets/themes/`](assets/themes) use the same format as user themes.
+Catppuccin Mocha, Rosé Pine, Solarized Dark, Monokai Pro, Everforest Dark, Kanagawa, Ayu Dark, Night Owl,
+Material Palenight, GitHub Dark, Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2,
+and the light themes Clay Light, GitHub Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light
+and One Light. Their sources in [`assets/themes/`](assets/themes) use the same format as user themes.
 
 ### Making your own
 
