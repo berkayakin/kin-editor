@@ -3515,36 +3515,41 @@ impl Workspace {
             Modal::Clone(c) => c.clone().into_any_element(),
         };
         let top = (window.viewport_size().height * 0.12).max(px(TITLEBAR_HEIGHT + 12.));
+        // Deferred above the other deferred layers (resize handles), so they
+        // neither show through a modal nor take its mouse events.
         Some(
-            div()
-                .id("modal-layer")
-                .absolute()
-                .inset_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .pt(top)
-                .bg(gpui::black().opacity(0.18))
-                // Wheel and hover don't reach the editor behind a modal.
-                .occlude()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|ws, _, window, cx| {
-                        // A running clone keeps its dialog open; it has a Stop button.
-                        if let Some(Modal::Clone(c)) = &ws.modal
-                            && c.read(cx).is_busy()
-                        {
-                            return;
-                        }
-                        ws.close_modal(window, cx)
-                    }),
-                )
-                .child(
-                    div()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(content),
-                )
-                .into_any_element(),
+            gpui::deferred(
+                div()
+                    .id("modal-layer")
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(top)
+                    .bg(gpui::black().opacity(0.18))
+                    // Wheel and hover don't reach the editor behind a modal.
+                    .occlude()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|ws, _, window, cx| {
+                            // A running clone keeps its dialog open; it has a Stop button.
+                            if let Some(Modal::Clone(c)) = &ws.modal
+                                && c.read(cx).is_busy()
+                            {
+                                return;
+                            }
+                            ws.close_modal(window, cx)
+                        }),
+                    )
+                    .child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(content),
+                    )
+            )
+            .with_priority(1)
+            .into_any_element(),
         )
     }
 
