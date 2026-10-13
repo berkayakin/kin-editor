@@ -164,9 +164,9 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
-/// Run as a bare binary (`cargo run`), macOS names the app after the executable, `kin`,
-/// in the menu bar and Dock. Give it the display name; a bundled `Kin.app` already has
-/// it in Info.plist. Must run before the application starts.
+/// Run as a bare binary (`cargo run`), macOS names the app after the executable, `kin`.
+/// This fixes the menu bar; the Dock label still says `kin` until Kin runs as the bundled
+/// `Kin.app`, which gets its name from Info.plist. Must run before the application starts.
 #[cfg(target_os = "macos")]
 fn set_app_name() {
     use objc2::{rc::Retained, runtime::AnyObject};
