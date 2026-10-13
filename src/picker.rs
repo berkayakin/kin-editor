@@ -20,6 +20,7 @@ use nucleo_matcher::{
 use crate::{
     assets::Icon,
     clone_dialog::display_path,
+    lsp::protocol::{Encoding, Location},
     syntax::Symbol,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline, PageDown, PageUp, Submit},
     theme::Theme,
@@ -36,6 +37,19 @@ pub enum PickerMode {
     Actions,
     /// The active file's symbols; see [`Picker::set_symbols`].
     Structure,
+    /// Places in the project (usages, declarations); see [`Picker::set_locations`].
+    Locations,
+}
+
+/// One place in a [`PickerMode::Locations`] list.
+pub struct LocationRow {
+    pub location: Location,
+    /// The file, relative to the project.
+    pub file: String,
+    /// 1-based.
+    pub line: usize,
+    /// The line's text, trimmed.
+    pub preview: String,
 }
 
 pub struct ActionEntry {
@@ -49,6 +63,7 @@ pub enum PickerEvent {
     RunAction(Box<dyn Action>),
     /// Jump to an offset in the active editor.
     GoTo(usize),
+    OpenLocation { location: Location, encoding: Encoding },
     Dismissed,
 }
 
@@ -79,6 +94,9 @@ enum Item {
         /// Indent by nesting; flat while filtering.
         nested: bool,
     },
+    Location {
+        ix: usize,
+    },
 }
 
 pub struct Picker {
@@ -93,6 +111,10 @@ pub struct Picker {
     symbols: Arc<Vec<(Symbol, usize)>>,
     /// The symbol around the caret, preselected like JetBrains.
     current_symbol: Option<usize>,
+    locations: Arc<Vec<LocationRow>>,
+    location_encoding: Encoding,
+    /// Overrides the mode's title (Locations: "Usages of foo").
+    title: Option<SharedString>,
     items: Arc<Vec<Item>>,
     selected: usize,
     scroll: UniformListScrollHandle,
@@ -124,6 +146,7 @@ impl Picker {
             PickerMode::Projects => "Search recent projects",
             PickerMode::Actions => "Search actions",
             PickerMode::Structure => "Search symbols",
+            PickerMode::Locations => "Filter",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
         window.focus(&query.focus_handle(cx));
@@ -139,6 +162,9 @@ impl Picker {
             shortcuts,
             symbols: Arc::new(Vec::new()),
             current_symbol: None,
+            locations: Arc::new(Vec::new()),
+            location_encoding: Encoding::Utf16,
+            title: None,
             items: Arc::new(Vec::new()),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
@@ -167,6 +193,14 @@ impl Picker {
     pub fn set_symbols(&mut self, symbols: Vec<(Symbol, usize)>, cursor: usize, cx: &mut Context<Self>) {
         self.current_symbol = symbols.iter().rposition(|(s, _)| s.offset <= cursor);
         self.symbols = Arc::new(symbols);
+        self.update_items(cx);
+    }
+
+    /// Fills a Locations picker.
+    pub fn set_locations(&mut self, title: SharedString, rows: Vec<LocationRow>, encoding: Encoding, cx: &mut Context<Self>) {
+        self.title = Some(title);
+        self.locations = Arc::new(rows);
+        self.location_encoding = encoding;
         self.update_items(cx);
     }
 
@@ -345,6 +379,29 @@ impl Picker {
             items.extend(scored.into_iter().take(limit).map(|(_, i)| i));
         }
 
+        if self.mode == PickerMode::Locations {
+            let locations = self.locations.clone();
+            let mut scored: Vec<(u32, Item)> = Vec::new();
+            for (ix, row) in locations.iter().enumerate() {
+                let score = match &pattern {
+                    Some(p) => {
+                        let text = format!("{} {}", row.file, row.preview);
+                        let mut buf = Vec::new();
+                        match p.score(Utf32Str::new(&text, &mut buf), &mut self.matcher) {
+                            Some(score) => score,
+                            None => continue,
+                        }
+                    }
+                    None => 0,
+                };
+                scored.push((score, Item::Location { ix }));
+            }
+            if pattern.is_some() {
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+            items.extend(scored.into_iter().map(|(_, i)| i));
+        }
+
         if self.mode == PickerMode::Structure {
             let mut scored: Vec<(u32, Item)> =
                 (0..self.symbols.len()).filter_map(|ix| self.symbol_item(ix, pattern.as_ref())).collect();
@@ -387,6 +444,10 @@ impl Picker {
             }
             Some(Item::Action { ix, .. }) => cx.emit(PickerEvent::RunAction(self.actions[*ix].action.boxed_clone())),
             Some(Item::Symbol { ix, .. }) => cx.emit(PickerEvent::GoTo(self.symbols[*ix].0.offset)),
+            Some(Item::Location { ix }) => cx.emit(PickerEvent::OpenLocation {
+                location: self.locations[*ix].location.clone(),
+                encoding: self.location_encoding,
+            }),
             _ => {}
         }
     }
@@ -453,10 +514,17 @@ impl Render for Picker {
             ),
             PickerMode::Actions => ("Actions", Icon::Command, ""),
             PickerMode::Structure => ("File Structure", Icon::Braces, ""),
+            PickerMode::Locations => ("", Icon::Search, ""),
         };
+        let title: SharedString = match &self.title {
+            Some(t) => t.clone(),
+            None => title.into(),
+        };
+        let hint = if self.mode == PickerMode::Locations { format!("{} found", self.locations.len()) } else { hint.to_string() };
         let items = self.items.clone();
         let actions = self.actions.clone();
         let symbols = self.symbols.clone();
+        let locations = self.locations.clone();
         let shortcuts = self.shortcuts.clone();
         let selected = self.selected;
         let count = items.len();
@@ -546,6 +614,25 @@ impl Render for Picker {
                                                     .text_size(px(12.))
                                                     .text_color(theme.text_dim)
                                                     .child(format!(":{line}")),
+                                            )
+                                    }
+                                    Item::Location { ix } => {
+                                        let row_data = &locations[*ix];
+                                        row.child(icon_el(Icon::FileCode, px(14.), theme.text_muted.into()))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_color(theme.text)
+                                                    .child(row_data.preview.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(12.))
+                                                    .text_color(theme.text_dim)
+                                                    .child(format!("{}:{}", row_data.file, row_data.line)),
                                             )
                                     }
                                     Item::Header(_) => unreachable!(),

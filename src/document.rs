@@ -77,7 +77,10 @@ pub struct Document {
     pub diagnostics: Vec<Diagnostic>,
     builtin_diagnostics: Vec<Diagnostic>,
     external_diagnostics: Vec<Diagnostic>,
+    lsp_diagnostics: Vec<Diagnostic>,
     pub uses_crlf: bool,
+    /// Edits since the language server last heard about this document.
+    lsp_changes: LspChanges,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -122,7 +125,9 @@ impl Document {
             diagnostics: Vec::new(),
             builtin_diagnostics: Vec::new(),
             external_diagnostics: Vec::new(),
+            lsp_diagnostics: Vec::new(),
             uses_crlf,
+            lsp_changes: LspChanges::default(),
             disk_mtime: None,
         }
     }
@@ -178,6 +183,7 @@ impl Document {
         }
         self.rope = Rope::from_str(&text);
         self.syntax = Syntax::new(self.language, &self.rope);
+        self.lsp_changes.mark_full();
         self.version += 1;
         self.saved_version = self.version;
         self.undo_stack.clear();
@@ -386,6 +392,7 @@ impl Document {
     }
 
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
+        self.lsp_changes.record(&self.rope, range.clone(), text);
         let edit = input_edit(&self.rope, range.clone(), text);
         let s = self.rope.byte_to_char(range.start);
         let e = self.rope.byte_to_char(range.end);
@@ -405,11 +412,23 @@ impl Document {
         self.merge_diagnostics();
     }
 
+    pub fn set_lsp_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        self.lsp_diagnostics = diagnostics;
+        self.merge_diagnostics();
+    }
+
+    /// Edits not yet sent to the language server, oldest first; each is
+    /// relative to the text after the previous one, as LSP expects.
+    pub fn take_lsp_changes(&mut self) -> LspChanges {
+        std::mem::take(&mut self.lsp_changes)
+    }
+
     fn merge_diagnostics(&mut self) {
         self.diagnostics = self
             .builtin_diagnostics
             .iter()
             .chain(&self.external_diagnostics)
+            .chain(&self.lsp_diagnostics)
             .cloned()
             .collect();
         self.diagnostics
@@ -418,10 +437,58 @@ impl Document {
 
     /// Keeps stale diagnostics roughly in place until the next lint finishes.
     fn shift_diagnostics(&mut self, range: Range<usize>, new_len: usize) {
-        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics] {
+        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.lsp_diagnostics] {
             shift(list, &range, new_len);
         }
         self.merge_diagnostics();
+    }
+}
+
+/// One replacement in LSP terms: where it was (as line plus UTF-8 and
+/// UTF-16 columns, since servers differ) and the new text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LspChange {
+    pub start: (u32, u32, u32),
+    pub end: (u32, u32, u32),
+    pub text: String,
+}
+
+#[derive(Default, Debug)]
+pub struct LspChanges {
+    pub changes: Vec<LspChange>,
+    /// Too many changes, or the whole text was replaced: send it all.
+    pub full: bool,
+}
+
+impl LspChanges {
+    /// Past this, sending the whole text is cheaper than the edit list.
+    const MAX: usize = 1000;
+
+    fn record(&mut self, rope: &Rope, range: Range<usize>, text: &str) {
+        if self.full {
+            return;
+        }
+        if self.changes.len() >= Self::MAX {
+            self.mark_full();
+            return;
+        }
+        let point = |offset: usize| {
+            let line = rope.byte_to_line(offset);
+            let line_start = rope.line_to_byte(line);
+            let (c0, c1) = (rope.byte_to_char(line_start), rope.byte_to_char(offset));
+            let utf16 = rope.char_to_utf16_cu(c1) - rope.char_to_utf16_cu(c0);
+            (line as u32, (offset - line_start) as u32, utf16 as u32)
+        };
+        self.changes.push(LspChange { start: point(range.start), end: point(range.end), text: text.to_string() });
+    }
+
+    fn mark_full(&mut self) {
+        self.changes.clear();
+        self.full = true;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty() && !self.full
     }
 }
 

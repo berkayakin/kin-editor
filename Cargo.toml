@@ -12,6 +12,7 @@ category = "public.app-category.developer-tools"
 short_description = "A small, fast GPU-rendered code editor"
 
 [dependencies]
+futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 ignore = "0.4.33"
 nucleo-matcher = "0.3.1"
@@ -43,6 +44,7 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
+url = "2.5.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"

@@ -24,6 +24,9 @@ platform-native text rendering (CoreText / DirectWrite).
     project's own config (JavaScript and TypeScript); built-in rules then drop back to syntax errors only
   - **CSS, Rust, Go, Python, PHP, shell, JSON, YAML, TOML** — syntax errors from the tree-sitter parser
     (unexpected and missing tokens)
+- Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
+  signature help, Go to Declaration, Find Usages, Rename and context actions (quick fixes and
+  refactorings); see [Language servers](#language-servers)
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
 - Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
@@ -102,6 +105,12 @@ reachable through Find Action, which shows its shortcut.
 | Next / previous change | ⌃⌥⇧↓ / ⌃⌥⇧↑ | Ctrl+Alt+Shift+↓ / ↑ |
 | Settings | ⌘, | Ctrl+Alt+S |
 | Increase / decrease font size | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
+| Basic completion | ⌃Space | Ctrl+Space |
+| Go to Declaration | ⌘B or ⌘-click | Ctrl+B or Ctrl+click |
+| Find Usages | ⌥F7 | Alt+F7 |
+| Rename | ⇧F6 | Shift+F6 |
+| Show Context Actions | ⌥↩ | Alt+Enter |
+| Quick Documentation | F1 | Ctrl+Q |
 
 ### Your own bindings
 
@@ -125,6 +134,34 @@ Find Action:
 `secondary` is ⌘ on macOS and Ctrl elsewhere. Leave out `context` to bind everywhere; a binding
 in a more specific context (like `"Editor"`) still wins there. Mistakes show up as a notification.
 
+## Language servers
+
+Kin starts a language server the first time you open a file it handles, one per server and
+project, and shows it in the status bar (with indexing progress). It never downloads anything:
+it uses the server in the project's `node_modules/.bin` or on your PATH (also the login shell's
+PATH, `~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kin is opened from the Dock).
+If none is installed, the status bar says **No language server**; click it to copy the install
+command.
+
+| Language | Server | Install |
+| --- | --- | --- |
+| Rust | rust-analyzer | `rustup component add rust-analyzer` |
+| Go | gopls | `go install golang.org/x/tools/gopls@latest` |
+| JavaScript, TypeScript | typescript-language-server or vtsls | `npm install -g typescript typescript-language-server` |
+| Python | basedpyright, pyright or pylsp | `pip install basedpyright` |
+| PHP | intelephense or phpactor | `npm install -g intelephense` |
+| HTML, CSS, JSON | vscode-langservers-extracted | `npm install -g vscode-langservers-extracted` |
+| YAML | yaml-language-server | `npm install -g yaml-language-server` |
+| TOML | taplo | `cargo install taplo-cli --locked --features lsp` |
+| Shell | bash-language-server | `npm install -g bash-language-server` |
+| Markdown | marksman | `brew install marksman` |
+
+With a server running, its diagnostics replace Kin's built-in syntax check (the other built-in
+rules and ESLint still run). Hover a symbol for its documentation and any problem there;
+completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
+Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
+server or turn one off, see `language_servers` below.
+
 ## Settings
 
 **Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
@@ -146,6 +183,7 @@ picker, Toggle Auto Save).
 | `trim_trailing_whitespace` | `false` | on save; lines with a caret are left alone |
 | `insert_final_newline` | `false` | on save |
 | `languages` | | per-language overrides of the last five, by the name in the status bar |
+| `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 
 ```jsonc
 {
@@ -283,6 +321,8 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 - `src/editor.rs` — editor view, input handling and the GPU element that paints it
 - `src/wrap.rs` — soft wrap: where long lines break into display rows
 - `src/syntax.rs` — tree-sitter parsing, highlighting, bracket matching and file outlines
+- `src/lsp/` — language server client: JSON-RPC transport, protocol types, server discovery
+- `src/editor/lsp.rs` — completion, hover, signature help and LSP requests in the editor
 - `src/lint/` — built-in JS/HTML linters and the ESLint bridge
 - `src/search.rs`, `src/find_bar.rs`, `src/project_search.rs` — in-file and project search
 - `src/picker.rs` — Search Everywhere, Go to File, Recent Files, Recent Projects, Find Action,

@@ -1,6 +1,10 @@
 //! The text editor view: multi-cursor editing, keyboard/mouse/IME input and a
 //! custom element that paints only the visible lines straight to the GPU.
 
+mod lsp;
+
+pub use lsp::EditorLspEvent;
+
 use std::{ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
@@ -92,6 +96,12 @@ actions!(
         PreviousChange,
         ToggleInlineBlame,
         ToggleSoftWrap,
+        ShowCompletions,
+        QuickDocumentation,
+        GoToDeclaration,
+        FindUsages,
+        RenameSymbol,
+        ShowContextActions,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -209,6 +219,8 @@ pub struct Editor {
     soft_wrap: bool,
     /// Line breaks for soft wrap, recomputed lazily (see `sync_wrap`).
     wrap: Option<WrapMap>,
+    /// Language server state: completion, hover, signature help.
+    lsp: lsp::EditorLsp,
 }
 
 impl Editor {
@@ -256,6 +268,7 @@ impl Editor {
             blame_task: None,
             soft_wrap: false,
             wrap: None,
+            lsp: lsp::EditorLsp::default(),
         };
         this.apply_settings(cx);
         this.detect_external_linter();
@@ -491,7 +504,7 @@ impl Editor {
                 self.linted_version = None;
                 self.schedule_lint(Duration::ZERO, cx);
                 self.schedule_diff(Duration::ZERO, cx);
-                cx.emit(EditorEvent::Edited);
+                self.edited(cx);
                 cx.notify();
             }
             Ok(false) => {}
@@ -554,6 +567,7 @@ impl Editor {
     pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
         self.apply_save_actions(cx);
         self.doc.save()?;
+        self.lsp_did_save(cx);
         self.doc.finalize_transaction();
         self.schedule_lint(Duration::ZERO, cx);
         self.run_external_linter(cx);
@@ -606,6 +620,7 @@ impl Editor {
         self.cursor_visible = true;
         self.blink_epoch += 1;
         self.blink_task = None;
+        self.lsp_selection_changed(cx);
         cx.notify();
     }
 
@@ -706,7 +721,7 @@ impl Editor {
         self.doc.set_selections_after(&self.selections);
         self.schedule_lint(Duration::from_millis(150), cx);
         self.schedule_diff(Duration::from_millis(120), cx);
-        cx.emit(EditorEvent::Edited);
+        self.edited(cx);
         cx.notify();
     }
 
@@ -749,6 +764,7 @@ impl Editor {
             let len = typed.len();
             (range, typed.clone(), Some(len))
         });
+        self.after_typing(text, cx);
     }
 
     fn schedule_lint(&mut self, delay: Duration, cx: &mut Context<Self>) {
@@ -774,6 +790,11 @@ impl Editor {
                 .await;
             this.update(cx, |editor, cx| {
                 if editor.doc.version() == version {
+                    let mut diagnostics = diagnostics;
+                    // The language server reports syntax errors itself.
+                    if editor.lsp.active {
+                        diagnostics.retain(|d| d.rule != "syntax");
+                    }
                     editor.doc.set_builtin_diagnostics(diagnostics);
                     editor.linted_version = Some(version);
                     cx.notify();
@@ -1036,6 +1057,9 @@ impl Editor {
     }
 
     fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_key(lsp::CompletionKey::Move(-1), cx) {
+            return;
+        }
         if self.is_single_line() {
             cx.propagate();
             return;
@@ -1044,6 +1068,9 @@ impl Editor {
     }
 
     fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_key(lsp::CompletionKey::Move(1), cx) {
+            return;
+        }
         if self.is_single_line() {
             cx.propagate();
             return;
@@ -1222,6 +1249,9 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_key(lsp::CompletionKey::Accept { replace: false }, cx) {
+            return;
+        }
         if self.is_single_line() {
             cx.propagate();
             return;
@@ -1305,6 +1335,9 @@ impl Editor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_key(lsp::CompletionKey::Accept { replace: true }, cx) {
+            return;
+        }
         if self.is_chromeless() {
             cx.propagate();
             return;
@@ -1580,6 +1613,9 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.dismiss_lsp_popovers(cx) {
+            return;
+        }
         let p = self.primary_selection();
         if self.is_single_line() || (self.selections.len() == 1 && p.is_empty()) {
             // Nothing to collapse: let the parent (find bar, modal) handle Escape.
@@ -1658,7 +1694,7 @@ impl Editor {
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
             self.schedule_diff(Duration::from_millis(120), cx);
-            cx.emit(EditorEvent::Edited);
+            self.edited(cx);
         }
     }
 
@@ -1668,7 +1704,7 @@ impl Editor {
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
             self.schedule_diff(Duration::from_millis(120), cx);
-            cx.emit(EditorEvent::Edited);
+            self.edited(cx);
         }
     }
 
@@ -1739,9 +1775,16 @@ impl Editor {
             }
         }
         self.open_hunk = None;
+        self.dismiss_lsp_popovers(cx);
 
         let offset = self.offset_for_position(event.position, window, cx);
         let in_gutter = event.position.x < layout.bounds.left() + layout.gutter_width;
+        // ⌘-click (Ctrl-click elsewhere): Go to Declaration.
+        if event.modifiers.secondary() && !in_gutter && event.click_count == 1 && !self.is_chromeless() {
+            self.set_selections(vec![Selection::cursor(offset)], 0, cx);
+            self.navigate_from(offset, cx);
+            return;
+        }
         let (mode, unit) = if in_gutter || event.click_count >= 3 {
             (DragMode::Line, self.line_range(offset))
         } else if event.click_count == 2 {
@@ -1828,6 +1871,7 @@ impl Editor {
         if event.pressed_button != Some(MouseButton::Left) {
             self.drag = None;
             self.scrollbar_drag = None;
+            self.hover_at(event.position, window, cx);
             return;
         }
         if self.scrollbar_drag.is_some() {
@@ -1875,6 +1919,7 @@ impl Editor {
         self.scroll.y -= delta.y;
         self.scroll.x -= delta.x;
         self.clamp_scroll();
+        self.lsp.hover = None;
         cx.notify();
     }
 
@@ -2355,7 +2400,10 @@ impl Editor {
                 }
                 if let Some(worst) = worst {
                     let color = severity_color(&theme, worst.severity);
-                    let mut message = worst.message.clone();
+                    // Multi-line messages (rust-analyzer's) fit on one line here;
+                    // hovering shows them in full.
+                    let mut message =
+                        worst.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
                     if message.len() > 160 {
                         message.truncate(message.floor_char_boundary(160));
                         message.push('…');
@@ -3196,8 +3244,9 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let popover = self.render_hunk_popover(cx);
+        let lsp_popovers = self.render_lsp_popovers(window, cx);
         let theme = Theme::get(cx);
         div()
             .id("editor")
@@ -3269,6 +3318,12 @@ impl Render for Editor {
             .on_action(cx.listener(Self::previous_change))
             .on_action(cx.listener(Self::toggle_inline_blame))
             .on_action(cx.listener(Self::toggle_soft_wrap))
+            .on_action(cx.listener(Self::show_completions))
+            .on_action(cx.listener(Self::quick_documentation))
+            .on_action(cx.listener(Self::go_to_declaration))
+            .on_action(cx.listener(Self::find_usages))
+            .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::show_context_actions))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
@@ -3279,6 +3334,7 @@ impl Render for Editor {
             .relative()
             .child(EditorElement { editor: cx.entity() })
             .children(popover)
+            .children(lsp_popovers)
     }
 }
 

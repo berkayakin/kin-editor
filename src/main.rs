@@ -12,6 +12,7 @@ mod git_panel;
 mod input_dialog;
 mod keymap;
 mod lint;
+mod lsp;
 mod picker;
 mod project_search;
 mod search;
@@ -84,6 +85,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Select Next Occurrence", SelectNextOccurrence),
                 MenuItem::action("Toggle Comment", ToggleComment),
                 MenuItem::action("Duplicate Line", DuplicateLine),
+                MenuItem::action("Rename…", RenameSymbol),
                 MenuItem::separator(),
                 MenuItem::action("Find…", Find),
                 MenuItem::action("Replace…", Replace),
@@ -99,6 +101,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Recent Files…", RecentFiles),
                 MenuItem::action("Go to Line…", GoToLine),
                 MenuItem::action("File Structure…", FileStructure),
+                MenuItem::separator(),
+                MenuItem::action("Go to Declaration", GoToDeclaration),
+                MenuItem::action("Find Usages", FindUsages),
                 MenuItem::action("Find Action…", FindAction),
             ],
         },

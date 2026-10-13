@@ -38,6 +38,9 @@ pub struct Settings {
     pub editor: EditorSettings,
     /// Overrides by language name as shown in the status bar ("Go", "YAML").
     pub languages: HashMap<String, EditorSettings>,
+    /// Per language: `false` to turn its language server off, or a command
+    /// (`["pylsp"]`) to use instead of the built-in choice.
+    pub language_servers: HashMap<String, serde_json::Value>,
 }
 
 impl Global for Settings {}
@@ -119,6 +122,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "editor_font_size",
     "editor_line_height",
     "languages",
+    "language_servers",
 ];
 
 const EDITOR_KEYS: &[&str] = &["tab_size", "hard_tabs", "soft_wrap", "trim_trailing_whitespace", "insert_final_newline"];
@@ -328,6 +332,13 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "languages": {
   //   "Markdown": { "soft_wrap": true },
   //   "Python": { "tab_size": 4 }
+  // },
+
+  // Language servers are found on PATH or in the project's node_modules.
+  // false turns one off; a command replaces the built-in choice.
+  // "language_servers": {
+  //   "Python": ["pylsp"],
+  //   "Markdown": false
   // }
 }
 "#;

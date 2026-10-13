@@ -25,13 +25,17 @@ use crate::{
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
     diff_view::{DiffView, DiffViewEvent},
-    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, GitFile},
+    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorLspEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
     keymap,
     lint::Severity,
-    picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, Picker, PickerEvent, PickerMode},
+    lsp::{
+        LspEvent, LspStatus, LspStore, Server,
+        protocol::{self, CodeAction, Encoding, Location, Position, TextEdit},
+    },
+    picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, project_files},
     state::{ProjectSession, SessionState, TabSession},
@@ -74,6 +78,7 @@ actions!(
         FileStructure,
         OpenSettings,
         OpenKeymap,
+        RestartLanguageServer,
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
@@ -125,6 +130,8 @@ enum SidebarMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToastKind {
     Success,
+    /// Neutral news ("No usages found").
+    Info,
     Error,
 }
 
@@ -176,6 +183,8 @@ enum PendingInput {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
+    /// Rename a symbol through its language server.
+    RenameSymbol { server: Arc<Server>, path: PathBuf, position: Position, current: String },
 }
 
 /// What a context menu item does.
@@ -183,6 +192,8 @@ enum MenuAction {
     Tree(TreeAction),
     /// An action dispatched to the focused editor.
     Run(Box<dyn gpui::Action>),
+    /// A language server's fix or refactoring.
+    CodeAction(Arc<Server>, CodeAction),
 }
 
 impl Clone for MenuAction {
@@ -190,6 +201,7 @@ impl Clone for MenuAction {
         match self {
             MenuAction::Tree(action) => MenuAction::Tree(action.clone()),
             MenuAction::Run(action) => MenuAction::Run(action.boxed_clone()),
+            MenuAction::CodeAction(server, action) => MenuAction::CodeAction(server.clone(), action.clone()),
         }
     }
 }
@@ -287,6 +299,8 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
+    /// Language servers for this window's files.
+    lsp: Entity<LspStore>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -333,12 +347,23 @@ impl Workspace {
             if let Err(err) = ws.save_session(cx) {
                 eprintln!("couldn't save the session: {err}");
             }
+            ws.lsp.update(cx, |s, _| s.shutdown_all());
             async {}
         });
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             this.update(cx, |ws, cx| ws.prepare_to_close(CloseIntent::CloseWindow, window, cx)).unwrap_or(true)
         });
+        let lsp = cx.new(|_| LspStore::new());
+        let lsp_subscription = cx.subscribe_in(&lsp, window, |ws, _, event: &LspEvent, window, cx| match event {
+            LspEvent::ApplyEdit { key, request_id, encoding, edits } => {
+                let applied = ws.apply_workspace_edit(edits.clone(), *encoding, window, cx);
+                let (key, id) = (key.clone(), request_id.clone());
+                ws.lsp.read(cx).respond(&key, id, serde_json::json!({ "applied": applied }));
+            }
+            LspEvent::Message(message) => ws.toast(ToastKind::Error, message.clone(), None, cx),
+        });
+        let lsp_observer = cx.observe(&lsp, |_, _, cx| cx.notify());
         let settings = Settings::get(cx).clone();
         // Settings changed (saved settings.json): re-apply everywhere.
         let settings_observer = cx.observe_global::<Settings>(|ws, cx| {
@@ -412,7 +437,8 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
-            _subscriptions: vec![find_subscription, git_subscription, activation, quit, settings_observer],
+            lsp,
+            _subscriptions: vec![find_subscription, git_subscription, activation, quit, settings_observer, lsp_subscription, lsp_observer],
         };
         // Problems with settings.json / keymap.json found at startup.
         if let Some(problems) = cx.try_global::<StartupProblems>().map(|p| p.0.clone()) {
@@ -465,6 +491,10 @@ impl Workspace {
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
             ws.open_editor_menu(editor.clone(), event.0, window, cx);
         }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
+            ws.on_editor_lsp_event(event, window, cx);
+        }));
+        self.lsp.update(cx, |s, cx| s.register(&editor, cx));
         if self.repo.is_none() && self.root.is_none() {
             // A lone file: use the repository it lives in, if any.
             if let Some(dir) = editor.read(cx).doc.path.as_deref().and_then(Path::parent) {
@@ -522,6 +552,8 @@ impl Workspace {
             self.detect_repo(root, cx);
         }
         self.save_state();
+        let root = self.root.clone();
+        self.lsp.update(cx, |s, _| s.set_root(root));
         if self.tabs.is_empty() {
             self.restore_session(window, cx);
         }
@@ -819,6 +851,10 @@ impl Workspace {
         self.tabs.clear();
         self.active = 0;
         self.session_task = None;
+        self.lsp.update(cx, |s, _| {
+            s.shutdown_all();
+            s.set_root(None);
+        });
         self.auto_save_tasks.clear();
         self.auto_save_warned.clear();
         self.recent.clear();
@@ -882,6 +918,183 @@ impl Workspace {
             }
         }
         self.open_path(path, window, cx);
+    }
+
+    // ---- Language servers -----------------------------------------------------------
+
+    fn on_editor_lsp_event(&mut self, event: &EditorLspEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            EditorLspEvent::Navigate { title, locations, encoding } => match locations.as_slice() {
+                [one] => self.open_location(one.clone(), *encoding, window, cx),
+                many => self.show_locations(title.clone(), many.to_vec(), *encoding, window, cx),
+            },
+            EditorLspEvent::Rename { server, path, position, current } => {
+                let pending = PendingInput::RenameSymbol {
+                    server: server.clone(),
+                    path: path.clone(),
+                    position: *position,
+                    current: current.clone(),
+                };
+                self.ask_for_name(pending, window, cx);
+            }
+            EditorLspEvent::CodeActions { server, actions, position } => {
+                let entries = actions
+                    .iter()
+                    .map(|a| if a.preferred { MenuEntry::item(a.title.clone(), Icon::Check) } else { MenuEntry::text(a.title.clone()) })
+                    .collect();
+                let menu_actions = actions.iter().map(|a| Some(MenuAction::CodeAction(server.clone(), a.clone()))).collect();
+                self.show_context_menu(entries, menu_actions, *position, None, window, cx);
+            }
+            EditorLspEvent::Message(message) => self.toast(ToastKind::Info, message.clone(), None, cx),
+        }
+    }
+
+    /// The open tab for `path`, comparing real paths (servers may report
+    /// `/tmp/…` for `/private/tmp/…`).
+    fn tab_for(&self, path: &Path, cx: &App) -> Option<Entity<Editor>> {
+        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.tabs
+            .iter()
+            .find(|t| {
+                t.read(cx).doc.path.as_deref().is_some_and(|p| p == path || p.canonicalize().is_ok_and(|p| p == wanted))
+            })
+            .cloned()
+    }
+
+    fn open_location(&mut self, location: Location, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path(location.path.clone(), window, cx);
+        if let Some(editor) = self.tab_for(&location.path, cx) {
+            editor.update(cx, |e, cx| {
+                let offset = protocol::position_to_offset(e.doc.rope(), location.range.start, encoding);
+                e.go_to(offset, window, cx);
+            });
+        }
+    }
+
+    /// Lists usages (or several declarations) to pick from.
+    fn show_locations(&mut self, title: SharedString, locations: Vec<Location>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) {
+        let mut files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let mut rows = Vec::with_capacity(locations.len());
+        for location in locations {
+            let line = location.range.start.line as usize;
+            let lines = files.entry(location.path.clone()).or_insert_with(|| match self.tab_for(&location.path, cx) {
+                Some(editor) => editor.read(cx).doc.rope().to_string().lines().map(str::to_string).collect(),
+                None => std::fs::read_to_string(&location.path).unwrap_or_default().lines().map(str::to_string).collect(),
+            });
+            let preview = lines.get(line).map(|l| l.trim().to_string()).unwrap_or_default();
+            rows.push(LocationRow { file: self.display_rel(&location.path), line: line + 1, preview, location });
+        }
+        self.close_modal(window, cx);
+        self.open_picker(PickerMode::Locations, window, cx);
+        if let Some(Modal::Picker(picker)) = &self.modal {
+            picker.update(cx, |p, cx| p.set_locations(title, rows, encoding, cx));
+        }
+    }
+
+    /// Applies a language server's edits, opening files that aren't open;
+    /// each file's edits are one undo step. Returns whether all applied.
+    fn apply_workspace_edit(&mut self, edits: Vec<(PathBuf, Vec<TextEdit>)>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let active = self.active_editor().cloned();
+        let mut applied = true;
+        for (path, file_edits) in edits {
+            if self.tab_for(&path, cx).is_none() {
+                self.open_path(path.clone(), window, cx);
+            }
+            let Some(editor) = self.tab_for(&path, cx) else {
+                applied = false;
+                continue;
+            };
+            editor.update(cx, |e, cx| {
+                let resolved = protocol::resolve_edits(e.doc.rope(), &file_edits, encoding);
+                e.replace_ranges(resolved, cx);
+            });
+        }
+        // Opening files switched tabs; go back to where the user was.
+        if let Some(ix) = active.and_then(|a| self.tabs.iter().position(|t| t == &a)) {
+            self.activate(ix, window, cx);
+        }
+        applied
+    }
+
+    fn rename_symbol(&mut self, server: Arc<Server>, path: PathBuf, position: Position, new_name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let params = serde_json::json!({
+            "textDocument": { "uri": protocol::path_to_uri(&path) },
+            "position": position.to_json(),
+            "newName": new_name,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = server.request("textDocument/rename", params).await;
+            this.update_in(cx, |ws, window, cx| match result {
+                Ok(value) => {
+                    let edits = protocol::workspace_edit(&value);
+                    let (files, count) = (edits.len(), edits.iter().map(|(_, e)| e.len()).sum::<usize>());
+                    if count == 0 {
+                        ws.toast(ToastKind::Info, "Nothing to rename here", None, cx);
+                    } else if ws.apply_workspace_edit(edits, server.encoding, window, cx) {
+                        let files = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
+                        ws.toast(ToastKind::Success, format!("Renamed {count} occurrence{} in {files}", plural(count)), None, cx);
+                    }
+                }
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't rename", Some(err.message), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs a chosen code action: its edit, then its command; actions that
+    /// carry neither are resolved first.
+    fn apply_code_action(&mut self, server: Arc<Server>, action: serde_json::Value, window: &mut Window, cx: &mut Context<Self>) {
+        // A bare Command rather than a CodeAction.
+        if action.get("command").and_then(serde_json::Value::as_str).is_some() {
+            self.execute_command(server, action, cx);
+            return;
+        }
+        let (edit, command) = (action.get("edit"), action.get("command"));
+        if edit.is_none() && command.is_none() {
+            if !server.resolves("codeActionProvider") {
+                return;
+            }
+            cx.spawn_in(window, async move |this, cx| {
+                let resolved = server.request("codeAction/resolve", action).await;
+                this.update_in(cx, |ws, window, cx| match resolved {
+                    Ok(resolved) if resolved.get("edit").is_some() || resolved.get("command").is_some() => {
+                        ws.apply_code_action(server, resolved, window, cx);
+                    }
+                    Ok(_) => {}
+                    Err(err) => ws.toast(ToastKind::Error, "Couldn't apply the action", Some(err.message), cx),
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        if let Some(edit) = edit {
+            self.apply_workspace_edit(protocol::workspace_edit(edit), server.encoding, window, cx);
+        }
+        if let Some(command) = command.cloned() {
+            self.execute_command(server, command, cx);
+        }
+    }
+
+    /// Asks the server to run a command; it may answer with edits
+    /// (`workspace/applyEdit`), which the LSP store forwards.
+    fn execute_command(&mut self, server: Arc<Server>, command: serde_json::Value, cx: &mut Context<Self>) {
+        let params = serde_json::json!({
+            "command": command.get("command").cloned().unwrap_or_default(),
+            "arguments": command.get("arguments").cloned().unwrap_or_else(|| serde_json::json!([])),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = server.request("workspace/executeCommand", params).await {
+                this.update(cx, |ws, cx| ws.toast(ToastKind::Error, "The action failed", Some(err.message), cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn restart_language_server(&mut self, _: &RestartLanguageServer, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) else { return };
+        self.lsp.update(cx, |s, cx| s.restart(&path, cx));
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
@@ -1092,6 +1305,8 @@ impl Workspace {
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
+                    // A new name can mean a new language and server.
+                    ws.lsp.update(cx, |s, cx| s.register(&editor, cx));
                     ws.rebuild_tree();
                     cx.notify();
                 })
@@ -1144,6 +1359,9 @@ impl Workspace {
     fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t == editor) else { return };
         self.tabs.remove(ix);
+        if let Some(path) = editor.read(cx).doc.path.clone() {
+            self.lsp.update(cx, |s, _| s.did_close(&path));
+        }
         self.schedule_session_save(cx);
         self.auto_save_tasks.remove(&editor.entity_id());
         self.auto_save_warned.remove(&editor.entity_id());
@@ -1628,6 +1846,10 @@ impl Workspace {
                 ws.close_modal(window, cx);
                 window.dispatch_action(action.boxed_clone(), cx);
             }
+            PickerEvent::OpenLocation { location, encoding } => {
+                ws.close_modal(window, cx);
+                ws.open_location(location.clone(), *encoding, window, cx);
+            }
             PickerEvent::GoTo(offset) => {
                 ws.close_modal(window, cx);
                 if let Some(editor) = ws.active_editor().cloned() {
@@ -1996,6 +2218,7 @@ impl Workspace {
                 match action {
                     Some(MenuAction::Tree(action)) => ws.run_tree_action(action, window, cx),
                     Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
+                    Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
                     None => {}
                 }
             }
@@ -2023,6 +2246,17 @@ impl Workspace {
         let run = |entry: MenuEntry, action: Box<dyn gpui::Action>| {
             (entry.shortcut(binding_label(&*action, window)), Some(MenuAction::Run(action)))
         };
+        // Code intelligence first, as in VS Code and JetBrains.
+        for (label, action) in [
+            ("Go to Declaration", Box::new(editor::GoToDeclaration) as Box<dyn gpui::Action>),
+            ("Find Usages", Box::new(editor::FindUsages)),
+            ("Rename…", Box::new(editor::RenameSymbol)),
+            ("Show Context Actions", Box::new(editor::ShowContextActions)),
+        ] {
+            let (entry, action) = run(MenuEntry::text(label), action);
+            add(entry, action);
+        }
+        add(MenuEntry::Separator, None);
         let (entry, action) = run(MenuEntry::text("Cut"), Box::new(editor::Cut));
         add(entry, action);
         let (entry, action) = run(MenuEntry::item("Copy", Icon::Copy), Box::new(editor::Copy));
@@ -2154,6 +2388,9 @@ impl Workspace {
                 let stem = if path.is_dir() { name.len() } else { name.rfind('.').filter(|&i| i > 0).unwrap_or(name.len()) };
                 ("Rename", Icon::Pencil, format!("Rename {name}"), name.clone(), Some(0..stem))
             }
+            PendingInput::RenameSymbol { current, .. } => {
+                ("Rename", Icon::Pencil, format!("Rename {current} and its usages"), current.clone(), Some(0..current.len()))
+            }
         };
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| InputDialog::new(title, icon, hint, &initial, select, window, cx));
@@ -2185,6 +2422,16 @@ impl Workspace {
 
     /// Creates or renames according to the open input dialog.
     fn apply_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        if let Some(PendingInput::RenameSymbol { server, path, position, current }) = self.pending_input.as_ref() {
+            let new_name = name.trim();
+            if new_name.is_empty() {
+                return Err("Enter a name".into());
+            }
+            if new_name != current {
+                self.rename_symbol(server.clone(), path.clone(), *position, new_name.to_string(), window, cx);
+            }
+            return Ok(());
+        }
         let name = name.trim_matches('/');
         if name.split('/').any(|part| part == ".." || part.is_empty()) {
             return Err("That isn't a valid name".into());
@@ -2230,6 +2477,8 @@ impl Workspace {
                 self.reveal_in_tree(&new);
                 self.after_fs_change(cx);
             }
+            // Handled before the name checks above.
+            PendingInput::RenameSymbol { .. } => {}
         }
         Ok(())
     }
@@ -2495,6 +2744,7 @@ impl Workspace {
                     let id = t.id;
                     let (icon, color): (Icon, Hsla) = match t.kind {
                         ToastKind::Success => (Icon::CircleCheck, theme.success.into()),
+                        ToastKind::Info => (Icon::CircleAlert, theme.text_muted.into()),
                         ToastKind::Error => (Icon::CircleX, theme.error.into()),
                     };
                     div()
@@ -3619,8 +3869,54 @@ impl Workspace {
         }
     }
 
+    /// The active file's language server: its name, what it's busy with, or
+    /// what's wrong (click to copy the install command or to restart).
+    fn render_lsp_status(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let path = self.active_editor()?.read(cx).doc.path.clone()?;
+        let status = self.lsp.read(cx).status(&path)?;
+        let dim: Hsla = theme.text_dim.into();
+        let (label, color, tip): (String, Hsla, Option<String>) = match &status {
+            LspStatus::Starting => ("Starting language server…".into(), dim, None),
+            LspStatus::Busy(work) => {
+                let mut short = work.clone();
+                if short.chars().count() > 48 {
+                    short = short.chars().take(47).collect::<String>() + "…";
+                }
+                (short, dim, Some(work.clone()))
+            }
+            LspStatus::Ready(name) => (name.clone(), dim, None),
+            LspStatus::Missing(install) => {
+                ("No language server".into(), theme.warning.into(), Some(format!("Install one with `{install}`. Click to copy.")))
+            }
+            LspStatus::Failed(message) => ("Language server stopped".into(), theme.error.into(), Some(format!("{message}. Click to restart."))),
+        };
+        Some(
+            div()
+                .id("lsp-status")
+                .text_color(color)
+                .when(matches!(status, LspStatus::Missing(_) | LspStatus::Failed(_)), |el| el.cursor_pointer())
+                .child(label)
+                .when_some(tip, |el, tip| el.tooltip(move |_, cx| tooltip_view(tip.clone(), cx)))
+                .on_click(cx.listener(move |ws, _, window, cx| match &status {
+                    LspStatus::Missing(install) => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(install.to_string()));
+                        ws.toast(
+                            ToastKind::Success,
+                            "Install command copied",
+                            Some(format!("Run `{install}` in a terminal, then restart the language server.")),
+                            cx,
+                        );
+                    }
+                    LspStatus::Failed(_) => ws.restart_language_server(&RestartLanguageServer, window, cx),
+                    _ => {}
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_statusbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let lsp_item = self.render_lsp_status(&theme, cx);
         let editor = self.active_editor().map(|e| e.read(cx));
         let count = |sev: Severity| {
             editor.map_or(0, |e| e.doc.diagnostics.iter().filter(|d| d.severity == sev).count())
@@ -3679,6 +3975,9 @@ impl Workspace {
                     )
                     .into_any_element(),
                 );
+            }
+            if let Some(lsp_item) = lsp_item {
+                right.push(item(lsp_item).into_any_element());
             }
             right.push(item(e.indent_label().into_any_element()).into_any_element());
             right.push(item(if e.doc.uses_crlf { "CRLF" } else { "LF" }.into_any_element()).into_any_element());
@@ -3833,6 +4132,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_to_line))
             .on_action(cx.listener(Self::file_structure))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::restart_language_server))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::open_themes_folder))
@@ -3899,6 +4199,10 @@ impl Render for Workspace {
 }
 
 use crate::ui::file_icon;
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
 
 /// The platform's name for showing a file in the file manager.
 fn reveal_label() -> &'static str {
