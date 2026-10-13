@@ -310,7 +310,7 @@ enum Modal {
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 
 const TITLEBAR_HEIGHT: f32 = 38.0;
-const STATUSBAR_HEIGHT: f32 = 26.0;
+const STATUSBAR_HEIGHT: f32 = 30.0;
 const TAB_HEIGHT: f32 = 36.0;
 const TREE_ROW_HEIGHT: f32 = 26.0;
 
@@ -5115,7 +5115,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h_full()
+                    .h(px(22.))
                     .px_2()
                     .rounded(px(4.))
                     .cursor_pointer()
