@@ -20,6 +20,8 @@ use crate::{
     ui::{icon_el, modal_panel, text_button, tooltip_view},
 };
 
+const ROW_HEIGHT: f32 = 20.;
+
 pub enum DiffViewEvent {
     Close,
     OpenFile(PathBuf),
@@ -150,6 +152,17 @@ impl DiffView {
         } else {
             (GitOp::StageLines { rel, text: loaded.current.to_string(), rows: change.new_rows.clone() }, "Stage")
         })
+    }
+
+    /// Header, borders and padding plus the rows (or the one-line message
+    /// shown while loading or when there's nothing to show).
+    fn content_height(&self) -> gpui::Pixels {
+        const CHROME: f32 = 46. + 1. + 2. + 4. + 10.;
+        let rows = match &self.loaded {
+            Some(l) if !l.doc.changes.is_empty() => self.rows_len(),
+            _ => 2,
+        };
+        px(CHROME + rows as f32 * ROW_HEIGHT)
     }
 
     fn rows_len(&self) -> usize {
@@ -393,7 +406,8 @@ impl Render for DiffView {
                 .track_scroll(self.scroll.clone())
                 .flex_1()
                 .w_full()
-                .py_1()
+                .pt_1()
+                .pb(px(10.))
                 .bg(theme.background)
                 .font_family(theme.mono_font.clone())
                 .text_size(px(theme.editor_font_size - 1.))
@@ -409,8 +423,8 @@ impl Render for DiffView {
             .on_action(cx.listener(Self::on_previous))
             .w(px(1180.))
             .max_w(window.viewport_size().width - px(48.))
-            .h(px(760.))
-            .max_h(window.viewport_size().height - px(90.))
+            // As tall as the diff, up to what fits in the window.
+            .h(self.content_height().min(px(760.)).min(crate::workspace::modal_max_height(window)))
             .child(header)
             .child(body)
     }
@@ -432,7 +446,7 @@ impl DiffView {
                 .text_color(theme.line_number)
                 .child(n.map(|n| n.to_string()).unwrap_or_default())
         };
-        let row = div().id(ix).relative().w_full().flex().h(px(20.));
+        let row = div().id(ix).relative().w_full().flex().h(px(ROW_HEIGHT));
 
         let (kind, label, change) = if side_by_side {
             let r = &loaded.doc.split[ix];

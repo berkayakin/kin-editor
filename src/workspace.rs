@@ -3553,7 +3553,7 @@ impl Workspace {
             Modal::Clone(c) => c.clone().into_any_element(),
             Modal::Preferences(p) => p.clone().into_any_element(),
         };
-        let top = (window.viewport_size().height * 0.12).max(px(TITLEBAR_HEIGHT + 12.));
+        let top = modal_top(window);
         // Deferred above the other deferred layers (resize handles), so they
         // neither show through a modal nor take its mouse events.
         Some(
@@ -5387,6 +5387,16 @@ fn severity_icon(severity: Severity, theme: &Theme) -> (Icon, Hsla) {
 /// Opens a Kin window and runs `setup` on its workspace. With `near` (the
 /// bounds of the window it was opened from) it's cascaded a little down and
 /// to the right so it doesn't cover that window exactly.
+/// Where modals start: a little below the title bar, lower in tall windows.
+fn modal_top(window: &Window) -> Pixels {
+    (window.viewport_size().height * 0.12).max(px(TITLEBAR_HEIGHT + 12.))
+}
+
+/// The tallest a modal can be and still end above the window's bottom edge.
+pub fn modal_max_height(window: &Window) -> Pixels {
+    (window.viewport_size().height - modal_top(window) - px(16.)).max(px(120.))
+}
+
 pub fn open_window(
     near: Option<Bounds<Pixels>>,
     cx: &mut App,
