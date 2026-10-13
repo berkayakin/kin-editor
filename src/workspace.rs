@@ -4274,10 +4274,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_4()
-            .child(
-                // The border keeps the black logo's rounded edge visible on dark themes.
-                img(assets::LOGO).size(px(56.)).rounded(px(14.)).border_1().border_color(theme.border),
-            )
+            .child(img(assets::LOGO).size(px(56.)).rounded(px(14.)))
             .child(
                 div()
                     .flex()

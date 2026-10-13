@@ -1,6 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-  <rect width="1024" height="1024" rx="184" fill="#000"/>
-  <path d="M111.4 508.6L111.4 494.9L245.3 373.8L258.7 387.8L175.4 501.4L175.4 502.1L258.7 615.7L245.3 629.8Z" fill="#808080" fill-rule="evenodd"/>
-  <path d="M912.6 494.9L912.6 508.6L778.7 629.8L765.3 615.7L848.6 502.1L848.6 501.4L765.3 387.8L778.7 373.8Z" fill="#808080" fill-rule="evenodd"/>
-  <path d="M305.9 757.8L305.9 741.6L361.1 738.0L361.1 265.5L305.9 261.9L305.9 245.8L508.2 245.8L508.2 261.9L453.0 265.5L453.0 483.6L453.7 483.6L657.1 265.5L610.8 261.9L610.8 245.8L727.1 245.8L727.1 261.9L685.1 265.5L518.3 441.7L746.1 738.0L784.9 741.6L784.9 757.8L580.0 757.8L580.0 741.6L626.3 738.0L453.7 502.3L453.0 502.3L453.0 738.0L508.2 741.6L508.2 757.8Z" fill="#ffffff" fill-rule="evenodd"/>
+  <defs>
+    <clipPath id="plate"><rect width="1024" height="1024" rx="184"/></clipPath>
+    <radialGradient id="b0" gradientUnits="userSpaceOnUse" cx="123" cy="102" r="1106"><stop offset="0.00" stop-color="#a78bfa" stop-opacity="1.000"/><stop offset="0.12" stop-color="#a78bfa" stop-opacity="0.932"/><stop offset="0.25" stop-color="#a78bfa" stop-opacity="0.755"/><stop offset="0.38" stop-color="#a78bfa" stop-opacity="0.531"/><stop offset="0.50" stop-color="#a78bfa" stop-opacity="0.325"/><stop offset="0.62" stop-color="#a78bfa" stop-opacity="0.172"/><stop offset="0.75" stop-color="#a78bfa" stop-opacity="0.080"/><stop offset="0.88" stop-color="#a78bfa" stop-opacity="0.032"/><stop offset="1.00" stop-color="#a78bfa" stop-opacity="0.011"/></radialGradient>
+    <radialGradient id="b1" gradientUnits="userSpaceOnUse" cx="942" cy="389" r="1106"><stop offset="0.00" stop-color="#ec4899" stop-opacity="1.000"/><stop offset="0.12" stop-color="#ec4899" stop-opacity="0.932"/><stop offset="0.25" stop-color="#ec4899" stop-opacity="0.755"/><stop offset="0.38" stop-color="#ec4899" stop-opacity="0.531"/><stop offset="0.50" stop-color="#ec4899" stop-opacity="0.325"/><stop offset="0.62" stop-color="#ec4899" stop-opacity="0.172"/><stop offset="0.75" stop-color="#ec4899" stop-opacity="0.080"/><stop offset="0.88" stop-color="#ec4899" stop-opacity="0.032"/><stop offset="1.00" stop-color="#ec4899" stop-opacity="0.011"/></radialGradient>
+  </defs>
+  <g clip-path="url(#plate)">
+    <rect width="1024" height="1024" fill="#fb923c"/>
+    <rect width="1024" height="1024" fill="url(#b0)"/>
+    <rect width="1024" height="1024" fill="url(#b1)"/>
+    <path d="M111.4 508.6L111.4 494.9L245.3 373.8L258.7 387.8L175.4 501.4L175.4 502.1L258.7 615.7L245.3 629.8Z" fill="#000000" fill-opacity="0.62" fill-rule="evenodd"/>
+    <path d="M912.6 494.9L912.6 508.6L778.7 629.8L765.3 615.7L848.6 502.1L848.6 501.4L765.3 387.8L778.7 373.8Z" fill="#000000" fill-opacity="0.62" fill-rule="evenodd"/>
+    <path d="M305.9 757.8L305.9 741.6L361.1 738.0L361.1 265.5L305.9 261.9L305.9 245.8L508.2 245.8L508.2 261.9L453.0 265.5L453.0 483.6L453.7 483.6L657.1 265.5L610.8 261.9L610.8 245.8L727.1 245.8L727.1 261.9L685.1 265.5L518.3 441.7L746.1 738.0L784.9 741.6L784.9 757.8L580.0 757.8L580.0 741.6L626.3 738.0L453.7 502.3L453.0 502.3L453.0 738.0L508.2 741.6L508.2 757.8Z" fill="#000000" fill-rule="evenodd"/>
+  </g>
 </svg>
