@@ -3255,7 +3255,9 @@ impl Workspace {
             div()
                 .absolute()
                 .inset_0()
-                // Clicking anywhere else closes the menu.
+                // While a menu is open, what's behind it doesn't react to the
+                // pointer (no editor hovers); clicking anywhere else closes it.
+                .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|ws, _, window, cx| ws.close_context_menu(window, cx)))
                 .on_mouse_down(MouseButton::Right, cx.listener(|ws, _, window, cx| ws.close_context_menu(window, cx)))
                 .child(gpui::deferred(
@@ -3264,6 +3266,7 @@ impl Workspace {
                         .snap_to_window_with_margin(px(8.))
                         .child(
                             div()
+                                .occlude()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                                 .child(open.menu.clone()),

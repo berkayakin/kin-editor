@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use super::{Editor, EditorEvent, EditorMode, Selection};
 use crate::{
+    assets::Icon,
     document::EditKind,
     lint::Severity,
     lsp::{
@@ -27,6 +28,7 @@ use crate::{
         },
     },
     theme::Theme,
+    ui::{icon_el, tooltip_view},
 };
 
 /// Requests the workspace carries out, since they reach beyond this editor.
@@ -85,6 +87,9 @@ pub(super) struct EditorLsp {
     hover_task: Option<Task<()>>,
     /// The word a pending hover request is for.
     hover_pending: Option<std::ops::Range<usize>>,
+    /// Closes a shown hover shortly after the pointer leaves its word, unless
+    /// the pointer reaches the popover first.
+    hover_hide: Option<Task<()>>,
     pub(super) signature: Option<SignatureHelp>,
     signature_task: Option<Task<()>>,
     /// The server's diagnostics as received, for code action requests.
@@ -408,16 +413,24 @@ impl Editor {
             && position.x >= layout.bounds.left() + layout.gutter_width
             && position.x < layout.bounds.right() - px(super::SCROLLBAR_WIDTH);
         if !over_text {
-            self.clear_hover(cx);
+            self.cancel_pending_hover();
+            self.hide_hover_soon(window, cx);
             return;
         }
         let offset = self.offset_for_position(position, window, cx);
         let range = super::word_range(&self.doc, offset);
         let range = if range.is_empty() { offset..self.doc.next_char_boundary(offset) } else { range };
-        if self.lsp.hover.as_ref().is_some_and(|h| h.range == range) || self.lsp.hover_pending.as_ref() == Some(&range) {
+        if self.lsp.hover.as_ref().is_some_and(|h| h.range == range) {
+            // Back on the word: keep its popover.
+            self.lsp.hover_hide = None;
             return;
         }
-        self.clear_hover(cx);
+        if self.lsp.hover_pending.as_ref() == Some(&range) {
+            return;
+        }
+        // On the way to the popover the pointer crosses other words, so the
+        // shown one stays a moment longer.
+        self.hide_hover_soon(window, cx);
         self.lsp.hover_pending = Some(range.clone());
         self.lsp.hover_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(450)).await;
@@ -425,12 +438,32 @@ impl Editor {
         }));
     }
 
-    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+    /// The pointer left the editor (onto tabs, the title bar, a menu): a
+    /// hover that was about to open would describe code it's no longer over,
+    /// and a shown one goes away.
+    pub(super) fn pointer_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_hover();
+        self.hide_hover_soon(window, cx);
+    }
+
+    fn cancel_pending_hover(&mut self) {
         self.lsp.hover_task = None;
         self.lsp.hover_pending = None;
-        if self.lsp.hover.take().is_some() {
-            cx.notify();
+    }
+
+    fn hide_hover_soon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lsp.hover.is_none() || self.lsp.hover_hide.is_some() {
+            return;
         }
+        self.lsp.hover_hide = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
+            this.update(cx, |e, cx| {
+                e.lsp.hover_hide = None;
+                e.lsp.hover = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn quick_documentation(&mut self, _: &super::QuickDocumentation, window: &mut Window, cx: &mut Context<Self>) {
@@ -467,6 +500,7 @@ impl Editor {
                 if blocks.is_empty() && diagnostics.is_empty() {
                     return;
                 }
+                e.lsp.hover_hide = None;
                 e.lsp.hover = Some(HoverPopover { range, diagnostics, blocks, anchor });
                 cx.notify();
             })
@@ -704,21 +738,67 @@ impl Editor {
                     div().text_color(theme.text_muted).child(block.text.clone())
                 });
             }
-            // Above the word, or below it near the top of the editor.
-            let below = hover.anchor.y < px(160.);
+            // Above the word when it fits, else on the side with more room,
+            // never taller than that side so it's always fully visible.
+            const MAX_WIDTH: f32 = 560.;
+            const MAX_HEIGHT: f32 = 320.;
+            let gap = px(2.);
+            let space_above = hover.anchor.y - gap - px(6.);
+            let space_below = layout.bounds.size.height - (hover.anchor.y + layout.line_height) - gap - px(6.);
+            let below = space_above < px(MAX_HEIGHT) && space_below > space_above;
+            let max_h = if below { space_below } else { space_above }.min(px(MAX_HEIGHT)).max(px(48.));
+            let right_edge = layout.bounds.size.width - px(super::SCROLLBAR_WIDTH + 4.);
+            let left = hover.anchor.x.min(right_edge - px(MAX_WIDTH)).max(px(0.));
+            // Its text, for the Copy button (the popover's text isn't selectable).
+            let text: String = hover
+                .diagnostics
+                .iter()
+                .map(|(_, m)| m.clone())
+                .chain(hover.blocks.iter().map(|b| b.text.clone()))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let copy = div()
+                .id("hover-copy")
+                .absolute()
+                .top(px(4.))
+                .right(px(4.))
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .bg(theme.elevated)
+                .border_1()
+                .border_color(theme.border)
+                .cursor_pointer()
+                .invisible()
+                .group_hover("hover-popover", |s| s.visible())
+                .hover(|s| s.bg(theme.hover))
+                .tooltip(|_, cx| tooltip_view("Copy", cx))
+                .on_click(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone())))
+                .child(icon_el(Icon::Copy, px(13.), theme.text_muted.into()));
             let el = panel()
-                .id("hover")
-                .left(hover.anchor.x.max(px(0.)))
-                .max_w(px(560.))
-                .max_h(px(320.))
-                .overflow_y_scroll()
-                .p_2()
-                .on_mouse_move(|_, _, cx| cx.stop_propagation())
-                .child(body);
+                .group("hover-popover")
+                .left(left)
+                .max_w(px(MAX_WIDTH))
+                // Clicks stay in the popover (they'd move the caret and close it).
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                // The wheel scrolls the popover, not the editor under it.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                // Reaching the popover keeps it open (and stops another word's
+                // popover from replacing it).
+                .on_mouse_move(cx.listener(|e, _, _, cx| {
+                    cx.stop_propagation();
+                    e.lsp.hover_hide = None;
+                    e.cancel_pending_hover();
+                }))
+                .child(div().id("hover").max_h(max_h).overflow_y_scroll().p_2().child(body))
+                .child(copy);
             let el = if below {
-                el.top(hover.anchor.y + layout.line_height + px(2.))
+                el.top(hover.anchor.y + layout.line_height + gap)
             } else {
-                el.bottom(layout.bounds.size.height - hover.anchor.y + px(2.))
+                el.bottom(layout.bounds.size.height - hover.anchor.y + gap)
             };
             out.push(el.into_any_element());
         }
