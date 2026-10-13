@@ -465,7 +465,8 @@ impl Render for GitLog {
             .when(self.path.is_some(), |el| {
                 el.child(toggle("log-whole", Icon::X, false, "Show the Whole Log").on_click(cx.listener(|this, _, _, cx| this.show_path(None, cx))))
             })
-            .child(div().w(px(280.)).child(input_box(&self.filter, Some(Icon::Search), window, cx)))
+            // Compact, like the header's buttons, so the 32px header keeps some room.
+            .child(div().w(px(280.)).child(input_box(&self.filter, Some(Icon::Search), window, cx).h(px(24.)).rounded(px(6.)).text_size(px(12.5))))
             .when(self.path.is_none(), |el| {
                 el.child(toggle("log-all", Icon::GitBranch, self.all_branches, "Show All Branches").on_click(cx.listener(|this, _, _, cx| {
                     this.all_branches = !this.all_branches;
