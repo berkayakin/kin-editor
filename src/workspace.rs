@@ -24,8 +24,9 @@ use crate::{
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
-    diff_view::{DiffView, DiffViewEvent},
-    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorLspEvent, EditorRunEvent, GitFile},
+    diff_view::{DiffSource, DiffView, DiffViewEvent},
+    git_log::{GitLog, GitLogEvent},
+    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent, EditorRunEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
@@ -66,6 +67,8 @@ actions!(
         ToggleSidebar,
         ToggleProblems,
         ToggleTerminal,
+        ToggleGitLog,
+        ShowFileHistory,
         NewTerminal,
         CloseTerminal,
         SplitRight,
@@ -365,6 +368,9 @@ pub struct Workspace {
     last_shift_tap: Option<Instant>,
     sidebar_mode: SidebarMode,
     git_panel: Entity<GitPanel>,
+    git_log: Entity<GitLog>,
+    /// The bottom panel shows the Git log (instead of Problems or the terminal).
+    show_git_log: bool,
     /// Working-tree root of the project's Git repository.
     repo: Option<PathBuf>,
     git_status: Arc<RepoStatus>,
@@ -417,6 +423,16 @@ impl Workspace {
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
             GitPanelEvent::ShowBranches => ws.git_branches(&GitBranches, window, cx),
+        });
+        let git_log = cx.new(GitLog::new);
+        let log_subscription = cx.subscribe_in(&git_log, window, |ws, _, event: &GitLogEvent, window, cx| match event {
+            GitLogEvent::OpenDiff(source) => ws.show_diff(source.clone(), window, cx),
+            GitLogEvent::Close => {
+                ws.show_git_log = false;
+                ws.focus_active(window, cx);
+                ws.save_state();
+                cx.notify();
+            }
         });
         // Keep Git state fresh: when the window regains focus, and every few seconds.
         // Leaving the window saves edits, like VS Code and Zed.
@@ -502,6 +518,7 @@ impl Workspace {
             show_sidebar: state.show_sidebar.unwrap_or(true),
             show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
             show_terminal: state.show_terminal.unwrap_or(false),
+            show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminals: Vec::new(),
             active_terminal: 0,
             last_run: None,
@@ -521,6 +538,7 @@ impl Workspace {
             last_shift_tap: None,
             sidebar_mode: if state.sidebar_mode.as_deref() == Some("commit") { SidebarMode::Commit } else { SidebarMode::Files },
             git_panel,
+            git_log,
             repo: None,
             git_status: Arc::new(RepoStatus::default()),
             git_paths: Arc::new(HashMap::new()),
@@ -542,7 +560,7 @@ impl Workspace {
             close_confirmed: false,
             session_task: None,
             lsp,
-            _subscriptions: vec![find_subscription, git_subscription, activation, quit, settings_observer, lsp_subscription, lsp_observer],
+            _subscriptions: vec![find_subscription, git_subscription, log_subscription, activation, quit, settings_observer, lsp_subscription, lsp_observer],
         };
         // Problems with settings.json / keymap.json found at startup.
         if let Some(problems) = cx.try_global::<StartupProblems>().map(|p| p.0.clone()) {
@@ -596,6 +614,9 @@ impl Workspace {
         }));
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
             ws.run_target(event.0.clone(), window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
+            ws.run_git(event.0.clone(), window, cx);
         }));
         self.lsp.update(cx, |s, cx| s.register(&editor, cx));
         if self.repo.is_none() && self.root.is_none() {
@@ -863,8 +884,10 @@ impl Workspace {
                 SidebarMode::Files => "files".into(),
                 SidebarMode::Commit => "commit".into(),
             }),
+            show_git_log: Some(self.show_git_log),
             // Shared with other windows, so keep what's on disk.
             font_zoom: saved.font_zoom,
+            diff_side_by_side: saved.diff_side_by_side,
             recent_projects: saved.recent_projects,
         };
         if let Err(err) = state.save() {
@@ -1872,6 +1895,7 @@ impl Workspace {
                 ws.last_commit = None;
                 ws.git_status = Arc::new(RepoStatus::default());
                 ws.git_paths = Arc::new(HashMap::new());
+                ws.git_log.update(cx, |l, cx| l.set_repo(repo.clone(), cx));
                 ws.git_panel.update(cx, |p, cx| {
                     p.set_repo(repo, project, cx);
                     p.set_status(Arc::new(RepoStatus::default()), cx);
@@ -1909,15 +1933,18 @@ impl Workspace {
                 if *ws.git_status == status {
                     return;
                 }
-                let head_changed = ws.git_status.head_oid != status.head_oid;
+                let moved = (&ws.git_status.head_oid, &ws.git_status.branch, ws.git_status.ahead, ws.git_status.behind)
+                    != (&status.head_oid, &status.branch, status.ahead, status.behind);
+                if moved && ws.show_git_log {
+                    ws.git_log.update(cx, |l, cx| l.reload(cx));
+                }
                 ws.git_paths = Arc::new(status.path_map(&repo));
                 ws.git_status = Arc::new(status);
                 let status = ws.git_status.clone();
                 ws.git_panel.update(cx, |p, cx| p.set_status(status, cx));
-                if head_changed {
-                    for editor in ws.tabs.clone() {
-                        ws.load_diff_base(&editor, cx);
-                    }
+                // HEAD or the index may have moved (commits, staging, checkouts).
+                for editor in ws.tabs.clone() {
+                    ws.load_diff_base(&editor, cx);
                 }
                 cx.notify();
             })
@@ -1930,15 +1957,18 @@ impl Workspace {
         let Some(repo) = self.repo.clone() else { return };
         let Some(path) = editor.read(cx).doc.path.clone() else { return };
         let Ok(rel) = path.strip_prefix(&repo) else {
-            editor.update(cx, |e, cx| e.set_diff_base(None, None, cx));
+            editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
             return;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let git_file = GitFile { root: repo.clone(), rel: rel.clone(), user_name: self.git_user.clone() };
         let editor = editor.downgrade();
         cx.spawn(async move |_, cx| {
-            let base = cx.background_executor().spawn(async move { git::head_text(&repo, &rel) }).await;
-            editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, cx)).ok();
+            let (base, index) = cx
+                .background_executor()
+                .spawn(async move { (git::head_text(&repo, &rel), git::index_text(&repo, &rel)) })
+                .await;
+            editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, index, cx)).ok();
         })
         .detach();
     }
@@ -1952,6 +1982,29 @@ impl Workspace {
     }
 
     fn run_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {
+        // Marking a file resolved while it still has conflict markers is
+        // usually a mistake, so ask.
+        if let (GitOp::Stage(rels), Some(repo)) = (&op, &self.repo) {
+            let unresolved: Vec<&String> = rels
+                .iter()
+                .filter(|rel| self.git_status.conflicted().any(|f| &f.rel == *rel))
+                .filter(|rel| std::fs::read_to_string(repo.join(rel)).is_ok_and(|t| !crate::conflict::parse(&t).is_empty()))
+                .collect();
+            if !unresolved.is_empty() {
+                let message = match unresolved.as_slice() {
+                    [one] => format!("{one} still has conflict markers"),
+                    many => format!("{} files still have conflict markers", many.len()),
+                };
+                let rx = window.prompt(PromptLevel::Warning, &message, Some("Mark as resolved anyway?"), &["Mark as Resolved", "Cancel"], cx);
+                cx.spawn_in(window, async move |this, cx| {
+                    if rx.await == Ok(0) {
+                        this.update(cx, |ws, cx| ws.execute_git(op, cx)).ok();
+                    }
+                })
+                .detach();
+                return;
+            }
+        }
         if let GitOp::Discard(files) = &op {
             // Rolling back can't be undone, so ask first.
             let message = match files.as_slice() {
@@ -1999,7 +2052,9 @@ impl Workspace {
                 match result {
                     Ok(message) => {
                         if let Some(message) = message {
-                            ws.toast(ToastKind::Success, message, None, cx);
+                            // A merge or rebase that stopped on conflicts isn't done yet.
+                            let kind = if message.contains("conflicts") { ToastKind::Info } else { ToastKind::Success };
+                            ws.toast(kind, message, None, cx);
                         }
                         match &op {
                             GitOp::Commit { .. } => ws.git_panel.update(cx, |p, cx| p.committed(cx)),
@@ -2023,8 +2078,37 @@ impl Workspace {
                         ws.toast(ToastKind::Error, title, Some(err), cx);
                     }
                 }
-                if matches!(op, GitOp::Discard(_) | GitOp::Pull | GitOp::Checkout(_)) {
+                if matches!(
+                    op,
+                    GitOp::Discard(_) | GitOp::Pull | GitOp::Checkout(_) | GitOp::Merge(_) | GitOp::Rebase(_) | GitOp::Abort(_) | GitOp::Continue(_)
+                ) {
                     ws.reload_changed_files(cx);
+                }
+                if ws.show_git_log
+                    && matches!(
+                        op,
+                        GitOp::Commit { .. }
+                            | GitOp::Fetch
+                            | GitOp::Pull
+                            | GitOp::Push
+                            | GitOp::Checkout(_)
+                            | GitOp::CreateBranch(_)
+                            | GitOp::Merge(_)
+                            | GitOp::Rebase(_)
+                            | GitOp::Abort(_)
+                            | GitOp::Continue(_)
+                    )
+                {
+                    ws.git_log.update(cx, |l, cx| l.reload(cx));
+                }
+                // Staging part of a file may leave its status as it was.
+                if matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
+                    for editor in ws.tabs.clone() {
+                        ws.load_diff_base(&editor, cx);
+                    }
+                }
+                if let Some(Modal::Diff(view)) = &ws.modal {
+                    view.update(cx, |v, cx| v.reload(cx));
                 }
                 ws.status_task = None;
                 ws.refresh_git(cx);
@@ -2138,14 +2222,19 @@ impl Workspace {
     }
 
     fn open_diff(&mut self, file: FileStatus, staged: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo.clone() else { return };
         let buffer = self
             .tabs
             .iter()
             .find(|t| t.read(cx).doc.path.as_deref() == Some(file.path.as_path()))
             .map(|t| t.read(cx).text());
+        self.show_diff(DiffSource::Working { file, staged, buffer }, window, cx);
+    }
+
+    fn show_diff(&mut self, source: DiffSource, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
         self.close_modal(window, cx);
-        let view = cx.new(|cx| DiffView::new(repo, file, staged, buffer, window, cx));
+        let side_by_side = SessionState::load().diff_side_by_side.unwrap_or(true);
+        let view = cx.new(|cx| DiffView::new(repo, source, side_by_side, window, cx));
         self.modal_subscription = Some(cx.subscribe_in(&view, window, |ws, _, event: &DiffViewEvent, window, cx| match event {
             DiffViewEvent::Close => ws.close_modal(window, cx),
             DiffViewEvent::OpenFile(path) => {
@@ -2153,8 +2242,17 @@ impl Workspace {
                 ws.open_path(path.clone(), window, cx);
             }
             DiffViewEvent::Run(op) => {
-                ws.close_modal(window, cx);
+                // Staging a change keeps the diff open (it reloads afterwards).
+                if !matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
+                    ws.close_modal(window, cx);
+                }
                 ws.run_git(op.clone(), window, cx);
+            }
+            DiffViewEvent::Layout { side_by_side } => {
+                // App-wide, like the font zoom.
+                let mut state = SessionState::load();
+                state.diff_side_by_side = Some(*side_by_side);
+                state.save().ok();
             }
         }));
         self.modal = Some(Modal::Diff(view));
@@ -2163,6 +2261,9 @@ impl Workspace {
 
     fn toggle_problems(&mut self, _: &ToggleProblems, window: &mut Window, cx: &mut Context<Self>) {
         self.show_problems = !self.show_problems;
+        if self.show_problems {
+            self.show_git_log = false;
+        }
         if self.show_problems && self.show_terminal {
             self.show_terminal = false;
             self.focus_active(window, cx);
@@ -2182,6 +2283,7 @@ impl Workspace {
         } else {
             self.show_terminal = true;
             self.show_problems = false;
+            self.show_git_log = false;
             if self.terminals.is_empty() {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
@@ -2190,6 +2292,62 @@ impl Workspace {
         }
         self.save_state();
         cx.notify();
+    }
+
+    /// Git log in the bottom panel (⌘9 / Alt+9); again hides it.
+    fn toggle_git_log(&mut self, _: &ToggleGitLog, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_git_log {
+            self.show_git_log = false;
+            self.focus_active(window, cx);
+        } else {
+            self.git_log.update(cx, |l, cx| l.show_path(None, cx));
+            self.open_git_log(window, cx);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The active file's commits (Git → Show History).
+    fn show_file_history(&mut self, _: &ShowFileHistory, window: &mut Window, cx: &mut Context<Self>) {
+        let rel = self.active_editor().and_then(|e| {
+            let path = e.read(cx).doc.path.clone()?;
+            Some(path.strip_prefix(self.repo.as_ref()?).ok()?.to_string_lossy().replace('\\', "/"))
+        });
+        let Some(rel) = rel else {
+            self.toast(ToastKind::Info, "This file isn't in a Git repository", None, cx);
+            return;
+        };
+        self.git_log.update(cx, |l, cx| l.show_path(Some(rel), cx));
+        self.open_git_log(window, cx);
+        self.save_state();
+        cx.notify();
+    }
+
+    fn open_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.toast(ToastKind::Info, "Not a Git repository", None, cx);
+            return;
+        }
+        self.show_git_log = true;
+        self.show_problems = false;
+        self.show_terminal = false;
+        self.git_log.update(cx, |l, cx| l.reload(cx));
+        self.git_log.read(cx).focus_filter(window, cx);
+    }
+
+    fn render_git_log_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .h(self.problems_height)
+            .flex_shrink_0()
+            .bg(theme.background)
+            .border_t_1()
+            .border_color(theme.border)
+            .child(self.git_log.clone())
+            .child(self.resize_handle(Edge::Problems, cx))
     }
 
     /// After `open_window`'s setup: start the shell for a terminal panel that
@@ -2245,6 +2403,7 @@ impl Workspace {
                 self.active_terminal = ix;
                 self.show_terminal = true;
                 self.show_problems = false;
+                self.show_git_log = false;
                 if focus {
                     self.focus_terminal(window, cx);
                 }
@@ -2960,6 +3119,8 @@ impl Workspace {
         let e = editor.read(cx);
         let path = e.doc.path.clone();
         let has_change = e.has_change_at_cursor();
+        let change_staged = e.change_at_cursor_staged();
+        let in_conflict = e.has_conflict_at_cursor();
         let soft_wrap = e.soft_wrap();
         let mut entries: Vec<MenuEntry> = Vec::new();
         let mut actions: Vec<Option<MenuAction>> = Vec::new();
@@ -3006,7 +3167,22 @@ impl Workspace {
         {
             add(MenuEntry::Separator, None);
             add(MenuEntry::Header("Git".into()), None);
+            if in_conflict {
+                for (label, action) in [
+                    ("Accept Current Change", Box::new(editor::AcceptCurrent) as Box<dyn gpui::Action>),
+                    ("Accept Incoming Change", Box::new(editor::AcceptIncoming)),
+                    ("Accept Both Changes", Box::new(editor::AcceptBoth)),
+                ] {
+                    let (entry, action) = run(MenuEntry::text(label), action);
+                    add(entry, action);
+                }
+            }
             if has_change {
+                let (entry, action) = match change_staged {
+                    Some(true) => run(MenuEntry::item("Unstage Lines", Icon::Minus), Box::new(editor::UnstageHunk)),
+                    _ => run(MenuEntry::item("Stage Lines", Icon::Plus), Box::new(editor::StageHunk)),
+                };
+                add(entry, action);
                 let (entry, action) = run(MenuEntry::item("Rollback Lines", Icon::Undo), Box::new(editor::RollbackHunk));
                 add(entry, action);
             }
@@ -3016,6 +3192,8 @@ impl Workspace {
                     Some(MenuAction::Tree(TreeAction::ShowDiff(f.clone(), f.unstaged.is_none()))),
                 );
             }
+            let (entry, action) = run(MenuEntry::item("Show History", Icon::History), Box::new(ShowFileHistory));
+            add(entry, action);
             let (entry, action) = run(MenuEntry::item("Toggle Inline Git Blame", Icon::GitCommit), Box::new(editor::ToggleInlineBlame));
             add(entry, action);
         }
@@ -4936,6 +5114,15 @@ impl Workspace {
             })
             .child(div().flex_1())
             .children(right)
+            .when(self.repo.is_some(), |el| {
+                el.child(
+                    self.icon_button("toggle-git-log", Icon::GitCommit, self.show_git_log, cx, |ws, _, window, cx| {
+                        ws.toggle_git_log(&ToggleGitLog, window, cx)
+                    })
+                    .size(px(22.))
+                    .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
+                )
+            })
             .child(
                 self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
                     ws.toggle_terminal(&ToggleTerminal, window, cx)
@@ -5035,6 +5222,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_pull))
             .on_action(cx.listener(Self::git_fetch))
             .on_action(cx.listener(Self::git_branches))
+            .on_action(cx.listener(Self::toggle_git_log))
+            .on_action(cx.listener(Self::show_file_history))
             .on_action(cx.listener(Self::git_clone))
             .on_action(cx.listener(Self::git_init))
             .on_action(cx.listener(Self::open_remote))
@@ -5081,7 +5270,8 @@ impl Render for Workspace {
                             .min_w_0()
                             .child(div().flex_1().min_h_0().overflow_hidden().child(panes))
                             .when(self.show_problems, |el| el.child(self.render_problems(cx)))
-                            .when(self.show_terminal, |el| el.child(terminal_panel.unwrap())),
+                            .when(self.show_terminal, |el| el.child(terminal_panel.unwrap()))
+                            .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx))),
                     ),
             )
             .child(self.render_statusbar(cx))
@@ -5298,6 +5488,28 @@ fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<Stri
     match op {
         GitOp::Stage(rels) => git::stage(dir, &rels).map(|_| None),
         GitOp::Unstage(rels) => git::unstage(dir, &rels, status.head_oid.is_some()).map(|_| None),
+        GitOp::StageLines { rel, text, rows } => git::stage_lines(dir, &rel, &text, rows).map(|_| None),
+        GitOp::UnstageLines { rel, text, rows } => git::unstage_lines(dir, &rel, text.as_deref(), rows).map(|_| None),
+        GitOp::Merge(branch) => git::merge(dir, &branch).map(|out| {
+            Some(if out == "CONFLICT" {
+                "Merge stopped on conflicts".into()
+            } else if out.contains("Already up to date") {
+                "Already up to date".into()
+            } else {
+                format!("Merged {branch}")
+            })
+        }),
+        GitOp::Rebase(onto) => git::rebase(dir, &onto).map(|out| {
+            Some(if out == "CONFLICT" { "Rebase stopped on conflicts".into() } else { format!("Rebased onto {onto}") })
+        }),
+        GitOp::Abort(state) => git::abort(dir, state).map(|_| Some(format!("{} aborted", state.noun()))),
+        GitOp::Continue(state) => git::continue_op(dir, state).map(|_| {
+            Some(match git::repo_state(dir) {
+                // A rebase can stop again on the next commit.
+                Some(_) => "Stopped on more conflicts".into(),
+                None => format!("{} finished", state.noun()),
+            })
+        }),
         GitOp::Discard(files) => {
             let n = files.len();
             git::discard(dir, &files).map(|_| Some(format!("Rolled back {n} file{}", if n == 1 { "" } else { "s" })))

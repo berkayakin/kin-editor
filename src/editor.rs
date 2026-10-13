@@ -3,6 +3,7 @@
 
 mod fold;
 mod format;
+mod conflict;
 mod lsp;
 mod run;
 
@@ -23,6 +24,7 @@ use gpui::{
 
 use crate::{
     assets::Icon,
+    conflict::Resolution,
     document::{Document, EditKind, Selection},
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
@@ -101,6 +103,11 @@ actions!(
         NewlineAbove,
         ToggleBlockComment,
         RollbackHunk,
+        StageHunk,
+        UnstageHunk,
+        AcceptCurrent,
+        AcceptIncoming,
+        AcceptBoth,
         NextChange,
         PreviousChange,
         ToggleInlineBlame,
@@ -130,6 +137,11 @@ pub struct GitFile {
     /// The repository's `user.name`, shown as "You" in blame.
     pub user_name: Option<String>,
 }
+
+/// A Git operation started from the editor (staging a change).
+pub struct EditorGitEvent(pub crate::git_panel::GitOp);
+
+impl EventEmitter<EditorGitEvent> for Editor {}
 
 /// App-wide toggle for inline blame.
 pub struct InlineBlame(pub bool);
@@ -224,7 +236,11 @@ pub struct Editor {
     git_file: Option<GitFile>,
     /// The file's text at HEAD; changes are shown against it.
     diff_base: Option<Arc<str>>,
+    /// The file's staged text, to tell staged changes from unstaged ones.
+    index_base: Option<Arc<str>>,
     hunks: Arc<Vec<Hunk>>,
+    /// Per hunk: whether it's fully staged.
+    hunk_staged: Arc<Vec<bool>>,
     diff_task: Option<Task<()>>,
     /// Index into `hunks` of the change popover that is open.
     open_hunk: Option<usize>,
@@ -244,6 +260,10 @@ pub struct Editor {
     gutter_hovered: bool,
     /// Runnable targets for a version (gutter ▶).
     run_cache: Option<(u64, Arc<Vec<crate::run::RunTarget>>)>,
+    /// Merge conflicts for a version.
+    conflict_cache: Option<(u64, Arc<Vec<crate::conflict::Conflict>>)>,
+    /// Accept labels on screen last frame: (bounds, conflict start row, choice).
+    conflict_hits: Vec<(Bounds<Pixels>, usize, crate::conflict::Resolution)>,
 }
 
 impl Editor {
@@ -283,7 +303,9 @@ impl Editor {
             external_task: None,
             git_file: None,
             diff_base: None,
+            index_base: None,
             hunks: Arc::new(Vec::new()),
+            hunk_staged: Arc::new(Vec::new()),
             diff_task: None,
             open_hunk: None,
             blame: None,
@@ -296,6 +318,8 @@ impl Editor {
             fold_pills: Vec::new(),
             gutter_hovered: false,
             run_cache: None,
+            conflict_cache: None,
+            conflict_hits: Vec::new(),
         };
         this.apply_settings(cx);
         this.detect_external_linter();
@@ -473,15 +497,16 @@ impl Editor {
         window.focus(&self.focus_handle);
     }
 
-    /// Sets the text that changes are measured against (HEAD), or clears it
-    /// for files outside a repository or not yet committed.
-    pub fn set_diff_base(&mut self, git_file: Option<GitFile>, base: Option<String>, cx: &mut Context<Self>) {
+    /// Sets the text that changes are measured against (HEAD) and the staged
+    /// text, or clears them for files outside a repository or not yet committed.
+    pub fn set_diff_base(&mut self, git_file: Option<GitFile>, base: Option<String>, index: Option<String>, cx: &mut Context<Self>) {
         if self.git_file != git_file {
             self.blame = None;
             self.blame_request = None;
         }
         self.git_file = git_file;
         self.diff_base = base.map(Arc::from);
+        self.index_base = index.map(Arc::from);
         self.schedule_diff(Duration::ZERO, cx);
     }
 
@@ -496,17 +521,29 @@ impl Editor {
         };
         let rope = self.doc.rope().clone();
         let version = self.doc.version();
+        let index = self.index_base.clone();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
             }
-            let hunks = cx
+            let (hunks, staged) = cx
                 .background_executor()
-                .spawn(async move { git::diff_hunks(&base, &rope.to_string()) })
+                .spawn(async move {
+                    let text = rope.to_string();
+                    let hunks = git::diff_hunks(&base, &text);
+                    // A change is staged when nothing differs from the index there.
+                    let unstaged = index.map(|index| git::diff_hunks(&index, &text));
+                    let staged: Vec<bool> = hunks
+                        .iter()
+                        .map(|h| unstaged.as_ref().is_some_and(|u| !u.iter().any(|u| git::rows_touch(&u.new_rows, &h.new_rows))))
+                        .collect();
+                    (hunks, staged)
+                })
                 .await;
             this.update(cx, |editor, cx| {
                 if editor.doc.version() == version {
                     editor.hunks = Arc::new(hunks);
+                    editor.hunk_staged = Arc::new(staged);
                     if editor.open_hunk.is_some_and(|i| i >= editor.hunks.len()) {
                         editor.open_hunk = None;
                     }
@@ -1807,6 +1844,11 @@ impl Editor {
                     return;
                 }
             }
+            // Accept Current / Incoming / Both on a conflict.
+            if let Some(&(_, start, resolution)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&event.position)) {
+                self.resolve_conflict(start, resolution, cx);
+                return;
+            }
             // The `⋯` placeholder unfolds.
             if let Some(&(_, start)) = self.fold_pills.iter().find(|(b, _)| b.contains(&event.position)) {
                 self.doc.unfold_where(|f| f.start == start);
@@ -1905,6 +1947,19 @@ impl Editor {
     /// Whether the caret is on a changed (git) line, for Rollback Lines.
     pub fn has_change_at_cursor(&self) -> bool {
         self.current_hunk().is_some()
+    }
+
+    /// Whether the change at the caret is staged (`None`: no change there).
+    pub fn change_at_cursor_staged(&self) -> Option<bool> {
+        self.current_hunk().map(|i| self.hunk_staged.get(i).copied().unwrap_or(false))
+    }
+
+    /// Whether the caret is in a merge conflict (as of the last frame).
+    pub fn has_conflict_at_cursor(&self) -> bool {
+        let row = self.doc.row_of(self.primary_selection().head);
+        self.conflict_cache
+            .as_ref()
+            .is_some_and(|(v, c)| *v == self.doc.version() && c.iter().any(|c| c.rows().contains(&row)))
     }
 
     fn line_range(&self, offset: usize) -> Range<usize> {
@@ -2107,6 +2162,8 @@ impl Editor {
         let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.fold_regions());
         let run_rows: Vec<usize> =
             if single { Vec::new() } else { self.run_targets().iter().filter_map(|t| t.row).collect() };
+        let conflicts = if single { Arc::new(Vec::new()) } else { self.conflicts() };
+        self.conflict_hits.clear();
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
         let diagnostics: Vec<&lint::Diagnostic> = self
             .doc
@@ -2278,6 +2335,23 @@ impl Editor {
                     frame.backgrounds.push(fill(
                         Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
                         theme.current_line,
+                    ));
+                }
+
+                // Merge conflict regions: current side green, incoming blue,
+                // markers stronger.
+                if let Some(c) = conflicts.iter().find(|c| c.rows().contains(&row)) {
+                    let marker = row == c.start || row == c.end || row + 1 == c.theirs.start || c.base.as_ref().is_some_and(|b| row + 1 == b.start);
+                    let color: Hsla = if row == c.start || c.ours.contains(&row) {
+                        theme.git_added.into()
+                    } else if row == c.end || c.theirs.contains(&row) {
+                        theme.git_modified.into()
+                    } else {
+                        theme.text_dim.into()
+                    };
+                    frame.backgrounds.push(fill(
+                        Bounds::from_corners(point(bounds.left() + gutter_width, y), point(bounds.right(), y + line_height)),
+                        color.alpha(if marker { 0.24 } else { 0.11 }),
                     ));
                 }
 
@@ -2465,13 +2539,15 @@ impl Editor {
 
                 // Git change bars.
                 let bar_x = bounds.left() + gutter_width - px(GIT_BAR_OFFSET) - px(1.5);
-                for hunk in self.hunks.iter() {
+                for (hix, hunk) in self.hunks.iter().enumerate() {
                     let color: Hsla = match hunk.kind {
                         HunkKind::Added => theme.git_added,
                         HunkKind::Modified => theme.git_modified,
                         HunkKind::Deleted => theme.git_deleted,
                     }
                     .into();
+                    // Staged changes are drawn faded.
+                    let color = if self.hunk_staged.get(hix).copied().unwrap_or(false) { color.alpha(0.4) } else { color };
                     if hunk.kind == HunkKind::Deleted {
                         if hunk.new_rows.start == row && first_seg {
                             frame.gutter_marks.push(
@@ -2503,7 +2579,31 @@ impl Editor {
                 }
                 // A folded header ends with a `⋯` placeholder (click to unfold).
                 let mut text_end = origin.x + shaped.width;
-                if let Some(fold) = self.fold_under(row) {
+                if let Some(c) = conflicts.iter().find(|c| c.start == row) {
+                    // Accept Current · Accept Incoming · Accept Both
+                    let mut x = text_end + char_width * 3.;
+                    for resolution in [Resolution::Current, Resolution::Incoming, Resolution::Both] {
+                        let label = resolution.label();
+                        let line = text_system.shape_line(
+                            SharedString::from(label),
+                            px(theme.ui_font_size - 0.5),
+                            &[TextRun {
+                                len: label.len(),
+                                font: ui_font.clone(),
+                                color: theme.text_muted.into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }],
+                            None,
+                        );
+                        let pill = Bounds::new(point(x - px(5.), y + px(2.)), size(line.width + px(10.), line_height - px(4.)));
+                        frame.inline_bgs.push(fill(pill, theme.hover).corner_radii(px(4.)));
+                        x += line.width + px(16.);
+                        frame.inline_texts.push((point(pill.left() + px(5.), y), line));
+                        self.conflict_hits.push((pill, c.start, resolution));
+                    }
+                } else if let Some(fold) = self.fold_under(row) {
                     let label = self.fold_placeholder(&fold);
                     let pill_line = text_system.shape_line(
                         SharedString::from(label.clone()),
@@ -2898,6 +2998,30 @@ impl Editor {
         self.edit_and_remap(vec![(start..end, text)], EditKind::Other, cx);
     }
 
+    fn stage_hunk(&mut self, _: &StageHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.stage_current_hunk(true, cx);
+    }
+
+    fn unstage_hunk(&mut self, _: &UnstageHunk, _: &mut Window, cx: &mut Context<Self>) {
+        self.stage_current_hunk(false, cx);
+    }
+
+    /// Stages (or unstages) the change at the caret, as the buffer shows it,
+    /// unsaved edits included.
+    fn stage_current_hunk(&mut self, stage: bool, cx: &mut Context<Self>) {
+        let (Some(hunk), Some(git_file)) = (self.current_hunk().and_then(|i| self.hunks.get(i)).cloned(), self.git_file.clone()) else {
+            cx.emit(EditorLspEvent::Message("No change at the caret".into()));
+            return;
+        };
+        let (rel, text, rows) = (git_file.rel, self.text(), hunk.new_rows);
+        let op = if stage {
+            crate::git_panel::GitOp::StageLines { rel, text, rows }
+        } else {
+            crate::git_panel::GitOp::UnstageLines { rel, text: Some(text), rows }
+        };
+        cx.emit(EditorGitEvent(op));
+    }
+
     fn jump_to_change(&mut self, forward: bool, cx: &mut Context<Self>) {
         if self.hunks.is_empty() {
             return;
@@ -2972,6 +3096,7 @@ impl Editor {
         let top = layout.line_height * anchor_row as f32 - self.scroll.y + px(2.);
         let left = layout.gutter_width - px(4.);
         let width = (layout.bounds.size.width - left - px(28.)).min(px(720.)).max(px(240.));
+        let staged = self.hunk_staged.get(ix).copied().unwrap_or(false);
         let (title, color): (String, Hsla) = match hunk.kind {
             HunkKind::Added => (format!("{} added line{}", hunk.new_rows.len(), plural(hunk.new_rows.len())), theme.git_added.into()),
             HunkKind::Modified => (format!("{} changed line{}", hunk.new_rows.len(), plural(hunk.new_rows.len())), theme.git_modified.into()),
@@ -3019,7 +3144,14 @@ impl Editor {
                         .border_b_1()
                         .border_color(theme.border_subtle)
                         .child(div().size(px(8.)).rounded_full().bg(color))
-                        .child(div().flex_1().pl_1().text_color(theme.text_muted).child(title))
+                        .child(div().pl_1().text_color(theme.text_muted).child(title))
+                        .when(staged, |el| el.child(div().text_size(px(11.)).text_color(theme.text_dim).child("· Staged")))
+                        .child(div().flex_1())
+                        .child(if staged {
+                            button("hunk-stage", Icon::Minus, "Unstage Lines").on_click(cx.listener(|e, _, _, cx| e.stage_current_hunk(false, cx)))
+                        } else {
+                            button("hunk-stage", Icon::Plus, "Stage Lines").on_click(cx.listener(|e, _, _, cx| e.stage_current_hunk(true, cx)))
+                        })
                         .child(button("hunk-rollback", Icon::Undo, "Rollback Lines").on_click(cx.listener(|e, _, w, cx| e.rollback_hunk(&RollbackHunk, w, cx))))
                         .child(button("hunk-prev", Icon::ChevronUp, "Previous Change").on_click(cx.listener(|e, _, _, cx| e.jump_to_change(false, cx))))
                         .child(button("hunk-next", Icon::ChevronDown, "Next Change").on_click(cx.listener(|e, _, _, cx| e.jump_to_change(true, cx))))
@@ -3441,6 +3573,11 @@ impl Render for Editor {
             .on_action(cx.listener(Self::newline_above))
             .on_action(cx.listener(Self::toggle_block_comment))
             .on_action(cx.listener(Self::rollback_hunk))
+            .on_action(cx.listener(Self::stage_hunk))
+            .on_action(cx.listener(Self::unstage_hunk))
+            .on_action(cx.listener(Self::accept_current))
+            .on_action(cx.listener(Self::accept_incoming))
+            .on_action(cx.listener(Self::accept_both))
             .on_action(cx.listener(Self::next_change))
             .on_action(cx.listener(Self::previous_change))
             .on_action(cx.listener(Self::toggle_inline_blame))

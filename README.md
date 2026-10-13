@@ -40,7 +40,9 @@ platform-native text rendering (CoreText / DirectWrite).
 - Search Everywhere (double Shift), fuzzy Go to File, Recent Files, Find Action, Go to Line, and
   File Structure: the current file's functions, classes, headings, selectors or keys
 - Git: clone, init, gutter change markers with rollback, inline blame, file status colors, a Commit panel
-  (stage, discard, commit, amend, push), diff viewer, branches, pull and fetch
+  (stage, discard, commit, amend, push), staging single changes, side-by-side diffs with changed words
+  highlighted, a log with a branch graph and file history, merge/rebase with conflict resolution in
+  the editor, branches, pull and fetch
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
 - 11 built-in themes (9 dark, 2 light) and JSON user themes with live preview
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
@@ -122,6 +124,8 @@ reachable through Find Action, which shows its shortcut.
 | Push / Update Project (pull) | ⌘⇧K / ⌘T | Ctrl+Shift+K / Ctrl+T |
 | Rollback lines (change under caret) | ⌥⌘Z | Ctrl+Alt+Z |
 | Next / previous change | ⌃⌥⇧↓ / ⌃⌥⇧↑ | Ctrl+Alt+Shift+↓ / ↑ |
+| Git log | ⌘9 | Alt+9 |
+| Next / previous change (in a diff) | F7 / ⇧F7 | F7 / Shift+F7 |
 | Settings | ⌘, | Ctrl+Alt+S |
 | Increase / decrease font size | ⌥⌘= / ⌥⌘- | Ctrl+Alt+= / Ctrl+Alt+- |
 | Collapse / expand (fold) | ⌘- / ⌘= | Ctrl+- / Ctrl+= |
@@ -327,7 +331,10 @@ all apply. Prompts are disabled, so a remote that needs a password fails fast wi
 message instead of hanging; use an SSH agent or a credential helper.
 
 - **Gutter:** green/blue/red bars mark added, changed and deleted lines against `HEAD`,
-  updated as you type. Click a bar to see the original lines and **Rollback** them.
+  updated as you type; staged changes are drawn faded. Click a bar to see the original lines,
+  **Stage** (or **Unstage**) just that change, or **Rollback** it. Stage Lines / Unstage Lines are
+  also in the editor's right-click menu and Find Action, and stage what the editor shows, unsaved
+  edits included.
 - **Inline blame:** the caret line shows its author, age and commit message
   (Find Action → Toggle Inline Git Blame).
 - **File tree:** changed files are colored with a status letter; folders containing
@@ -336,8 +343,22 @@ message instead of hanging; use an SSH agent or a credential helper.
   on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
   staged, everything is committed), or use **Commit and Push**. **Amend** starts from the
   previous message. In a folder that isn't a repository it offers **Initialize Repository**.
+- **Diffs** show side by side or unified (the choice is remembered), with syntax colors and the
+  changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
+  through changes; collapsed unchanged lines expand on click.
 - **Branches:** the branch is shown in the title bar with ahead/behind counts; click it to
-  switch to a local or remote branch, or type a new name to create one.
+  switch to a local or remote branch, or type a new name to create one. Hover another branch
+  for **Merge** (into the current one) and **Rebase** (the current one onto it).
+- **Merge conflicts:** a merge or rebase that stops on conflicts shows a banner in the Commit
+  panel with **Abort**. Conflicted files open in the editor, where each conflict is tinted
+  (current side green, incoming blue) with **Accept Current / Accept Incoming / Accept Both**
+  on its first line (also in the right-click menu and Find Action). Mark a file resolved with
+  ✓ on hover (Kin asks if markers remain), then **Commit Merge** / **Continue**. The merge
+  message is filled in, and committing is blocked while conflicts remain.
+- **Log** (⌘9 / Alt+9, or the status bar button): commits of all branches (toggle) with a branch
+  graph, branch and tag labels, and a filter by message, author, hash or branch. Select a commit
+  for its message, author, date, hash (copy) and changed files; click a file for its diff.
+  **Show History** (editor right-click menu, Git menu) lists one file's commits, following renames.
 - **Push / Pull / Fetch:** from the Commit panel, the keyboard, or Find Action. Pushing a
   new branch sets its upstream. Results appear as notifications.
 

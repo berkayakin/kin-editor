@@ -2,7 +2,7 @@
 //! stage/unstage/discard, a commit message box and push/pull controls.
 //! Operations are emitted as events; the workspace runs them.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
@@ -12,7 +12,7 @@ use gpui::{
 use crate::{
     assets::Icon,
     editor::{Editor, Submit},
-    git::{self, Branch, Change, FileStatus, RepoStatus},
+    git::{self, Branch, Change, FileStatus, RepoState, RepoStatus},
     theme::Theme,
     ui::{icon_el, kbd, tooltip_view},
 };
@@ -21,6 +21,11 @@ use crate::{
 pub enum GitOp {
     Stage(Vec<String>),
     Unstage(Vec<String>),
+    /// Stage the changes of `text` (the file's current text) touching `rows`.
+    StageLines { rel: String, text: String, rows: Range<usize> },
+    /// Unstage the staged changes touching `rows`: of `text` when given (an
+    /// editor's rows), else of the index version.
+    UnstageLines { rel: String, text: Option<String>, rows: Range<usize> },
     Discard(Vec<FileStatus>),
     Commit { message: String, amend: bool, all: bool, push: bool },
     Push,
@@ -29,6 +34,12 @@ pub enum GitOp {
     Checkout(Branch),
     CreateBranch(String),
     Init,
+    /// Merge a branch into the current one.
+    Merge(String),
+    /// Rebase the current branch onto another.
+    Rebase(String),
+    Abort(RepoState),
+    Continue(RepoState),
 }
 
 impl GitOp {
@@ -37,6 +48,12 @@ impl GitOp {
         match self {
             GitOp::Stage(_) => "Staging…",
             GitOp::Unstage(_) => "Unstaging…",
+            GitOp::StageLines { .. } => "Staging lines…",
+            GitOp::UnstageLines { .. } => "Unstaging lines…",
+            GitOp::Merge(_) => "Merging…",
+            GitOp::Rebase(_) => "Rebasing…",
+            GitOp::Abort(_) => "Aborting…",
+            GitOp::Continue(_) => "Continuing…",
             GitOp::Discard(_) => "Discarding…",
             GitOp::Commit { push: true, .. } => "Committing and pushing…",
             GitOp::Commit { .. } => "Committing…",
@@ -106,6 +123,21 @@ impl GitPanel {
     }
 
     pub fn set_status(&mut self, status: Arc<RepoStatus>, cx: &mut Context<Self>) {
+        // A merge that just stopped: start from git's merge message, as JetBrains does.
+        let merge_started = status.state == Some(RepoState::Merging) && self.status.state != Some(RepoState::Merging);
+        if merge_started
+            && self.message_text(cx).is_empty()
+            && let Some(repo) = self.repo.clone()
+        {
+            let message = self.message.clone();
+            cx.spawn(async move |_, cx| {
+                let text = cx.background_executor().spawn(async move { git::merge_message(&repo) }).await;
+                if let Some(text) = text {
+                    message.update(cx, |m, cx| m.set_text(&text, cx)).ok();
+                }
+            })
+            .detach();
+        }
         self.status = status;
         cx.notify();
     }
@@ -133,6 +165,8 @@ impl GitPanel {
         self.busy.is_none()
             && !self.message_text(cx).is_empty()
             && (self.amend || !self.status.files.is_empty())
+            // Unresolved conflicts would be committed with their markers.
+            && self.status.conflicted().next().is_none()
     }
 
     fn commit(&mut self, push: bool, cx: &mut Context<Self>) {
@@ -209,6 +243,7 @@ impl GitPanel {
         let f_open = file.clone();
         let rel = file.rel.clone();
         let deleted = change == Change::Deleted;
+        let conflicted = change == Change::Conflicted;
 
         div().w_full().px_1p5().child(
             div()
@@ -227,7 +262,8 @@ impl GitPanel {
                 .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                     this.selected = Some((f.rel.clone(), staged));
-                    if e.click_count() >= 2 && !deleted {
+                    // A conflict is resolved in the editor, not read in a diff.
+                    if (e.click_count() >= 2 || conflicted) && !deleted {
                         cx.emit(GitPanelEvent::OpenFile(f.path.clone()));
                     } else {
                         cx.emit(GitPanelEvent::OpenDiff { file: f.clone(), staged });
@@ -249,7 +285,7 @@ impl GitPanel {
                         .flex()
                         .invisible()
                         .group_hover(group.clone(), |s| s.visible())
-                        .when(!staged, |el| {
+                        .when(!staged && !conflicted, |el| {
                             let discard = f_open.clone();
                             el.child(
                                 self.small_button(("discard", ix), Icon::Undo, "Rollback Changes", cx)
@@ -271,7 +307,13 @@ impl GitPanel {
                         })
                         .child({
                             let rel = rel.clone();
-                            let (icon, tip) = if staged { (Icon::Minus, "Unstage") } else { (Icon::Plus, "Stage") };
+                            let (icon, tip) = if staged {
+                                (Icon::Minus, "Unstage")
+                            } else if conflicted {
+                                (Icon::Check, "Mark as Resolved")
+                            } else {
+                                (Icon::Plus, "Stage")
+                            };
                             self.small_button(("stage", (staged as usize) * 100_000 + ix), icon, tip, cx)
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.stop_propagation();
@@ -365,6 +407,64 @@ impl GitPanel {
                     .items_center()
                     .child(self.small_button("git-push", Icon::ArrowUp, "Push", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::Run(GitOp::Push)))))
                     .children(counter(s.ahead)),
+            )
+    }
+
+    /// A stopped merge or rebase: what's left, and Abort / Continue.
+    fn render_state_banner(&self, state: RepoState, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let conflicts = self.status.conflicted().count();
+        let busy = self.busy.is_some();
+        let detail = match conflicts {
+            0 => "conflicts resolved".to_string(),
+            1 => "1 conflict".to_string(),
+            n => format!("{n} conflicts"),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .m_2()
+            .p_2()
+            .rounded(px(7.))
+            .bg(Hsla::from(theme.git_conflict).alpha(0.1))
+            .border_1()
+            .border_color(Hsla::from(theme.git_conflict).alpha(0.35))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(icon_el(Icon::GitBranch, px(14.), theme.git_conflict.into()))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.text).child(state.label()))
+                    .child(div().text_color(theme.text_muted).child(format!("· {detail}"))),
+            )
+            .when(conflicts > 0, |el| {
+                el.child(div().text_size(px(12.)).text_color(theme.text_muted).child(
+                    "Open each conflicted file, pick a side on its conflicts, then mark it resolved.",
+                ))
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_1p5()
+                    .child(crate::ui::text_button("state-abort", "Abort", false, cx).on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(GitPanelEvent::Run(GitOp::Abort(state)));
+                    })))
+                    .when(conflicts == 0 && !busy, |el| {
+                        el.child(crate::ui::text_button("state-continue", if state == RepoState::Merging { "Commit Merge" } else { "Continue" }, true, cx).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                // A merge commit takes the message box's text when there is one.
+                                let message = this.message_text(cx);
+                                let op = if state == RepoState::Merging && !message.is_empty() {
+                                    GitOp::Commit { message, amend: false, all: false, push: false }
+                                } else {
+                                    GitOp::Continue(state)
+                                };
+                                cx.emit(GitPanelEvent::Run(op));
+                            }),
+                        ))
+                    }),
             )
     }
 
@@ -536,6 +636,7 @@ impl Render for GitPanel {
                         .child(busy),
                 )
             })
+            .when_some(self.status.state, |el, state| el.child(self.render_state_banner(state, cx)))
             .child(list)
             .child(self.render_commit_box(window, cx))
             .child(

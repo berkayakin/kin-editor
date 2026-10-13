@@ -28,6 +28,12 @@ pub struct SessionState {
     /// Editor font zoom in points, added to the configured size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_zoom: Option<f32>,
+    /// Diffs show side by side (`false`: unified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff_side_by_side: Option<bool>,
+    /// The bottom panel shows the Git log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_git_log: Option<bool>,
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,

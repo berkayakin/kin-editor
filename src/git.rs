@@ -77,11 +77,17 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub files: Vec<FileStatus>,
+    /// A merge or rebase that stopped and waits to be continued or aborted.
+    pub state: Option<RepoState>,
 }
 
 impl RepoStatus {
     pub fn staged(&self) -> impl Iterator<Item = &FileStatus> {
         self.files.iter().filter(|f| f.staged.is_some() && f.staged != Some(Change::Conflicted))
+    }
+
+    pub fn conflicted(&self) -> impl Iterator<Item = &FileStatus> {
+        self.files.iter().filter(|f| f.staged == Some(Change::Conflicted))
     }
 
     pub fn unstaged(&self) -> impl Iterator<Item = &FileStatus> {
@@ -181,7 +187,22 @@ fn error_text(stderr: &[u8], stdout: &[u8]) -> String {
         .or(lines.first())
         .copied()
         .unwrap_or("git failed");
-    line.trim_start_matches("fatal: ").trim_start_matches("error: ").to_string()
+    let mut message = line.trim_start_matches("fatal: ").trim_start_matches("error: ").to_string();
+    // "…would be overwritten by merge:" is followed by the indented files.
+    if message.ends_with(':') {
+        let listed: Vec<&str> = text
+            .lines()
+            .skip_while(|l| l.trim() != line)
+            .skip(1)
+            .take_while(|l| l.starts_with([' ', '\t']))
+            .map(str::trim)
+            .collect();
+        if !listed.is_empty() {
+            message.push(' ');
+            message.push_str(&listed.join(", "));
+        }
+    }
+    message
 }
 
 pub fn is_available() -> bool {
@@ -212,7 +233,9 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
             "--untracked-files=all",
         ],
     )?;
-    Ok(parse_status(root, &out))
+    let mut status = parse_status(root, &out);
+    status.state = repo_state(root);
+    Ok(status)
 }
 
 fn change_for(c: char) -> Option<Change> {
@@ -673,55 +696,529 @@ pub struct DiffLine {
     pub kind: DiffLineKind,
     pub old_no: Option<usize>,
     pub new_no: Option<usize>,
+    /// The line with tabs expanded (the skipped-lines label for `Skipped`).
     pub text: String,
+    /// Byte ranges of `text` that changed within a modified line.
+    pub emphasis: Vec<Range<usize>>,
+    /// The change block this line belongs to, and whether it's its first line.
+    pub change: Option<(usize, bool)>,
 }
 
-/// A unified diff with `context` unchanged lines around each change.
-pub fn unified_lines(base: &str, current: &str, context: usize) -> Vec<DiffLine> {
-    use similar::ChangeTag;
-    let diff = similar::TextDiff::configure()
-        .timeout(Duration::from_secs(2))
-        .diff_lines(base, current);
+/// One side of a side-by-side row.
+#[derive(Clone, Debug)]
+pub struct DiffSide {
+    pub no: usize,
+    pub text: String,
+    pub emphasis: Vec<Range<usize>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SplitRow {
+    /// `Context`, `Skipped`, or `Added`/`Removed` for any row of a change.
+    pub kind: DiffLineKind,
+    pub left: Option<DiffSide>,
+    pub right: Option<DiffSide>,
+    /// The skipped-lines label.
+    pub label: String,
+    pub change: Option<(usize, bool)>,
+}
+
+/// A contiguous change: rows in the base and in the current text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffChange {
+    pub old_rows: Range<usize>,
+    pub new_rows: Range<usize>,
+}
+
+/// A diff in both layouts, with unchanged runs beyond `context` lines collapsed.
+#[derive(Clone, Debug, Default)]
+pub struct DiffDocument {
+    pub unified: Vec<DiffLine>,
+    pub split: Vec<SplitRow>,
+    pub changes: Vec<DiffChange>,
+    pub added: usize,
+    pub removed: usize,
+}
+
+fn expand_tabs(line: &str) -> String {
+    line.trim_end_matches(['\n', '\r']).replace('\t', "    ")
+}
+
+/// Splits a line into words, whitespace runs and single punctuation marks.
+fn tokens(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
+    let mut start = 0;
+    let class = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let mut prev = None;
+    for (i, c) in line.char_indices() {
+        let k = class(c);
+        if i > start && (prev != Some(k) || k == 2) {
+            out.push(&line[start..i]);
+            start = i;
+        }
+        prev = Some(k);
+    }
+    if start < line.len() {
+        out.push(&line[start..]);
+    }
+    out
+}
+
+/// Changed byte ranges between two versions of a line, by token; empty when
+/// the lines have little in common (the whole line reads as changed then).
+fn word_emphasis(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let (a, b) = (tokens(old), tokens(new));
+    let diff = similar::TextDiff::configure().timeout(Duration::from_millis(20)).diff_slices(&a, &b);
+    if diff.ratio() < 0.4 {
+        return (Vec::new(), Vec::new());
+    }
+    // Byte offset of each token, plus the end.
+    let offsets = |toks: &[&str]| -> Vec<usize> {
+        let mut at = 0;
+        let mut v: Vec<usize> = toks
+            .iter()
+            .map(|t| {
+                let start = at;
+                at += t.len();
+                start
+            })
+            .collect();
+        v.push(at);
+        v
+    };
+    let (oa, ob) = (offsets(&a), offsets(&b));
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    for op in diff.ops() {
+        if !matches!(op, similar::DiffOp::Equal { .. }) {
+            let (o, n) = (op.old_range(), op.new_range());
+            if !o.is_empty() {
+                left.push(oa[o.start]..oa[o.end]);
+            }
+            if !n.is_empty() {
+                right.push(ob[n.start]..ob[n.end]);
+            }
+        }
+    }
+    (left, right)
+}
+
+pub fn diff_document(base: &str, current: &str, context: usize) -> DiffDocument {
+    use similar::DiffOp;
+    let diff = similar::TextDiff::configure().timeout(Duration::from_secs(2)).diff_lines(base, current);
+    let old_lines: Vec<String> = base.split_inclusive('\n').map(expand_tabs).collect();
+    let new_lines: Vec<String> = current.split_inclusive('\n').map(expand_tabs).collect();
+    let mut doc = DiffDocument::default();
     let mut shown_until = 0; // old-line index after the last shown line
-    for group in diff.grouped_ops(context) {
+    let skipped = |n: usize| format!("{n} unchanged line{}", if n == 1 { "" } else { "s" });
+    let push_skipped = |doc: &mut DiffDocument, n: usize| {
+        doc.unified.push(DiffLine { kind: DiffLineKind::Skipped, old_no: None, new_no: None, text: skipped(n), emphasis: Vec::new(), change: None });
+        doc.split.push(SplitRow { kind: DiffLineKind::Skipped, left: None, right: None, label: skipped(n), change: None });
+    };
+    let groups = if context == usize::MAX {
+        vec![diff.ops().to_vec()]
+    } else {
+        diff.grouped_ops(context)
+    };
+    for group in groups {
         let start = group.first().map_or(0, |op| op.old_range().start);
         if start > shown_until {
-            out.push(DiffLine {
-                kind: DiffLineKind::Skipped,
-                old_no: None,
-                new_no: None,
-                text: format!("{} unchanged lines", start - shown_until),
-            });
+            push_skipped(&mut doc, start - shown_until);
         }
         shown_until = group.last().map_or(start, |op| op.old_range().end);
         for op in &group {
-            for change in diff.iter_changes(op) {
-                let text = change.value().trim_end_matches(['\n', '\r']).to_string();
-                let (kind, old_no, new_no) = match change.tag() {
-                    ChangeTag::Equal => (DiffLineKind::Context, change.old_index(), change.new_index()),
-                    ChangeTag::Delete => (DiffLineKind::Removed, change.old_index(), None),
-                    ChangeTag::Insert => (DiffLineKind::Added, None, change.new_index()),
-                };
-                out.push(DiffLine {
-                    kind,
-                    old_no: old_no.map(|n| n + 1),
-                    new_no: new_no.map(|n| n + 1),
-                    text,
+            let (old, new) = (op.old_range(), op.new_range());
+            let side = |lines: &[String], i: usize, emphasis: Vec<Range<usize>>| DiffSide { no: i + 1, text: lines[i].clone(), emphasis };
+            if let DiffOp::Equal { .. } = op {
+                for (o, n) in old.clone().zip(new.clone()) {
+                    doc.unified.push(DiffLine {
+                        kind: DiffLineKind::Context,
+                        old_no: Some(o + 1),
+                        new_no: Some(n + 1),
+                        text: new_lines[n].clone(),
+                        emphasis: Vec::new(),
+                        change: None,
+                    });
+                    doc.split.push(SplitRow {
+                        kind: DiffLineKind::Context,
+                        left: Some(side(&old_lines, o, Vec::new())),
+                        right: Some(side(&new_lines, n, Vec::new())),
+                        label: String::new(),
+                        change: None,
+                    });
+                }
+                continue;
+            }
+            let ix = doc.changes.len();
+            doc.changes.push(DiffChange { old_rows: old.clone(), new_rows: new.clone() });
+            doc.added += new.len();
+            doc.removed += old.len();
+            // Pair lines of a replacement for word emphasis.
+            let pairs = old.len().min(new.len());
+            let emphasis: Vec<_> = (0..pairs).map(|k| word_emphasis(&old_lines[old.start + k], &new_lines[new.start + k])).collect();
+            let mut first = true;
+            for (k, o) in old.clone().enumerate() {
+                doc.unified.push(DiffLine {
+                    kind: DiffLineKind::Removed,
+                    old_no: Some(o + 1),
+                    new_no: None,
+                    text: old_lines[o].clone(),
+                    emphasis: emphasis.get(k).map(|e| e.0.clone()).unwrap_or_default(),
+                    change: Some((ix, std::mem::take(&mut first))),
+                });
+            }
+            for (k, n) in new.clone().enumerate() {
+                doc.unified.push(DiffLine {
+                    kind: DiffLineKind::Added,
+                    old_no: None,
+                    new_no: Some(n + 1),
+                    text: new_lines[n].clone(),
+                    emphasis: emphasis.get(k).map(|e| e.1.clone()).unwrap_or_default(),
+                    change: Some((ix, std::mem::take(&mut first))),
+                });
+            }
+            for k in 0..old.len().max(new.len()) {
+                let left = (k < old.len()).then(|| side(&old_lines, old.start + k, emphasis.get(k).map(|e| e.0.clone()).unwrap_or_default()));
+                let right = (k < new.len()).then(|| side(&new_lines, new.start + k, emphasis.get(k).map(|e| e.1.clone()).unwrap_or_default()));
+                doc.split.push(SplitRow {
+                    kind: if left.is_some() { DiffLineKind::Removed } else { DiffLineKind::Added },
+                    left,
+                    right,
+                    label: String::new(),
+                    change: Some((ix, k == 0)),
                 });
             }
         }
     }
-    let total = base.split_inclusive('\n').count();
-    if !out.is_empty() && total > shown_until {
-        out.push(DiffLine {
-            kind: DiffLineKind::Skipped,
-            old_no: None,
-            new_no: None,
-            text: format!("{} unchanged lines", total - shown_until),
-        });
+    if !doc.changes.is_empty() && old_lines.len() > shown_until {
+        push_skipped(&mut doc, old_lines.len() - shown_until);
     }
+    doc
+}
+
+// ---- Partial staging ----------------------------------------------------------------
+
+/// Whether two row ranges touch. An empty range (a deletion point) touches
+/// the rows on either side of it.
+pub fn rows_touch(a: &Range<usize>, b: &Range<usize>) -> bool {
+    if a.is_empty() || b.is_empty() {
+        a.start <= b.end && b.start <= a.end
+    } else {
+        a.start < b.end && b.start < a.end
+    }
+}
+
+/// `base` with the hunks of `base → target` that `pick` selects applied.
+pub fn apply_hunks(base: &str, target: &str, pick: impl Fn(&Hunk) -> bool) -> String {
+    let base_lines: Vec<&str> = base.split_inclusive('\n').collect();
+    let target_lines: Vec<&str> = target.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(base.len().max(target.len()));
+    let mut at = 0;
+    for hunk in diff_hunks(base, target).iter().filter(|h| pick(h)) {
+        out.extend(base_lines[at..hunk.old_rows.start].iter().copied());
+        out.extend(target_lines[hunk.new_rows.clone()].iter().copied());
+        at = hunk.old_rows.end;
+    }
+    out.extend(base_lines[at..].iter().copied());
     out
+}
+
+/// Maps rows of `target` to rows of `base` across the changes between them
+/// (rows inside a change map to the whole changed range).
+pub fn map_rows_to_base(base: &str, target: &str, rows: Range<usize>) -> Range<usize> {
+    let hunks = diff_hunks(base, target);
+    let map = |row: usize, end: bool| {
+        let mut delta: isize = 0;
+        for h in &hunks {
+            if h.new_rows.start >= row {
+                break;
+            }
+            if h.new_rows.end <= row {
+                delta += h.old_rows.len() as isize - h.new_rows.len() as isize;
+            } else {
+                // Inside a change: snap to its edge in the base.
+                return if end { h.old_rows.end } else { h.old_rows.start };
+            }
+        }
+        (row as isize + delta).max(0) as usize
+    };
+    let start = map(rows.start, false);
+    start..map(rows.end, true).max(start)
+}
+
+/// Stages the changes in `current` (the working copy or an editor's text)
+/// that touch `rows` of it, leaving the file's other changes unstaged.
+pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) -> Result<(), String> {
+    let index = index_text(root, rel).unwrap_or_default();
+    let staged = apply_hunks(&index, current, |h| rows_touch(&h.new_rows, &rows));
+    write_index(root, rel, &staged)
+}
+
+/// Unstages the staged changes touching `rows` of the index version.
+/// `current` maps rows of an editor's text to the index first.
+pub fn unstage_lines(root: &Path, rel: &str, current: Option<&str>, rows: Range<usize>) -> Result<(), String> {
+    let index = index_text(root, rel).unwrap_or_default();
+    let rows = match current {
+        Some(current) => map_rows_to_base(&index, current, rows),
+        None => rows,
+    };
+    let Some(head) = head_text(root, rel) else {
+        // Not in HEAD: unstaging part of a new file isn't meaningful.
+        return unstage(root, &[rel.to_string()], has_head(root));
+    };
+    let unstaged = apply_hunks(&index, &head, |h| rows_touch(&h.old_rows, &rows));
+    write_index(root, rel, &unstaged)
+}
+
+fn has_head(root: &Path) -> bool {
+    run(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok()
+}
+
+/// Puts `text` in the index as `rel`, keeping its file mode.
+fn write_index(root: &Path, rel: &str, text: &str) -> Result<(), String> {
+    let sha = run_with_stdin(root, &["hash-object", "-w", "--stdin", "--path", rel], text.as_bytes())?;
+    let mode = run(root, &["ls-files", "--stage", "--", rel])
+        .ok()
+        .and_then(|out| out.split_whitespace().next().map(str::to_string))
+        .unwrap_or_else(|| {
+            let executable = std::fs::metadata(root.join(rel)).is_ok_and(|m| is_executable(&m));
+            if executable { "100755" } else { "100644" }.to_string()
+        });
+    let info = format!("{mode},{},{rel}", sha.trim());
+    run(root, &["update-index", "--add", "--cacheinfo", &info]).map(drop)
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &std::fs::Metadata) -> bool {
+    false
+}
+
+// ---- Merges and rebases ----------------------------------------------------------------
+
+/// An operation in progress that stopped (usually on conflicts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoState {
+    Merging,
+    Rebasing,
+    CherryPicking,
+    Reverting,
+}
+
+impl RepoState {
+    pub fn label(self) -> &'static str {
+        match self {
+            RepoState::Merging => "Merging",
+            RepoState::Rebasing => "Rebasing",
+            RepoState::CherryPicking => "Cherry-picking",
+            RepoState::Reverting => "Reverting",
+        }
+    }
+
+    /// "Merge", for "Merge aborted".
+    pub fn noun(self) -> &'static str {
+        match self {
+            RepoState::Merging => "Merge",
+            RepoState::Rebasing => "Rebase",
+            RepoState::CherryPicking => "Cherry-pick",
+            RepoState::Reverting => "Revert",
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            RepoState::Merging => "merge",
+            RepoState::Rebasing => "rebase",
+            RepoState::CherryPicking => "cherry-pick",
+            RepoState::Reverting => "revert",
+        }
+    }
+}
+
+/// The `.git` directory (worktrees and submodules point elsewhere).
+pub fn git_dir(root: &Path) -> Option<PathBuf> {
+    let out = run(root, &["rev-parse", "--absolute-git-dir"]).ok()?;
+    Some(PathBuf::from(out.trim()))
+}
+
+pub fn repo_state(root: &Path) -> Option<RepoState> {
+    let dir = git_dir(root)?;
+    if dir.join("rebase-merge").is_dir() || dir.join("rebase-apply").is_dir() {
+        Some(RepoState::Rebasing)
+    } else if dir.join("MERGE_HEAD").is_file() {
+        Some(RepoState::Merging)
+    } else if dir.join("CHERRY_PICK_HEAD").is_file() {
+        Some(RepoState::CherryPicking)
+    } else if dir.join("REVERT_HEAD").is_file() {
+        Some(RepoState::Reverting)
+    } else {
+        None
+    }
+}
+
+/// The message git prepared for the merge commit (MERGE_MSG), without comments.
+pub fn merge_message(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(git_dir(root)?.join("MERGE_MSG")).ok()?;
+    let message: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+    Some(message.join("\n").trim().to_string()).filter(|m| !m.is_empty())
+}
+
+pub fn abort(root: &Path, state: RepoState) -> Result<(), String> {
+    run(root, &[state.command(), "--abort"]).map(drop)
+}
+
+/// Continues after conflicts are resolved and staged, keeping git's message.
+pub fn continue_op(root: &Path, state: RepoState) -> Result<String, String> {
+    match state {
+        // A merge continues by committing.
+        RepoState::Merging => run(root, &["commit", "--no-edit"]),
+        _ => run(root, &["-c", "core.editor=true", state.command(), "--continue"]),
+    }
+}
+
+/// Merges `branch` into the current branch. Conflicts aren't an error: the
+/// merge stops and `repo_state` reports it.
+pub fn merge(root: &Path, branch: &str) -> Result<String, String> {
+    run(root, &["merge", "--no-edit", branch]).or_else(|e| conflicts_or(root, e))
+}
+
+pub fn rebase(root: &Path, onto: &str) -> Result<String, String> {
+    run(root, &["-c", "core.editor=true", "rebase", onto]).or_else(|e| conflicts_or(root, e))
+}
+
+fn conflicts_or(root: &Path, err: String) -> Result<String, String> {
+    if repo_state(root).is_some() && status(root).is_ok_and(|s| s.files.iter().any(|f| f.staged == Some(Change::Conflicted))) {
+        Ok("CONFLICT".into())
+    } else {
+        Err(err)
+    }
+}
+
+// ---- History ------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    /// Local date and time, "2026-10-13 21:05".
+    pub date: String,
+    pub summary: String,
+    /// Branch and tag names pointing here ("HEAD -> main", "origin/main", "tag: v1").
+    pub refs: Vec<String>,
+}
+
+/// Up to `limit` commits reachable from HEAD (`all`: from every branch),
+/// newest first; `path` limits it to one file's history, following renames.
+pub fn log(root: &Path, limit: usize, all: bool, path: Option<&str>) -> Result<Vec<LogEntry>, String> {
+    let limit = format!("--max-count={limit}");
+    let mut args = vec![
+        "log",
+        "--date-order",
+        "--decorate=full",
+        "--date=format-local:%Y-%m-%d %H:%M",
+        &limit,
+        "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%ct%x1f%ad%x1f%D%x1f%s%x1e",
+    ];
+    if all && path.is_none() {
+        args.push("--all");
+    }
+    if let Some(path) = path {
+        args.extend(["--follow", "--", path]);
+    }
+    match run(root, &args) {
+        Ok(out) => Ok(parse_log(&out)),
+        // A repository without commits has no history.
+        Err(e) if e.contains("does not have any commits") || e.contains("bad default revision") => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_log(out: &str) -> Vec<LogEntry> {
+    out.split('\x1e')
+        .filter_map(|record| {
+            let mut f = record.trim_start_matches('\n').split('\x1f');
+            let sha = f.next()?.to_string();
+            if sha.is_empty() {
+                return None;
+            }
+            Some(LogEntry {
+                sha,
+                parents: f.next()?.split_whitespace().map(str::to_string).collect(),
+                author: f.next()?.to_string(),
+                email: f.next()?.to_string(),
+                time: f.next()?.parse().unwrap_or(0),
+                date: f.next()?.to_string(),
+                refs: f
+                    .next()?
+                    .split(", ")
+                    .filter(|r| !r.is_empty())
+                    .map(|r| r.replace("refs/heads/", "").replace("refs/remotes/", "").replace("refs/tags/", ""))
+                    .filter(|r| !r.ends_with("/HEAD"))
+                    .collect(),
+                summary: f.next()?.trim_end().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// A file changed by a commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFile {
+    pub change: Change,
+    pub rel: String,
+    /// The path before a rename.
+    pub old_rel: Option<String>,
+}
+
+/// The full message and changed files of a commit (against its first parent).
+pub fn commit_details(root: &Path, sha: &str) -> Result<(String, Vec<CommitFile>), String> {
+    let message = run(root, &["log", "-1", "--format=%B", sha])?.trim_end().to_string();
+    let out = run(root, &["show", "--first-parent", "-M", "--name-status", "-z", "--format=", sha])?;
+    Ok((message, parse_name_status(&out)))
+}
+
+fn parse_name_status(out: &str) -> Vec<CommitFile> {
+    let mut fields = out.split('\0').map(|f| f.trim_start_matches('\n')).filter(|f| !f.is_empty());
+    let mut files = Vec::new();
+    while let Some(status) = fields.next() {
+        let change = match status.chars().next() {
+            Some('A') => Change::Added,
+            Some('D') => Change::Deleted,
+            Some('R') => Change::Renamed,
+            Some('C') => Change::Added,
+            _ => Change::Modified,
+        };
+        let (old_rel, rel) = if matches!(status.chars().next(), Some('R' | 'C')) {
+            let old = fields.next().map(str::to_string);
+            (old, fields.next())
+        } else {
+            (None, fields.next())
+        };
+        if let Some(rel) = rel {
+            files.push(CommitFile { change, rel: rel.to_string(), old_rel });
+        }
+    }
+    files
+}
+
+/// A file's contents at a revision (`sha:path`), `None` if it isn't there.
+pub fn text_at(root: &Path, rev: &str, rel: &str) -> Option<String> {
+    run(root, &["show", &format!("{rev}:{rel}")]).ok()
+}
+
+/// The texts a commit changed a file between: first parent → commit.
+pub fn commit_file_texts(root: &Path, sha: &str, file: &CommitFile) -> (String, String) {
+    let old_rel = file.old_rel.as_deref().unwrap_or(&file.rel);
+    let base = if file.change == Change::Added { None } else { text_at(root, &format!("{sha}^"), old_rel) };
+    let current = if file.change == Change::Deleted { None } else { text_at(root, sha, &file.rel) };
+    (base.unwrap_or_default(), current.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -784,7 +1281,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
     fn unified_diff_collapses_unchanged_runs() {
         let base: String = (1..=20).map(|i| format!("line {i}\n")).collect();
         let current = base.replace("line 10\n", "line ten\n");
-        let lines = unified_lines(&base, &current, 2);
+        let lines = diff_document(&base, &current, 2).unified;
         assert_eq!(lines[0].kind, DiffLineKind::Skipped);
         assert_eq!(lines[0].text, "7 unchanged lines");
         let removed = lines.iter().find(|l| l.kind == DiffLineKind::Removed).unwrap();
@@ -792,6 +1289,139 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let added = lines.iter().find(|l| l.kind == DiffLineKind::Added).unwrap();
         assert_eq!((added.new_no, added.text.as_str()), (Some(10), "line ten"));
         assert_eq!(lines.last().unwrap().kind, DiffLineKind::Skipped);
+    }
+
+    #[test]
+    fn error_lists_the_files_git_names() {
+        let stderr = b"error: Your local changes to the following files would be overwritten by merge:\n\tapp.rs\n\tlib.rs\nMerge with strategy ort failed.\n";
+        assert_eq!(error_text(stderr, b""), "Your local changes to the following files would be overwritten by merge: app.rs, lib.rs");
+    }
+
+    #[test]
+    fn applies_selected_hunks() {
+        let base = "a\nb\nc\nd\ne\n";
+        let target = "a\nB\nc\nd\nE\nf\n";
+        // Only the change touching row 1.
+        assert_eq!(apply_hunks(base, target, |h| rows_touch(&h.new_rows, &(1..2))), "a\nB\nc\nd\ne\n");
+        assert_eq!(apply_hunks(base, target, |h| rows_touch(&h.new_rows, &(4..6))), "a\nb\nc\nd\nE\nf\n");
+        assert_eq!(apply_hunks(base, target, |_| true), target);
+        // A deletion is picked by the row it sits at.
+        assert_eq!(apply_hunks(base, "a\nd\ne\n", |h| rows_touch(&h.new_rows, &(1..1))), "a\nd\ne\n");
+    }
+
+    #[test]
+    fn maps_rows_across_changes() {
+        // Two lines inserted at the top shift everything after them.
+        let base = "x\ny\nz\n";
+        let target = "1\n2\nx\ny\nz\n";
+        assert_eq!(map_rows_to_base(base, target, 3..4), 1..2);
+        // A row inside a change snaps to the change in the base.
+        assert_eq!(map_rows_to_base("a\nb\nc\n", "a\nB\nc\n", 1..2), 1..2);
+    }
+
+    #[test]
+    fn word_level_emphasis() {
+        assert_eq!(tokens("let x = foo(bar);"), ["let", " ", "x", " ", "=", " ", "foo", "(", "bar", ")", ";"]);
+        let (old, new) = word_emphasis("let total = price * 2;", "let total = price * 3;");
+        assert_eq!((old, new), (vec![20..21], vec![20..21]));
+        // Unrelated lines get no emphasis: the whole line changed.
+        assert_eq!(word_emphasis("fn main() {", "# heading").0, Vec::<Range<usize>>::new());
+    }
+
+    #[test]
+    fn split_rows_pair_replacements() {
+        let doc = diff_document("a\nb\nc\n", "a\nB\nB2\nc\n", 3);
+        assert_eq!(doc.changes, [DiffChange { old_rows: 1..2, new_rows: 1..3 }]);
+        assert_eq!((doc.added, doc.removed), (2, 1));
+        let kinds: Vec<_> = doc.split.iter().map(|r| (r.left.as_ref().map(|s| s.no), r.right.as_ref().map(|s| s.no))).collect();
+        assert_eq!(kinds, [(Some(1), Some(1)), (Some(2), Some(2)), (None, Some(3)), (Some(3), Some(4))]);
+        assert_eq!(doc.split[1].change, Some((0, true)));
+        assert_eq!(doc.unified.iter().filter(|l| l.change == Some((0, true))).count(), 1);
+        // Everything, with nothing collapsed.
+        let long: String = (0..50).map(|i| format!("{i}\n")).collect();
+        let edited = long.replace("25\n", "x\n");
+        assert!(diff_document(&long, &edited, 3).split.iter().any(|r| r.kind == DiffLineKind::Skipped));
+        assert!(!diff_document(&long, &edited, usize::MAX).split.iter().any(|r| r.kind == DiffLineKind::Skipped));
+    }
+
+    #[test]
+    fn parses_log_and_name_status() {
+        let out = "abc\x1fp1 p2\x1fAda\x1fada@x.io\x1f1700000000\x1f2023-11-14 22:13\x1fHEAD -> refs/heads/main, refs/remotes/origin/main, refs/remotes/origin/HEAD, tag: refs/tags/v1\x1fMerge it\n\x1e\ndef\x1f\x1fBob\x1fb@x.io\x1f1600000000\x1f2020-09-13 12:26\x1f\x1fFirst\n\x1e\n";
+        let log = parse_log(out);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].parents, ["p1", "p2"]);
+        assert_eq!(log[0].refs, ["HEAD -> main", "origin/main", "tag: v1"]);
+        assert_eq!(log[0].date, "2023-11-14 22:13");
+        assert_eq!((log[1].summary.as_str(), log[1].parents.len(), log[1].refs.len()), ("First", 0, 0));
+        let files = parse_name_status("M\0src/a.rs\0R087\0old.rs\0new.rs\0A\0b.txt\0");
+        assert_eq!(files[1], CommitFile { change: Change::Renamed, rel: "new.rs".into(), old_rel: Some("old.rs".into()) });
+        assert_eq!((files[0].change, files[2].change), (Change::Modified, Change::Added));
+    }
+
+    #[test]
+    fn partial_staging_merges_and_history() {
+        if !is_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kin-git-hunks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com"), ("init.defaultBranch", "main")] {
+            run(&dir, &["config", k, v]).unwrap();
+        }
+        let root = discover(&dir).unwrap();
+        let lines: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("f.txt"), &lines).unwrap();
+        stage(&root, &["f.txt".into()]).unwrap();
+        commit(&root, "first", false).unwrap();
+
+        // Two separate changes; stage only the second.
+        let edited = lines.replace("line 2\n", "line two\n").replace("line 11\n", "line eleven\n");
+        std::fs::write(dir.join("f.txt"), &edited).unwrap();
+        stage_lines(&root, "f.txt", &edited, 10..11).unwrap();
+        let index = index_text(&root, "f.txt").unwrap();
+        assert!(index.contains("line eleven") && index.contains("line 2\n"));
+        let s = status(&root).unwrap();
+        assert_eq!((s.files[0].staged, s.files[0].unstaged), (Some(Change::Modified), Some(Change::Modified)));
+        // Unstage it again, addressing it by the editor's row.
+        unstage_lines(&root, "f.txt", Some(&edited), 10..11).unwrap();
+        assert_eq!(index_text(&root, "f.txt").unwrap(), lines);
+
+        // History and commit details.
+        stage(&root, &["f.txt".into()]).unwrap();
+        commit(&root, "edit", false).unwrap();
+        let history = log(&root, 10, false, Some("f.txt")).unwrap();
+        assert_eq!(history.iter().map(|e| e.summary.as_str()).collect::<Vec<_>>(), ["edit", "first"]);
+        let (message, files) = commit_details(&root, &history[0].sha).unwrap();
+        assert_eq!((message.as_str(), files[0].rel.as_str()), ("edit", "f.txt"));
+        let (old, new) = commit_file_texts(&root, &history[0].sha, &files[0]);
+        assert_eq!((old, new), (lines.clone(), edited.clone()));
+
+        // A conflicting merge stops in the Merging state; abort restores.
+        create_branch(&root, "other").unwrap();
+        std::fs::write(dir.join("f.txt"), edited.replace("line 6\n", "theirs\n")).unwrap();
+        stage(&root, &["f.txt".into()]).unwrap();
+        commit(&root, "theirs", false).unwrap();
+        run(&root, &["switch", "main"]).unwrap();
+        std::fs::write(dir.join("f.txt"), edited.replace("line 6\n", "ours\n")).unwrap();
+        stage(&root, &["f.txt".into()]).unwrap();
+        commit(&root, "ours", false).unwrap();
+        assert_eq!(merge(&root, "other").unwrap(), "CONFLICT");
+        assert_eq!(repo_state(&root), Some(RepoState::Merging));
+        assert!(merge_message(&root).unwrap().starts_with("Merge branch 'other'"));
+        let text = std::fs::read_to_string(dir.join("f.txt")).unwrap();
+        assert!(text.contains("<<<<<<<") && text.contains("theirs"));
+        abort(&root, RepoState::Merging).unwrap();
+        assert_eq!(repo_state(&root), None);
+        // Resolve and continue this time.
+        merge(&root, "other").unwrap();
+        std::fs::write(dir.join("f.txt"), edited.replace("line 6\n", "both\n")).unwrap();
+        stage(&root, &["f.txt".into()]).unwrap();
+        continue_op(&root, RepoState::Merging).unwrap();
+        assert_eq!(repo_state(&root), None);
+        assert_eq!(log(&root, 1, false, None).unwrap()[0].parents.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,10 +1,11 @@
-//! Branch switcher: check out local or remote branches, or create one.
+//! Branch switcher: check out local or remote branches, create one, or
+//! merge / rebase with another.
 
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render,
-    ScrollStrategy, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
 };
 
@@ -156,6 +157,7 @@ impl Render for BranchPicker {
                                 .child(icon_el(Icon::Plus, px(14.), theme.accent.into()))
                                 .child(div().text_color(theme.text).child(format!("Create branch “{name}”"))),
                             Item::Branch(b) => row
+                                .group(SharedString::from(format!("branch-{ix}")))
                                 .child(icon_el(
                                     if b.current { Icon::Check } else { Icon::GitBranch },
                                     px(14.),
@@ -167,6 +169,39 @@ impl Render for BranchPicker {
                                 })
                                 .when(b.current, |el| {
                                     el.child(div().text_size(px(11.)).text_color(theme.text_dim).child("current"))
+                                })
+                                // Merge into / rebase onto, on hover (or for the selected row).
+                                .when(!b.current, |el| {
+                                    let group = SharedString::from(format!("branch-{ix}"));
+                                    let action = |id: &'static str, label: &'static str, tip: &'static str, op: GitOp| {
+                                        div()
+                                            .id((id, ix))
+                                            .px_1p5()
+                                            .h(px(20.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(4.))
+                                            .text_size(px(11.5))
+                                            .text_color(theme.text_muted)
+                                            .bg(theme.elevated)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .hover(|s| s.text_color(theme.text).bg(theme.hover))
+                                            .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
+                                            .on_click(cx.listener(move |_, _, _, cx| {
+                                                cx.stop_propagation();
+                                                cx.emit(BranchPickerEvent::Run(op.clone()));
+                                            }))
+                                            .child(label)
+                                    };
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .when(!is_selected, |el| el.invisible().group_hover(group, |s| s.visible()))
+                                            .child(action("merge", "Merge", "Merge into Current Branch", GitOp::Merge(b.name.clone())))
+                                            .child(action("rebase", "Rebase", "Rebase Current Branch onto This", GitOp::Rebase(b.name.clone()))),
+                                    )
                                 }),
                         };
                         div().w_full().px_1p5().child(row)

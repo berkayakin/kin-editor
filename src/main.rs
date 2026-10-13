@@ -1,6 +1,7 @@
 mod assets;
 mod branch_picker;
 mod clone_dialog;
+mod conflict;
 mod context_menu;
 mod diff_view;
 mod document;
@@ -10,6 +11,7 @@ mod find_bar;
 mod fold;
 mod format;
 mod git;
+mod git_log;
 mod git_panel;
 mod input_dialog;
 mod keymap;
@@ -37,7 +39,7 @@ use crate::{
     editor::*,
     workspace::{
         CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
-        ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -150,6 +152,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Fetch", GitFetch),
                 MenuItem::separator(),
                 MenuItem::action("Branches…", GitBranches),
+                MenuItem::action("Log", ToggleGitLog),
+                MenuItem::action("Show History for File", ShowFileHistory),
                 MenuItem::action("Open Repository in Browser", OpenRemote),
                 MenuItem::separator(),
                 MenuItem::action("Clone Repository…", GitClone),
