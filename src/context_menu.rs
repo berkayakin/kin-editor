@@ -138,12 +138,15 @@ impl Render for ContextMenu {
                     let selected = self.selected == Some(ix);
                     let color: Hsla = if *danger { theme.error.into() } else { theme.text.into() };
                     // The whole row (not just its text) is the hover and click target.
+                    // Rows rely on the column's stretch alignment: inside a popover
+                    // the menu's width isn't known up front, so `w_full()` would
+                    // collapse to the label's width.
                     div()
-                        .w_full()
+                        .flex()
+                        .flex_col()
                         .child(
                             div()
                                 .id(ix)
-                                .w_full()
                                 .flex()
                                 .items_center()
                                 .gap(px(7.))
