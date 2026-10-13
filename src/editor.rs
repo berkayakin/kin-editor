@@ -18,11 +18,11 @@ use crate::{
     document::{Document, EditKind, Selection},
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
+    settings::{FileSettings, Settings},
     theme::Theme,
     wrap::{self, Break, WrapKey, WrapMap},
 };
 
-pub const TAB_SIZE: usize = 4;
 const SCROLLBAR_WIDTH: f32 = 12.0;
 const TEXT_PADDING: f32 = 6.0;
 /// Distance of the git change bar's center from the gutter's right edge.
@@ -184,6 +184,10 @@ pub struct Editor {
     scrollbar_drag: Option<Pixels>,
     marked_range: Option<Range<usize>>,
     indent_unit: String,
+    /// Display width of a tab character (and of an indent level with tabs).
+    tab_size: usize,
+    /// Resolved settings for this file (see `apply_settings`).
+    file_settings: FileSettings,
     cursor_visible: bool,
     blink_epoch: usize,
     blink_task: Option<Task<()>>,
@@ -209,9 +213,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
-        let indent_unit = detect_indent(&doc);
-        // Prose wraps by default; code keeps its lines (JetBrains does the same).
-        let soft_wrap = matches!(doc.language, crate::syntax::Language::Markdown | crate::syntax::Language::PlainText);
+        let file_settings = Settings::get(cx).for_file(doc.language, doc.path.as_deref());
         let mut this = Self {
             doc,
             mode: EditorMode::Full,
@@ -233,7 +235,9 @@ impl Editor {
             drag: None,
             scrollbar_drag: None,
             marked_range: None,
-            indent_unit,
+            indent_unit: String::new(),
+            tab_size: file_settings.tab_size,
+            file_settings,
             cursor_visible: true,
             blink_epoch: 0,
             blink_task: None,
@@ -250,9 +254,10 @@ impl Editor {
             blame: None,
             blame_request: None,
             blame_task: None,
-            soft_wrap,
+            soft_wrap: false,
             wrap: None,
         };
+        this.apply_settings(cx);
         this.detect_external_linter();
         this.schedule_lint(Duration::ZERO, cx);
         this.run_external_linter(cx);
@@ -494,7 +499,60 @@ impl Editor {
         }
     }
 
+    /// Re-reads the settings and `.editorconfig` for this file: tab size,
+    /// indentation, soft wrap and what saving does.
+    pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        let fs = Settings::get(cx).for_file(self.doc.language, self.doc.path.as_deref());
+        self.file_settings = fs;
+        self.tab_size = fs.tab_size;
+        let configured = if fs.hard_tabs { "\t".to_string() } else { " ".repeat(fs.tab_size) };
+        // A file's own indentation wins over settings, but not over .editorconfig.
+        self.indent_unit = if fs.indent_is_explicit { configured } else { detect_indent(&self.doc).unwrap_or(configured) };
+        if self.mode == EditorMode::Full {
+            self.soft_wrap = fs.soft_wrap;
+        }
+        self.wrap = None;
+        cx.notify();
+    }
+
+    /// `trim_trailing_whitespace` and `insert_final_newline`. Lines with a
+    /// caret and a caret at the very end are left alone, so auto-save never
+    /// eats a space or moves the caret mid-typing.
+    fn apply_save_actions(&mut self, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Full {
+            return;
+        }
+        let FileSettings { trim_trailing_whitespace, insert_final_newline, .. } = self.file_settings;
+        let caret_rows: Vec<usize> = self.selections.iter().map(|s| self.doc.row_of(s.head)).collect();
+        let mut edits = Vec::new();
+        if trim_trailing_whitespace {
+            for row in 0..self.doc.line_count() {
+                if caret_rows.contains(&row) {
+                    continue;
+                }
+                let text = self.doc.line_text(row);
+                let kept = text.trim_end_matches([' ', '\t']).len();
+                if kept < text.len() {
+                    let start = self.doc.line_start(row);
+                    edits.push((start + kept..start + text.len(), String::new()));
+                }
+            }
+        }
+        let len = self.doc.len();
+        if insert_final_newline
+            && len > 0
+            && self.doc.rope().byte(len - 1) != b'\n'
+            && !self.selections.iter().any(|s| s.head == len)
+        {
+            edits.push((len..len, "\n".to_string()));
+        }
+        if !edits.is_empty() {
+            self.edit_and_remap(edits, EditKind::Other, cx);
+        }
+    }
+
     pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
+        self.apply_save_actions(cx);
         self.doc.save()?;
         self.doc.finalize_transaction();
         self.schedule_lint(Duration::ZERO, cx);
@@ -505,6 +563,7 @@ impl Editor {
 
     pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.doc.set_path(path);
+        self.apply_settings(cx);
         self.detect_external_linter();
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
@@ -779,7 +838,7 @@ impl Editor {
     /// Shapes the part of `row` shown on display segment `seg`.
     fn shape_segment(&self, row: usize, seg: usize, window: &mut Window, cx: &App) -> RowShape {
         let theme = Theme::get(cx);
-        let dl = DisplayLine::new(&self.doc.line_text(row));
+        let dl = DisplayLine::new(&self.doc.line_text(row), self.tab_size);
         let breaks = self.line_breaks(row);
         let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.text.len());
         let last = seg >= breaks.len();
@@ -807,7 +866,7 @@ impl Editor {
     /// The x of `offset` within its display row (wrap indent included).
     fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
         let row = self.doc.row_of(offset);
-        let col = DisplayLine::new(&self.doc.line_text(row)).to_display(offset - self.doc.line_start(row));
+        let col = DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - self.doc.line_start(row));
         let seg = wrap::segment_of(self.line_breaks(row), col);
         let shape = self.shape_segment(row, seg, window, cx);
         shape.indent + shape.line.x_for_index(col - shape.range.start)
@@ -879,6 +938,7 @@ impl Editor {
             width: layout.wrap_width,
             font_family: font.family.clone(),
             font_size: self.font_size(cx),
+            tab_size: self.tab_size,
         };
         if self.wrap.as_ref().is_some_and(|w| w.key == key) {
             return;
@@ -914,7 +974,7 @@ impl Editor {
         if breaks.is_empty() {
             return self.first_display_row(row);
         }
-        let col = DisplayLine::new(&self.doc.line_text(row)).to_display(offset - self.doc.line_start(row));
+        let col = DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - self.doc.line_start(row));
         self.first_display_row(row) + wrap::segment_of(breaks, col)
     }
 
@@ -1251,12 +1311,13 @@ impl Editor {
         }
         if self.selections.iter().all(|s| s.is_empty()) {
             let unit = self.indent_unit.clone();
+            let tab_size = self.tab_size;
             self.edit_selections(EditKind::Other, cx, |doc, s| {
                 let text = if unit == "\t" {
                     "\t".to_string()
                 } else {
                     let row_start = doc.line_start(doc.row_of(s.head));
-                    let col = DisplayLine::new(&doc.slice(row_start..s.head)).text.chars().count();
+                    let col = DisplayLine::new(&doc.slice(row_start..s.head), tab_size).text.chars().count();
                     " ".repeat(unit.len() - col % unit.len())
                 };
                 let len = text.len();
@@ -1282,7 +1343,7 @@ impl Editor {
             return;
         }
         let mut edits = Vec::new();
-        let width = if self.indent_unit == "\t" { TAB_SIZE } else { self.indent_unit.len() };
+        let width = if self.indent_unit == "\t" { self.tab_size } else { self.indent_unit.len() };
         for block in self.selected_row_blocks() {
             for row in block {
                 let text = self.doc.line_text(row);
@@ -1959,6 +2020,9 @@ impl Editor {
         };
         let ui_font = font(theme.ui_font.clone());
 
+        let tab_size = self.tab_size;
+        // Guides at each indent level of the file's own style.
+        let guide_step = if self.indent_unit == "\t" { tab_size } else { self.indent_unit.len().max(1) };
         // Indentation (in columns) for indent guides.
         let indents: Vec<Option<usize>> = (first_row..last_row)
             .map(|row| {
@@ -1966,7 +2030,7 @@ impl Editor {
                 if t.trim().is_empty() {
                     None
                 } else {
-                    Some(DisplayLine::new(&t[..t.len() - t.trim_start().len()]).text.len())
+                    Some(DisplayLine::new(&t[..t.len() - t.trim_start().len()], tab_size).text.len())
                 }
             })
             .collect();
@@ -1976,7 +2040,7 @@ impl Editor {
             let line_start = self.doc.line_start(row);
             let text = self.doc.line_text(row);
             let line_end = line_start + text.len();
-            let dl = DisplayLine::new(&text);
+            let dl = DisplayLine::new(&text, tab_size);
 
             // Build styled runs from highlight spans and diagnostics.
             while hl_ix < highlights.len() && highlights[hl_ix].0.end <= line_start {
@@ -2094,7 +2158,7 @@ impl Editor {
 
                 // Indent guides.
                 let mut col = 0;
-                while !single && col + TAB_SIZE <= indent.max(1) && col < indent {
+                while !single && col + guide_step <= indent.max(1) && col < indent {
                     let x = base_x + char_width * col as f32;
                     if x >= text_bounds.left() {
                         frame.guides.push(fill(
@@ -2102,7 +2166,7 @@ impl Editor {
                             theme.indent_guide,
                         ));
                     }
-                    col += TAB_SIZE;
+                    col += guide_step;
                 }
 
                 // Search matches.
@@ -2447,7 +2511,8 @@ fn closing_pair(c: char) -> Option<char> {
     }
 }
 
-fn detect_indent(doc: &Document) -> String {
+/// The indentation a file already uses, if it has indented lines.
+fn detect_indent(doc: &Document) -> Option<String> {
     let (mut tabs, mut spaces2, mut spaces4) = (0, 0, 0);
     for row in 0..doc.line_count().min(500) {
         let t = doc.line_text(row);
@@ -2464,23 +2529,14 @@ fn detect_indent(doc: &Document) -> String {
             }
         }
     }
-    if tabs > spaces2 + spaces4 {
-        "\t".into()
+    if tabs + spaces2 + spaces4 == 0 {
+        None
+    } else if tabs > spaces2 + spaces4 {
+        Some("\t".into())
     } else if spaces2 > spaces4 / 2 && spaces2 > 0 {
-        "  ".into()
-    } else if spaces4 == 0
-        && matches!(
-            doc.language,
-            crate::syntax::Language::Html | crate::syntax::Language::Json | crate::syntax::Language::Yaml
-        )
-    {
-        // The usual style for markup and data files (and npm's package.json).
-        "  ".into()
-    } else if spaces4 == 0 && doc.language == crate::syntax::Language::Go {
-        // gofmt indents with tabs.
-        "\t".into()
+        Some("  ".into())
     } else {
-        "    ".into()
+        Some("    ".into())
     }
 }
 
@@ -2587,7 +2643,7 @@ pub struct DisplayLine {
 }
 
 impl DisplayLine {
-    pub fn new(line: &str) -> Self {
+    pub fn new(line: &str, tab_size: usize) -> Self {
         if !line.contains('\t') {
             return Self { text: line.to_string(), map: None };
         }
@@ -2599,7 +2655,7 @@ impl DisplayLine {
                 map.push(text.len());
             }
             if ch == '\t' {
-                let n = TAB_SIZE - col % TAB_SIZE;
+                let n = tab_size - col % tab_size;
                 text.extend(std::iter::repeat_n(' ', n));
                 col += n;
             } else {

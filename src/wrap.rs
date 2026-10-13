@@ -8,7 +8,7 @@
 use gpui::{Font, LineFragment, Pixels, SharedString, TextSystem};
 use ropey::Rope;
 
-use crate::editor::{DisplayLine, TAB_SIZE};
+use crate::editor::DisplayLine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Break {
@@ -26,6 +26,7 @@ pub struct WrapKey {
     pub width: Pixels,
     pub font_family: SharedString,
     pub font_size: Pixels,
+    pub tab_size: usize,
 }
 
 pub struct WrapMap {
@@ -38,7 +39,7 @@ pub struct WrapMap {
 
 impl WrapMap {
     pub fn new(key: WrapKey, rope: &Rope, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
-        let width = key.width;
+        let (width, tab_size) = (key.width, key.tab_size);
         let mut wrapper = text_system.line_wrapper(font, key.font_size);
         // Lines narrower than this many columns can't wrap, which skips
         // shaping-free measurement for most lines.
@@ -51,11 +52,11 @@ impl WrapMap {
             row_starts.push(rows);
             let line = rope.line(row);
             let mut line_breaks = Vec::new();
-            if line.len_chars() > max_cols / TAB_SIZE && display_columns(line) > max_cols {
+            if line.len_chars() > max_cols / tab_size && display_columns(line, tab_size) > max_cols {
                 // Same text as `Document::line_text`: without the newline.
                 let text = line.to_string();
                 let text = text.strip_suffix('\n').unwrap_or(&text);
-                let dl = DisplayLine::new(text);
+                let dl = DisplayLine::new(text, tab_size);
                 let fragments = [LineFragment::text(&dl.text)];
                 line_breaks.extend(
                     wrapper
@@ -99,11 +100,11 @@ impl WrapMap {
 
 /// Display columns of a rope line (tabs expanded, wide characters as two),
 /// an upper bound for whether it can need wrapping.
-fn display_columns(line: ropey::RopeSlice) -> usize {
+fn display_columns(line: ropey::RopeSlice, tab_size: usize) -> usize {
     let mut col = 0;
     for c in line.chars() {
         col += match c {
-            '\t' => TAB_SIZE - col % TAB_SIZE,
+            '\t' => tab_size - col % tab_size,
             '\n' => 0,
             c if (c as u32) >= 0x1100 => 2,
             _ => 1,
@@ -145,14 +146,15 @@ mod tests {
     #[test]
     fn counts_display_columns() {
         let rope = Rope::from_str("\tab\n世界\n");
-        assert_eq!(display_columns(rope.line(0)), TAB_SIZE + 2);
-        assert_eq!(display_columns(rope.line(1)), 4);
+        assert_eq!(display_columns(rope.line(0), 4), 6);
+        assert_eq!(display_columns(rope.line(0), 2), 4);
+        assert_eq!(display_columns(rope.line(1), 4), 4);
     }
 
     #[test]
     fn maps_display_rows_to_lines() {
         let map = WrapMap {
-            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.) },
+            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4 },
             breaks: vec![vec![], vec![Break { ix: 5, indent: 0 }, Break { ix: 9, indent: 0 }], vec![]],
             row_starts: vec![0, 1, 4, 5],
         };

@@ -100,6 +100,67 @@ reachable through Find Action, which shows its shortcut.
 | Push / Update Project (pull) | ⌘⇧K / ⌘T | Ctrl+Shift+K / Ctrl+T |
 | Rollback lines (change under caret) | ⌥⌘Z | Ctrl+Alt+Z |
 | Next / previous change | ⌃⌥⇧↓ / ⌃⌥⇧↑ | Ctrl+Alt+Shift+↓ / ↑ |
+| Settings | ⌘, | Ctrl+Alt+S |
+| Increase / decrease font size | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
+
+### Your own bindings
+
+**Keymap…** (in the app menu and Find Action) opens `keymap.json` in the config folder. Its
+bindings are added on top of the built-in keymap, apply when you save, and show in menus and
+Find Action:
+
+```jsonc
+[
+  {
+    "context": "Editor",
+    "bindings": {
+      "secondary-shift-d": "Duplicate Line or Selection", // a Find Action name…
+      "f6": "editor::DeleteLine",                          // …or an action id
+      "secondary-d": null                                  // null removes a built-in binding
+    }
+  }
+]
+```
+
+`secondary` is ⌘ on macOS and Ctrl elsewhere. Leave out `context` to bind everywhere; a binding
+in a more specific context (like `"Editor"`) still wins there. Mistakes show up as a notification.
+
+## Settings
+
+**Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
+Changes apply when you save (or when you come back to Kin after editing it elsewhere). Comments
+and trailing commas are fine, and Kin keeps them when it updates a value itself (the theme
+picker, Toggle Auto Save).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `theme` | `"Clay Black"` | see [Themes](#themes) |
+| `auto_save` | `"after_delay"` | `"off"`, `"after_delay"`, `"on_focus_change"`, `"on_window_change"` |
+| `auto_save_delay` | `1000` | milliseconds |
+| `editor_font_family` | built-in choice | any installed font |
+| `editor_font_size` | `14` | the zoom actions adjust it on top (remembered between launches) |
+| `editor_line_height` | `1.57` | multiple of the font size |
+| `tab_size` | `4` (2 for HTML, JSON, YAML) | columns per indent and per tab |
+| `hard_tabs` | `false` (`true` for Go) | indent with tabs |
+| `soft_wrap` | `false` (`true` for Markdown and plain text) | |
+| `trim_trailing_whitespace` | `false` | on save; lines with a caret are left alone |
+| `insert_final_newline` | `false` | on save |
+| `languages` | | per-language overrides of the last five, by the name in the status bar |
+
+```jsonc
+{
+  "editor_font_size": 15,
+  "tab_size": 2,
+  "languages": {
+    "Python": { "tab_size": 4 },
+    "Markdown": { "soft_wrap": false }
+  }
+}
+```
+
+A file's existing indentation wins over `tab_size`/`hard_tabs`. A project's `.editorconfig`
+wins over both: `indent_style`, `indent_size`, `tab_width`, `trim_trailing_whitespace` and
+`insert_final_newline` are supported, read up to the nearest `root = true`.
 
 ## Windows and projects
 

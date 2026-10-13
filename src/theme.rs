@@ -13,9 +13,9 @@ use std::{
 };
 
 use gpui::{App, Global, Hsla, Rgba, SharedString, rgba};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::syntax::Highlight;
+use crate::{settings::Settings, state::SessionState, syntax::Highlight};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Appearance {
@@ -461,6 +461,12 @@ fn resolve(
 
 /// The known key closest to a misspelled one, if any is close enough.
 fn suggest_key(key: &str) -> Option<&'static str> {
+    closest(key, COLOR_KEYS.iter().copied())
+}
+
+/// The candidate closest to a misspelled word (edit distance ≤ 3), for
+/// "did you mean" hints.
+pub fn closest<'a>(word: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     fn distance(a: &str, b: &str) -> usize {
         let b: Vec<char> = b.chars().collect();
         let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -473,9 +479,9 @@ fn suggest_key(key: &str) -> Option<&'static str> {
         }
         prev[b.len()]
     }
-    COLOR_KEYS
-        .iter()
-        .map(|k| (distance(key, k), *k))
+    candidates
+        .into_iter()
+        .map(|k| (distance(word, k), k))
         .filter(|(d, _)| *d <= 3)
         .min_by_key(|(d, _)| *d)
         .map(|(_, k)| k)
@@ -507,54 +513,6 @@ pub fn config_dir() -> Option<PathBuf> {
 
 pub fn themes_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("themes"))
-}
-
-#[derive(Serialize, Deserialize, Default)]
-pub struct Settings {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<String>,
-    /// When edited files are written to disk without an explicit save.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_save: Option<AutoSave>,
-    /// Idle time in milliseconds before `after_delay` saves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_save_delay: Option<u64>,
-}
-
-/// Auto-save modes, named like VS Code's `files.autoSave`. Every mode but
-/// `off` also saves when the window loses focus, a tab is closed and on quit.
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoSave {
-    Off,
-    /// Shortly after typing stops (the default).
-    #[default]
-    AfterDelay,
-    /// When switching tabs or leaving the window.
-    OnFocusChange,
-    /// Only when leaving the window.
-    OnWindowChange,
-}
-
-impl Settings {
-    fn path() -> Option<PathBuf> {
-        config_dir().map(|d| d.join("settings.json"))
-    }
-
-    pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)? + "\n")
-    }
 }
 
 /// Makes `name` the active theme, keeping the current fonts.
@@ -648,18 +606,55 @@ pub fn pick_fonts(cx: &App) -> (SharedString, SharedString) {
 
 /// Installs the theme registry and the saved (or default) theme.
 pub fn init(cx: &mut App) {
-    let (ui_font, mono_font) = pick_fonts(cx);
     let registry = ThemeRegistry::load();
-    let wanted = Settings::load().theme.unwrap_or_else(|| DEFAULT_DARK.to_string());
+    let wanted = Settings::get(cx).theme.clone().unwrap_or_else(|| DEFAULT_DARK.to_string());
     let entry = registry
         .find(&wanted)
         .or_else(|| registry.find(DEFAULT_DARK))
         .expect("default theme is built in");
-    let mut theme = (*entry.theme).clone();
-    theme.ui_font = ui_font;
-    theme.mono_font = mono_font;
+    let theme = (*entry.theme).clone();
     cx.set_global(registry);
     cx.set_global(theme);
+    apply_fonts(cx);
+}
+
+/// Default editor size; zoom and `editor_font_size` move away from it.
+pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 14.0;
+/// 22px lines at 14px, the spacing Kin has always used.
+const DEFAULT_LINE_HEIGHT: f32 = 22.0 / 14.0;
+
+/// Sets the fonts from the settings and the remembered zoom.
+pub fn apply_fonts(cx: &mut App) {
+    let (ui_font, mono_font) = pick_fonts(cx);
+    let settings = Settings::get(cx).clone();
+    let mono_font = match settings.editor_font_family.as_deref() {
+        Some(family) if cx.text_system().all_font_names().iter().any(|f| f == family) => family.to_string().into(),
+        _ => mono_font,
+    };
+    let zoom = SessionState::load().font_zoom.unwrap_or(0.);
+    let size = (settings.editor_font_size.unwrap_or(DEFAULT_EDITOR_FONT_SIZE) + zoom).clamp(6., 72.);
+    let line_height = settings.editor_line_height.unwrap_or(DEFAULT_LINE_HEIGHT).clamp(1., 3.);
+    let mut theme = Theme::get(cx).clone();
+    theme.ui_font = ui_font;
+    theme.mono_font = mono_font;
+    theme.editor_font_size = size;
+    theme.editor_line_height = (size * line_height).round();
+    cx.set_global(theme);
+    cx.refresh_windows();
+}
+
+/// Changes the editor zoom by `delta` points (or resets it with `None`)
+/// and remembers it for the next launch.
+pub fn zoom(delta: Option<f32>, cx: &mut App) {
+    let mut state = SessionState::load();
+    let base = Settings::get(cx).editor_font_size.unwrap_or(DEFAULT_EDITOR_FONT_SIZE);
+    state.font_zoom = delta
+        .map(|d| (state.font_zoom.unwrap_or(0.) + d).clamp(6. - base, 72. - base))
+        .filter(|z| *z != 0.);
+    if let Err(err) = state.save() {
+        eprintln!("couldn't save the zoom: {err}");
+    }
+    apply_fonts(cx);
 }
 
 #[cfg(test)]

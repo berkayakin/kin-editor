@@ -5,6 +5,7 @@ mod context_menu;
 mod diff_view;
 mod document;
 mod editor;
+mod editorconfig;
 mod find_bar;
 mod git;
 mod git_panel;
@@ -14,6 +15,7 @@ mod lint;
 mod picker;
 mod project_search;
 mod search;
+mod settings;
 mod state;
 mod syntax;
 mod theme;
@@ -29,7 +31,8 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CloseTab, CloseWindow, FileStructure, Find, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
+        ResetFontSize, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -41,7 +44,12 @@ fn menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "Kin".into(),
-            items: vec![MenuItem::action("Quit Kin", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Keymap…", OpenKeymap),
+                MenuItem::separator(),
+                MenuItem::action("Quit Kin", Quit),
+            ],
         },
         Menu {
             name: "File".into(),
@@ -102,6 +110,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Soft-Wrap", ToggleSoftWrap),
                 MenuItem::separator(),
                 MenuItem::action("Select Theme…", SelectTheme),
+                MenuItem::action("Increase Font Size", IncreaseFontSize),
+                MenuItem::action("Decrease Font Size", DecreaseFontSize),
+                MenuItem::action("Reset Font Size", ResetFontSize),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -172,9 +183,13 @@ fn main() {
             #[cfg(target_os = "macos")]
             set_dock_icon();
             assets::load_fonts(cx);
+            // Settings first: the theme and key bindings come from them.
+            let problems = settings::init(cx);
+            cx.set_global(settings::StartupProblems(problems));
             theme::init(cx);
-
-            cx.bind_keys(keymap::bindings());
+            cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));
+            cx.on_action(|_: &DecreaseFontSize, cx| theme::zoom(Some(-1.), cx));
+            cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));
             // Quitting asks each window with unsaved edits in turn.
             cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
             cx.on_action(|_: &NewWindow, cx| {

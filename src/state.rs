@@ -23,6 +23,9 @@ pub struct SessionState {
     pub show_problems: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_mode: Option<String>,
+    /// Editor font zoom in points, added to the configured size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font_zoom: Option<f32>,
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,

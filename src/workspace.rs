@@ -36,7 +36,8 @@ use crate::{
     search::{SearchQuery, project_files},
     state::{ProjectSession, SessionState, TabSession},
     syntax::Language,
-    theme::{self, AutoSave, Settings, Theme},
+    settings::{self, AutoSave, Settings, StartupProblems},
+    theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
     ui::{binding_label, icon_button, icon_el, kbd, tooltip_view},
 };
@@ -71,6 +72,11 @@ actions!(
         FindAction,
         GoToLine,
         FileStructure,
+        OpenSettings,
+        OpenKeymap,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
         SelectTheme,
         OpenThemesFolder,
         ReloadThemes,
@@ -308,6 +314,7 @@ impl Workspace {
         // Leaving the window saves edits, like VS Code and Zed.
         let activation = cx.observe_window_activation(window, |ws, window, cx| {
             if window.is_window_active() {
+                ws.check_config(cx);
                 ws.refresh_git(cx);
                 ws.reload_changed_files(cx);
                 // Other windows may have opened projects meanwhile.
@@ -332,7 +339,17 @@ impl Workspace {
         window.on_window_should_close(cx, move |window, cx| {
             this.update(cx, |ws, cx| ws.prepare_to_close(CloseIntent::CloseWindow, window, cx)).unwrap_or(true)
         });
-        let settings = Settings::load();
+        let settings = Settings::get(cx).clone();
+        // Settings changed (saved settings.json): re-apply everywhere.
+        let settings_observer = cx.observe_global::<Settings>(|ws, cx| {
+            let settings = Settings::get(cx).clone();
+            ws.auto_save = settings.auto_save.unwrap_or_default();
+            ws.auto_save_delay = Duration::from_millis(settings.auto_save_delay.unwrap_or(1000).max(50));
+            for tab in ws.tabs.clone() {
+                tab.update(cx, |e, cx| e.apply_settings(cx));
+            }
+            cx.notify();
+        });
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -349,7 +366,7 @@ impl Workspace {
             }
         })
         .detach();
-        Self {
+        let mut this = Self {
             focus_handle,
             root: None,
             expanded: HashSet::new(),
@@ -395,8 +412,14 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
-            _subscriptions: vec![find_subscription, git_subscription, activation, quit],
+            _subscriptions: vec![find_subscription, git_subscription, activation, quit, settings_observer],
+        };
+        // Problems with settings.json / keymap.json found at startup.
+        if let Some(problems) = cx.try_global::<StartupProblems>().map(|p| p.0.clone()) {
+            cx.set_global(StartupProblems::default());
+            this.report_config_problems(problems, cx);
         }
+        this
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -613,6 +636,7 @@ impl Workspace {
                 SidebarMode::Commit => "commit".into(),
             }),
             // Shared with other windows, so keep what's on disk.
+            font_zoom: saved.font_zoom,
             recent_projects: saved.recent_projects,
         };
         if let Err(err) = state.save() {
@@ -819,12 +843,53 @@ impl Workspace {
         match editor.update(cx, |e, cx| e.save(cx)) {
             Ok(()) => {
                 self.auto_save_warned.remove(&editor.entity_id());
+                self.check_config(cx);
             }
             Err(err) => {
                 let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
             }
         }
         self.refresh_git(cx);
+    }
+
+    // ---- Settings and keymap files -----------------------------------------------------
+
+    /// Applies settings.json / keymap.json if they changed, reporting problems.
+    fn check_config(&mut self, cx: &mut Context<Self>) {
+        let problems = settings::reload_if_changed(cx);
+        self.report_config_problems(problems, cx);
+    }
+
+    fn report_config_problems(&mut self, problems: Vec<String>, cx: &mut Context<Self>) {
+        const SHOWN: usize = 3;
+        for problem in problems.iter().take(SHOWN) {
+            let (file, detail) = problem.split_once(": ").unwrap_or(("settings", problem));
+            self.toast(ToastKind::Error, format!("Problem in {file}"), Some(detail.to_string()), cx);
+        }
+        if problems.len() > SHOWN {
+            self.toast(ToastKind::Error, format!("{} more problems in your settings", problems.len() - SHOWN), None, cx);
+        }
+    }
+
+    /// Opens a config file in a tab, creating it from `template` first.
+    fn open_config_file(&mut self, path: Option<PathBuf>, template: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = path else { return };
+        if !path.exists() {
+            let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, template));
+            if let Err(err) = written {
+                let _ = window.prompt(PromptLevel::Warning, "Couldn't create the file", Some(&err.to_string()), &["OK"], cx);
+                return;
+            }
+        }
+        self.open_path(path, window, cx);
+    }
+
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_config_file(Settings::path(), settings::SETTINGS_TEMPLATE, window, cx);
+    }
+
+    fn open_keymap(&mut self, _: &OpenKeymap, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_config_file(keymap::keymap_path(), keymap::KEYMAP_TEMPLATE, window, cx);
     }
 
     // ---- Auto-save -------------------------------------------------------------------
@@ -878,6 +943,7 @@ impl Workspace {
             Ok(()) => {
                 self.auto_save_warned.remove(&id);
                 self.refresh_git(cx);
+                self.check_config(cx);
                 true
             }
             Err(err) => {
@@ -898,10 +964,10 @@ impl Workspace {
 
     fn toggle_auto_save(&mut self, _: &ToggleAutoSave, window: &mut Window, cx: &mut Context<Self>) {
         self.auto_save = if self.auto_save == AutoSave::Off { AutoSave::AfterDelay } else { AutoSave::Off };
-        let settings = Settings { auto_save: Some(self.auto_save), ..Settings::load() };
-        if let Err(err) = settings.save() {
+        if let Err(err) = Settings::set("auto_save", self.auto_save.key().into()) {
             let _ = window.prompt(PromptLevel::Warning, "Couldn't save the auto-save choice", Some(&err.to_string()), &["OK"], cx);
         }
+        self.check_config(cx);
         if self.auto_save == AutoSave::Off {
             self.auto_save_tasks.clear();
             self.toast(ToastKind::Success, "Auto-save off", None, cx);
@@ -1583,10 +1649,10 @@ impl Workspace {
         let picker = cx.new(|cx| ThemePicker::new(window, cx));
         self.modal_subscription = Some(cx.subscribe_in(&picker, window, |ws, _, event: &ThemePickerEvent, window, cx| match event {
             ThemePickerEvent::Confirmed(name) => {
-                let settings = Settings { theme: Some(name.clone()), ..Settings::load() };
-                if let Err(err) = settings.save() {
+                if let Err(err) = Settings::set("theme", name.as_str().into()) {
                     let _ = window.prompt(PromptLevel::Warning, "Couldn't save the theme choice", Some(&err.to_string()), &["OK"], cx);
                 }
+                ws.check_config(cx);
                 ws.close_modal(window, cx);
             }
             ThemePickerEvent::Dismissed => ws.close_modal(window, cx),
@@ -3766,6 +3832,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::find_action))
             .on_action(cx.listener(Self::go_to_line))
             .on_action(cx.listener(Self::file_structure))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::open_themes_folder))
             .on_action(cx.listener(Self::reload_themes))

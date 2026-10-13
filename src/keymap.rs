@@ -1,14 +1,21 @@
 //! Key bindings modeled on the JetBrains IDE keymaps: the macOS keymap on
 //! macOS and the Windows/Linux keymap elsewhere. Double Shift (Search
 //! Everywhere) isn't a regular binding; the workspace detects it.
+//!
+//! The user's `keymap.json` is added on top; see [`install`].
 
-use gpui::{Action, KeyBinding};
+use std::{collections::HashMap, path::PathBuf, rc::Rc};
+
+use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, KeyBindingMetaIndex, NoAction};
+use serde::Deserialize;
 
 use crate::{
     editor::*,
     picker::ActionEntry,
+    settings::strip_jsonc,
+    theme::{self, config_dir},
     workspace::{
-        CloseTab, FileStructure, Find, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine,
+        CloseTab, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine,
         CloseWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
@@ -32,6 +39,9 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-r", ReplaceInFiles, None),
         KeyBinding::new("secondary-e", RecentFiles, None),
         KeyBinding::new("secondary-f12", FileStructure, None),
+        KeyBinding::new("secondary-=", IncreaseFontSize, None),
+        KeyBinding::new("secondary-+", IncreaseFontSize, None),
+        KeyBinding::new("secondary--", DecreaseFontSize, None),
         KeyBinding::new("secondary-shift-a", FindAction, None),
         KeyBinding::new("secondary-p", GoToFile, None),
         KeyBinding::new("f3", FindNext, None),
@@ -103,6 +113,7 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("cmd-shift-g", FindPrevious, None),
             KeyBinding::new("cmd-shift-o", GoToFile, None),
             KeyBinding::new("cmd-l", GoToLine, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("ctrl-right", NextTab, None),
             KeyBinding::new("ctrl-left", PrevTab, None),
@@ -148,6 +159,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         b.extend([
             KeyBinding::new("ctrl-shift-n", GoToFile, None),
             KeyBinding::new("ctrl-g", GoToLine, None),
+            KeyBinding::new("ctrl-alt-s", OpenSettings, None),
             KeyBinding::new("ctrl-f4", CloseTab, None),
             KeyBinding::new("alt-right", NextTab, None),
             KeyBinding::new("alt-left", PrevTab, None),
@@ -249,9 +261,123 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Previous Change", PreviousChange),
         a("Toggle Inline Git Blame", ToggleInlineBlame),
         a("Soft-Wrap", ToggleSoftWrap),
+        a("Settings", OpenSettings),
+        a("Keymap", OpenKeymap),
+        a("Increase Font Size", IncreaseFontSize),
+        a("Decrease Font Size", DecreaseFontSize),
+        a("Reset Font Size", ResetFontSize),
         a("Select Theme…", SelectTheme),
         a("Open Themes Folder", OpenThemesFolder),
         a("Reload Themes", ReloadThemes),
         a("Quit", Quit),
     ]
 }
+
+// ---- User keymap -----------------------------------------------------------------
+
+/// Marks bindings from `keymap.json`, so shortcut hints show them first.
+pub const USER_BINDING: KeyBindingMetaIndex = KeyBindingMetaIndex(1);
+
+pub fn keymap_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("keymap.json"))
+}
+
+/// One block of `keymap.json`: bindings, optionally limited to a context.
+#[derive(Deserialize)]
+struct Section {
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    bindings: HashMap<String, serde_json::Value>,
+}
+
+/// Replaces all key bindings with the built-in keymap plus the user's
+/// `keymap.json`. User bindings come later, so they win. Returns problems
+/// with the user file; the bindings that are fine still apply.
+pub fn install(cx: &mut App) -> Vec<String> {
+    let (user, problems) = user_bindings(cx);
+    cx.clear_key_bindings();
+    cx.bind_keys(bindings());
+    cx.bind_keys(user);
+    problems
+}
+
+fn user_bindings(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
+    let Some(text) = keymap_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return (out, problems);
+    };
+    if text.trim().is_empty() {
+        return (out, problems);
+    }
+    let sections: Vec<Section> = match serde_json::from_str(&strip_jsonc(&text)) {
+        Ok(sections) => sections,
+        Err(err) => return (out, vec![format!("keymap.json: {err}")]),
+    };
+    // Find Action's names work too, so nobody has to look up ids.
+    let by_label: HashMap<&'static str, Box<dyn Action>> =
+        action_entries().into_iter().map(|e| (e.name, e.action)).collect();
+    for section in sections {
+        let context = match section.context.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(c) => match KeyBindingContextPredicate::parse(c) {
+                Ok(predicate) => Some(Rc::new(predicate)),
+                Err(err) => {
+                    problems.push(format!("keymap.json: invalid context \"{c}\": {err}"));
+                    continue;
+                }
+            },
+            None => None,
+        };
+        for (keys, value) in section.bindings {
+            let action: Box<dyn Action> = match &value {
+                // null removes a built-in binding.
+                serde_json::Value::Null => Box::new(NoAction),
+                serde_json::Value::String(name) => match by_label.get(name.as_str()) {
+                    Some(action) => action.boxed_clone(),
+                    None => match cx.build_action(name, None) {
+                        Ok(action) => action,
+                        Err(_) => {
+                            let names = by_label.keys().copied().chain(cx.all_action_names().iter().copied());
+                            problems.push(match theme::closest(name, names) {
+                                Some(near) => format!("keymap.json: unknown action \"{name}\" (did you mean \"{near}\"?)"),
+                                None => format!("keymap.json: unknown action \"{name}\""),
+                            });
+                            continue;
+                        }
+                    },
+                },
+                _ => {
+                    problems.push(format!("keymap.json: \"{keys}\" should map to an action name or null"));
+                    continue;
+                }
+            };
+            match KeyBinding::load(&keys, action, context.clone(), false, None, cx.keyboard_mapper().as_ref()) {
+                Ok(binding) => out.push(binding.with_meta(USER_BINDING)),
+                Err(err) => problems.push(format!("keymap.json: invalid keys \"{keys}\": {err}")),
+            }
+        }
+    }
+    (out, problems)
+}
+
+/// Written by Open Keymap when there's no file yet.
+pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the built-in JetBrains keymap.
+// Changes apply when you save this file.
+//
+// Keys: "cmd-shift-d", "ctrl-alt-l", "f5", or two strokes like "cmd-k cmd-s".
+//       "secondary" means Cmd on macOS and Ctrl elsewhere.
+// Actions: a name from Find Action ("Duplicate Line or Selection") or an
+//          action id ("editor::DuplicateLine"). null removes a built-in binding.
+// Context: "Editor" for the code editor; leave it out to bind everywhere
+//          (bindings in a more specific context still win there).
+[
+  // {
+  //   "context": "Editor",
+  //   "bindings": {
+  //     "secondary-shift-d": "Duplicate Line or Selection",
+  //     "secondary-d": null
+  //   }
+  // }
+]
+"#;

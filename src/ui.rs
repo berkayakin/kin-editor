@@ -127,9 +127,15 @@ pub fn kbd(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
 /// The shortcut currently bound to `action`, formatted for this platform.
 pub fn binding_label(action: &dyn gpui::Action, window: &Window) -> Option<String> {
     // Look the binding up as if an editor were focused, so editor-only
-    // shortcuts show too. The first binding is the primary one.
+    // shortcuts show too. The first built-in binding is the primary one.
     let context = gpui::KeyContext::parse("Workspace Editor").ok()?;
-    let binding = window.bindings_for_action_in_context(action, context).into_iter().next()?;
+    let bindings = window.bindings_for_action_in_context(action, context);
+    // The user's own binding (keymap.json) is the one to show.
+    let binding = bindings
+        .iter()
+        .rev()
+        .find(|b| b.meta() == Some(crate::keymap::USER_BINDING))
+        .or(bindings.first())?;
     let parts: Vec<String> = binding
         .keystrokes()
         .iter()
