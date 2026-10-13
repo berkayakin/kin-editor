@@ -50,6 +50,9 @@ platform-native text rendering (CoreText / DirectWrite).
   folds are kept with the project
 - Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
   move them between panes; pinned tabs; a tab menu with Close Others / All / to the Right
+- Run and test: ▶ in the gutter next to tests and `main` functions (Rust, Go, Python, JS/TS),
+  project commands (cargo, npm scripts, go, make, pytest) and your own run configurations, each
+  in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
 - File tree, tabs, custom title bar, IME support
 
 ## Running
@@ -104,6 +107,9 @@ reachable through Find Action, which shows its shortcut.
 | Add caret above / below | ⌥⌘↑ / ⌥⌘↓ | Ctrl+Alt+↑ / ↓ |
 | Project sidebar / Problems | ⌘1 / ⌘6 | Alt+1 / Alt+6 |
 | Terminal (open, focus, hide) | ⌥F12 | Alt+F12 |
+| Run… / Run again | ⌃⌥R / ⌃R | Alt+Shift+F10 / Shift+F10 |
+| Run test or function at caret | ⌃⇧R | Ctrl+Shift+F10 |
+| Stop | ⌘F2 | Ctrl+F2 |
 | Split and Move Right / Down | ⌘\\ / ⌘⇧\\ | Ctrl+\\ / Ctrl+Shift+\\ |
 | Next pane | ⌥⇥ | — |
 | New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
@@ -212,6 +218,37 @@ On macOS, Option types characters as usual (`@` on many layouts). Full-screen pr
 htop, less) get mouse and wheel events; hold Shift to select text in them instead. Colors come
 from the theme's `terminal_*` keys.
 
+## Run and test
+
+A ▶ in the gutter marks what can run in the file; click it to run that one thing:
+
+| Language | ▶ on | Runs with |
+| --- | --- | --- |
+| Rust | `#[test]` functions, `#[cfg(test)]` modules, `fn main` | `cargo test … --exact`, `cargo run` (with `--bin`/`--example`/`--test` as needed) |
+| Go | `Test…`, `Benchmark…`, `Example…` functions, `func main` | `go test -run '^Name$'`, `go run .` |
+| Python | `test_…` functions, `Test…` classes and methods, `if __name__ == "__main__"` | `python3 -m pytest file::Class::test`, `python3 file` |
+| JavaScript, TypeScript | `test(…)`, `it(…)`, `describe(…)` | the project's vitest or jest, else `node --test` |
+
+**Run at caret** (⌃⇧R / Ctrl+Shift+F10) runs the innermost test or function around the caret.
+**Run…** (⌃⌥R / Alt+Shift+F10) lists the last run first, then your `run_configurations`, the
+project's commands (cargo run/test/build and binaries, `package.json` scripts with its package
+manager, go, Makefile targets, pytest) and the current file's tests. **Run** (⌃R / Shift+F10)
+repeats the last one, **Stop** (⌘F2 / Ctrl+F2) interrupts it.
+
+Each run gets a terminal tab named after it, which stays open with the exit code when it ends and
+shows ▶ while running, ✓ on success and ✕ on failure. Running the same thing again reuses its tab.
+Unsaved files are saved first. Add your own commands in `settings.json`:
+
+```jsonc
+"run_configurations": [
+  { "name": "Dev server", "command": "npm run dev -- --port 3000" },
+  { "name": "API tests", "command": "pytest -x tests/api", "cwd": "backend" }
+]
+```
+
+`cwd` is relative to the project folder. Commands run through your login shell, so aliases and
+PATH work as in the terminal.
+
 ## Settings
 
 **Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
@@ -236,6 +273,7 @@ picker, Toggle Auto Save).
 | `languages` | | per-language overrides of the last five, by the name in the status bar |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
+| `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
 
 ```jsonc

@@ -21,6 +21,7 @@ use crate::{
     assets::Icon,
     clone_dialog::display_path,
     lsp::protocol::{Encoding, Location},
+    run::RunTarget,
     syntax::Symbol,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline, PageDown, PageUp, Submit},
     theme::Theme,
@@ -39,6 +40,8 @@ pub enum PickerMode {
     Structure,
     /// Places in the project (usages, declarations); see [`Picker::set_locations`].
     Locations,
+    /// Run configurations; see [`Picker::set_run_targets`].
+    Run,
 }
 
 /// One place in a [`PickerMode::Locations`] list.
@@ -64,6 +67,7 @@ pub enum PickerEvent {
     /// Jump to an offset in the active editor.
     GoTo(usize),
     OpenLocation { location: Location, encoding: Encoding },
+    Run(RunTarget),
     Dismissed,
 }
 
@@ -97,6 +101,10 @@ enum Item {
     Location {
         ix: usize,
     },
+    Run {
+        ix: usize,
+        hl: Vec<Range<usize>>,
+    },
 }
 
 pub struct Picker {
@@ -113,6 +121,7 @@ pub struct Picker {
     current_symbol: Option<usize>,
     locations: Arc<Vec<LocationRow>>,
     location_encoding: Encoding,
+    run_targets: Arc<Vec<RunTarget>>,
     /// Overrides the mode's title (Locations: "Usages of foo").
     title: Option<SharedString>,
     items: Arc<Vec<Item>>,
@@ -147,6 +156,7 @@ impl Picker {
             PickerMode::Actions => "Search actions",
             PickerMode::Structure => "Search symbols",
             PickerMode::Locations => "Filter",
+            PickerMode::Run => "Run configuration",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
         window.focus(&query.focus_handle(cx));
@@ -164,6 +174,7 @@ impl Picker {
             current_symbol: None,
             locations: Arc::new(Vec::new()),
             location_encoding: Encoding::Utf16,
+            run_targets: Arc::new(Vec::new()),
             title: None,
             items: Arc::new(Vec::new()),
             selected: 0,
@@ -193,6 +204,12 @@ impl Picker {
     pub fn set_symbols(&mut self, symbols: Vec<(Symbol, usize)>, cursor: usize, cx: &mut Context<Self>) {
         self.current_symbol = symbols.iter().rposition(|(s, _)| s.offset <= cursor);
         self.symbols = Arc::new(symbols);
+        self.update_items(cx);
+    }
+
+    /// Fills a Run picker.
+    pub fn set_run_targets(&mut self, targets: Vec<RunTarget>, cx: &mut Context<Self>) {
+        self.run_targets = Arc::new(targets);
         self.update_items(cx);
     }
 
@@ -379,6 +396,32 @@ impl Picker {
             items.extend(scored.into_iter().take(limit).map(|(_, i)| i));
         }
 
+        if self.mode == PickerMode::Run {
+            let targets = self.run_targets.clone();
+            let mut scored: Vec<(u32, Item)> = Vec::new();
+            for (ix, target) in targets.iter().enumerate() {
+                match &pattern {
+                    Some(p) => {
+                        let mut buf = Vec::new();
+                        let mut indices = Vec::new();
+                        let Some(score) = p.indices(Utf32Str::new(&target.name, &mut buf), &mut self.matcher, &mut indices) else {
+                            continue;
+                        };
+                        let hl = indices
+                            .into_iter()
+                            .filter_map(|c| target.name.char_indices().nth(c as usize).map(|(b, ch)| b..b + ch.len_utf8()))
+                            .collect();
+                        scored.push((score, Item::Run { ix, hl }));
+                    }
+                    None => scored.push((0, Item::Run { ix, hl: Vec::new() })),
+                }
+            }
+            if pattern.is_some() {
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+            items.extend(scored.into_iter().map(|(_, i)| i));
+        }
+
         if self.mode == PickerMode::Locations {
             let locations = self.locations.clone();
             let mut scored: Vec<(u32, Item)> = Vec::new();
@@ -444,6 +487,7 @@ impl Picker {
             }
             Some(Item::Action { ix, .. }) => cx.emit(PickerEvent::RunAction(self.actions[*ix].action.boxed_clone())),
             Some(Item::Symbol { ix, .. }) => cx.emit(PickerEvent::GoTo(self.symbols[*ix].0.offset)),
+            Some(Item::Run { ix, .. }) => cx.emit(PickerEvent::Run(self.run_targets[*ix].clone())),
             Some(Item::Location { ix }) => cx.emit(PickerEvent::OpenLocation {
                 location: self.locations[*ix].location.clone(),
                 encoding: self.location_encoding,
@@ -515,6 +559,7 @@ impl Render for Picker {
             PickerMode::Actions => ("Actions", Icon::Command, ""),
             PickerMode::Structure => ("File Structure", Icon::Braces, ""),
             PickerMode::Locations => ("", Icon::Search, ""),
+            PickerMode::Run => ("Run", Icon::Play, ""),
         };
         let title: SharedString = match &self.title {
             Some(t) => t.clone(),
@@ -525,6 +570,7 @@ impl Render for Picker {
         let actions = self.actions.clone();
         let symbols = self.symbols.clone();
         let locations = self.locations.clone();
+        let run_targets = self.run_targets.clone();
         let shortcuts = self.shortcuts.clone();
         let selected = self.selected;
         let count = items.len();
@@ -615,6 +661,26 @@ impl Render for Picker {
                                                     .text_color(theme.text_dim)
                                                     .child(format!(":{line}")),
                                             )
+                                    }
+                                    Item::Run { ix, hl } => {
+                                        let target = &run_targets[*ix];
+                                        row.child(icon_el(Icon::Play, px(13.), theme.success.into()))
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_color(theme.text)
+                                                    .child(highlighted(target.name.clone().into(), hl, theme.accent.into())),
+                                            )
+                                            .when(target.command != target.name, |row| {
+                                                row.child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(px(12.))
+                                                        .text_color(theme.text_dim)
+                                                        .child(target.command.clone()),
+                                                )
+                                            })
                                     }
                                     Item::Location { ix } => {
                                         let row_data = &locations[*ix];

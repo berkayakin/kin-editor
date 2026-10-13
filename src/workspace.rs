@@ -25,7 +25,7 @@ use crate::{
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
     diff_view::{DiffView, DiffViewEvent},
-    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorLspEvent, GitFile},
+    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorLspEvent, EditorRunEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
@@ -41,7 +41,8 @@ use crate::{
     state::{PaneLayout, ProjectSession, SessionState, TabSession},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
-    terminal::{TerminalEvent, TerminalView},
+    run::{self, RunTarget},
+    terminal::{RunState, TerminalEvent, TerminalView},
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
     ui::{binding_label, icon_button, icon_el, kbd, tooltip_view},
@@ -70,6 +71,9 @@ actions!(
         SplitRight,
         SplitDown,
         NextPane,
+        RunConfiguration,
+        Rerun,
+        StopRun,
         CloseOtherTabs,
         CloseAllTabs,
         TogglePinTab,
@@ -341,6 +345,8 @@ pub struct Workspace {
     show_terminal: bool,
     terminals: Vec<Entity<TerminalView>>,
     active_terminal: usize,
+    /// For Rerun.
+    last_run: Option<RunTarget>,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -498,6 +504,7 @@ impl Workspace {
             show_terminal: state.show_terminal.unwrap_or(false),
             terminals: Vec::new(),
             active_terminal: 0,
+            last_run: None,
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
             resizing: None,
@@ -586,6 +593,9 @@ impl Workspace {
         }));
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
             ws.on_editor_lsp_event(event, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
+            ws.run_target(event.0.clone(), window, cx);
         }));
         self.lsp.update(cx, |s, cx| s.register(&editor, cx));
         if self.repo.is_none() && self.root.is_none() {
@@ -2209,17 +2219,35 @@ impl Workspace {
             .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)))
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/"));
-        match TerminalView::create(cwd, cx) {
+        self.open_terminal(cwd, None, None, true, window, cx);
+    }
+
+    /// Adds a terminal tab (at `at`, or last). A Run tab stays open when its
+    /// program ends, showing how it went.
+    fn open_terminal(
+        &mut self,
+        cwd: PathBuf,
+        run: Option<RunTarget>,
+        at: Option<usize>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match TerminalView::create(cwd, run, cx) {
             Ok(terminal) => {
                 self._subscriptions.push(cx.subscribe_in(&terminal, window, |ws, terminal, event: &TerminalEvent, window, cx| match event {
                     TerminalEvent::TitleChanged => cx.notify(),
+                    TerminalEvent::Exited if terminal.read(cx).run().is_some() => cx.notify(),
                     TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
                 }));
-                self.terminals.push(terminal);
-                self.active_terminal = self.terminals.len() - 1;
+                let ix = at.unwrap_or(self.terminals.len()).min(self.terminals.len());
+                self.terminals.insert(ix, terminal);
+                self.active_terminal = ix;
                 self.show_terminal = true;
                 self.show_problems = false;
-                self.focus_terminal(window, cx);
+                if focus {
+                    self.focus_terminal(window, cx);
+                }
                 self.save_state();
             }
             Err(err) => {
@@ -2229,6 +2257,92 @@ impl Workspace {
             }
         }
         cx.notify();
+    }
+
+    // ---- Running ----------------------------------------------------------------------
+
+    /// Runs a configuration in a Run tab, replacing the previous run of it.
+    /// The editor keeps focus, like JetBrains' Run window.
+    fn run_target(&mut self, target: RunTarget, window: &mut Window, cx: &mut Context<Self>) {
+        // Unsaved edits would make the run disagree with what's on screen.
+        for editor in self.tabs.clone() {
+            if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+                editor.update(cx, |e, cx| e.save(cx)).ok();
+            }
+        }
+        let previous = self.terminals.iter().position(|t| t.read(cx).run().is_some_and(|(r, _)| r.name == target.name && r.command == target.command));
+        if let Some(ix) = previous {
+            self.terminals.remove(ix);
+        }
+        self.last_run = Some(target.clone());
+        let focused = self.active_editor().cloned();
+        self.open_terminal(target.cwd.clone(), Some(target), previous, false, window, cx);
+        if let Some(editor) = focused {
+            window.focus(&editor.focus_handle(cx));
+        }
+    }
+
+    /// Run (⌃R / Shift+F10): the last configuration again, or the list.
+    fn rerun(&mut self, _: &Rerun, window: &mut Window, cx: &mut Context<Self>) {
+        match self.last_run.clone() {
+            Some(target) => self.run_target(target, window, cx),
+            None => self.run_configuration(&RunConfiguration, window, cx),
+        }
+    }
+
+    /// Stop (⌘F2 / Ctrl+F2): interrupts the newest running program.
+    fn stop_run(&mut self, _: &StopRun, _: &mut Window, cx: &mut Context<Self>) {
+        let running = self.terminals.iter().rev().find(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running)).cloned();
+        if let Some(terminal) = running {
+            terminal.update(cx, |t, cx| t.interrupt(cx));
+        }
+    }
+
+    /// Run… (⌃⌥R / Alt+Shift+F10): the project's configurations and the current file.
+    fn run_configuration(&mut self, _: &RunConfiguration, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self
+            .root
+            .clone()
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)));
+        let Some(root) = root else {
+            self.toast(ToastKind::Info, "Open a folder or a file to run something", None, cx);
+            return;
+        };
+        let current = self.active_editor().and_then(|e| {
+            let doc = &e.read(cx).doc;
+            doc.path.clone().map(|p| (p, doc.language))
+        });
+        let mut targets: Vec<RunTarget> = Settings::get(cx)
+            .run_configurations
+            .iter()
+            .map(|c| RunTarget {
+                name: c.name.clone(),
+                command: c.command.clone(),
+                cwd: c.cwd.as_ref().map(|d| root.join(d)).unwrap_or_else(|| root.clone()),
+                row: None,
+                rows: 0..0,
+            })
+            .collect();
+        targets.extend(run::project_targets(&root, current.as_ref().map(|(p, l)| (p.as_path(), *l))));
+        // Then the current file's tests and mains, by name.
+        if let Some(editor) = self.active_editor() {
+            let file = editor.update(cx, |e, _| e.run_targets());
+            targets.extend(file.iter().filter(|t| !targets.iter().any(|o| o.command == t.command)).cloned().collect::<Vec<_>>());
+        }
+        // The last run comes first, so Enter repeats it.
+        if let Some(last) = self.last_run.clone() {
+            targets.retain(|t| t.command != last.command || t.cwd != last.cwd);
+            targets.insert(0, last);
+        }
+        if targets.is_empty() {
+            self.toast(ToastKind::Info, "Nothing to run here", Some("Add run_configurations to settings.json".into()), cx);
+            return;
+        }
+        self.close_modal(window, cx);
+        self.open_picker(PickerMode::Run, window, cx);
+        if let Some(Modal::Picker(picker)) = &self.modal {
+            picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
+        }
     }
 
     fn close_terminal(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -2286,7 +2400,13 @@ impl Workspace {
                         ws.focus_terminal(window, cx);
                         cx.notify();
                     }))
-                    .child(icon_el(Icon::Terminal, px(12.), theme.text_muted.into()))
+                    .child(match terminal.read(cx).run().map(|(_, state)| *state) {
+                        // A Run tab shows how its program is doing.
+                        Some(RunState::Running) => icon_el(Icon::Play, px(12.), theme.success.into()),
+                        Some(RunState::Exited(Some(0))) => icon_el(Icon::CircleCheck, px(12.), theme.success.into()),
+                        Some(RunState::Exited(_)) => icon_el(Icon::CircleX, px(12.), theme.error.into()),
+                        None => icon_el(Icon::Terminal, px(12.), theme.text_muted.into()),
+                    })
                     .child(div().truncate().child(title))
                     .child(
                         div()
@@ -2445,6 +2565,10 @@ impl Workspace {
             PickerEvent::RunAction(action) => {
                 ws.close_modal(window, cx);
                 window.dispatch_action(action.boxed_clone(), cx);
+            }
+            PickerEvent::Run(target) => {
+                ws.close_modal(window, cx);
+                ws.run_target(target.clone(), window, cx);
             }
             PickerEvent::OpenLocation { location, encoding } => {
                 ws.close_modal(window, cx);
@@ -4891,6 +5015,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart_language_server))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::split_right))
+            .on_action(cx.listener(Self::rerun))
+            .on_action(cx.listener(Self::stop_run))
+            .on_action(cx.listener(Self::run_configuration))
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::next_pane))
             .on_action(cx.listener(Self::close_other_tabs))

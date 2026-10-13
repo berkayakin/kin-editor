@@ -274,6 +274,6 @@ mod tests {
         dispatch(json!({"id": 7, "error": {"code": -1, "message": "nope"}}), &pending, &incoming_tx);
         assert_eq!(rx.try_recv().unwrap().unwrap().unwrap_err().message, "nope");
         dispatch(json!({"id": "a", "method": "workspace/configuration", "params": {}}), &pending, &incoming_tx);
-        assert!(matches!(incoming.try_next(), Ok(Some(Incoming::Request { method, .. })) if method == "workspace/configuration"));
+        assert!(matches!(incoming.try_recv(), Ok(Incoming::Request { method, .. }) if method == "workspace/configuration"));
     }
 }

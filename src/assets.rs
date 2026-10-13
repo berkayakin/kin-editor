@@ -68,6 +68,7 @@ static ICONS: &[(&str, &[u8])] = icons![
     "pin",
     "columns-2",
     "rows-2",
+    "play",
 ];
 
 /// The app logo, sized for the 96pt welcome-screen mark (2x pixels).
@@ -163,6 +164,7 @@ pub enum Icon {
     Pin,
     SplitRight,
     SplitDown,
+    Play,
 }
 
 impl Icon {
@@ -223,6 +225,7 @@ impl Icon {
             Icon::Pin => "icons/pin.svg",
             Icon::SplitRight => "icons/columns-2.svg",
             Icon::SplitDown => "icons/rows-2.svg",
+            Icon::Play => "icons/play.svg",
         }
     }
 }

@@ -16,6 +16,7 @@ mod keymap;
 mod lint;
 mod lsp;
 mod picker;
+mod run;
 mod project_search;
 mod search;
 mod settings;
@@ -36,7 +37,7 @@ use crate::{
     editor::*,
     workspace::{
         CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
-        ResetFontSize, SplitDown, SplitRight, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -129,6 +130,15 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
+            ],
+        },
+        Menu {
+            name: "Run".into(),
+            items: vec![
+                MenuItem::action("Run", Rerun),
+                MenuItem::action("Run…", RunConfiguration),
+                MenuItem::action("Run at Caret", RunAtCaret),
+                MenuItem::action("Stop", StopRun),
             ],
         },
         Menu {

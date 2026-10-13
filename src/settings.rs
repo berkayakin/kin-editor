@@ -46,6 +46,17 @@ pub struct Settings {
     pub formatters: HashMap<String, serde_json::Value>,
     /// The terminal's shell and arguments; the login shell by default.
     pub terminal_shell: Option<Vec<String>>,
+    /// Extra entries for Run…: a name, a shell command and an optional
+    /// folder relative to the project.
+    pub run_configurations: Vec<RunConfiguration>,
+}
+
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct RunConfiguration {
+    pub name: String,
+    pub command: String,
+    pub cwd: Option<String>,
 }
 
 impl Global for Settings {}
@@ -133,6 +144,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "language_servers",
     "formatters",
     "terminal_shell",
+    "run_configurations",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -373,7 +385,13 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // },
 
   // The terminal's shell; your login shell by default.
-  // "terminal_shell": ["/opt/homebrew/bin/fish", "--login"]
+  // "terminal_shell": ["/opt/homebrew/bin/fish", "--login"],
+
+  // More entries for Run… (detected ones include cargo, npm scripts, go,
+  // make and pytest).
+  // "run_configurations": [
+  //   { "name": "Serve docs", "command": "mkdocs serve", "cwd": "docs" }
+  // ]
 }
 "#;
 

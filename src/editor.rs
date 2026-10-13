@@ -4,8 +4,10 @@
 mod fold;
 mod format;
 mod lsp;
+mod run;
 
 pub use lsp::EditorLspEvent;
+pub use run::EditorRunEvent;
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -36,6 +38,8 @@ const GIT_BAR_OFFSET: f32 = 8.0;
 /// The fold arrow sits this far left of the gutter's right edge (to its right edge).
 const FOLD_ZONE_RIGHT: f32 = 14.0;
 const FOLD_ICON: f32 = 12.0;
+/// The ▶ for runnable lines, at the gutter's left edge (where the problem dot goes).
+const RUN_ICON: f32 = 11.0;
 
 actions!(
     editor,
@@ -112,6 +116,7 @@ actions!(
         ExpandRegion,
         CollapseAllRegions,
         ExpandAllRegions,
+        RunAtCaret,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -237,6 +242,8 @@ pub struct Editor {
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
     /// The pointer is over the gutter, so fold arrows show.
     gutter_hovered: bool,
+    /// Runnable targets for a version (gutter ▶).
+    run_cache: Option<(u64, Arc<Vec<crate::run::RunTarget>>)>,
 }
 
 impl Editor {
@@ -288,6 +295,7 @@ impl Editor {
             fold_cache: None,
             fold_pills: Vec::new(),
             gutter_hovered: false,
+            run_cache: None,
         };
         this.apply_settings(cx);
         this.detect_external_linter();
@@ -1788,6 +1796,17 @@ impl Editor {
         }
 
         if !self.is_chromeless() {
+            // A ▶ runs its target.
+            if event.position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) {
+                let y = event.position.y - layout.bounds.top() + self.scroll.y;
+                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
+                if seg == 0
+                    && let Some(target) = self.run_target_at(row)
+                {
+                    cx.emit(EditorRunEvent(target));
+                    return;
+                }
+            }
             // The `⋯` placeholder unfolds.
             if let Some(&(_, start)) = self.fold_pills.iter().find(|(b, _)| b.contains(&event.position)) {
                 self.doc.unfold_where(|f| f.start == start);
@@ -2086,6 +2105,8 @@ impl Editor {
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
         let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.fold_regions());
+        let run_rows: Vec<usize> =
+            if single { Vec::new() } else { self.run_targets().iter().filter_map(|t| t.row).collect() };
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
         let diagnostics: Vec<&lint::Diagnostic> = self
             .doc
@@ -2423,7 +2444,14 @@ impl Editor {
                         ));
                     }
 
-                    if let Some(worst) = worst {
+                    if run_rows.contains(&row) {
+                        let icon_size = px(RUN_ICON);
+                        frame.fold_icons.push((
+                            Bounds::new(point(bounds.left() + px(5.), y + (line_height - icon_size) / 2.), size(icon_size, icon_size)),
+                            Icon::Play.path(),
+                            theme.success.into(),
+                        ));
+                    } else if let Some(worst) = worst {
                         let dot = px(6.);
                         frame.gutter_marks.push(
                             fill(
@@ -3428,6 +3456,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::expand_region))
             .on_action(cx.listener(Self::collapse_all))
             .on_action(cx.listener(Self::expand_all))
+            .on_action(cx.listener(Self::run_at_caret))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))

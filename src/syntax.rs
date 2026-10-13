@@ -567,6 +567,10 @@ impl Syntax {
         this
     }
 
+    pub fn tree(&self) -> Option<&Tree> {
+        self.tree.as_ref()
+    }
+
     /// Informs the old tree about an edit so the next parse can reuse nodes.
     pub fn edit(&mut self, edit: &InputEdit) {
         if let Some(tree) = self.tree.as_mut() {

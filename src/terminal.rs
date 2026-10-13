@@ -27,7 +27,7 @@ use gpui::{
     actions, div, fill, font, point, prelude::*, px, relative, size,
 };
 
-use crate::{settings::Settings, theme::Theme};
+use crate::{run::RunTarget, settings::Settings, theme::Theme};
 
 actions!(terminal, [TerminalCopy, TerminalPaste, TerminalClear]);
 
@@ -60,15 +60,37 @@ pub struct TerminalView {
     selecting: bool,
     /// Remainder of fractional wheel scrolling, in lines.
     scroll_rest: f32,
+    /// Set for a Run tab: what runs, and its exit code once it's done.
+    run: Option<(RunTarget, RunState)>,
     _events: Task<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunState {
+    Running,
+    /// Exit code (None when it was killed by a signal).
+    Exited(Option<i32>),
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl TerminalView {
-    /// Starts a shell in `cwd`.
-    pub fn create(cwd: PathBuf, cx: &mut App) -> std::io::Result<Entity<Self>> {
-        let shell = Settings::get(cx).terminal_shell.clone();
+    /// Starts a shell in `cwd`, or with `run`, a command in the user's shell
+    /// that stays on screen with its exit code when done.
+    pub fn create(cwd: PathBuf, run: Option<RunTarget>, cx: &mut App) -> std::io::Result<Entity<Self>> {
+        let configured = Settings::get(cx).terminal_shell.clone();
+        let shell = match &run {
+            Some(target) => {
+                // A login, interactive shell so PATH matches the user's terminal.
+                let program = configured
+                    .as_ref()
+                    .and_then(|c| c.first().cloned())
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(|| "/bin/sh".into());
+                Some(vec![program, "-l".into(), "-i".into(), "-c".into(), run_script(&target.command)])
+            }
+            None => configured,
+        };
         let (tx, rx) = mpsc::unbounded();
         let listener = Listener(tx);
         let mut env = HashMap::new();
@@ -79,7 +101,9 @@ impl TerminalView {
             let (program, args) = command.split_first()?;
             Some(tty::Shell::new(program.clone(), args.to_vec()))
         });
-        let options = tty::Options { shell, working_directory: Some(cwd), drain_on_exit: false, env, ..Default::default() };
+        // A Run tab must show everything the program printed before it exited.
+        let drain_on_exit = run.is_some();
+        let options = tty::Options { shell, working_directory: Some(cwd), drain_on_exit, env, ..Default::default() };
         let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, window_size, 0)?;
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener.clone());
@@ -87,7 +111,24 @@ impl TerminalView {
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let notifier = Notifier(event_loop.channel());
         event_loop.spawn();
-        Ok(cx.new(|cx| Self::new(term, notifier, rx, cx)))
+        Ok(cx.new(|cx| {
+            let mut view = Self::new(term, notifier, rx, cx);
+            if let Some(target) = run {
+                view.title = target.name.clone().into();
+                view.run = Some((target, RunState::Running));
+            }
+            view
+        }))
+    }
+
+    /// What a Run tab runs and how it went.
+    pub fn run(&self) -> Option<&(RunTarget, RunState)> {
+        self.run.as_ref()
+    }
+
+    /// Interrupts the running program (Ctrl+C).
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        self.input(&b"\x03"[..], cx);
     }
 
     fn new(
@@ -130,6 +171,7 @@ impl TerminalView {
             cell: (px(8.), px(16.)),
             selecting: false,
             scroll_rest: 0.,
+            run: None,
             _events: events,
         }
     }
@@ -140,7 +182,8 @@ impl TerminalView {
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
-            TermEvent::Title(title) => {
+            // A Run tab keeps its configuration's name.
+            TermEvent::Title(title) if self.run.is_none() => {
                 self.title = title.into();
                 cx.emit(TerminalEvent::TitleChanged);
             }
@@ -161,7 +204,18 @@ impl TerminalView {
                     self.write(format(size).into_bytes());
                 }
             }
-            TermEvent::Exit | TermEvent::ChildExit(_) => cx.emit(TerminalEvent::Exited),
+            TermEvent::ChildExit(status) => {
+                if let Some((_, state)) = self.run.as_mut() {
+                    *state = RunState::Exited(status.code());
+                }
+                cx.emit(TerminalEvent::Exited);
+            }
+            TermEvent::Exit => {
+                if let Some((_, state @ RunState::Running)) = self.run.as_mut() {
+                    *state = RunState::Exited(None);
+                }
+                cx.emit(TerminalEvent::Exited);
+            }
             _ => {}
         }
     }
@@ -492,6 +546,17 @@ pub struct TerminalFrame {
     cursor: Option<PaintQuad>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     hitbox: Option<Hitbox>,
+}
+
+/// The shell script for a Run tab: shows the command, runs it, then says
+/// how it ended (the tab stays open). The no-op INT trap lets the wrapper
+/// outlive a Stop; the command runs in a subshell, which resets the trap so
+/// ⌃C still stops it. (`status` is read-only in zsh.)
+fn run_script(command: &str) -> String {
+    let shown = command.replace('\'', r"'\''");
+    format!(
+        "trap : INT\nprintf '\\033[2m$ %s\\033[0m\\n' '{shown}'\n(\n{command}\n)\nkin_code=$?\nprintf '\\n\\033[2mProcess finished with exit code %s\\033[0m\\n' \"$kin_code\"\nexit $kin_code\n"
+    )
 }
 
 // ---- Colors ------------------------------------------------------------------------
