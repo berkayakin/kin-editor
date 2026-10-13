@@ -713,6 +713,7 @@ impl Workspace {
                     unsaved: dirty.then(|| e.doc.rope().to_string()),
                     pane: pane_ix,
                     pinned: self.pinned.contains(&tab.entity_id()),
+                    folds: e.folded_rows(),
                 });
             }
             pane_active.push(active_in_pane);
@@ -771,7 +772,10 @@ impl Workspace {
                 self.pinned.insert(editor.entity_id());
             }
             self.add_tab(editor.clone(), window, cx);
-            editor.update(cx, |e, cx| e.go_to(tab.cursor.min(e.doc.len()), window, cx));
+            editor.update(cx, |e, cx| {
+                e.restore_folds(&tab.folds, cx);
+                e.go_to(tab.cursor.min(e.doc.len()), window, cx);
+            });
         }
         // Panes left empty (their files are gone) aren't worth keeping.
         self.drop_empty_panes();

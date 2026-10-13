@@ -1,6 +1,7 @@
 //! The text editor view: multi-cursor editing, keyboard/mouse/IME input and a
 //! custom element that paints only the visible lines straight to the GPU.
 
+mod fold;
 mod format;
 mod lsp;
 
@@ -32,6 +33,9 @@ const SCROLLBAR_WIDTH: f32 = 12.0;
 const TEXT_PADDING: f32 = 6.0;
 /// Distance of the git change bar's center from the gutter's right edge.
 const GIT_BAR_OFFSET: f32 = 8.0;
+/// The fold arrow sits this far left of the gutter's right edge (to its right edge).
+const FOLD_ZONE_RIGHT: f32 = 14.0;
+const FOLD_ICON: f32 = 12.0;
 
 actions!(
     editor,
@@ -104,6 +108,10 @@ actions!(
         RenameSymbol,
         ShowContextActions,
         ReformatCode,
+        CollapseRegion,
+        ExpandRegion,
+        CollapseAllRegions,
+        ExpandAllRegions,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -223,6 +231,12 @@ pub struct Editor {
     wrap: Option<WrapMap>,
     /// Language server state: completion, hover, signature help.
     lsp: lsp::EditorLsp,
+    /// Fold regions for a (version, tab size).
+    fold_cache: Option<((u64, usize), Arc<Vec<crate::fold::FoldRegion>>)>,
+    /// `⋯` placeholders on screen last frame, for clicks: (bounds, fold start).
+    fold_pills: Vec<(Bounds<Pixels>, usize)>,
+    /// The pointer is over the gutter, so fold arrows show.
+    gutter_hovered: bool,
 }
 
 impl Editor {
@@ -271,6 +285,9 @@ impl Editor {
             soft_wrap: false,
             wrap: None,
             lsp: lsp::EditorLsp::default(),
+            fold_cache: None,
+            fold_pills: Vec::new(),
+            gutter_hovered: false,
         };
         this.apply_settings(cx);
         this.detect_external_linter();
@@ -622,6 +639,7 @@ impl Editor {
         self.cursor_visible = true;
         self.blink_epoch += 1;
         self.blink_task = None;
+        self.unfold_at_carets();
         self.lsp_selection_changed(cx);
         cx.notify();
     }
@@ -949,7 +967,9 @@ impl Editor {
     /// Recomputes line breaks when the text, width or font changed. Called
     /// before anything maps between offsets and display rows.
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
-        if !self.soft_wrap || self.is_single_line() {
+        let wrap = self.soft_wrap && !self.is_single_line();
+        // Without wrapping or folds, display rows are buffer lines.
+        if !wrap && self.doc.folds().is_empty() {
             self.wrap = None;
             return;
         }
@@ -962,6 +982,8 @@ impl Editor {
             font_family: font.family.clone(),
             font_size: self.font_size(cx),
             tab_size: self.tab_size,
+            wrap,
+            folds: self.doc.folds().to_vec(),
         };
         if self.wrap.as_ref().is_some_and(|w| w.key == key) {
             return;
@@ -1765,6 +1787,25 @@ impl Editor {
             return;
         }
 
+        if !self.is_chromeless() {
+            // The `⋯` placeholder unfolds.
+            if let Some(&(_, start)) = self.fold_pills.iter().find(|(b, _)| b.contains(&event.position)) {
+                self.doc.unfold_where(|f| f.start == start);
+                cx.notify();
+                return;
+            }
+            // The fold arrow toggles its region.
+            let arrow_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT);
+            if event.position.x <= arrow_right + px(2.) && event.position.x >= arrow_right - px(FOLD_ICON + 4.) {
+                let y = event.position.y - layout.bounds.top() + self.scroll.y;
+                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
+                if seg == 0 && (self.fold_under(row).is_some() || self.fold_regions().iter().any(|r| r.start == row)) {
+                    self.toggle_fold_at(row, cx);
+                    return;
+                }
+            }
+        }
+
         // Clicking a change marker in the gutter toggles its popover.
         let bar_x = layout.bounds.left() + layout.gutter_width - px(GIT_BAR_OFFSET);
         if !self.is_chromeless() && (event.position.x - bar_x).abs() < px(6.) {
@@ -1873,6 +1914,14 @@ impl Editor {
         if event.pressed_button != Some(MouseButton::Left) {
             self.drag = None;
             self.scrollbar_drag = None;
+            let over_gutter = !self.is_chromeless()
+                && self.layout.as_ref().is_some_and(|l| {
+                    l.bounds.contains(&event.position) && event.position.x < l.bounds.left() + l.gutter_width
+                });
+            if over_gutter != self.gutter_hovered {
+                self.gutter_hovered = over_gutter;
+                cx.notify();
+            }
             self.hover_at(event.position, window, cx);
             return;
         }
@@ -1929,7 +1978,7 @@ impl Editor {
         let Some(l) = self.layout.as_ref() else { return };
         let max_y = l.line_height * (self.display_row_count().saturating_sub(1)) as f32;
         self.scroll.y = self.scroll.y.clamp(px(0.), max_y.max(px(0.)));
-        if self.wrap.is_some() {
+        if self.wrap.as_ref().is_some_and(|w| w.key.wrap) {
             self.scroll.x = px(0.);
             return;
         }
@@ -1963,7 +2012,8 @@ impl Editor {
 
         let line_count = self.doc.line_count();
         let digits = line_count.to_string().len().max(3);
-        let gutter_width = if single { px(0.) } else { char_width * digits as f32 + px(44.) };
+        // Diagnostic dot, numbers, fold arrow, git bar.
+        let gutter_width = if single { px(0.) } else { char_width * digits as f32 + px(58.) };
         let text_bounds = Bounds::from_corners(
             point(bounds.left() + gutter_width, bounds.top()),
             bounds.bottom_right(),
@@ -1983,7 +2033,7 @@ impl Editor {
             wrap_width,
         });
         self.sync_wrap(window, cx);
-        let wrapping = self.wrap.is_some();
+        let wrapping = self.wrap.as_ref().is_some_and(|w| w.key.wrap);
 
         // Keep the primary cursor visible after keyboard navigation.
         if std::mem::take(&mut self.reveal_primary) {
@@ -2032,6 +2082,10 @@ impl Editor {
         let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1).0 + 1).min(line_count) };
         let range_start = self.doc.line_start(first_row);
         let range_end = if last_row == 0 { 0 } else { self.doc.line_end(last_row - 1) };
+        self.fold_pills.clear();
+        // Fold arrows show for folded headers, and for every foldable line
+        // while the pointer is over the gutter.
+        let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.fold_regions());
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
         let diagnostics: Vec<&lint::Diagnostic> = self
             .doc
@@ -2084,6 +2138,9 @@ impl Editor {
 
         let mut hl_ix = 0;
         for row in first_row..last_row {
+            if self.row_hidden(row) {
+                continue;
+            }
             let line_start = self.doc.line_start(row);
             let text = self.doc.line_text(row);
             let line_end = line_start + text.len();
@@ -2347,8 +2404,24 @@ impl Editor {
                         }],
                         None,
                     );
-                    let nx = bounds.left() + gutter_width - px(18.) - number_line.width;
+                    let nx = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.) - number_line.width;
                     frame.numbers.push((point(nx, y), number_line));
+
+                    let folded = self.fold_under(row).is_some();
+                    let foldable = !folded
+                        && self.gutter_hovered
+                        && fold_regions.as_ref().is_some_and(|r| r.binary_search_by_key(&row, |region| region.start).is_ok());
+                    if folded || foldable {
+                        let icon_size = px(FOLD_ICON);
+                        let x = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT) - icon_size;
+                        let (icon, color) =
+                            if folded { (Icon::ChevronRight, theme.text_muted) } else { (Icon::ChevronDown, theme.text_dim) };
+                        frame.fold_icons.push((
+                            Bounds::new(point(x, y + (line_height - icon_size) / 2.), size(icon_size, icon_size)),
+                            icon.path(),
+                            color.into(),
+                        ));
+                    }
 
                     if let Some(worst) = worst {
                         let dot = px(6.);
@@ -2400,6 +2473,30 @@ impl Editor {
                     frame.lines.push((origin, shaped));
                     continue;
                 }
+                // A folded header ends with a `⋯` placeholder (click to unfold).
+                let mut text_end = origin.x + shaped.width;
+                if let Some(fold) = self.fold_under(row) {
+                    let label = self.fold_placeholder(&fold);
+                    let pill_line = text_system.shape_line(
+                        SharedString::from(label.clone()),
+                        font_size,
+                        &[TextRun {
+                            len: label.len(),
+                            font: editor_font.clone(),
+                            color: theme.text_muted.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    let x = text_end + char_width * 0.6;
+                    let pill = Bounds::new(point(x - px(4.), y + px(2.)), size(pill_line.width + px(8.), line_height - px(4.)));
+                    frame.inline_bgs.push(fill(pill, theme.active).corner_radii(px(4.)));
+                    frame.inline_texts.push((point(x, y), pill_line));
+                    self.fold_pills.push((pill, fold.start));
+                    text_end = pill.right();
+                }
                 if let Some(worst) = worst {
                     let color = severity_color(&theme, worst.severity);
                     // Multi-line messages (rust-analyzer's) fit on one line here;
@@ -2428,7 +2525,7 @@ impl Editor {
                         }],
                         None,
                     );
-                    let x = origin.x + shaped.width + char_width * 3.;
+                    let x = text_end + char_width * 3.;
                     let pad = px(8.);
                     let pill_h = line_height - px(4.);
                     frame.inline_bgs.push(
@@ -2474,7 +2571,7 @@ impl Editor {
                         }],
                         None,
                     );
-                    frame.inline_texts.push((point(origin.x + shaped.width + char_width * 4., y), line));
+                    frame.inline_texts.push((point(text_end + char_width * 4., y), line));
                 }
 
                 frame.lines.push((origin, shaped));
@@ -3327,6 +3424,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::show_context_actions))
             .on_action(cx.listener(Self::reformat_code))
+            .on_action(cx.listener(Self::collapse_region))
+            .on_action(cx.listener(Self::expand_region))
+            .on_action(cx.listener(Self::collapse_all))
+            .on_action(cx.listener(Self::expand_all))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
@@ -3355,6 +3456,8 @@ pub struct FrameLayout {
     cursors: Vec<PaintQuad>,
     numbers: Vec<(Point<Pixels>, ShapedLine)>,
     gutter_marks: Vec<PaintQuad>,
+    /// Fold arrows: bounds, icon and color.
+    fold_icons: Vec<(Bounds<Pixels>, &'static str, Hsla)>,
     inline_bgs: Vec<PaintQuad>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
@@ -3462,6 +3565,9 @@ impl Element for EditorElement {
         }
         for q in frame.gutter_marks.drain(..) {
             window.paint_quad(q);
+        }
+        for (bounds, icon, color) in frame.fold_icons.drain(..) {
+            window.paint_svg(bounds, icon.into(), gpui::TransformationMatrix::unit(), color, cx).ok();
         }
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);

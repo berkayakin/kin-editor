@@ -7,6 +7,7 @@ mod document;
 mod editor;
 mod editorconfig;
 mod find_bar;
+mod fold;
 mod format;
 mod git;
 mod git_panel;

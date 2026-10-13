@@ -1,4 +1,5 @@
-//! Soft wrap: where long buffer lines break into several display rows.
+//! Display rows: where long buffer lines break into several rows (soft
+//! wrap) and which lines are hidden by folds (zero rows).
 //!
 //! Positions are byte offsets into a line's [`DisplayLine`] text (tabs
 //! expanded). A break's offset starts a new row, so a cursor exactly on a
@@ -27,6 +28,10 @@ pub struct WrapKey {
     pub font_family: SharedString,
     pub font_size: Pixels,
     pub tab_size: usize,
+    /// Break long lines (off when only folds need the map).
+    pub wrap: bool,
+    /// Folded byte ranges.
+    pub folds: Vec<std::ops::Range<usize>>,
 }
 
 pub struct WrapMap {
@@ -39,6 +44,14 @@ pub struct WrapMap {
 
 impl WrapMap {
     pub fn new(key: WrapKey, rope: &Rope, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
+        // Rows hidden by folds take no display rows.
+        let mut hidden = vec![false; rope.len_lines()];
+        for fold in &key.folds {
+            let (first, last) = (rope.byte_to_line(fold.start.min(rope.len_bytes())), rope.byte_to_line(fold.end.min(rope.len_bytes())));
+            for row in first..=last.min(hidden.len().saturating_sub(1)) {
+                hidden[row] = true;
+            }
+        }
         let (width, tab_size) = (key.width, key.tab_size);
         let mut wrapper = text_system.line_wrapper(font, key.font_size);
         // Lines narrower than this many columns can't wrap, which skips
@@ -50,9 +63,13 @@ impl WrapMap {
         let mut rows = 0;
         for row in 0..lines {
             row_starts.push(rows);
+            if hidden[row] {
+                breaks.push(Vec::new());
+                continue;
+            }
             let line = rope.line(row);
             let mut line_breaks = Vec::new();
-            if line.len_chars() > max_cols / tab_size && display_columns(line, tab_size) > max_cols {
+            if key.wrap && line.len_chars() > max_cols / tab_size && display_columns(line, tab_size) > max_cols {
                 // Same text as `Document::line_text`: without the newline.
                 let text = line.to_string();
                 let text = text.strip_suffix('\n').unwrap_or(&text);
@@ -73,6 +90,11 @@ impl WrapMap {
 
     pub fn row_count(&self) -> usize {
         *self.row_starts.last().unwrap_or(&1)
+    }
+
+    /// Whether a fold hides buffer line `row`.
+    pub fn hidden(&self, row: usize) -> bool {
+        matches!((self.row_starts.get(row), self.row_starts.get(row + 1)), (Some(a), Some(b)) if a == b)
     }
 
     pub fn breaks(&self, row: usize) -> &[Break] {
@@ -154,7 +176,7 @@ mod tests {
     #[test]
     fn maps_display_rows_to_lines() {
         let map = WrapMap {
-            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4 },
+            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true, folds: Vec::new() },
             breaks: vec![vec![], vec![Break { ix: 5, indent: 0 }, Break { ix: 9, indent: 0 }], vec![]],
             row_starts: vec![0, 1, 4, 5],
         };
@@ -165,5 +187,19 @@ mod tests {
         assert_eq!(map.line_of(4), (2, 0));
         assert_eq!(map.line_of(99), (2, 0));
         assert_eq!(map.first_display_row(2), 4);
+    }
+
+    #[test]
+    fn folded_lines_take_no_rows() {
+        // Lines 1 and 2 are hidden: row_starts repeats.
+        let map = WrapMap {
+            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false, folds: Vec::new() },
+            breaks: vec![vec![], vec![], vec![], vec![]],
+            row_starts: vec![0, 1, 1, 1, 2],
+        };
+        assert_eq!(map.row_count(), 2);
+        assert!(map.hidden(1) && map.hidden(2) && !map.hidden(0) && !map.hidden(3));
+        assert_eq!(map.line_of(1), (3, 0));
+        assert_eq!(map.first_display_row(3), 1);
     }
 }

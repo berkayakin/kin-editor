@@ -46,6 +46,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste; shell keys like Ctrl+R reach the shell
+- Code folding by indentation (Markdown by section), with gutter arrows and a `⋯` placeholder;
+  folds are kept with the project
 - Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
   move them between panes; pinned tabs; a tab menu with Close Others / All / to the Right
 - File tree, tabs, custom title bar, IME support
@@ -115,7 +117,9 @@ reachable through Find Action, which shows its shortcut.
 | Rollback lines (change under caret) | ⌥⌘Z | Ctrl+Alt+Z |
 | Next / previous change | ⌃⌥⇧↓ / ⌃⌥⇧↑ | Ctrl+Alt+Shift+↓ / ↑ |
 | Settings | ⌘, | Ctrl+Alt+S |
-| Increase / decrease font size | ⌘= / ⌘- | Ctrl+= / Ctrl+- |
+| Increase / decrease font size | ⌥⌘= / ⌥⌘- | Ctrl+Alt+= / Ctrl+Alt+- |
+| Collapse / expand (fold) | ⌘- / ⌘= | Ctrl+- / Ctrl+= |
+| Collapse all / expand all | ⌘⇧- / ⌘⇧= | Ctrl+Shift+- / Ctrl+Shift+= |
 | Basic completion | ⌃Space | Ctrl+Space |
 | Go to Declaration | ⌘B or ⌘-click | Ctrl+B or Ctrl+click |
 | Find Usages | ⌥F7 | Alt+F7 |

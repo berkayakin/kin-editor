@@ -95,6 +95,9 @@ pub struct TabSession {
     pub pane: usize,
     #[serde(skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Folded regions as (header row, last hidden row).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub folds: Vec<[usize; 2]>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -165,8 +168,8 @@ mod tests {
         let session = ProjectSession {
             root: "/work/kin".into(),
             tabs: vec![
-                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, unsaved: None, pane: 0, pinned: true },
-                TabSession { path: None, cursor: 0, unsaved: Some("draft".into()), pane: 1, pinned: false },
+                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]] },
+                TabSession { path: None, cursor: 0, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new() },
             ],
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),

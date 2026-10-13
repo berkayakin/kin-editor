@@ -81,6 +81,9 @@ pub struct Document {
     pub uses_crlf: bool,
     /// Edits since the language server last heard about this document.
     lsp_changes: LspChanges,
+    /// Folded (hidden) text: from the start of the first hidden line to the
+    /// end of the last. Edits that touch a fold open it.
+    folds: Vec<Range<usize>>,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -128,6 +131,7 @@ impl Document {
             lsp_diagnostics: Vec::new(),
             uses_crlf,
             lsp_changes: LspChanges::default(),
+            folds: Vec::new(),
             disk_mtime: None,
         }
     }
@@ -184,6 +188,7 @@ impl Document {
         self.rope = Rope::from_str(&text);
         self.syntax = Syntax::new(self.language, &self.rope);
         self.lsp_changes.mark_full();
+        self.folds.clear();
         self.version += 1;
         self.saved_version = self.version;
         self.undo_stack.clear();
@@ -399,6 +404,7 @@ impl Document {
         self.rope.remove(s..e);
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
+        self.shift_folds(&range, text.len());
         self.shift_diagnostics(range, text.len());
     }
 
@@ -415,6 +421,43 @@ impl Document {
     pub fn set_lsp_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
         self.lsp_diagnostics = diagnostics;
         self.merge_diagnostics();
+    }
+
+    pub fn folds(&self) -> &[Range<usize>] {
+        &self.folds
+    }
+
+    /// Hides rows `start..=end` (byte offsets of whole lines).
+    pub fn fold_rows(&mut self, start: usize, end: usize) {
+        if start == 0 || start >= self.line_count() {
+            return;
+        }
+        let range = self.line_start(start)..self.line_end(end.min(self.line_count() - 1));
+        if !range.is_empty() && !self.folds.contains(&range) {
+            self.folds.push(range);
+            self.folds.sort_by_key(|f| f.start);
+        }
+    }
+
+    /// Opens the folds `unfold` matches; returns whether any opened.
+    pub fn unfold_where(&mut self, mut unfold: impl FnMut(&Range<usize>) -> bool) -> bool {
+        let before = self.folds.len();
+        self.folds.retain(|f| !unfold(f));
+        self.folds.len() != before
+    }
+
+    /// Folds move with edits before them; an edit touching one opens it.
+    fn shift_folds(&mut self, range: &Range<usize>, new_len: usize) {
+        let delta = new_len as isize - range.len() as isize;
+        self.folds.retain_mut(|f| {
+            if range.end < f.start {
+                f.start = (f.start as isize + delta) as usize;
+                f.end = (f.end as isize + delta) as usize;
+                true
+            } else {
+                range.start > f.end
+            }
+        });
     }
 
     /// Edits not yet sent to the language server, oldest first; each is
@@ -514,6 +557,21 @@ fn shift(diagnostics: &mut Vec<Diagnostic>, range: &Range<usize>, new_len: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folds_follow_edits() {
+        let mut doc = Document::from_text("a {\n  b\n  c\n}\nz\n".into(), None);
+        doc.fold_rows(1, 3);
+        assert_eq!(doc.folds(), [4..13]);
+        // An edit above moves the fold.
+        doc.edit(vec![(0..0, "x".into())], &[], EditKind::Other);
+        assert_eq!(doc.folds(), [5..14]);
+        // An edit after it leaves it alone; one inside opens it.
+        doc.edit(vec![(15..15, "y".into())], &[], EditKind::Other);
+        assert_eq!(doc.folds(), [5..14]);
+        doc.edit(vec![(8..8, "!".into())], &[], EditKind::Other);
+        assert!(doc.folds().is_empty());
+    }
 
     #[test]
     fn multi_edit_and_undo() {
