@@ -64,6 +64,7 @@ static ICONS: &[(&str, &[u8])] = icons![
     "external-link",
     "keyboard",
     "save",
+    "terminal",
 ];
 
 /// The app logo, sized for the 96pt welcome-screen mark (2x pixels).
@@ -155,6 +156,7 @@ pub enum Icon {
     ExternalLink,
     Keyboard,
     Save,
+    Terminal,
 }
 
 impl Icon {
@@ -211,6 +213,7 @@ impl Icon {
             Icon::ExternalLink => "icons/external-link.svg",
             Icon::Keyboard => "icons/keyboard.svg",
             Icon::Save => "icons/save.svg",
+            Icon::Terminal => "icons/terminal.svg",
         }
     }
 }

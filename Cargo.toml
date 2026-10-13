@@ -12,6 +12,7 @@ category = "public.app-category.developer-tools"
 short_description = "A small, fast GPU-rendered code editor"
 
 [dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
 futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 ignore = "0.4.33"

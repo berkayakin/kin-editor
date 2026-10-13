@@ -94,6 +94,24 @@ pub struct Theme {
     pub git_untracked: Rgba,
     pub git_conflict: Rgba,
 
+    /// The terminal's 16 ANSI colors.
+    pub terminal_black: Rgba,
+    pub terminal_red: Rgba,
+    pub terminal_green: Rgba,
+    pub terminal_yellow: Rgba,
+    pub terminal_blue: Rgba,
+    pub terminal_magenta: Rgba,
+    pub terminal_cyan: Rgba,
+    pub terminal_white: Rgba,
+    pub terminal_bright_black: Rgba,
+    pub terminal_bright_red: Rgba,
+    pub terminal_bright_green: Rgba,
+    pub terminal_bright_yellow: Rgba,
+    pub terminal_bright_blue: Rgba,
+    pub terminal_bright_magenta: Rgba,
+    pub terminal_bright_cyan: Rgba,
+    pub terminal_bright_white: Rgba,
+
     pub syntax: SyntaxColors,
 }
 
@@ -147,6 +165,22 @@ color_keys! {
     "git_deleted" => git_deleted,
     "git_untracked" => git_untracked,
     "git_conflict" => git_conflict,
+    "terminal_black" => terminal_black,
+    "terminal_red" => terminal_red,
+    "terminal_green" => terminal_green,
+    "terminal_yellow" => terminal_yellow,
+    "terminal_blue" => terminal_blue,
+    "terminal_magenta" => terminal_magenta,
+    "terminal_cyan" => terminal_cyan,
+    "terminal_white" => terminal_white,
+    "terminal_bright_black" => terminal_bright_black,
+    "terminal_bright_red" => terminal_bright_red,
+    "terminal_bright_green" => terminal_bright_green,
+    "terminal_bright_yellow" => terminal_bright_yellow,
+    "terminal_bright_blue" => terminal_bright_blue,
+    "terminal_bright_magenta" => terminal_bright_magenta,
+    "terminal_bright_cyan" => terminal_bright_cyan,
+    "terminal_bright_white" => terminal_bright_white,
     "syntax.plain" => syntax.plain,
     "syntax.keyword" => syntax.keyword,
     "syntax.string" => syntax.string,
@@ -168,6 +202,11 @@ color_keys! {
 impl Theme {
     pub fn get(cx: &App) -> &Theme {
         cx.global::<Theme>()
+    }
+
+    #[cfg(test)]
+    pub fn blank_for_tests() -> Self {
+        Self::blank(Appearance::Dark)
     }
 
     /// Neutral starting point before a theme file is applied.
@@ -236,6 +275,22 @@ impl Theme {
             git_deleted: rgba(0xff5555ff),
             git_untracked: rgba(0xcc8855ff),
             git_conflict: rgba(0xffaa00ff),
+            terminal_black: rgba(0x2b2b2bff),
+            terminal_red: rgba(0xe06c75ff),
+            terminal_green: rgba(0x98c379ff),
+            terminal_yellow: rgba(0xe5c07bff),
+            terminal_blue: rgba(0x61afefff),
+            terminal_magenta: rgba(0xc678ddff),
+            terminal_cyan: rgba(0x56b6c2ff),
+            terminal_white: rgba(0xc8c8c8ff),
+            terminal_bright_black: rgba(0x6b6b6bff),
+            terminal_bright_red: rgba(0xef8a92ff),
+            terminal_bright_green: rgba(0xb0d48fff),
+            terminal_bright_yellow: rgba(0xefcf94ff),
+            terminal_bright_blue: rgba(0x85c1f5ff),
+            terminal_bright_magenta: rgba(0xd595e6ff),
+            terminal_bright_cyan: rgba(0x7ccbd4ff),
+            terminal_bright_white: rgba(0xffffffff),
             syntax,
         }
     }

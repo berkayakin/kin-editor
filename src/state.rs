@@ -22,6 +22,8 @@ pub struct SessionState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_problems: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_terminal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_mode: Option<String>,
     /// Editor font zoom in points, added to the configured size.
     #[serde(skip_serializing_if = "Option::is_none")]

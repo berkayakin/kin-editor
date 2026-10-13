@@ -44,6 +44,8 @@ pub struct Settings {
     /// Per language: `"language_server"`, a command reading stdin and writing
     /// stdout (`["black", "-q", "-"]`), or `false` to never format.
     pub formatters: HashMap<String, serde_json::Value>,
+    /// The terminal's shell and arguments; the login shell by default.
+    pub terminal_shell: Option<Vec<String>>,
 }
 
 impl Global for Settings {}
@@ -130,6 +132,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "languages",
     "language_servers",
     "formatters",
+    "terminal_shell",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -367,7 +370,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "formatters": {
   //   "Python": ["black", "--quiet", "-"],
   //   "TypeScript": "language_server"
-  // }
+  // },
+
+  // The terminal's shell; your login shell by default.
+  // "terminal_shell": ["/opt/homebrew/bin/fish", "--login"]
 }
 "#;
 

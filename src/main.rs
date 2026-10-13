@@ -20,6 +20,7 @@ mod search;
 mod settings;
 mod state;
 mod syntax;
+mod terminal;
 mod theme;
 mod theme_picker;
 mod ui;
@@ -34,7 +35,7 @@ use crate::{
     editor::*,
     workspace::{
         CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
-        ResetFontSize, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        ResetFontSize, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -114,6 +115,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Problems", ToggleProblems),
+                MenuItem::action("Terminal", ToggleTerminal),
                 MenuItem::action("Soft-Wrap", ToggleSoftWrap),
                 MenuItem::separator(),
                 MenuItem::action("Select Theme…", SelectTheme),

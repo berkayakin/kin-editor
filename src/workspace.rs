@@ -41,6 +41,7 @@ use crate::{
     state::{ProjectSession, SessionState, TabSession},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
+    terminal::{TerminalEvent, TerminalView},
     theme::{self, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
     ui::{binding_label, icon_button, icon_el, kbd, tooltip_view},
@@ -63,6 +64,9 @@ actions!(
         PrevTab,
         ToggleSidebar,
         ToggleProblems,
+        ToggleTerminal,
+        NewTerminal,
+        CloseTerminal,
         Quit,
         Find,
         Replace,
@@ -252,7 +256,11 @@ pub struct Workspace {
     active: usize,
     show_sidebar: bool,
     show_problems: bool,
+    /// Height of the bottom panel (Problems or Terminal; one shows at a time).
     problems_height: Pixels,
+    show_terminal: bool,
+    terminals: Vec<Entity<TerminalView>>,
+    active_terminal: usize,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -400,7 +408,10 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             show_sidebar: state.show_sidebar.unwrap_or(true),
-            show_problems: state.show_problems.unwrap_or(false),
+            show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
+            show_terminal: state.show_terminal.unwrap_or(false),
+            terminals: Vec::new(),
+            active_terminal: 0,
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
             resizing: None,
@@ -663,6 +674,7 @@ impl Workspace {
             problems_height: Some(self.problems_height.into()),
             show_sidebar: Some(self.show_sidebar),
             show_problems: Some(self.show_problems),
+            show_terminal: Some(self.show_terminal),
             sidebar_mode: Some(match self.sidebar_mode {
                 SidebarMode::Files => "files".into(),
                 SidebarMode::Commit => "commit".into(),
@@ -851,6 +863,8 @@ impl Workspace {
         self.tabs.clear();
         self.active = 0;
         self.session_task = None;
+        self.terminals.clear();
+        self.show_terminal = false;
         self.lsp.update(cx, |s, _| {
             s.shutdown_all();
             s.set_root(None);
@@ -1767,10 +1781,195 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_problems(&mut self, _: &ToggleProblems, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_problems(&mut self, _: &ToggleProblems, window: &mut Window, cx: &mut Context<Self>) {
         self.show_problems = !self.show_problems;
+        if self.show_problems && self.show_terminal {
+            self.show_terminal = false;
+            self.focus_active(window, cx);
+        }
         self.save_state();
         cx.notify();
+    }
+
+    // ---- Terminal -------------------------------------------------------------------
+
+    /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
+    fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.terminals.get(self.active_terminal).is_some_and(|t| t.focus_handle(cx).contains_focused(window, cx));
+        if self.show_terminal && focused {
+            self.show_terminal = false;
+            self.focus_active(window, cx);
+        } else {
+            self.show_terminal = true;
+            self.show_problems = false;
+            if self.terminals.is_empty() {
+                self.new_terminal(&NewTerminal, window, cx);
+            } else {
+                self.focus_terminal(window, cx);
+            }
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.terminals.get(self.active_terminal) {
+            window.focus(&terminal.focus_handle(cx));
+        }
+    }
+
+    /// Starts a shell in the project folder (or the current file's folder).
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self
+            .root
+            .clone()
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)))
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        match TerminalView::create(cwd, cx) {
+            Ok(terminal) => {
+                self._subscriptions.push(cx.subscribe_in(&terminal, window, |ws, terminal, event: &TerminalEvent, window, cx| match event {
+                    TerminalEvent::TitleChanged => cx.notify(),
+                    TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
+                }));
+                self.terminals.push(terminal);
+                self.active_terminal = self.terminals.len() - 1;
+                self.show_terminal = true;
+                self.show_problems = false;
+                self.focus_terminal(window, cx);
+                self.save_state();
+            }
+            Err(err) => {
+                // Don't retry on every frame.
+                self.show_terminal = !self.terminals.is_empty();
+                self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_terminal(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.terminals.get(self.active_terminal).cloned() {
+            self.remove_terminal(&terminal, window, cx);
+        }
+    }
+
+    fn remove_terminal(&mut self, terminal: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.terminals.iter().position(|t| t == terminal) else { return };
+        let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
+        self.terminals.remove(ix);
+        if self.terminals.is_empty() {
+            self.show_terminal = false;
+            self.active_terminal = 0;
+            self.save_state();
+            self.focus_active(window, cx);
+        } else {
+            self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
+            if was_focused {
+                self.focus_terminal(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reopened at launch: start a shell the first time it shows.
+        if self.terminals.is_empty() {
+            self.new_terminal(&NewTerminal, window, cx);
+        }
+        let theme = Theme::get(cx).clone();
+        let tabs: Vec<AnyElement> = self
+            .terminals
+            .iter()
+            .enumerate()
+            .map(|(ix, terminal)| {
+                let active = ix == self.active_terminal;
+                let title = terminal.read(cx).title();
+                let entity = terminal.clone();
+                div()
+                    .id(("terminal-tab", ix))
+                    .group("terminal-tab")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(24.))
+                    .pl_2()
+                    .pr_1()
+                    .max_w(px(220.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_color(if active { theme.text } else { theme.text_muted })
+                    .when(active, |el| el.bg(theme.active))
+                    .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        ws.active_terminal = ix;
+                        ws.focus_terminal(window, cx);
+                        cx.notify();
+                    }))
+                    .child(icon_el(Icon::Terminal, px(12.), theme.text_muted.into()))
+                    .child(div().truncate().child(title))
+                    .child(
+                        div()
+                            .id(("close-terminal", ix))
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.))
+                            .invisible()
+                            .group_hover("terminal-tab", |s| s.visible())
+                            .hover(|s| s.bg(theme.hover))
+                            .on_click(cx.listener(move |ws, _, window, cx| {
+                                cx.stop_propagation();
+                                ws.remove_terminal(&entity, window, cx);
+                            }))
+                            .child(icon_el(Icon::X, px(11.), theme.text_muted.into())),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(32.))
+            .px_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme.border_subtle)
+            .child(
+                div()
+                    .px_1()
+                    .mr_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_muted)
+                    .child("TERMINAL"),
+            )
+            .children(tabs)
+            .child(
+                self.icon_button("new-terminal", Icon::Plus, false, cx, |ws, _, window, cx| ws.new_terminal(&NewTerminal, window, cx))
+                    .tooltip(|window, cx| status_tooltip("New Terminal", &NewTerminal, window, cx)),
+            )
+            .child(div().flex_1())
+            .child(self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
+                ws.show_terminal = false;
+                ws.focus_active(window, cx);
+                ws.save_state();
+                cx.notify();
+            }));
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .h(self.problems_height)
+            .flex_shrink_0()
+            .bg(theme.background)
+            .border_t_1()
+            .border_color(theme.border)
+            .child(header)
+            .child(div().flex_1().min_h_0().children(self.terminals.get(self.active_terminal).cloned()))
+            .child(self.resize_handle(Edge::Problems, cx))
     }
 
     // ---- Search & navigation ---------------------------------------------------
@@ -4084,6 +4283,13 @@ impl Workspace {
             .child(div().flex_1())
             .children(right)
             .child(
+                self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
+                    ws.toggle_terminal(&ToggleTerminal, window, cx)
+                })
+                .size(px(22.))
+                .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
+            )
+            .child(
                 self.icon_button("toggle-problems", Icon::PanelBottom, self.show_problems, cx, |ws, _, window, cx| {
                     ws.toggle_problems(&ToggleProblems, window, cx)
                 })
@@ -4122,6 +4328,7 @@ impl Render for Workspace {
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
+        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(window, cx).into_any_element());
         let center: AnyElement = match self.active_editor() {
             Some(editor) => editor.clone().into_any_element(),
             None => self.render_welcome(window, cx).into_any_element(),
@@ -4155,6 +4362,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::file_structure))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::restart_language_server))
+            .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::open_themes_folder))
@@ -4210,7 +4420,8 @@ impl Render for Workspace {
                             .when(!self.tabs.is_empty(), |el| el.child(self.render_tabs(cx)))
                             .when(self.show_find && !self.tabs.is_empty(), |el| el.child(self.find_bar.clone()))
                             .child(div().flex_1().min_h_0().overflow_hidden().child(center))
-                            .when(self.show_problems, |el| el.child(self.render_problems(cx))),
+                            .when(self.show_problems, |el| el.child(self.render_problems(cx)))
+                            .when(self.show_terminal, |el| el.child(terminal_panel.unwrap())),
                     ),
             )
             .child(self.render_statusbar(cx))

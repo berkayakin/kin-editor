@@ -12,10 +12,11 @@ use serde::Deserialize;
 use crate::{
     editor::*,
     picker::ActionEntry,
+    terminal::{TerminalClear, TerminalCopy, TerminalPaste},
     settings::strip_jsonc,
     theme::{self, config_dir},
     workspace::{
-        CloseTab, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine,
+        CloseTab, CloseTerminal, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine,
         CloseWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
@@ -39,6 +40,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-r", ReplaceInFiles, None),
         KeyBinding::new("secondary-e", RecentFiles, None),
         KeyBinding::new("secondary-f12", FileStructure, None),
+        KeyBinding::new("alt-f12", ToggleTerminal, None),
         KeyBinding::new("ctrl-space", ShowCompletions, e),
         KeyBinding::new("secondary-b", GoToDeclaration, e),
         KeyBinding::new("alt-f7", FindUsages, e),
@@ -121,6 +123,11 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("cmd-l", GoToLine, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("f1", QuickDocumentation, e),
+            KeyBinding::new("cmd-t", NewTerminal, Some("Terminal")),
+            KeyBinding::new("cmd-w", CloseTerminal, Some("Terminal")),
+            KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
+            KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
+            KeyBinding::new("cmd-k", TerminalClear, Some("Terminal")),
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("ctrl-right", NextTab, None),
             KeyBinding::new("ctrl-left", PrevTab, None),
@@ -168,6 +175,10 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-g", GoToLine, None),
             KeyBinding::new("ctrl-alt-s", OpenSettings, None),
             KeyBinding::new("ctrl-q", QuickDocumentation, e),
+            KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-w", CloseTerminal, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
             KeyBinding::new("ctrl-f4", CloseTab, None),
             KeyBinding::new("alt-right", NextTab, None),
             KeyBinding::new("alt-left", PrevTab, None),
@@ -225,6 +236,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Basic Completion", ShowCompletions),
         a("Quick Documentation", QuickDocumentation),
         a("Restart Language Server", RestartLanguageServer),
+        a("Terminal", ToggleTerminal),
+        a("New Terminal", NewTerminal),
         a("Recent Files", RecentFiles),
         a("New File", NewFile),
         a("Open File…", OpenFile),
@@ -312,10 +325,37 @@ struct Section {
 /// with the user file; the bindings that are fine still apply.
 pub fn install(cx: &mut App) -> Vec<String> {
     let (user, problems) = user_bindings(cx);
+    let defaults = bindings();
+    let passthrough = terminal_passthrough(&defaults);
     cx.clear_key_bindings();
-    cx.bind_keys(bindings());
+    cx.bind_keys(defaults);
+    cx.bind_keys(passthrough);
     cx.bind_keys(user);
     problems
+}
+
+/// In the terminal, keys belong to the shell (Ctrl+R searches history, Ctrl+F
+/// moves the cursor). This turns off the app's global shortcuts there, except
+/// ⌘/Cmd ones and a few for getting around; JetBrains does the same.
+fn terminal_passthrough(defaults: &[KeyBinding]) -> Vec<KeyBinding> {
+    const KEEP: &[&str] = &[
+        "workspace::ToggleTerminal",
+        "workspace::NextTab",
+        "workspace::PrevTab",
+        "workspace::FindAction",
+        "workspace::ToggleSidebar",
+        "workspace::ToggleProblems",
+        "workspace::Quit",
+    ];
+    defaults
+        .iter()
+        .filter(|b| b.predicate().is_none() && !KEEP.contains(&b.action().name()))
+        .filter(|b| !b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
+        .map(|b| {
+            let keys: Vec<String> = b.keystrokes().iter().map(|k| k.inner().unparse()).collect();
+            KeyBinding::new(&keys.join(" "), NoAction, Some("Terminal"))
+        })
+        .collect()
 }
 
 fn user_bindings(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {

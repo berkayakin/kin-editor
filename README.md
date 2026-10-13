@@ -44,6 +44,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
 - 11 built-in themes (9 dark, 2 light) and JSON user themes with live preview
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
+- Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
+  full-screen programs, selection and copy/paste; shell keys like Ctrl+R reach the shell
 - File tree, tabs, custom title bar, IME support
 
 ## Running
@@ -97,6 +99,9 @@ reachable through Find Action, which shows its shortcut.
 | Start new line / line above | ⇧↩ / ⌥⌘↩ | Shift+Enter / Ctrl+Alt+Enter |
 | Add caret above / below | ⌥⌘↑ / ⌥⌘↓ | Ctrl+Alt+↑ / ↓ |
 | Project sidebar / Problems | ⌘1 / ⌘6 | Alt+1 / Alt+6 |
+| Terminal (open, focus, hide) | ⌥F12 | Alt+F12 |
+| New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
+| Copy / paste / clear (in the terminal) | ⌘C / ⌘V / ⌘K | Ctrl+Shift+C / Ctrl+Shift+V / — |
 | Close tab / next / previous | ⌘W / ⌃→ / ⌃← | Ctrl+F4 / Alt+→ / Alt+← |
 | Open file / folder | ⌘O / ⌥⌘O | Ctrl+O / Ctrl+Alt+O |
 | New window / close window | ⌘⇧N / ⌘⇧W | — / Alt+F4 |
@@ -175,6 +180,18 @@ Only the changed lines are replaced, so the caret stays put and one undo reverts
 read their own config (`.prettierrc`, `rustfmt.toml`, `pyproject.toml`…). Set `format_on_save`
 (per language too) to format on Save; choose a formatter per language with `formatters`.
 
+## Terminal
+
+**Terminal** (⌥F12 / Alt+F12, or the status bar button) opens a shell in the project folder in
+the bottom panel, which it shares with Problems. Press it again to jump between the terminal and
+the editor. Each **+** tab is its own shell; a tab closes when its shell exits.
+
+While the terminal has focus, keys go to the shell: Ctrl shortcuts (Ctrl+R history search, Ctrl+F,
+Ctrl+E…) aren't taken by Kin, except a few for getting around (⌥F12, tab switching, Find Action).
+On macOS, Option types characters as usual (`@` on many layouts). Full-screen programs (vim,
+htop, less) get mouse and wheel events; hold Shift to select text in them instead. Colors come
+from the theme's `terminal_*` keys.
+
 ## Settings
 
 **Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
@@ -198,6 +215,7 @@ picker, Toggle Auto Save).
 | `format_on_save` | `false` | reformat on Save (auto-save never reformats) |
 | `languages` | | per-language overrides of the last five, by the name in the status bar |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
+| `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
 
 ```jsonc
@@ -325,6 +343,7 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 | `bracket_match` | the bracket pair around the cursor |
 | `error`, `warning`, `info`, `success` | diagnostics and status |
 | `file_js`, `file_html` | file icons |
+| `terminal_black` … `terminal_white`, `terminal_bright_black` … `terminal_bright_white` | the terminal's 16 ANSI colors |
 
 `syntax` keys: `plain`, `keyword`, `string`, `number`, `constant`, `function`, `method`,
 `property`, `type`, `variable_builtin`, `comment`, `operator`, `punctuation`, `tag`,
