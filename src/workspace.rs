@@ -517,6 +517,7 @@ impl Workspace {
             pinned: HashSet::new(),
             show_sidebar: state.show_sidebar.unwrap_or(true),
             show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
+            // Closed unless it was open when the window last closed.
             show_terminal: state.show_terminal.unwrap_or(false),
             show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminals: Vec::new(),

@@ -317,7 +317,8 @@ These are all in the File menu and Find Action.
 
 Kin reopens the last project folder when started without arguments, lists the last ten
 folders under Recent Projects (shared by all windows; hover a welcome-screen row to remove it), and remembers
-panel sizes and whether the sidebar and Problems panel are open. This lives in
+panel sizes and whether the sidebar, Problems panel, terminal and Git log are open (all but the sidebar start
+closed the first time). This lives in
 `state.json` next to `settings.json` in the config folder.
 
 Each project also reopens with the tabs it had, the active tab and each caret. Unsaved edits
