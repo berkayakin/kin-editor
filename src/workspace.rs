@@ -25,6 +25,7 @@ use crate::{
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
+    push_dialog::{PushDialog, PushDialogEvent},
     git_log::{GitLog, GitLogEvent},
     editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent, EditorRunEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
@@ -307,6 +308,7 @@ enum Modal {
     Input(Entity<InputDialog>),
     Clone(Entity<CloneDialog>),
     Preferences(Entity<Preferences>),
+    Push(Entity<PushDialog>),
 }
 
 /// How long two Shift taps may be apart to count as a double Shift.
@@ -372,6 +374,8 @@ pub struct Workspace {
     sidebar_mode: SidebarMode,
     git_panel: Entity<GitPanel>,
     git_log: Entity<GitLog>,
+    /// The Push dialog a diff was opened from; it comes back when the diff closes.
+    diff_return: Option<Entity<PushDialog>>,
     /// The bottom panel shows the Git log (instead of Problems or the terminal).
     show_git_log: bool,
     /// Working-tree root of the project's Git repository.
@@ -544,6 +548,7 @@ impl Workspace {
             sidebar_mode: if state.sidebar_mode.as_deref() == Some("commit") { SidebarMode::Commit } else { SidebarMode::Files },
             git_panel,
             git_log,
+            diff_return: None,
             repo: None,
             git_status: Arc::new(RepoStatus::default()),
             git_paths: Arc::new(HashMap::new()),
@@ -2006,6 +2011,11 @@ impl Workspace {
     }
 
     fn run_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {
+        // Push asks first, like JetBrains: the commits to push, then Push or Cancel.
+        if matches!(op, GitOp::Push) {
+            self.show_push(window, cx);
+            return;
+        }
         // Marking a file resolved while it still has conflict markers is
         // usually a mistake, so ask.
         if let (GitOp::Stage(rels), Some(repo)) = (&op, &self.repo) {
@@ -2092,7 +2102,7 @@ impl Workspace {
                     }
                     Err(err) => {
                         let title = match &op {
-                            GitOp::Push | GitOp::Commit { push: true, .. } => "Push failed",
+                            GitOp::Push | GitOp::PushNow { .. } | GitOp::Commit { push: true, .. } => "Push failed",
                             GitOp::Pull => "Update failed",
                             GitOp::Fetch => "Fetch failed",
                             GitOp::Commit { .. } => "Commit failed",
@@ -2115,6 +2125,7 @@ impl Workspace {
                             | GitOp::Fetch
                             | GitOp::Pull
                             | GitOp::Push
+                            | GitOp::PushNow { .. }
                             | GitOp::Checkout(_)
                             | GitOp::CreateBranch(_)
                             | GitOp::Merge(_)
@@ -2254,18 +2265,54 @@ impl Workspace {
         self.show_diff(DiffSource::Working { file, staged, buffer }, window, cx);
     }
 
+    fn show_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            self.toast(ToastKind::Error, "Not a Git repository", None, cx);
+            return;
+        };
+        self.close_modal(window, cx);
+        self.diff_return = None;
+        let dialog = cx.new(|cx| PushDialog::new(repo, window, cx));
+        self.open_push_modal(dialog, window, cx);
+    }
+
+    fn open_push_modal(&mut self, dialog: Entity<PushDialog>, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, dialog, event: &PushDialogEvent, window, cx| match event {
+            PushDialogEvent::Push { force } => {
+                ws.close_modal(window, cx);
+                ws.run_git(GitOp::PushNow { force: *force }, window, cx);
+            }
+            PushDialogEvent::OpenDiff(source) => {
+                ws.diff_return = Some(dialog.clone());
+                ws.show_diff(source.clone(), window, cx);
+            }
+            PushDialogEvent::Dismissed => ws.close_modal(window, cx),
+        }));
+        dialog.read(cx).focus(window);
+        self.modal = Some(Modal::Push(dialog));
+        cx.notify();
+    }
+
     fn show_diff(&mut self, source: DiffSource, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
         self.close_modal(window, cx);
         let side_by_side = SessionState::load().diff_side_by_side.unwrap_or(true);
         let view = cx.new(|cx| DiffView::new(repo, source, side_by_side, window, cx));
         self.modal_subscription = Some(cx.subscribe_in(&view, window, |ws, _, event: &DiffViewEvent, window, cx| match event {
-            DiffViewEvent::Close => ws.close_modal(window, cx),
+            DiffViewEvent::Close => {
+                ws.close_modal(window, cx);
+                // Back to the Push dialog the diff came from.
+                if let Some(dialog) = ws.diff_return.take() {
+                    ws.open_push_modal(dialog, window, cx);
+                }
+            }
             DiffViewEvent::OpenFile(path) => {
+                ws.diff_return = None;
                 ws.close_modal(window, cx);
                 ws.open_path(path.clone(), window, cx);
             }
             DiffViewEvent::Run(op) => {
+                ws.diff_return = None;
                 // Staging a change keeps the diff open (it reloads afterwards).
                 if !matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
                     ws.close_modal(window, cx);
@@ -3556,6 +3603,7 @@ impl Workspace {
             Modal::Input(i) => i.clone().into_any_element(),
             Modal::Clone(c) => c.clone().into_any_element(),
             Modal::Preferences(p) => p.clone().into_any_element(),
+            Modal::Push(p) => p.clone().into_any_element(),
         };
         let top = modal_top(window);
         // Deferred above the other deferred layers (resize handles), so they
@@ -5540,15 +5588,16 @@ fn monogram_color(name: &str, theme: &Theme) -> Hsla {
 
 /// Runs one Git operation; blocking. Returns a message for a success toast.
 fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<String>, String> {
-    let push = |dir: &Path| -> Result<String, String> {
+    let push = |dir: &Path, force: bool| -> Result<String, String> {
         if !git::has_remote(dir) {
             return Err("No remote is configured. Add one with: git remote add origin <url>".into());
         }
         let branch = git::status(dir).ok().and_then(|s| s.branch).or_else(|| status.branch.clone());
         let has_upstream = git::status(dir).ok().and_then(|s| s.upstream).is_some();
+        let verb = if force { "Force-pushed" } else { "Pushed" };
         match (has_upstream, branch) {
-            (false, Some(branch)) => git::push(dir, Some(&branch)).map(|_| format!("Pushed {branch} to origin")),
-            _ => git::push(dir, None).map(|_| "Pushed".to_string()),
+            (false, Some(branch)) => git::push(dir, Some(&branch), force).map(|_| format!("{verb} {branch} to origin")),
+            _ => git::push(dir, None, force).map(|_| verb.to_string()),
         }
     };
     match op {
@@ -5586,13 +5635,15 @@ fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<Stri
             }
             let summary = git::commit(dir, &message, amend)?;
             if and_push {
-                push(dir)?;
+                push(dir, false)?;
                 Ok(Some(format!("Committed and pushed {summary}")))
             } else {
                 Ok(Some(format!("Committed {summary}")))
             }
         }
-        GitOp::Push => push(dir).map(Some),
+        // `Push` opens the dialog before it gets here; treat it as a plain push.
+        GitOp::Push | GitOp::PushNow { force: false } => push(dir, false).map(Some),
+        GitOp::PushNow { force: true } => push(dir, true).map(Some),
         GitOp::Pull => git::pull(dir).map(|out| {
             Some(if out.contains("Already up to date") { "Already up to date".into() } else { "Project updated".into() })
         }),

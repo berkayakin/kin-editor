@@ -365,11 +365,42 @@ pub fn last_commit_message(root: &Path) -> Option<String> {
     run(root, &["log", "-1", "--format=%B"]).ok().map(|s| s.trim_end().to_string())
 }
 
-pub fn push(root: &Path, set_upstream: Option<&str>) -> Result<String, String> {
-    match set_upstream {
-        Some(branch) => run(root, &["push", "--porcelain", "--set-upstream", "origin", branch]),
-        None => run(root, &["push", "--porcelain"]),
+/// `force` replaces the remote branch, but only if it's still where we last
+/// saw it (`--force-with-lease`), so nobody's new commits are lost unseen.
+pub fn push(root: &Path, set_upstream: Option<&str>, force: bool) -> Result<String, String> {
+    let mut args = vec!["push", "--porcelain"];
+    if force {
+        args.push("--force-with-lease");
     }
+    if let Some(branch) = set_upstream {
+        args.extend(["--set-upstream", "origin", branch]);
+    }
+    run(root, &args)
+}
+
+/// What a push would send: the branch, where it goes, and its new commits.
+#[derive(Clone, Debug)]
+pub struct PushPreview {
+    pub branch: String,
+    /// "origin/main", or `None` when the branch has no upstream yet (the
+    /// push creates `origin/<branch>`).
+    pub upstream: Option<String>,
+    pub commits: Vec<LogEntry>,
+    /// Commits on the remote branch that aren't here (a push would be
+    /// rejected without force).
+    pub behind: u32,
+    pub has_remote: bool,
+}
+
+pub fn push_preview(root: &Path) -> Result<PushPreview, String> {
+    let status = status(root)?;
+    let branch = status.branch.clone().ok_or("HEAD is detached; check out a branch to push")?;
+    // Without an upstream, everything no remote has yet.
+    let commits = match &status.upstream {
+        Some(upstream) => log_args(root, 500, &[&format!("{upstream}..HEAD")])?,
+        None => log_args(root, 500, &["HEAD", "--not", "--remotes"])?,
+    };
+    Ok(PushPreview { branch, upstream: status.upstream, commits, behind: status.behind, has_remote: has_remote(root) })
 }
 
 pub fn pull(root: &Path) -> Result<String, String> {
@@ -1132,6 +1163,18 @@ pub struct LogEntry {
 /// Up to `limit` commits reachable from HEAD (`all`: from every branch),
 /// newest first; `path` limits it to one file's history, following renames.
 pub fn log(root: &Path, limit: usize, all: bool, path: Option<&str>) -> Result<Vec<LogEntry>, String> {
+    let mut extra = Vec::new();
+    if all && path.is_none() {
+        extra.push("--all");
+    }
+    if let Some(path) = path {
+        extra.extend(["--follow", "--", path]);
+    }
+    log_args(root, limit, &extra)
+}
+
+/// `git log` with our format and `extra` revisions or options.
+fn log_args(root: &Path, limit: usize, extra: &[&str]) -> Result<Vec<LogEntry>, String> {
     let limit = format!("--max-count={limit}");
     let mut args = vec![
         "log",
@@ -1141,12 +1184,7 @@ pub fn log(root: &Path, limit: usize, all: bool, path: Option<&str>) -> Result<V
         &limit,
         "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%ct%x1f%ad%x1f%D%x1f%s%x1e",
     ];
-    if all && path.is_none() {
-        args.push("--all");
-    }
-    if let Some(path) = path {
-        args.extend(["--follow", "--", path]);
-    }
+    args.extend_from_slice(extra);
     match run(root, &args) {
         Ok(out) => Ok(parse_log(&out)),
         // A repository without commits has no history.
@@ -1496,7 +1534,12 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         assert!(!has_remote(&root));
         run(&root, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
         assert!(has_remote(&root));
-        push(&root, Some("feature")).unwrap();
+        // Before pushing, the preview lists the unpushed commit for a new branch.
+        let preview = push_preview(&root).unwrap();
+        assert_eq!((preview.branch.as_str(), preview.upstream.as_deref(), preview.commits.len()), ("feature", None, 1));
+        push(&root, Some("feature"), false).unwrap();
+        let preview = push_preview(&root).unwrap();
+        assert_eq!((preview.upstream.as_deref(), preview.commits.len()), (Some("origin/feature"), 0));
         let s = status(&root).unwrap();
         assert_eq!(s.upstream.as_deref(), Some("origin/feature"));
         assert_eq!((s.ahead, s.behind), (0, 0));

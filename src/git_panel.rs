@@ -28,7 +28,10 @@ pub enum GitOp {
     UnstageLines { rel: String, text: Option<String>, rows: Range<usize> },
     Discard(Vec<FileStatus>),
     Commit { message: String, amend: bool, all: bool, push: bool },
+    /// Opens the Push dialog (the commits to push, then Push or Cancel).
     Push,
+    /// Pushes the current branch (from the Push dialog).
+    PushNow { force: bool },
     Pull,
     Fetch,
     Checkout(Branch),
@@ -57,7 +60,7 @@ impl GitOp {
             GitOp::Discard(_) => "Discarding…",
             GitOp::Commit { push: true, .. } => "Committing and pushing…",
             GitOp::Commit { .. } => "Committing…",
-            GitOp::Push => "Pushing…",
+            GitOp::Push | GitOp::PushNow { .. } => "Pushing…",
             GitOp::Pull => "Pulling…",
             GitOp::Fetch => "Fetching…",
             GitOp::Checkout(_) => "Checking out…",

@@ -375,6 +375,11 @@ message instead of hanging; use an SSH agent or a credential helper.
   **Show History** (editor right-click menu, Git menu) lists one file's commits, following renames.
 - **Push / Pull / Fetch:** from the Commit panel, the keyboard, or Find Action. Pushing a
   new branch sets its upstream. Results appear as notifications.
+- **Push** (⌘⇧K / Ctrl+Shift+K) first opens a dialog with the branch and where it goes (a new
+  branch is marked), and the commits to push. Click a commit for its message and files, and a
+  file for its diff (closing it returns to the dialog). It warns when the remote has commits you
+  don't have; **Force push** replaces them only if the remote hasn't moved since your last fetch
+  (`--force-with-lease`). Enter pushes, Esc cancels.
 
 - **Clone:** **Clone Repository…** on the welcome screen, in the File and Git menus, or Find Action
   (also as "Get from Version Control"). Enter an HTTPS or SSH URL (one on the clipboard is

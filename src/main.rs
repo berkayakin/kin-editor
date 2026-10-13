@@ -23,6 +23,7 @@ mod preview;
 mod preferences;
 mod run;
 mod project_search;
+mod push_dialog;
 mod search;
 mod settings;
 mod state;

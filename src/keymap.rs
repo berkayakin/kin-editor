@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::{
     editor::*,
     picker::ActionEntry,
+    push_dialog::ConfirmPush,
     terminal::{TerminalClear, TerminalCopy, TerminalPaste},
     settings::strip_jsonc,
     theme::{self, config_dir},
@@ -81,6 +82,11 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-shift-down", NextChange, e),
         KeyBinding::new("ctrl-alt-shift-up", PreviousChange, e),
         KeyBinding::new("escape", Cancel, Some("DiffView")),
+        KeyBinding::new("escape", Cancel, Some("PushDialog")),
+        KeyBinding::new("enter", ConfirmPush, Some("PushDialog")),
+        KeyBinding::new("secondary-enter", ConfirmPush, Some("PushDialog")),
+        KeyBinding::new("up", MoveUp, Some("PushDialog")),
+        KeyBinding::new("down", MoveDown, Some("PushDialog")),
         // JetBrains' diff viewer: F7 / ⇧F7 step through changes.
         KeyBinding::new("f7", NextChange, Some("DiffView")),
         KeyBinding::new("shift-f7", PreviousChange, Some("DiffView")),
