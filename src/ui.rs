@@ -12,7 +12,15 @@ pub fn file_icon(path: &std::path::Path, theme: &Theme) -> (Icon, Hsla) {
     match Language::from_path(path) {
         Language::JavaScript => (Icon::FileCode, theme.file_js.into()),
         Language::Html => (Icon::CodeXml, theme.file_html.into()),
-        Language::Rust | Language::Go | Language::Python | Language::Php => (Icon::FileCode, theme.text_muted.into()),
+        Language::TypeScript
+        | Language::Tsx
+        | Language::Css
+        | Language::Rust
+        | Language::Go
+        | Language::Python
+        | Language::Php
+        | Language::Shell => (Icon::FileCode, theme.text_muted.into()),
+        Language::Json | Language::Yaml | Language::Toml => (Icon::Braces, theme.text_muted.into()),
         Language::Markdown => (Icon::FileText, theme.text_muted.into()),
         Language::PlainText => (Icon::File, theme.text_dim.into()),
     }

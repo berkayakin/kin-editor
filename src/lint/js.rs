@@ -1,4 +1,4 @@
-//! JavaScript linting on top of the oxc parser and semantic model.
+//! JavaScript and TypeScript linting on top of the oxc parser and semantic model.
 
 use std::collections::HashSet;
 
@@ -25,10 +25,30 @@ pub enum Context {
     InlineScript,
 }
 
-pub fn lint(source: &str, base: usize, context: Context) -> Vec<Diagnostic> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    JavaScript,
+    TypeScript,
+    Tsx,
+    /// A `.d.ts` file: only declarations, so only syntax is checked.
+    Declaration,
+}
+
+impl Dialect {
+    fn source_type(self) -> SourceType {
+        match self {
+            Dialect::JavaScript => SourceType::unambiguous().with_jsx(true),
+            Dialect::TypeScript => SourceType::ts(),
+            Dialect::Tsx => SourceType::tsx(),
+            Dialect::Declaration => SourceType::d_ts(),
+        }
+    }
+}
+
+pub fn lint(source: &str, base: usize, context: Context, dialect: Dialect) -> Vec<Diagnostic> {
     let allocator = Allocator::default();
-    let source_type = SourceType::unambiguous().with_jsx(true);
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let parsed = Parser::new(&allocator, source, dialect.source_type()).parse();
+    let typescript = dialect != Dialect::JavaScript;
 
     let mut out = Vec::new();
     let mut push = |span: Span, severity, message: String, rule: &'static str| {
@@ -53,6 +73,9 @@ pub fn lint(source: &str, base: usize, context: Context) -> Vec<Diagnostic> {
         .build(&parsed.program);
     for d in built.diagnostics.iter() {
         push(diagnostic_span(d), Severity::Error, clean_message(d), "syntax");
+    }
+    if dialect == Dialect::Declaration {
+        return out;
     }
 
     let semantic = built.semantic;
@@ -155,7 +178,9 @@ pub fn lint(source: &str, base: usize, context: Context) -> Vec<Diagnostic> {
                     );
                 }
             }
-            AstKind::IdentifierReference(ident) => {
+            // TypeScript reports undefined names itself, and ambient globals
+            // often come from `.d.ts` files this single-file pass can't see.
+            AstKind::IdentifierReference(ident) if !typescript => {
                 if semantic.is_unresolved_reference(node.id())
                     && !is_known_global(&ident.name)
                     && !matches!(nodes.parent_kind(node.id()), AstKind::UnaryExpression(u) if u.operator == UnaryOperator::Typeof)
@@ -192,7 +217,7 @@ pub fn lint(source: &str, base: usize, context: Context) -> Vec<Diagnostic> {
             }
         }
 
-        if name.starts_with('_') || flags.contains(SymbolFlags::CatchVariable) {
+        if name.starts_with('_') || flags.intersects(SymbolFlags::CatchVariable | SymbolFlags::Ambient) {
             continue;
         }
         if !flags.intersects(SymbolFlags::Variable | SymbolFlags::Function | SymbolFlags::Class | SymbolFlags::Import) {
@@ -202,7 +227,8 @@ pub fn lint(source: &str, base: usize, context: Context) -> Vec<Diagnostic> {
             continue;
         }
         let mut references = references;
-        if references.any(|r| r.is_read()) {
+        // A use in a type annotation counts (an import used only as a type).
+        if references.any(|r| r.is_read() || r.is_type()) {
             continue;
         }
         let decl = scoping.symbol_declaration(symbol);
@@ -329,7 +355,26 @@ mod tests {
     use super::*;
 
     fn rules(src: &str) -> Vec<String> {
-        lint(src, 0, Context::File).into_iter().map(|d| d.rule.into_owned()).collect()
+        lint(src, 0, Context::File, Dialect::JavaScript).into_iter().map(|d| d.rule.into_owned()).collect()
+    }
+
+    fn ts_rules(src: &str, dialect: Dialect) -> Vec<String> {
+        lint(src, 0, Context::File, dialect).into_iter().map(|d| d.rule.into_owned()).collect()
+    }
+
+    #[test]
+    fn lints_typescript() {
+        let ts = |src| ts_rules(src, Dialect::TypeScript);
+        assert!(ts("let x: number = ;").contains(&"syntax".to_string()));
+        assert!(ts("function f() { const unused: string = 'a'; } f();").contains(&"no-unused-vars".to_string()));
+        assert!(ts("const a = 1; if (a == 2) {}").contains(&"eqeqeq".to_string()));
+        // Type-only uses, ambient declarations and names TypeScript resolves.
+        assert!(ts("import { Foo } from './foo';\nexport let x: Foo;").is_empty(), "{:?}", ts("import { Foo } from './foo';\nexport let x: Foo;"));
+        assert!(ts("declare const API_URL: string;\nexport interface P { x: number }").is_empty());
+        assert!(ts("export const t: Record<string, NodeJS.Timeout> = {}; undeclaredGlobal();").is_empty());
+        assert!(ts_rules("const a = <div className=\"x\" />; export default a;", Dialect::Tsx).is_empty());
+        assert!(ts_rules("declare function f(a: string): void;\nexport {};", Dialect::Declaration).is_empty());
+        assert!(ts_rules("declare function f(a: string: void;", Dialect::Declaration).contains(&"syntax".to_string()));
     }
 
     #[test]

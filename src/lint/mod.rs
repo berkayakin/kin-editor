@@ -32,11 +32,29 @@ pub struct Diagnostic {
 /// `path` locates project config (e.g. `.markdownlint.json`) and relative links.
 pub fn lint(language: Language, text: &str, path: Option<&std::path::Path>, syntax_only: bool) -> Vec<Diagnostic> {
     let mut diagnostics = match language {
-        Language::JavaScript => js::lint(text, 0, js::Context::File),
-        Language::Html => html::lint(text),
-        Language::Rust | Language::Go | Language::Python | Language::Php => {
-            syntax::grammar(language).map_or_else(Vec::new, |g| syntax_errors::lint(&g, text))
+        Language::JavaScript => js::lint(text, 0, js::Context::File, js::Dialect::JavaScript),
+        Language::TypeScript | Language::Tsx => {
+            let declaration = path
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| [".d.ts", ".d.mts", ".d.cts"].iter().any(|ext| n.ends_with(ext)));
+            let dialect = match language {
+                _ if declaration => js::Dialect::Declaration,
+                Language::Tsx => js::Dialect::Tsx,
+                _ => js::Dialect::TypeScript,
+            };
+            js::lint(text, 0, js::Context::File, dialect)
         }
+        Language::Html => html::lint(text),
+        Language::Css
+        | Language::Rust
+        | Language::Go
+        | Language::Python
+        | Language::Php
+        | Language::Shell
+        | Language::Json
+        | Language::Yaml
+        | Language::Toml => syntax::grammar(language).map_or_else(Vec::new, |g| syntax_errors::lint(&g, text)),
         Language::Markdown => markdown::lint(text, path),
         Language::PlainText => Vec::new(),
     };

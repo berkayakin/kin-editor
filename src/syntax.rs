@@ -15,17 +15,32 @@ use tree_sitter::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
     JavaScript,
+    TypeScript,
+    Tsx,
     Html,
+    Css,
     Rust,
     Go,
     Python,
     Php,
+    Shell,
+    Json,
+    Yaml,
+    Toml,
     Markdown,
     PlainText,
 }
 
 impl Language {
     pub fn from_path(path: &Path) -> Self {
+        // Well-known files whose name, not extension, gives the language.
+        match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {
+            ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".profile" | ".zshrc"
+            | ".zshenv" | ".zprofile" | ".zlogin" | ".envrc" => return Language::Shell,
+            "Cargo.lock" | "poetry.lock" | "uv.lock" | "Pipfile" => return Language::Toml,
+            ".babelrc" | ".eslintrc" | ".swcrc" => return Language::Json,
+            _ => {}
+        }
         match path
             .extension()
             .and_then(|e| e.to_str())
@@ -33,11 +48,18 @@ impl Language {
             .as_deref()
         {
             Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
+            Some("ts" | "mts" | "cts") => Language::TypeScript,
+            Some("tsx") => Language::Tsx,
             Some("html" | "htm" | "xhtml") => Language::Html,
+            Some("css") => Language::Css,
             Some("rs") => Language::Rust,
             Some("go") => Language::Go,
             Some("py" | "pyw" | "pyi") => Language::Python,
             Some("php" | "phtml") => Language::Php,
+            Some("sh" | "bash" | "zsh") => Language::Shell,
+            Some("json" | "jsonc") => Language::Json,
+            Some("yaml" | "yml") => Language::Yaml,
+            Some("toml") => Language::Toml,
             Some("md" | "markdown" | "mdown" | "mkd") => Language::Markdown,
             _ => Language::PlainText,
         }
@@ -46,11 +68,18 @@ impl Language {
     pub fn name(self) -> &'static str {
         match self {
             Language::JavaScript => "JavaScript",
+            Language::TypeScript => "TypeScript",
+            Language::Tsx => "TSX",
             Language::Html => "HTML",
+            Language::Css => "CSS",
             Language::Rust => "Rust",
             Language::Go => "Go",
             Language::Python => "Python",
             Language::Php => "PHP",
+            Language::Shell => "Shell Script",
+            Language::Json => "JSON",
+            Language::Yaml => "YAML",
+            Language::Toml => "TOML",
             Language::Markdown => "Markdown",
             Language::PlainText => "Plain Text",
         }
@@ -62,17 +91,31 @@ impl Language {
 
     pub fn line_comment(self) -> Option<&'static str> {
         match self {
-            Language::JavaScript | Language::Rust | Language::Go | Language::Php => Some("// "),
-            Language::Python => Some("# "),
-            Language::Html | Language::Markdown | Language::PlainText => None,
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::Rust
+            | Language::Go
+            | Language::Php
+            // JSONC (tsconfig, VS Code settings); the grammar accepts comments.
+            | Language::Json => Some("// "),
+            Language::Python | Language::Shell | Language::Yaml | Language::Toml => Some("# "),
+            Language::Html | Language::Css | Language::Markdown | Language::PlainText => None,
         }
     }
 
     pub fn block_comment(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Language::JavaScript | Language::Rust | Language::Go | Language::Php => Some(("/* ", " */")),
+            Language::JavaScript
+            | Language::TypeScript
+            | Language::Tsx
+            | Language::Css
+            | Language::Rust
+            | Language::Go
+            | Language::Php
+            | Language::Json => Some(("/* ", " */")),
             Language::Html | Language::Markdown => Some(("<!-- ", " -->")),
-            Language::Python | Language::PlainText => None,
+            Language::Python | Language::Shell | Language::Yaml | Language::Toml | Language::PlainText => None,
         }
     }
 }
@@ -82,12 +125,19 @@ impl Language {
 pub fn grammar(language: Language) -> Option<TsLanguage> {
     Some(match language {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::Html => tree_sitter_html::LANGUAGE.into(),
+        Language::Css => tree_sitter_css::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         // The PHP grammar that also accepts HTML around `<?php` tags.
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::Shell => tree_sitter_bash::LANGUAGE.into(),
+        Language::Json => tree_sitter_json::LANGUAGE.into(),
+        Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
         // Block structure only; inline syntax is a second grammar (see `Syntax`).
         Language::Markdown => tree_sitter_md::LANGUAGE.into(),
         Language::PlainText => return None,
@@ -123,6 +173,7 @@ impl Highlight {
             (_, "function.method") => Highlight::Method,
             (_, "variable.builtin") => Highlight::VariableBuiltin,
             (_, "string.special") => Highlight::Escape,
+            (_, "string.special.key") => Highlight::Property,
             (_, "tag.error") => Highlight::Tag,
             // Markdown (nvim-treesitter style "text.*" captures).
             (_, "text.title" | "text.strong") => Highlight::Keyword,
@@ -130,10 +181,13 @@ impl Highlight {
             (_, "text.uri") => Highlight::Property,
             (_, "text.reference") => Highlight::Function,
             (_, "text.emphasis") => Highlight::Type,
-            ("keyword", _) => Highlight::Keyword,
+            // CSS at-rules capture under their own names.
+            ("keyword" | "charset" | "import" | "keyframes" | "media" | "namespace" | "supports", _) => {
+                Highlight::Keyword
+            }
             ("string", _) => Highlight::String,
             ("number", _) => Highlight::Number,
-            ("constant", _) => Highlight::Constant,
+            ("constant" | "boolean" | "label", _) => Highlight::Constant,
             ("function", _) => Highlight::Function,
             ("property", _) => Highlight::Property,
             ("constructor" | "type", _) => Highlight::Type,
@@ -164,6 +218,17 @@ const HTML_HIGHLIGHTS: &str = r#"
 
 const JS_EXTRA_HIGHLIGHTS: &str = r#"
 (escape_sequence) @escape
+"#;
+
+/// The grammar's own query captures keys before strings; here the later
+/// pattern wins, so keys must come after `(string)` to get their own color.
+const JSON_HIGHLIGHTS: &str = r#"
+(string) @string
+(pair key: (string) @property)
+(number) @number
+[(null) (true) (false)] @constant.builtin
+(escape_sequence) @escape
+(comment) @comment
 "#;
 
 /// The Rust grammar's query tags literals as `constant.builtin`; numbers read
@@ -199,12 +264,49 @@ static JS: LazyLock<LangConfig> = LazyLock::new(|| {
     LangConfig::new(
         tree_sitter_javascript::LANGUAGE.into(),
         &format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             JS_EXTRA_HIGHLIGHTS
         ),
     )
 });
+
+/// TypeScript's query only adds types and keywords on top of JavaScript's.
+fn typescript_config(language: TsLanguage, jsx: bool) -> LangConfig {
+    let jsx = if jsx { tree_sitter_javascript::JSX_HIGHLIGHT_QUERY } else { "" };
+    LangConfig::new(
+        language,
+        &format!(
+            "{}\n{}\n{}\n{}",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            jsx,
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            JS_EXTRA_HIGHLIGHTS
+        ),
+    )
+}
+
+static TYPESCRIPT: LazyLock<LangConfig> =
+    LazyLock::new(|| typescript_config(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), false));
+
+static TSX: LazyLock<LangConfig> =
+    LazyLock::new(|| typescript_config(tree_sitter_typescript::LANGUAGE_TSX.into(), true));
+
+static CSS: LazyLock<LangConfig> =
+    LazyLock::new(|| LangConfig::new(tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY));
+
+static SHELL: LazyLock<LangConfig> =
+    LazyLock::new(|| LangConfig::new(tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY));
+
+static JSON: LazyLock<LangConfig> =
+    LazyLock::new(|| LangConfig::new(tree_sitter_json::LANGUAGE.into(), JSON_HIGHLIGHTS));
+
+static YAML: LazyLock<LangConfig> =
+    LazyLock::new(|| LangConfig::new(tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY));
+
+static TOML: LazyLock<LangConfig> =
+    LazyLock::new(|| LangConfig::new(tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY));
 
 static HTML: LazyLock<LangConfig> =
     LazyLock::new(|| LangConfig::new(tree_sitter_html::LANGUAGE.into(), HTML_HIGHLIGHTS));
@@ -238,11 +340,18 @@ static MARKDOWN_INLINE: LazyLock<LangConfig> = LazyLock::new(|| {
 fn config(language: Language) -> Option<&'static LangConfig> {
     Some(match language {
         Language::JavaScript => &JS,
+        Language::TypeScript => &TYPESCRIPT,
+        Language::Tsx => &TSX,
         Language::Html => &HTML,
+        Language::Css => &CSS,
         Language::Rust => &RUST,
         Language::Go => &GO,
         Language::Python => &PYTHON,
         Language::Php => &PHP,
+        Language::Shell => &SHELL,
+        Language::Json => &JSON,
+        Language::Yaml => &YAML,
+        Language::Toml => &TOML,
         Language::Markdown => &MARKDOWN,
         Language::PlainText => return None,
     })
@@ -492,16 +601,88 @@ mod tests {
 
     #[test]
     fn highlight_queries_compile() {
-        for language in [
-            Language::JavaScript,
-            Language::Html,
-            Language::Rust,
-            Language::Go,
-            Language::Python,
-            Language::Php,
-        ] {
+        for language in ALL_HIGHLIGHTED {
             let config = config(language).unwrap();
             assert!(!config.captures.is_empty(), "{language:?}");
         }
+    }
+
+    const ALL_HIGHLIGHTED: [Language; 14] = [
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::Html,
+        Language::Css,
+        Language::Rust,
+        Language::Go,
+        Language::Python,
+        Language::Php,
+        Language::Shell,
+        Language::Json,
+        Language::Yaml,
+        Language::Toml,
+        Language::Markdown,
+    ];
+
+    fn highlights_of(path: &str, src: &str) -> Vec<(String, Highlight)> {
+        let language = Language::from_path(Path::new(path));
+        let rope = Rope::from_str(src);
+        let syntax = Syntax::new(language, &rope);
+        syntax
+            .highlights(&rope, 0..src.len())
+            .into_iter()
+            .map(|(r, h)| (src[r].to_string(), h))
+            .collect()
+    }
+
+    fn has(spans: &[(String, Highlight)], text: &str, h: Highlight) -> bool {
+        spans.iter().any(|(t, x)| t == text && *x == h)
+    }
+
+    #[test]
+    fn detects_languages_by_name_and_extension() {
+        for (path, language) in [
+            ("a.ts", Language::TypeScript),
+            ("a.d.ts", Language::TypeScript),
+            ("a.mts", Language::TypeScript),
+            ("App.tsx", Language::Tsx),
+            ("style.css", Language::Css),
+            ("run.sh", Language::Shell),
+            (".zshrc", Language::Shell),
+            ("package.json", Language::Json),
+            ("tsconfig.jsonc", Language::Json),
+            ("ci.yml", Language::Yaml),
+            ("Cargo.toml", Language::Toml),
+            ("Cargo.lock", Language::Toml),
+            ("yarn.lock", Language::PlainText),
+        ] {
+            assert_eq!(Language::from_path(Path::new(path)), language, "{path}");
+        }
+    }
+
+    #[test]
+    fn new_languages_highlight() {
+        let ts = highlights_of("a.ts", "interface Point { x: number }\nconst p: Point = { x: 1 };\n");
+        assert!(has(&ts, "interface", Highlight::Keyword), "{ts:?}");
+        assert!(has(&ts, "number", Highlight::Type), "{ts:?}");
+        assert!(has(&ts, "const", Highlight::Keyword), "{ts:?}");
+        let tsx = highlights_of("a.tsx", "const a = <div className=\"x\" />;\n");
+        assert!(has(&tsx, "div", Highlight::Tag), "{tsx:?}");
+        assert!(has(&tsx, "className", Highlight::Attribute), "{tsx:?}");
+        let css = highlights_of("a.css", "@media screen { .a { color: red; } }\n");
+        assert!(has(&css, "@media", Highlight::Keyword), "{css:?}");
+        assert!(has(&css, "color", Highlight::Property), "{css:?}");
+        let json = highlights_of("a.json", "{\"name\": \"kin\", \"n\": 1, \"ok\": true}\n");
+        assert!(has(&json, "\"name\"", Highlight::Property), "{json:?}");
+        assert!(has(&json, "\"kin\"", Highlight::String), "{json:?}");
+        assert!(has(&json, "true", Highlight::Constant), "{json:?}");
+        let yaml = highlights_of("a.yaml", "name: kin\non: true\n");
+        assert!(has(&yaml, "name", Highlight::Property), "{yaml:?}");
+        assert!(has(&yaml, "kin", Highlight::String), "{yaml:?}");
+        let toml = highlights_of("a.toml", "[package]\nname = \"kin\"\n");
+        assert!(has(&toml, "\"kin\"", Highlight::String), "{toml:?}");
+        let sh = highlights_of("a.sh", "# hi\nif [ -n \"$X\" ]; then echo ok; fi\n");
+        assert!(has(&sh, "# hi", Highlight::Comment), "{sh:?}");
+        assert!(has(&sh, "if", Highlight::Keyword), "{sh:?}");
     }
 }

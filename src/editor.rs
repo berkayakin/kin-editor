@@ -314,7 +314,10 @@ impl Editor {
 
     fn detect_external_linter(&mut self) {
         self.external = match (&self.doc.path, self.doc.language) {
-            (Some(path), crate::syntax::Language::JavaScript) => lint::external::find_for(path),
+            (
+                Some(path),
+                crate::syntax::Language::JavaScript | crate::syntax::Language::TypeScript | crate::syntax::Language::Tsx,
+            ) => lint::external::find_for(path),
             _ => None,
         };
         self.external_error = None;
@@ -1063,7 +1066,11 @@ impl Editor {
         }
         let unit = self.indent_unit.clone();
         let is_html = self.doc.language == crate::syntax::Language::Html;
-        let is_python = self.doc.language == crate::syntax::Language::Python;
+        // Python blocks and YAML mappings open with a trailing `:`.
+        let colon_opens = matches!(
+            self.doc.language,
+            crate::syntax::Language::Python | crate::syntax::Language::Yaml
+        );
         self.edit_selections(EditKind::Other, cx, |doc, s| {
             let r = s.range();
             let row = doc.row_of(r.start);
@@ -1081,9 +1088,9 @@ impl Editor {
                     !tag.starts_with("</") && !tag.starts_with("<!")
                 })
             };
-            // Python blocks open with a trailing `:` (`def f():`, `if x:`).
-            let opens_python_block = is_python && prev == Some(':') && !before.trim_start().starts_with('#');
-            let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_python_block;
+            // `def f():`, `if x:`, `steps:`
+            let opens_colon_block = colon_opens && prev == Some(':') && !before.trim_start().starts_with('#');
+            let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_colon_block;
             let closes_next = match prev {
                 Some('{') => next == Some('}'),
                 Some('[') => next == Some(']'),
@@ -1223,11 +1230,18 @@ impl Editor {
                         }
                     }
                 }
-                None if language == crate::syntax::Language::Html => {
+                // No line comments (HTML, CSS, Markdown): wrap each line in a block comment.
+                None => {
+                    let Some((open, close)) = language.block_comment() else {
+                        continue;
+                    };
+                    let (open_token, close_token) = (open.trim_end(), close.trim_start());
                     let all_commented = rows.iter().all(|&r| {
                         let t = self.doc.line_text(r);
                         let t = t.trim();
-                        t.starts_with("<!--") && t.ends_with("-->")
+                        t.len() >= open_token.len() + close_token.len()
+                            && t.starts_with(open_token)
+                            && t.ends_with(close_token)
                     });
                     for &r in &rows {
                         let t = self.doc.line_text(r);
@@ -1236,17 +1250,20 @@ impl Editor {
                         let end = start + t.trim_end().len();
                         if all_commented {
                             let body = t.trim();
-                            let open = if body.starts_with("<!-- ") { 5 } else { 4 };
-                            let close = if body.ends_with(" -->") { 4 } else { 3 };
-                            edits.push((end - close..end, String::new()));
-                            edits.push((start + indent..start + indent + open, String::new()));
+                            let mut open_len = if body.starts_with(open) { open.len() } else { open_token.len() };
+                            let mut close_len = if body.ends_with(close) { close.len() } else { close_token.len() };
+                            // `/* */`: the padding spaces overlap, so remove only the tokens.
+                            if open_len + close_len > body.len() {
+                                (open_len, close_len) = (open_token.len(), close_token.len());
+                            }
+                            edits.push((end - close_len..end, String::new()));
+                            edits.push((start + indent..start + indent + open_len, String::new()));
                         } else {
-                            edits.push((end..end, " -->".into()));
-                            edits.push((start + indent..start + indent, "<!-- ".into()));
+                            edits.push((end..end, close.into()));
+                            edits.push((start + indent..start + indent, open.into()));
                         }
                     }
                 }
-                None => {}
             }
         }
         if !edits.is_empty() {
@@ -2216,7 +2233,13 @@ fn detect_indent(doc: &Document) -> String {
         "\t".into()
     } else if spaces2 > spaces4 / 2 && spaces2 > 0 {
         "  ".into()
-    } else if spaces4 == 0 && doc.language == crate::syntax::Language::Html {
+    } else if spaces4 == 0
+        && matches!(
+            doc.language,
+            crate::syntax::Language::Html | crate::syntax::Language::Json | crate::syntax::Language::Yaml
+        )
+    {
+        // The usual style for markup and data files (and npm's package.json).
         "  ".into()
     } else if spaces4 == 0 && doc.language == crate::syntax::Language::Go {
         // gofmt indents with tabs.

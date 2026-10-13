@@ -291,7 +291,7 @@ pub fn lint(src: &str) -> Vec<Diagnostic> {
     }
 
     for (start, end) in scripts {
-        out.extend(js::lint(&src[start..end], start, js::Context::InlineScript));
+        out.extend(js::lint(&src[start..end], start, js::Context::InlineScript, js::Dialect::JavaScript));
     }
 
     out

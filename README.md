@@ -7,10 +7,13 @@ platform-native text rendering (CoreText / DirectWrite).
 ## Features
 
 - Rope-backed buffer (`ropey`) with undo/redo; only visible lines are shaped and painted
-- Tree-sitter syntax highlighting for JavaScript, HTML (including `<script>` blocks), Rust, Go, Python and PHP
+- Tree-sitter syntax highlighting for JavaScript/JSX, TypeScript/TSX, HTML (including `<script>` blocks),
+  CSS, Rust, Go, Python, PHP, shell scripts, JSON, YAML, TOML and Markdown
 - Linting off the main thread:
   - **JavaScript** — syntax errors plus `no-unused-vars`, `no-undef`, `no-const-assign`,
     `no-dupe-keys`, `eqeqeq`, `use-isnan`, `no-cond-assign`, `no-debugger`, `no-var` (built on oxc)
+  - **TypeScript** — the same rules except `no-undef` (TypeScript checks names itself); type-only
+    uses count as uses; `.d.ts` files get syntax errors only
   - **HTML** — unclosed/stray/void closing tags, duplicate attributes and ids, `img` alt,
     `lang`, doctype, `<title>`, obsolete tags, `target="_blank"` without `rel`; inline scripts are linted as JS
   - **Markdown** — the markdownlint rules (MD001–MD07x: heading structure, list style, code
@@ -18,8 +21,9 @@ platform-native text rendering (CoreText / DirectWrite).
     via [rumdl](https://rumdl.dev). A project's `.markdownlint.json`/`.yaml`, `.rumdl.toml` or
     `pyproject.toml` `[tool.rumdl]` is used when present; otherwise line length (MD013) is off
   - **ESLint** — if the file's project has `node_modules/.bin/eslint`, it runs on open/save with the
-    project's own config; built-in JS rules then drop back to syntax errors only
-  - **Rust, Go, Python, PHP** — syntax errors from the tree-sitter parser (unexpected and missing tokens)
+    project's own config (JavaScript and TypeScript); built-in rules then drop back to syntax errors only
+  - **CSS, Rust, Go, Python, PHP, shell, JSON, YAML, TOML** — syntax errors from the tree-sitter parser
+    (unexpected and missing tokens)
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
 - Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines

@@ -114,6 +114,11 @@ mod tests {
         assert!(errors(Language::Go, "package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n").is_empty());
         assert!(errors(Language::Python, "def f(x):\n    return x + 1\n").is_empty());
         assert!(errors(Language::Php, "<p><?php echo $x; ?></p>\n").is_empty());
+        assert!(errors(Language::Css, "@media screen {\n  .a > b:hover { color: #fff; }\n}\n").is_empty());
+        assert!(errors(Language::Shell, "#!/bin/sh\nif [ -n \"$1\" ]; then\n  echo \"$1\"\nfi\n").is_empty());
+        assert!(errors(Language::Json, "{\n  // comment\n  \"a\": [1, true, null]\n}\n").is_empty());
+        assert!(errors(Language::Yaml, "name: ci\non:\n  push:\n    branches: [main]\nsteps:\n  - run: echo hi\n").is_empty());
+        assert!(errors(Language::Toml, "[package]\nname = \"kin\"\n\n[dependencies]\nserde = { version = \"1\" }\n").is_empty());
     }
 
     #[test]
@@ -124,6 +129,11 @@ mod tests {
             (Language::Go, "package main\n\nfunc main() {\n\tx := \n}\n"),
             (Language::Python, "def f(x)\n    return x\n"),
             (Language::Php, "<?php\n$x = ;\n"),
+            (Language::Css, ".a { color: red;\n"),
+            (Language::Shell, "if true; then\n  echo hi\n"),
+            (Language::Json, "{\"a\": 1,, \"b\": 2}\n"),
+            (Language::Yaml, "a: [1, 2\nb: 3\n"),
+            (Language::Toml, "[package\nname = \"kin\"\n"),
         ] {
             let found = errors(language, src);
             eprintln!("{language:?}: {found:?}");

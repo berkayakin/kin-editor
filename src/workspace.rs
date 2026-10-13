@@ -3392,7 +3392,17 @@ impl Workspace {
             let (icon, color) = match e.doc.language {
                 Language::JavaScript => (Icon::Braces, Hsla::from(theme.file_js)),
                 Language::Html => (Icon::CodeXml, Hsla::from(theme.file_html)),
-                Language::Rust | Language::Go | Language::Python | Language::Php => (Icon::Braces, Hsla::from(theme.text_muted)),
+                Language::TypeScript
+                | Language::Tsx
+                | Language::Css
+                | Language::Rust
+                | Language::Go
+                | Language::Python
+                | Language::Php
+                | Language::Shell
+                | Language::Json
+                | Language::Yaml
+                | Language::Toml => (Icon::Braces, Hsla::from(theme.text_muted)),
                 Language::Markdown => (Icon::FileText, Hsla::from(theme.text_muted)),
                 Language::PlainText => (Icon::FileText, theme.text_dim.into()),
             };
