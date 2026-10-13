@@ -23,6 +23,7 @@
     "indent_guide": "#eceff410",
     "search_match": "#ebcb8b40",
     "search_active": "#ebcb8b80",
+    "bracket_match": "#d8dee926",
     "error": "#bf616a",
     "warning": "#ebcb8b",
     "info": "#81a1c1",

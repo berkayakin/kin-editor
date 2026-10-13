@@ -25,7 +25,7 @@ use crate::{
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
     diff_view::{DiffView, DiffViewEvent},
-    editor::{Cancel, Editor, EditorEvent, GitFile},
+    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
@@ -34,7 +34,7 @@ use crate::{
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, project_files},
-    state::SessionState,
+    state::{ProjectSession, SessionState, TabSession},
     syntax::Language,
     theme::{self, AutoSave, Settings, Theme},
     theme_picker::{ThemePicker, ThemePickerEvent},
@@ -70,6 +70,7 @@ actions!(
         RecentFiles,
         FindAction,
         GoToLine,
+        FileStructure,
         SelectTheme,
         OpenThemesFolder,
         ReloadThemes,
@@ -171,12 +172,28 @@ enum PendingInput {
     Rename(PathBuf),
 }
 
+/// What a context menu item does.
+enum MenuAction {
+    Tree(TreeAction),
+    /// An action dispatched to the focused editor.
+    Run(Box<dyn gpui::Action>),
+}
+
+impl Clone for MenuAction {
+    fn clone(&self) -> Self {
+        match self {
+            MenuAction::Tree(action) => MenuAction::Tree(action.clone()),
+            MenuAction::Run(action) => MenuAction::Run(action.boxed_clone()),
+        }
+    }
+}
+
 struct OpenContextMenu {
     menu: Entity<ContextMenu>,
     position: gpui::Point<Pixels>,
-    actions: Vec<Option<TreeAction>>,
+    actions: Vec<Option<MenuAction>>,
     /// The tree entry that was right-clicked (highlighted while open).
-    target: PathBuf,
+    target: Option<PathBuf>,
     _subscription: Subscription,
 }
 
@@ -262,6 +279,8 @@ pub struct Workspace {
     auto_save_warned: HashSet<EntityId>,
     /// The user chose to discard unsaved changes, so closing goes ahead.
     close_confirmed: bool,
+    /// Debounced write of the project session (see `save_session`).
+    session_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -303,6 +322,9 @@ impl Workspace {
         let quit = cx.on_app_quit(|ws, cx| {
             if ws.auto_save != AutoSave::Off {
                 ws.auto_save_all(cx);
+            }
+            if let Err(err) = ws.save_session(cx) {
+                eprintln!("couldn't save the session: {err}");
             }
             async {}
         });
@@ -372,6 +394,7 @@ impl Workspace {
             auto_save_tasks: HashMap::new(),
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
+            session_task: None,
             _subscriptions: vec![find_subscription, git_subscription, activation, quit],
         }
     }
@@ -386,7 +409,7 @@ impl Workspace {
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
         if path.is_dir() {
-            self.set_root(path, cx);
+            self.set_root(path, window, cx);
             return;
         }
         if let Some(ix) = self
@@ -412,8 +435,13 @@ impl Workspace {
 
     fn add_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         self._subscriptions.push(cx.observe(&editor, |_, _, cx| cx.notify()));
-        self._subscriptions
-            .push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| ws.schedule_auto_save(&editor, cx)));
+        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| {
+            ws.schedule_auto_save(&editor, cx);
+            ws.schedule_session_save(cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
+            ws.open_editor_menu(editor.clone(), event.0, window, cx);
+        }));
         if self.repo.is_none() && self.root.is_none() {
             // A lone file: use the repository it lives in, if any.
             if let Some(dir) = editor.read(cx).doc.path.as_deref().and_then(Path::parent) {
@@ -445,6 +473,7 @@ impl Workspace {
             if self.show_find {
                 self.find_bar.update(cx, |f, cx| f.set_target(Some(editor), cx));
             }
+            self.schedule_session_save(cx);
         }
         cx.notify();
     }
@@ -455,7 +484,7 @@ impl Workspace {
 
     // ---- File tree --------------------------------------------------------------
 
-    pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    pub fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.update_recent_projects(|list| {
             list.retain(|p| p != &root);
             list.insert(0, root.clone());
@@ -470,18 +499,91 @@ impl Workspace {
             self.detect_repo(root, cx);
         }
         self.save_state();
+        if self.tabs.is_empty() {
+            self.restore_session(window, cx);
+        }
         cx.notify();
     }
 
     /// Reopens the folder from the previous session, if it still exists.
-    pub fn restore_last_project(&mut self, cx: &mut Context<Self>) {
+    pub fn restore_last_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = SessionState::load().last_root.filter(|r| r.is_dir()) else {
             return;
         };
         // Opening a folder normally reveals the sidebar; keep the saved choice instead.
         let show_sidebar = self.show_sidebar;
-        self.set_root(root, cx);
+        self.set_root(root, window, cx);
         self.show_sidebar = show_sidebar;
+    }
+
+    // ---- Project session --------------------------------------------------------
+
+    /// Writes the project's tabs, carets and unsaved text for next time.
+    fn save_session(&self, cx: &App) -> std::io::Result<()> {
+        let Some(root) = self.root.clone() else { return Ok(()) };
+        let mut tabs = Vec::new();
+        let mut active = 0;
+        for (ix, tab) in self.tabs.iter().enumerate() {
+            let e = tab.read(cx);
+            let dirty = e.doc.is_dirty();
+            // An untitled buffer without edits has nothing to bring back.
+            if e.doc.path.is_none() && !dirty {
+                continue;
+            }
+            if ix == self.active {
+                active = tabs.len();
+            }
+            tabs.push(TabSession {
+                path: e.doc.path.clone(),
+                cursor: e.primary_selection().head,
+                unsaved: dirty.then(|| e.doc.rope().to_string()),
+            });
+        }
+        ProjectSession { root, tabs, active }.save()
+    }
+
+    fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            return;
+        }
+        self.session_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(800)).await;
+            this.update(cx, |ws, cx| {
+                if let Err(err) = ws.save_session(cx) {
+                    eprintln!("couldn't save the session: {err}");
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Reopens the tabs the project had last time, with their unsaved edits.
+    fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.root.as_deref().and_then(ProjectSession::load) else {
+            return;
+        };
+        for tab in session.tabs {
+            let doc = match tab.path.as_deref().map(Document::open) {
+                Some(Ok(doc)) => doc,
+                // The file is gone and there's nothing unsaved to keep.
+                Some(Err(_)) if tab.unsaved.is_none() => continue,
+                // Untitled, or a deleted file with edits: keep the text.
+                _ => Document::empty(),
+            };
+            let editor = cx.new(|cx| Editor::new(doc, cx));
+            if let Some(text) = tab.unsaved {
+                // An edit on top of the file, so undo gets back to the saved text.
+                editor.update(cx, |e, cx| {
+                    let len = e.doc.len();
+                    e.replace_ranges(vec![(0..len, text)], cx);
+                });
+            }
+            self.add_tab(editor.clone(), window, cx);
+            editor.update(cx, |e, cx| e.go_to(tab.cursor.min(e.doc.len()), window, cx));
+        }
+        if !self.tabs.is_empty() {
+            self.activate(session.active.min(self.tabs.len() - 1), window, cx);
+        }
     }
 
     /// Changes the recent projects list shared by all windows. It's re-read
@@ -664,10 +766,10 @@ impl Workspace {
             return;
         }
         match target {
-            OpenIn::Auto if self.root.is_none() => self.set_root(path, cx),
+            OpenIn::Auto if self.root.is_none() => self.set_root(path, window, cx),
             OpenIn::ThisWindow => self.replace_project(path, window, cx),
             OpenIn::NewWindow | OpenIn::Auto => {
-                open_window(Some(window.bounds()), cx, move |ws, _, cx| ws.set_root(path, cx));
+                open_window(Some(window.bounds()), cx, move |ws, window, cx| ws.set_root(path, window, cx));
             }
         }
     }
@@ -677,7 +779,7 @@ impl Workspace {
     /// files stay open.
     fn replace_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_none() {
-            self.set_root(path, cx);
+            self.set_root(path, window, cx);
         } else if self.prepare_to_close(CloseIntent::ReplaceProject(path.clone()), window, cx) {
             self.finish_close(CloseIntent::ReplaceProject(path), window, cx);
         }
@@ -692,6 +794,7 @@ impl Workspace {
         self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
         self.tabs.clear();
         self.active = 0;
+        self.session_task = None;
         self.auto_save_tasks.clear();
         self.auto_save_warned.clear();
         self.recent.clear();
@@ -809,15 +912,25 @@ impl Workspace {
     }
 
     /// Saves what it can before the window closes, the app quits or the
-    /// project is replaced. Returns false (and asks the user) when edits would
-    /// still be lost: untitled files, files that couldn't be saved, or any
-    /// edits with auto-save off.
+    /// project is replaced. A project's unsaved edits go into its session, so
+    /// that always proceeds. Without a project, returns false (and asks the
+    /// user) when edits would still be lost: untitled files, files that
+    /// couldn't be saved, or any edits with auto-save off.
     fn prepare_to_close(&mut self, intent: CloseIntent, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.close_confirmed && !matches!(intent, CloseIntent::ReplaceProject(_)) {
-            return true;
-        }
         if self.auto_save != AutoSave::Off {
             self.auto_save_all(cx);
+        }
+        // A project keeps unsaved edits in its session and brings them back
+        // next time ("hot exit"), so there's nothing to ask.
+        if self.root.is_some() {
+            self.session_task = None;
+            match self.save_session(cx) {
+                Ok(()) => return true,
+                Err(err) => eprintln!("couldn't save the session: {err}"),
+            }
+        }
+        if self.close_confirmed && !matches!(intent, CloseIntent::ReplaceProject(_)) {
+            return true;
         }
         let unsaved: Vec<String> = self
             .tabs
@@ -886,7 +999,7 @@ impl Workspace {
             }
             CloseIntent::ReplaceProject(path) => {
                 self.close_project(window, cx);
-                self.set_root(path, cx);
+                self.set_root(path, window, cx);
             }
         }
     }
@@ -965,6 +1078,7 @@ impl Workspace {
     fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t == editor) else { return };
         self.tabs.remove(ix);
+        self.schedule_session_save(cx);
         self.auto_save_tasks.remove(&editor.entity_id());
         self.auto_save_warned.remove(&editor.entity_id());
         if self.tabs.is_empty() {
@@ -1424,7 +1538,9 @@ impl Workspace {
             self.close_modal(window, cx);
             return;
         }
-        self.refresh_file_index(cx);
+        if mode != PickerMode::Structure {
+            self.refresh_file_index(cx);
+        }
         let files = if self.root.is_some() {
             self.file_index.clone()
         } else {
@@ -1445,6 +1561,12 @@ impl Workspace {
             PickerEvent::RunAction(action) => {
                 ws.close_modal(window, cx);
                 window.dispatch_action(action.boxed_clone(), cx);
+            }
+            PickerEvent::GoTo(offset) => {
+                ws.close_modal(window, cx);
+                if let Some(editor) = ws.active_editor().cloned() {
+                    editor.update(cx, |e, cx| e.go_to(*offset, window, cx));
+                }
             }
             PickerEvent::Dismissed => ws.close_modal(window, cx),
         }));
@@ -1500,6 +1622,30 @@ impl Workspace {
 
     fn find_action(&mut self, _: &FindAction, window: &mut Window, cx: &mut Context<Self>) {
         self.open_picker(PickerMode::Actions, window, cx);
+    }
+
+    fn file_structure(&mut self, _: &FileStructure, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let (symbols, cursor) = {
+            let e = editor.read(cx);
+            let symbols: Vec<_> = e
+                .doc
+                .syntax()
+                .symbols(e.doc.rope())
+                .into_iter()
+                .map(|s| {
+                    let line = e.doc.row_of(s.offset) + 1;
+                    (s, line)
+                })
+                .collect();
+            (symbols, e.primary_selection().head)
+        };
+        self.open_picker(PickerMode::Structure, window, cx);
+        if let Some(Modal::Picker(picker)) = &self.modal
+            && picker.read(cx).mode() == PickerMode::Structure
+        {
+            picker.update(cx, |p, cx| p.set_symbols(symbols, cursor, cx));
+        }
     }
 
     fn go_to_line(&mut self, _: &GoToLine, window: &mut Window, cx: &mut Context<Self>) {
@@ -1681,10 +1827,10 @@ impl Workspace {
     fn open_tree_menu(&mut self, path: PathBuf, is_dir: bool, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_modal(window, cx);
         let mut entries: Vec<MenuEntry> = Vec::new();
-        let mut actions: Vec<Option<TreeAction>> = Vec::new();
+        let mut actions: Vec<Option<MenuAction>> = Vec::new();
         let mut add = |entry: MenuEntry, action: Option<TreeAction>| {
             entries.push(entry);
-            actions.push(action);
+            actions.push(action.map(MenuAction::Tree));
         };
         let dir = if is_dir { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone()) };
         let is_root = self.root.as_deref() == Some(path.as_path());
@@ -1705,14 +1851,7 @@ impl Workspace {
         if !is_root {
             add(MenuEntry::item("Copy Relative Path", Icon::Clipboard), Some(TreeAction::CopyRelativePath(path.clone())));
         }
-        let reveal = if cfg!(target_os = "macos") {
-            "Reveal in Finder"
-        } else if cfg!(windows) {
-            "Show in Explorer"
-        } else {
-            "Open Containing Folder"
-        };
-        add(MenuEntry::item(reveal, Icon::FolderOpen), Some(TreeAction::Reveal(path.clone())));
+        add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(TreeAction::Reveal(path.clone())));
         if is_dir {
             add(MenuEntry::item("Find in Folder…", Icon::TextSearch), Some(TreeAction::FindInFolder(path.clone())));
             add(MenuEntry::item("Collapse All", Icon::ChevronsDownUp), Some(TreeAction::CollapseAll));
@@ -1770,19 +1909,107 @@ impl Workspace {
             add(MenuEntry::item(if cfg!(windows) { "Move to Recycle Bin" } else { "Move to Trash" }, Icon::Trash).danger(), Some(TreeAction::Delete(path.clone())));
         }
 
+        self.show_context_menu(entries, actions, position, Some(path), window, cx);
+    }
+
+    fn show_context_menu(
+        &mut self,
+        entries: Vec<MenuEntry>,
+        actions: Vec<Option<MenuAction>>,
+        position: gpui::Point<Pixels>,
+        target: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let menu = cx.new(|cx| ContextMenu::new(entries, window, cx));
         let subscription = cx.subscribe_in(&menu, window, |ws, _, event: &ContextMenuEvent, window, cx| match event {
             ContextMenuEvent::Chose(ix) => {
                 let action = ws.context_menu.as_ref().and_then(|m| m.actions.get(*ix).cloned().flatten());
+                // Closing refocuses the editor, so editor actions reach it.
                 ws.close_context_menu(window, cx);
-                if let Some(action) = action {
-                    ws.run_tree_action(action, window, cx);
+                match action {
+                    Some(MenuAction::Tree(action)) => ws.run_tree_action(action, window, cx),
+                    Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
+                    None => {}
                 }
             }
             ContextMenuEvent::Dismissed => ws.close_context_menu(window, cx),
         });
-        self.context_menu = Some(OpenContextMenu { menu, position, actions, target: path, _subscription: subscription });
+        self.context_menu = Some(OpenContextMenu { menu, position, actions, target, _subscription: subscription });
         cx.notify();
+    }
+
+    // ---- Editor context menu -----------------------------------------------------
+
+    fn open_editor_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        let e = editor.read(cx);
+        let path = e.doc.path.clone();
+        let has_change = e.has_change_at_cursor();
+        let soft_wrap = e.soft_wrap();
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        let mut actions: Vec<Option<MenuAction>> = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<MenuAction>| {
+            entries.push(entry);
+            actions.push(action);
+        };
+        // An editor action with its shortcut hint.
+        let run = |entry: MenuEntry, action: Box<dyn gpui::Action>| {
+            (entry.shortcut(binding_label(&*action, window)), Some(MenuAction::Run(action)))
+        };
+        let (entry, action) = run(MenuEntry::text("Cut"), Box::new(editor::Cut));
+        add(entry, action);
+        let (entry, action) = run(MenuEntry::item("Copy", Icon::Copy), Box::new(editor::Copy));
+        add(entry, action);
+        let (entry, action) = run(MenuEntry::item("Paste", Icon::Clipboard), Box::new(editor::Paste));
+        add(entry, action);
+        add(MenuEntry::Separator, None);
+        for (label, action) in [
+            ("Comment with Line Comment", Box::new(editor::ToggleComment) as Box<dyn gpui::Action>),
+            ("Duplicate Line or Selection", Box::new(editor::DuplicateLine)),
+            ("Select All Occurrences", Box::new(editor::SelectAllOccurrences)),
+            ("Extend Selection", Box::new(editor::ExtendSelection)),
+        ] {
+            let (entry, action) = run(MenuEntry::text(label), action);
+            add(entry, action);
+        }
+
+        // Git, when the file is in the repository.
+        if let (Some(path), Some(repo)) = (path.as_ref(), self.repo.as_ref())
+            && path.starts_with(repo)
+        {
+            add(MenuEntry::Separator, None);
+            add(MenuEntry::Header("Git".into()), None);
+            if has_change {
+                let (entry, action) = run(MenuEntry::item("Rollback Lines", Icon::Undo), Box::new(editor::RollbackHunk));
+                add(entry, action);
+            }
+            if let Some(f) = self.git_status.files.iter().find(|f| &f.path == path) {
+                add(
+                    MenuEntry::item("Show Diff", Icon::GitCompare),
+                    Some(MenuAction::Tree(TreeAction::ShowDiff(f.clone(), f.unstaged.is_none()))),
+                );
+            }
+            let (entry, action) = run(MenuEntry::item("Toggle Inline Git Blame", Icon::GitCommit), Box::new(editor::ToggleInlineBlame));
+            add(entry, action);
+        }
+
+        add(MenuEntry::Separator, None);
+        let wrap_entry = if soft_wrap { MenuEntry::item("Soft-Wrap", Icon::Check) } else { MenuEntry::text("Soft-Wrap") };
+        let (entry, action) = run(wrap_entry, Box::new(editor::ToggleSoftWrap));
+        add(entry, action);
+        if let Some(path) = path {
+            add(MenuEntry::Separator, None);
+            add(MenuEntry::item("Copy Path", Icon::Clipboard), Some(MenuAction::Tree(TreeAction::CopyPath(path.clone()))));
+            if self.root.as_ref().is_some_and(|r| path.starts_with(r)) {
+                add(
+                    MenuEntry::item("Copy Relative Path", Icon::Clipboard),
+                    Some(MenuAction::Tree(TreeAction::CopyRelativePath(path.clone()))),
+                );
+            }
+            add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(MenuAction::Tree(TreeAction::Reveal(path))));
+        }
+        self.show_context_menu(entries, actions, position, None, window, cx);
     }
 
     fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2355,7 +2582,7 @@ impl Workspace {
             let entries = self.entries.clone();
             let expanded = self.expanded.clone();
             let git_paths = self.git_paths.clone();
-            let menu_target = self.context_menu.as_ref().map(|m| m.target.clone());
+            let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
             uniform_list(
                 "file-tree",
                 entries.len(),
@@ -3538,6 +3765,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::recent_files))
             .on_action(cx.listener(Self::find_action))
             .on_action(cx.listener(Self::go_to_line))
+            .on_action(cx.listener(Self::file_structure))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::open_themes_folder))
             .on_action(cx.listener(Self::reload_themes))
@@ -3603,6 +3831,17 @@ impl Render for Workspace {
 }
 
 use crate::ui::file_icon;
+
+/// The platform's name for showing a file in the file manager.
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(windows) {
+        "Show in Explorer"
+    } else {
+        "Open Containing Folder"
+    }
+}
 
 /// A tooltip naming the action and its current shortcut.
 fn status_tooltip(label: &str, action: &dyn gpui::Action, window: &mut Window, cx: &mut App) -> gpui::AnyView {

@@ -29,6 +29,18 @@ impl MenuEntry {
         MenuEntry::Item { label: label.into(), icon: Some(icon), shortcut: None, danger: false }
     }
 
+    /// An item without an icon (its column stays reserved for alignment).
+    pub fn text(label: impl Into<SharedString>) -> Self {
+        MenuEntry::Item { label: label.into(), icon: None, shortcut: None, danger: false }
+    }
+
+    pub fn shortcut(mut self, keys: Option<String>) -> Self {
+        if let MenuEntry::Item { shortcut, .. } = &mut self {
+            *shortcut = keys.map(Into::into);
+        }
+        self
+    }
+
     pub fn danger(mut self) -> Self {
         if let MenuEntry::Item { danger, .. } = &mut self {
             *danger = true;

@@ -20,6 +20,7 @@ mod theme;
 mod theme_picker;
 mod ui;
 mod workspace;
+mod wrap;
 
 use std::path::PathBuf;
 
@@ -28,7 +29,7 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CloseTab, CloseWindow, Find, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        CloseTab, CloseWindow, FileStructure, Find, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -89,6 +90,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Go to File…", GoToFile),
                 MenuItem::action("Recent Files…", RecentFiles),
                 MenuItem::action("Go to Line…", GoToLine),
+                MenuItem::action("File Structure…", FileStructure),
                 MenuItem::action("Find Action…", FindAction),
             ],
         },
@@ -97,6 +99,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Problems", ToggleProblems),
+                MenuItem::action("Soft-Wrap", ToggleSoftWrap),
                 MenuItem::separator(),
                 MenuItem::action("Select Theme…", SelectTheme),
                 MenuItem::separator(),
@@ -190,10 +193,10 @@ fn main() {
             let restore = first_dir.is_none() && files.is_empty();
             let mut last = workspace::open_window(None, cx, move |workspace, window, cx| {
                 if restore {
-                    workspace.restore_last_project(cx);
+                    workspace.restore_last_project(window, cx);
                 }
                 if let Some(dir) = first_dir {
-                    workspace.set_root(dir, cx);
+                    workspace.set_root(dir, window, cx);
                 }
                 for path in files {
                     workspace.open_path(path, window, cx);
@@ -201,7 +204,7 @@ fn main() {
             });
             for dir in dirs {
                 let near = last.and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok());
-                last = workspace::open_window(near, cx, move |workspace, _, cx| workspace.set_root(dir, cx)).or(last);
+                last = workspace::open_window(near, cx, move |workspace, window, cx| workspace.set_root(dir, window, cx)).or(last);
             }
             cx.activate(true);
             cx.on_window_closed(|cx| {

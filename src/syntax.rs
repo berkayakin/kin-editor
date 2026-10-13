@@ -337,6 +337,174 @@ static MARKDOWN_INLINE: LazyLock<LangConfig> = LazyLock::new(|| {
     LangConfig::new(tree_sitter_md::INLINE_LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_INLINE)
 });
 
+// ---- Outline -------------------------------------------------------------------
+
+/// A named definition in a file, for File Structure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    /// What it is: "function", "class", "heading"…
+    pub kind: &'static str,
+    /// Start of the name, where navigation lands.
+    pub offset: usize,
+    /// Nesting level among the other symbols.
+    pub depth: usize,
+}
+
+/// Outline queries capture `@name` inside a `@definition.<kind>` node, the
+/// convention of tree-sitter's tags queries.
+struct OutlineConfig {
+    query: Query,
+    /// Per capture index: `Some(kind)` for definitions, `None` otherwise.
+    kinds: Vec<Option<&'static str>>,
+    name: u32,
+}
+
+impl OutlineConfig {
+    fn new(language: TsLanguage, source: &str) -> Self {
+        let query = Query::new(&language, source).expect("invalid outline query");
+        let kinds = query
+            .capture_names()
+            .iter()
+            .map(|n| n.strip_prefix("definition.").map(symbol_kind))
+            .collect();
+        let name = query.capture_index_for_name("name").expect("outline query without @name");
+        Self { query, kinds, name }
+    }
+}
+
+fn symbol_kind(kind: &str) -> &'static str {
+    match kind {
+        "function" => "function",
+        "method" => "method",
+        "class" => "class",
+        "interface" => "interface",
+        "module" => "module",
+        "macro" => "macro",
+        "constant" => "constant",
+        "type" => "type",
+        "enum" => "enum",
+        "implementation" => "impl",
+        "heading" => "heading",
+        "selector" => "selector",
+        "keyframes" => "keyframes",
+        "table" => "table",
+        "key" => "key",
+        _ => "symbol",
+    }
+}
+
+/// Tags queries group structs, enums and type aliases as "class"; the node
+/// says which one it is.
+fn node_kind_label(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "struct_item" | "struct_type" => "struct",
+        "enum_item" | "enum_declaration" => "enum",
+        "union_item" => "union",
+        "trait_item" | "trait_declaration" => "trait",
+        "type_item" | "type_alias_declaration" | "type_spec" => "type",
+        "interface_declaration" | "interface_type" => "interface",
+        "const_item" | "static_item" => "constant",
+        _ => return None,
+    })
+}
+
+/// Rust's tags query only references impl blocks; as containers they make
+/// methods easy to find.
+const RUST_OUTLINE: &str = r#"
+(impl_item type: (_) @name) @definition.implementation
+"#;
+
+/// Classes, type aliases and enums, whose names TypeScript parses as types.
+const TYPESCRIPT_OUTLINE: &str = r#"
+(class_declaration name: (type_identifier) @name) @definition.class
+(type_alias_declaration name: (type_identifier) @name) @definition.type
+(enum_declaration name: (identifier) @name) @definition.enum
+"#;
+
+const MARKDOWN_OUTLINE: &str = r#"
+(section (atx_heading heading_content: (inline) @name)) @definition.heading
+(section (setext_heading heading_content: (paragraph) @name)) @definition.heading
+"#;
+
+const CSS_OUTLINE: &str = r#"
+(rule_set (selectors) @name) @definition.selector
+(keyframes_statement (keyframes_name) @name) @definition.keyframes
+"#;
+
+const SHELL_OUTLINE: &str = r#"
+(function_definition name: (word) @name) @definition.function
+"#;
+
+const JSON_OUTLINE: &str = r#"
+(pair key: (string (string_content) @name)) @definition.key
+"#;
+
+const YAML_OUTLINE: &str = r#"
+(block_mapping_pair key: (flow_node) @name) @definition.key
+"#;
+
+const TOML_OUTLINE: &str = r#"
+(table [(bare_key) (dotted_key) (quoted_key)] @name) @definition.table
+(table_array_element [(bare_key) (dotted_key) (quoted_key)] @name) @definition.table
+"#;
+
+fn outline_config(language: Language) -> Option<&'static OutlineConfig> {
+    static JS: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::TAGS_QUERY));
+    static TS: LazyLock<OutlineConfig> = LazyLock::new(|| {
+        OutlineConfig::new(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            &format!("{}\n{}\n{}", tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY, TYPESCRIPT_OUTLINE),
+        )
+    });
+    static TSX: LazyLock<OutlineConfig> = LazyLock::new(|| {
+        OutlineConfig::new(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            &format!("{}\n{}\n{}", tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY, TYPESCRIPT_OUTLINE),
+        )
+    });
+    static RUST: LazyLock<OutlineConfig> = LazyLock::new(|| {
+        OutlineConfig::new(tree_sitter_rust::LANGUAGE.into(), &format!("{}\n{}", tree_sitter_rust::TAGS_QUERY, RUST_OUTLINE))
+    });
+    static GO: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY));
+    static PYTHON: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_python::LANGUAGE.into(), tree_sitter_python::TAGS_QUERY));
+    static PHP: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_php::LANGUAGE_PHP.into(), tree_sitter_php::TAGS_QUERY));
+    static MARKDOWN: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_md::LANGUAGE.into(), MARKDOWN_OUTLINE));
+    static CSS: LazyLock<OutlineConfig> = LazyLock::new(|| OutlineConfig::new(tree_sitter_css::LANGUAGE.into(), CSS_OUTLINE));
+    static SHELL: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_bash::LANGUAGE.into(), SHELL_OUTLINE));
+    static JSON: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_json::LANGUAGE.into(), JSON_OUTLINE));
+    static YAML: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_yaml::LANGUAGE.into(), YAML_OUTLINE));
+    static TOML: LazyLock<OutlineConfig> =
+        LazyLock::new(|| OutlineConfig::new(tree_sitter_toml_ng::LANGUAGE.into(), TOML_OUTLINE));
+    Some(match language {
+        Language::JavaScript => &JS,
+        Language::TypeScript => &TS,
+        Language::Tsx => &TSX,
+        Language::Rust => &RUST,
+        Language::Go => &GO,
+        Language::Python => &PYTHON,
+        Language::Php => &PHP,
+        Language::Markdown => &MARKDOWN,
+        Language::Css => &CSS,
+        Language::Shell => &SHELL,
+        Language::Json => &JSON,
+        Language::Yaml => &YAML,
+        Language::Toml => &TOML,
+        Language::Html | Language::PlainText => return None,
+    })
+}
+
+/// Huge data files (lockfiles) have more keys than anyone browses.
+const MAX_SYMBOLS: usize = 5000;
+
 fn config(language: Language) -> Option<&'static LangConfig> {
     Some(match language {
         Language::JavaScript => &JS,
@@ -449,6 +617,71 @@ impl Syntax {
             .min_by_key(|r| r.len())
     }
 
+    /// The bracket at `offset` (or just before it) and its partner. Brackets
+    /// in strings and comments aren't grammar tokens, so they never match.
+    pub fn matching_bracket(&self, offset: usize) -> Option<(usize, usize)> {
+        // The bracket after the cursor wins, as in JetBrains.
+        for at in [Some(offset), offset.checked_sub(1)].into_iter().flatten() {
+            for tree in [self.injection_tree.as_ref(), self.tree.as_ref()].into_iter().flatten() {
+                if let Some(partner) = bracket_partner(tree.root_node(), at) {
+                    return Some((at, partner));
+                }
+            }
+        }
+        None
+    }
+
+    /// The file's definitions in document order, nested by containment.
+    pub fn symbols(&self, rope: &Rope) -> Vec<Symbol> {
+        let (Some(tree), Some(config)) = (self.tree.as_ref(), outline_config(self.language)) else {
+            return Vec::new();
+        };
+        // (definition range, kind, name range)
+        let mut found: Vec<(Range<usize>, &'static str, Range<usize>)> = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&config.query, tree.root_node(), RopeProvider(rope));
+        while let Some(m) = matches.next() {
+            let mut def = None;
+            let mut name = None;
+            for c in m.captures() {
+                if c.index == config.name {
+                    name = Some(c.node.byte_range());
+                } else if let Some(kind) = config.kinds[c.index as usize] {
+                    def = Some((c.node.byte_range(), node_kind_label(c.node.kind()).unwrap_or(kind)));
+                }
+            }
+            if let (Some((range, kind)), Some(name)) = (def, name) {
+                found.push((range, kind, name));
+            }
+            if found.len() >= MAX_SYMBOLS * 2 {
+                break;
+            }
+        }
+        // Several patterns can match one definition (a Rust method is also a
+        // function); the first, more specific one wins.
+        found.sort_by_key(|(range, _, _)| (range.start, std::cmp::Reverse(range.end)));
+        found.dedup_by(|b, a| a.0 == b.0);
+
+        let mut symbols = Vec::new();
+        let mut open: Vec<usize> = Vec::new(); // ends of enclosing definitions
+        for (range, kind, name) in found.into_iter().take(MAX_SYMBOLS) {
+            while open.last().is_some_and(|&end| end <= range.start) {
+                open.pop();
+            }
+            let text = rope.byte_slice(name.clone()).to_string();
+            let mut name_text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if name_text.len() > 100 {
+                name_text.truncate(name_text.floor_char_boundary(100));
+                name_text.push('…');
+            }
+            if !name_text.is_empty() {
+                symbols.push(Symbol { name: name_text, kind, offset: name.start, depth: open.len() });
+            }
+            open.push(range.end);
+        }
+        symbols
+    }
+
     /// Returns non-overlapping highlighted spans (absolute byte ranges) for `range`.
     pub fn highlights(&self, rope: &Rope, range: Range<usize>) -> Vec<(Range<usize>, Highlight)> {
         let Some(tree) = self.tree.as_ref() else {
@@ -480,6 +713,31 @@ impl Syntax {
             }
         }
         spans
+    }
+}
+
+/// The offset of the bracket matching the bracket token at `at`: the nearest
+/// sibling of the other kind, since a pair shares a parent node.
+fn bracket_partner(root: Node, at: usize) -> Option<usize> {
+    let node = root.descendant_for_byte_range(at, at + 1)?;
+    if node.is_named() || node.byte_range() != (at..at + 1) {
+        return None;
+    }
+    let (partner, forward) = match node.kind() {
+        "(" => (")", true),
+        "[" => ("]", true),
+        "{" => ("}", true),
+        ")" => ("(", false),
+        "]" => ("[", false),
+        "}" => ("{", false),
+        _ => return None,
+    };
+    let mut sibling = node;
+    loop {
+        sibling = if forward { sibling.next_sibling()? } else { sibling.prev_sibling()? };
+        if !sibling.is_named() && sibling.kind() == partner {
+            return Some(sibling.start_byte());
+        }
     }
 }
 
@@ -637,6 +895,71 @@ mod tests {
 
     fn has(spans: &[(String, Highlight)], text: &str, h: Highlight) -> bool {
         spans.iter().any(|(t, x)| t == text && *x == h)
+    }
+
+    fn outline(path: &str, src: &str) -> Vec<(String, &'static str, usize)> {
+        let language = Language::from_path(Path::new(path));
+        let rope = Rope::from_str(src);
+        Syntax::new(language, &rope).symbols(&rope).into_iter().map(|s| (s.name, s.kind, s.depth)).collect()
+    }
+
+    #[test]
+    fn outline_queries_compile() {
+        for language in ALL_HIGHLIGHTED {
+            if language != Language::Html {
+                assert!(outline_config(language).is_some(), "{language:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn builds_outlines() {
+        let rust = outline("a.rs", "struct Point;\nimpl Point {\n    fn new() -> Self { Point }\n}\nfn main() {}\n");
+        assert_eq!(
+            rust,
+            [
+                ("Point".to_string(), "struct", 0),
+                ("Point".to_string(), "impl", 0),
+                ("new".to_string(), "method", 1),
+                ("main".to_string(), "function", 0)
+            ]
+        );
+        let ts = outline("a.ts", "interface P { x: number }\nclass A {\n  run() {}\n}\nexport function f() {}\n");
+        assert!(ts.contains(&("P".to_string(), "interface", 0)), "{ts:?}");
+        assert!(ts.contains(&("A".to_string(), "class", 0)), "{ts:?}");
+        assert!(ts.contains(&("run".to_string(), "method", 1)), "{ts:?}");
+        assert!(ts.contains(&("f".to_string(), "function", 0)), "{ts:?}");
+        let md = outline("a.md", "# Title\n\nText\n\n## Part one\n\n## Part two\n");
+        assert_eq!(
+            md,
+            [
+                ("Title".to_string(), "heading", 0),
+                ("Part one".to_string(), "heading", 1),
+                ("Part two".to_string(), "heading", 1)
+            ]
+        );
+        let toml = outline("Cargo.toml", "[package]\nname = \"x\"\n[dependencies]\n");
+        assert_eq!(toml.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(), ["package", "dependencies"]);
+        let css = outline("a.css", ".a, .b { color: red; }\n");
+        assert_eq!(css, [(".a, .b".to_string(), "selector", 0)]);
+        let json = outline("a.json", "{\"a\": {\"b\": 1}}\n");
+        assert_eq!(json, [("a".to_string(), "key", 0), ("b".to_string(), "key", 1)]);
+    }
+
+    #[test]
+    fn matches_brackets_outside_strings() {
+        let src = "fn f(a: [u8; 2]) { let s = \"(\"; }\n";
+        let rope = Rope::from_str(src);
+        let syntax = Syntax::new(Language::Rust, &rope);
+        let at = |c: char, nth: usize| src.match_indices(c).nth(nth).unwrap().0;
+        assert_eq!(syntax.matching_bracket(at('(', 0)), Some((at('(', 0), at(')', 0))));
+        // After a closing bracket, the cursor's left neighbor matches.
+        assert_eq!(syntax.matching_bracket(at(')', 0) + 1), Some((at(')', 0), at('(', 0))));
+        assert_eq!(syntax.matching_bracket(at('[', 0)), Some((at('[', 0), at(']', 0))));
+        assert_eq!(syntax.matching_bracket(at('{', 0)), Some((at('{', 0), at('}', 0))));
+        // The "(" inside the string literal isn't a bracket.
+        assert_eq!(syntax.matching_bracket(at('(', 1)), None);
+        assert_eq!(syntax.matching_bracket(at('l', 0)), None);
     }
 
     #[test]

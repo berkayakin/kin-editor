@@ -1,5 +1,5 @@
 //! Popups for jumping around: Search Everywhere (double Shift), Go to File,
-//! Recent Files, Recent Projects, Find Action and Go to Line.
+//! Recent Files, Recent Projects, Find Action, File Structure and Go to Line.
 
 use std::{
     ops::Range,
@@ -20,6 +20,7 @@ use nucleo_matcher::{
 use crate::{
     assets::Icon,
     clone_dialog::display_path,
+    syntax::Symbol,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline, PageDown, PageUp, Submit},
     theme::Theme,
     ui::{binding_label, icon_el, input_box, kbd, modal_panel},
@@ -33,6 +34,8 @@ pub enum PickerMode {
     /// Recently opened folders; `recent` holds them instead of files.
     Projects,
     Actions,
+    /// The active file's symbols; see [`Picker::set_symbols`].
+    Structure,
 }
 
 pub struct ActionEntry {
@@ -44,6 +47,8 @@ pub enum PickerEvent {
     OpenFile(PathBuf),
     OpenProject { path: PathBuf, new_window: bool },
     RunAction(Box<dyn Action>),
+    /// Jump to an offset in the active editor.
+    GoTo(usize),
     Dismissed,
 }
 
@@ -68,6 +73,12 @@ enum Item {
         ix: usize,
         hl: Vec<Range<usize>>,
     },
+    Symbol {
+        ix: usize,
+        hl: Vec<Range<usize>>,
+        /// Indent by nesting; flat while filtering.
+        nested: bool,
+    },
 }
 
 pub struct Picker {
@@ -78,6 +89,10 @@ pub struct Picker {
     recent: Vec<PathBuf>,
     actions: Arc<Vec<ActionEntry>>,
     shortcuts: Arc<Vec<Option<String>>>,
+    /// Symbols with their 1-based line numbers.
+    symbols: Arc<Vec<(Symbol, usize)>>,
+    /// The symbol around the caret, preselected like JetBrains.
+    current_symbol: Option<usize>,
     items: Arc<Vec<Item>>,
     selected: usize,
     scroll: UniformListScrollHandle,
@@ -108,6 +123,7 @@ impl Picker {
             PickerMode::Recent => "Search recent files",
             PickerMode::Projects => "Search recent projects",
             PickerMode::Actions => "Search actions",
+            PickerMode::Structure => "Search symbols",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
         window.focus(&query.focus_handle(cx));
@@ -121,6 +137,8 @@ impl Picker {
             recent,
             actions,
             shortcuts,
+            symbols: Arc::new(Vec::new()),
+            current_symbol: None,
             items: Arc::new(Vec::new()),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
@@ -142,6 +160,13 @@ impl Picker {
     /// Called when the background file scan finishes.
     pub fn set_files(&mut self, files: Arc<Vec<PathBuf>>, cx: &mut Context<Self>) {
         self.files = files;
+        self.update_items(cx);
+    }
+
+    /// Fills File Structure; `cursor` picks the symbol to preselect.
+    pub fn set_symbols(&mut self, symbols: Vec<(Symbol, usize)>, cursor: usize, cx: &mut Context<Self>) {
+        self.current_symbol = symbols.iter().rposition(|(s, _)| s.offset <= cursor);
+        self.symbols = Arc::new(symbols);
         self.update_items(cx);
     }
 
@@ -218,6 +243,22 @@ impl Picker {
             .filter_map(|c| name.char_indices().nth(c as usize).map(|(b, ch)| b..b + ch.len_utf8()))
             .collect();
         Some((score, Item::Action { ix, hl }))
+    }
+
+    fn symbol_item(&mut self, ix: usize, pattern: Option<&Pattern>) -> Option<(u32, Item)> {
+        let symbols = self.symbols.clone();
+        let name = symbols[ix].0.name.as_str();
+        let Some(p) = pattern else {
+            return Some((0, Item::Symbol { ix, hl: Vec::new(), nested: true }));
+        };
+        let mut buf = Vec::new();
+        let mut indices = Vec::new();
+        let score = p.indices(Utf32Str::new(name, &mut buf), &mut self.matcher, &mut indices)?;
+        let hl = indices
+            .into_iter()
+            .filter_map(|c| name.char_indices().nth(c as usize).map(|(b, ch)| b..b + ch.len_utf8()))
+            .collect();
+        Some((score, Item::Symbol { ix, hl, nested: false }))
     }
 
     fn update_items(&mut self, cx: &mut Context<Self>) {
@@ -304,9 +345,24 @@ impl Picker {
             items.extend(scored.into_iter().take(limit).map(|(_, i)| i));
         }
 
+        if self.mode == PickerMode::Structure {
+            let mut scored: Vec<(u32, Item)> =
+                (0..self.symbols.len()).filter_map(|ix| self.symbol_item(ix, pattern.as_ref())).collect();
+            if pattern.is_some() {
+                // Stable, so document order breaks ties.
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+            items.extend(scored.into_iter().map(|(_, i)| i));
+        }
+
         self.items = Arc::new(items);
-        // Like JetBrains, Recent Files preselects the previous file.
-        self.selected = if self.mode == PickerMode::Recent && pattern.is_none() && self.items.len() > 1 { 1 } else { 0 };
+        // Like JetBrains, Recent Files preselects the previous file and File
+        // Structure the symbol at the caret.
+        self.selected = match self.mode {
+            PickerMode::Recent if pattern.is_none() && self.items.len() > 1 => 1,
+            PickerMode::Structure if pattern.is_none() => self.current_symbol.unwrap_or(0),
+            _ => 0,
+        };
         self.move_selection(0, cx);
     }
 
@@ -330,6 +386,7 @@ impl Picker {
                 cx.emit(PickerEvent::OpenProject { path: path.clone(), new_window: secondary })
             }
             Some(Item::Action { ix, .. }) => cx.emit(PickerEvent::RunAction(self.actions[*ix].action.boxed_clone())),
+            Some(Item::Symbol { ix, .. }) => cx.emit(PickerEvent::GoTo(self.symbols[*ix].0.offset)),
             _ => {}
         }
     }
@@ -395,9 +452,11 @@ impl Render for Picker {
                 if cfg!(target_os = "macos") { "⌘↩ opens in a new window" } else { "Ctrl+Enter opens in a new window" },
             ),
             PickerMode::Actions => ("Actions", Icon::Command, ""),
+            PickerMode::Structure => ("File Structure", Icon::Braces, ""),
         };
         let items = self.items.clone();
         let actions = self.actions.clone();
+        let symbols = self.symbols.clone();
         let shortcuts = self.shortcuts.clone();
         let selected = self.selected;
         let count = items.len();
@@ -468,6 +527,27 @@ impl Render for Picker {
                                                 .child(highlighted(actions[*ix].name.into(), hl, theme.accent.into())),
                                         )
                                         .when_some(shortcuts[*ix].clone(), |el, s| el.child(kbd(s, cx))),
+                                    Item::Symbol { ix, hl, nested } => {
+                                        let (symbol, line) = &symbols[*ix];
+                                        let indent = if *nested { symbol.depth.min(8) as f32 * 16. } else { 0. };
+                                        row.child(div().w(px(indent)).flex_shrink_0())
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_color(theme.text)
+                                                    .child(highlighted(symbol.name.clone().into(), hl, theme.accent.into())),
+                                            )
+                                            .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.text_dim).child(symbol.kind))
+                                            .child(div().flex_1())
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(12.))
+                                                    .text_color(theme.text_dim)
+                                                    .child(format!(":{line}")),
+                                            )
+                                    }
                                     Item::Header(_) => unreachable!(),
                                 }
                             }

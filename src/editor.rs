@@ -19,6 +19,7 @@ use crate::{
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
     theme::Theme,
+    wrap::{self, Break, WrapKey, WrapMap},
 };
 
 pub const TAB_SIZE: usize = 4;
@@ -90,6 +91,7 @@ actions!(
         NextChange,
         PreviousChange,
         ToggleInlineBlame,
+        ToggleSoftWrap,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -125,6 +127,12 @@ pub enum EditorEvent {
 
 impl EventEmitter<EditorEvent> for Editor {}
 
+/// A right-click in the code editor, at this window position. Separate from
+/// [`EditorEvent`] because many views treat any `EditorEvent` as an edit.
+pub struct EditorContextMenu(pub Point<Pixels>);
+
+impl EventEmitter<EditorContextMenu> for Editor {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragMode {
     Char,
@@ -147,6 +155,8 @@ struct LayoutSnapshot {
     char_width: Pixels,
     gutter_width: Pixels,
     rows_per_page: usize,
+    /// Text width available to soft-wrapped rows.
+    wrap_width: Pixels,
 }
 
 pub struct Editor {
@@ -192,11 +202,16 @@ pub struct Editor {
     blame: Option<(usize, u64, BlameLine)>,
     blame_request: Option<(usize, u64)>,
     blame_task: Option<Task<()>>,
+    soft_wrap: bool,
+    /// Line breaks for soft wrap, recomputed lazily (see `sync_wrap`).
+    wrap: Option<WrapMap>,
 }
 
 impl Editor {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
         let indent_unit = detect_indent(&doc);
+        // Prose wraps by default; code keeps its lines (JetBrains does the same).
+        let soft_wrap = matches!(doc.language, crate::syntax::Language::Markdown | crate::syntax::Language::PlainText);
         let mut this = Self {
             doc,
             mode: EditorMode::Full,
@@ -235,6 +250,8 @@ impl Editor {
             blame: None,
             blame_request: None,
             blame_task: None,
+            soft_wrap,
+            wrap: None,
         };
         this.detect_external_linter();
         this.schedule_lint(Duration::ZERO, cx);
@@ -245,6 +262,7 @@ impl Editor {
     pub fn single_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let mut this = Self::new(Document::empty(), cx);
         this.mode = EditorMode::SingleLine;
+        this.soft_wrap = false;
         this.placeholder = placeholder.into();
         this
     }
@@ -252,6 +270,7 @@ impl Editor {
     pub fn multi_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let mut this = Self::single_line(placeholder, cx);
         this.mode = EditorMode::MultiLine;
+        this.soft_wrap = true;
         this
     }
 
@@ -757,37 +776,52 @@ impl Editor {
         }
     }
 
-    fn shape_plain(&self, row: usize, window: &mut Window, cx: &App) -> (ShapedLine, DisplayLine) {
+    /// Shapes the part of `row` shown on display segment `seg`.
+    fn shape_segment(&self, row: usize, seg: usize, window: &mut Window, cx: &App) -> RowShape {
         let theme = Theme::get(cx);
         let dl = DisplayLine::new(&self.doc.line_text(row));
+        let breaks = self.line_breaks(row);
+        let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.text.len());
+        let last = seg >= breaks.len();
+        let text = &dl.text[range.clone()];
         let run = TextRun {
-            len: dl.text.len(),
+            len: text.len(),
             font: self.editor_font(cx),
             color: theme.text.into(),
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let runs = if dl.text.is_empty() { vec![] } else { vec![run] };
-        let line = window.text_system().shape_line(
-            SharedString::from(dl.text.clone()),
-            self.font_size(cx),
-            &runs,
-            None,
-        );
-        (line, dl)
+        let runs = if text.is_empty() { vec![] } else { vec![run] };
+        let line = window
+            .text_system()
+            .shape_line(SharedString::from(text.to_string()), self.font_size(cx), &runs, None);
+        let indent = self.char_width() * indent as f32;
+        RowShape { line, dl, range, indent, last }
     }
 
+    fn char_width(&self) -> Pixels {
+        self.layout.as_ref().map_or(px(8.), |l| l.char_width)
+    }
+
+    /// The x of `offset` within its display row (wrap indent included).
     fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
         let row = self.doc.row_of(offset);
-        let (line, dl) = self.shape_plain(row, window, cx);
-        line.x_for_index(dl.to_display(offset - self.doc.line_start(row)))
+        let col = DisplayLine::new(&self.doc.line_text(row)).to_display(offset - self.doc.line_start(row));
+        let seg = wrap::segment_of(self.line_breaks(row), col);
+        let shape = self.shape_segment(row, seg, window, cx);
+        shape.indent + shape.line.x_for_index(col - shape.range.start)
     }
 
-    fn offset_for_row_x(&self, row: usize, x: Pixels, window: &mut Window, cx: &App) -> usize {
-        let (line, dl) = self.shape_plain(row, window, cx);
-        let display = line.closest_index_for_x(x);
-        self.doc.line_start(row) + dl.to_buffer(display)
+    fn offset_for_display_row_x(&self, drow: usize, x: Pixels, window: &mut Window, cx: &App) -> usize {
+        let (row, seg) = self.line_of_display_row(drow);
+        let shape = self.shape_segment(row, seg, window, cx);
+        let mut col = shape.range.start + shape.line.closest_index_for_x((x - shape.indent).max(px(0.)));
+        // The end of a wrapped row is the start of the next one; stay on this row.
+        if !shape.last && col >= shape.range.end && shape.range.end > shape.range.start {
+            col = shape.dl.text[..shape.range.end].char_indices().last().map_or(col, |(i, _)| i);
+        }
+        self.doc.line_start(row) + shape.dl.to_buffer(col)
     }
 
     fn offset_for_position(&self, position: Point<Pixels>, window: &mut Window, cx: &App) -> usize {
@@ -798,26 +832,94 @@ impl Editor {
         if y < px(0.) {
             return 0;
         }
-        let row = (y / layout.line_height).floor() as usize;
-        if row >= self.doc.line_count() {
+        let drow = (y / layout.line_height).floor() as usize;
+        if drow >= self.display_row_count() {
             return self.doc.len();
         }
         let x = position.x - layout.text_left + self.scroll.x;
-        self.offset_for_row_x(row, x.max(px(0.)), window, cx)
+        self.offset_for_display_row_x(drow, x.max(px(0.)), window, cx)
     }
 
     fn vertical_target(&self, sel: &Selection, rows: isize, goal: Pixels, window: &mut Window, cx: &App) -> usize {
-        let row = self.doc.row_of(sel.head) as isize + rows;
-        if row < 0 {
+        let drow = self.display_row_of(sel.head) as isize + rows;
+        if drow < 0 {
             0
-        } else if row as usize >= self.doc.line_count() {
+        } else if drow as usize >= self.display_row_count() {
             self.doc.len()
         } else {
-            self.offset_for_row_x(row as usize, goal, window, cx)
+            self.offset_for_display_row_x(drow as usize, goal, window, cx)
         }
     }
 
+    // ---- Soft wrap -------------------------------------------------------------
+
+    fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_chromeless() {
+            return;
+        }
+        self.soft_wrap = !self.soft_wrap;
+        self.wrap = None;
+        self.scroll.x = px(0.);
+        self.reveal_primary = true;
+        cx.notify();
+    }
+
+    /// Recomputes line breaks when the text, width or font changed. Called
+    /// before anything maps between offsets and display rows.
+    fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
+        if !self.soft_wrap || self.is_single_line() {
+            self.wrap = None;
+            return;
+        }
+        let Some(layout) = self.layout.as_ref() else { return };
+        let font = self.editor_font(cx);
+        let key = WrapKey {
+            version: self.doc.version(),
+            len: self.doc.len(),
+            width: layout.wrap_width,
+            font_family: font.family.clone(),
+            font_size: self.font_size(cx),
+        };
+        if self.wrap.as_ref().is_some_and(|w| w.key == key) {
+            return;
+        }
+        let char_width = layout.char_width;
+        self.wrap = Some(WrapMap::new(key, self.doc.rope(), window.text_system(), font, char_width));
+    }
+
+    fn display_row_count(&self) -> usize {
+        self.wrap.as_ref().map_or(self.doc.line_count(), WrapMap::row_count)
+    }
+
+    fn first_display_row(&self, row: usize) -> usize {
+        self.wrap.as_ref().map_or(row, |w| w.first_display_row(row))
+    }
+
+    /// The buffer line and its wrap segment on display row `drow`.
+    fn line_of_display_row(&self, drow: usize) -> (usize, usize) {
+        match &self.wrap {
+            Some(w) => w.line_of(drow),
+            None => (drow.min(self.doc.line_count().saturating_sub(1)), 0),
+        }
+    }
+
+    fn line_breaks(&self, row: usize) -> &[Break] {
+        self.wrap.as_ref().map_or(&[], |w| w.breaks(row))
+    }
+
+    /// The display row showing `offset` (on a wrap break, the later row).
+    fn display_row_of(&self, offset: usize) -> usize {
+        let row = self.doc.row_of(offset);
+        let breaks = self.line_breaks(row);
+        if breaks.is_empty() {
+            return self.first_display_row(row);
+        }
+        let col = DisplayLine::new(&self.doc.line_text(row)).to_display(offset - self.doc.line_start(row));
+        self.first_display_row(row) + wrap::segment_of(breaks, col)
+    }
+
     fn move_vertically(&mut self, rows: isize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_wrap(window, cx);
         let goals: Vec<Pixels> = self
             .selections
             .iter()
@@ -1383,6 +1485,7 @@ impl Editor {
     }
 
     fn add_cursor_vertical(&mut self, rows: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_wrap(window, cx);
         let primary = self.primary_selection();
         let goal = self.goal_x.unwrap_or_else(|| self.x_for_offset(primary.head, window, cx));
         let edge = if rows < 0 {
@@ -1391,11 +1494,11 @@ impl Editor {
             self.selections.iter().max_by_key(|s| s.head).copied()
         }
         .unwrap_or(primary);
-        let row = self.doc.row_of(edge.head) as isize + rows;
-        if row < 0 || row as usize >= self.doc.line_count() {
+        let drow = self.display_row_of(edge.head) as isize + rows;
+        if drow < 0 || drow as usize >= self.display_row_count() {
             return;
         }
-        let head = self.offset_for_row_x(row as usize, goal, window, cx);
+        let head = self.offset_for_display_row_x(drow as usize, goal, window, cx);
         let mut selections = self.selections.clone();
         selections.push(Selection::cursor(head));
         let primary_ix = selections.len() - 1;
@@ -1528,7 +1631,7 @@ impl Editor {
     fn scrollbar_geometry(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
         let l = self.layout.as_ref()?;
         let viewport = l.bounds.size.height;
-        let content = l.line_height * self.doc.line_count() as f32 + viewport - l.line_height;
+        let content = l.line_height * self.display_row_count() as f32 + viewport - l.line_height;
         if content <= viewport {
             return None;
         }
@@ -1548,6 +1651,7 @@ impl Editor {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+        self.sync_wrap(window, cx);
         let Some(layout) = self.layout.clone() else { return };
 
         if let Some((track, thumb)) = self.scrollbar_geometry()
@@ -1609,6 +1713,34 @@ impl Editor {
         self.restart_blink(window, cx);
     }
 
+    /// Right-click: place the caret (unless clicking inside a selection, so
+    /// Cut/Copy apply to it) and ask the workspace for the context menu.
+    fn on_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Full {
+            return;
+        }
+        window.focus(&self.focus_handle);
+        self.sync_wrap(window, cx);
+        self.open_hunk = None;
+        let offset = self.offset_for_position(event.position, window, cx);
+        let inside = self.selections.iter().any(|s| !s.is_empty() && s.range().contains(&offset));
+        if !inside {
+            self.set_selections(vec![Selection::cursor(offset)], 0, cx);
+            self.goal_x = None;
+        }
+        self.restart_blink(window, cx);
+        cx.emit(EditorContextMenu(event.position));
+    }
+
+    pub fn soft_wrap(&self) -> bool {
+        self.soft_wrap
+    }
+
+    /// Whether the caret is on a changed (git) line, for Rollback Lines.
+    pub fn has_change_at_cursor(&self) -> bool {
+        self.current_hunk().is_some()
+    }
+
     fn line_range(&self, offset: usize) -> Range<usize> {
         let row = self.doc.row_of(offset);
         let start = self.doc.line_start(row);
@@ -1621,7 +1753,7 @@ impl Editor {
             return;
         };
         let viewport = l.bounds.size.height;
-        let content = l.line_height * self.doc.line_count() as f32 + viewport - l.line_height;
+        let content = l.line_height * self.display_row_count() as f32 + viewport - l.line_height;
         let range = track.size.height - thumb.size.height;
         if range <= px(0.) {
             return;
@@ -1643,6 +1775,7 @@ impl Editor {
         }
         let Some(drag) = self.drag.as_ref() else { return };
         let (mode, origin) = (drag.mode, drag.origin.clone());
+        self.sync_wrap(window, cx);
         let offset = self.offset_for_position(event.position, window, cx);
         let unit = match mode {
             DragMode::Char => offset..offset,
@@ -1686,8 +1819,12 @@ impl Editor {
 
     fn clamp_scroll(&mut self) {
         let Some(l) = self.layout.as_ref() else { return };
-        let max_y = l.line_height * (self.doc.line_count().saturating_sub(1)) as f32;
+        let max_y = l.line_height * (self.display_row_count().saturating_sub(1)) as f32;
         self.scroll.y = self.scroll.y.clamp(px(0.), max_y.max(px(0.)));
+        if self.wrap.is_some() {
+            self.scroll.x = px(0.);
+            return;
+        }
         let text_width = l.bounds.right() - l.text_left - px(SCROLLBAR_WIDTH);
         let max_x = (self.max_line_width + l.char_width * 4. - text_width).max(px(0.));
         self.scroll.x = self.scroll.x.clamp(px(0.), max_x);
@@ -1725,6 +1862,8 @@ impl Editor {
         );
         let text_left = text_bounds.left() + if single { px(0.) } else { px(TEXT_PADDING) };
         let rows_per_page = ((bounds.size.height / line_height).floor() as usize).saturating_sub(2).max(1);
+        let wrap_width = (bounds.right() - text_left - if single { char_width } else { px(SCROLLBAR_WIDTH) + char_width })
+            .max(char_width * 10.);
 
         self.layout = Some(LayoutSnapshot {
             bounds,
@@ -1733,47 +1872,56 @@ impl Editor {
             char_width,
             gutter_width,
             rows_per_page,
+            wrap_width,
         });
+        self.sync_wrap(window, cx);
+        let wrapping = self.wrap.is_some();
 
         // Keep the primary cursor visible after keyboard navigation.
         if std::mem::take(&mut self.reveal_primary) {
-            let row = self.doc.row_of(self.primary_selection().head) as f32;
+            let drow = self.display_row_of(self.primary_selection().head) as f32;
             let visible = self.scroll.y..self.scroll.y + bounds.size.height - line_height;
-            if !visible.contains(&(line_height * row)) {
+            if !visible.contains(&(line_height * drow)) {
                 self.center_on_next_frame = true;
             } else {
                 self.autoscroll = true;
             }
         }
         if std::mem::take(&mut self.center_on_next_frame) && !single {
-            let row = self.doc.row_of(self.primary_selection().head);
-            self.scroll.y = (line_height * row as f32 - bounds.size.height / 3.).max(px(0.));
+            let drow = self.display_row_of(self.primary_selection().head);
+            self.scroll.y = (line_height * drow as f32 - bounds.size.height / 3.).max(px(0.));
             self.scroll.x = px(0.);
         } else if std::mem::take(&mut self.autoscroll) {
             let head = self.primary_selection().head;
-            let row = self.doc.row_of(head);
+            let drow = self.display_row_of(head);
             let margin = line_height * 3.;
-            let top = line_height * row as f32;
+            let top = line_height * drow as f32;
             let viewport = bounds.size.height;
             if top - margin < self.scroll.y {
                 self.scroll.y = (top - margin).max(px(0.));
             } else if top + line_height + margin > self.scroll.y + viewport {
                 self.scroll.y = top + line_height + margin - viewport;
             }
-            let x = self.x_for_offset(head, window, cx);
-            let text_width = bounds.right() - text_left - if single { px(0.) } else { px(SCROLLBAR_WIDTH) };
-            if x < self.scroll.x + char_width * 2. {
-                self.scroll.x = (x - char_width * 4.).max(px(0.));
-            } else if x > self.scroll.x + text_width - char_width * 3. {
-                self.scroll.x = x - text_width + char_width * 6.;
+            if !wrapping {
+                let x = self.x_for_offset(head, window, cx);
+                let text_width = bounds.right() - text_left - if single { px(0.) } else { px(SCROLLBAR_WIDTH) };
+                if x < self.scroll.x + char_width * 2. {
+                    self.scroll.x = (x - char_width * 4.).max(px(0.));
+                } else if x > self.scroll.x + text_width - char_width * 3. {
+                    self.scroll.x = x - text_width + char_width * 6.;
+                }
             }
         }
         self.clamp_scroll();
 
-        let first_row = (self.scroll.y / line_height).floor() as usize;
+        // Visible display rows, and the buffer lines they show.
+        let display_rows = self.display_row_count();
+        let first_drow = (self.scroll.y / line_height).floor() as usize;
         let visible_rows = (bounds.size.height / line_height).ceil() as usize + 1;
-        let last_row = (first_row + visible_rows).min(line_count);
-        let first_row = first_row.min(last_row);
+        let last_drow = (first_drow + visible_rows).min(display_rows);
+        let first_drow = first_drow.min(last_drow);
+        let first_row = self.line_of_display_row(first_drow).0;
+        let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1).0 + 1).min(line_count) };
         let range_start = self.doc.line_start(first_row);
         let range_end = if last_row == 0 { 0 } else { self.doc.line_end(last_row - 1) };
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
@@ -1790,6 +1938,19 @@ impl Editor {
             .filter(|s| s.is_empty())
             .map(|s| self.doc.row_of(s.head))
             .collect();
+        // Bracket pairs around carets (a few, so many cursors stay cheap).
+        let brackets: Vec<usize> = if focused && !single {
+            self.selections
+                .iter()
+                .filter(|s| s.is_empty())
+                .take(8)
+                .filter_map(|s| self.doc.syntax().matching_bracket(s.head))
+                .flat_map(|(a, b)| [a, b])
+                .filter(|o| (range_start..=range_end).contains(o))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut frame = FrameLayout {
             text_bounds,
@@ -1812,7 +1973,6 @@ impl Editor {
 
         let mut hl_ix = 0;
         for row in first_row..last_row {
-            let y = top + line_height * row as f32 - self.scroll.y;
             let line_start = self.doc.line_start(row);
             let text = self.doc.line_text(row);
             let line_end = line_start + text.len();
@@ -1877,260 +2037,334 @@ impl Editor {
                     strikethrough: None,
                 });
             }
-            let shaped = text_system.shape_line(SharedString::from(dl.text.clone()), font_size, &runs, None);
-            self.max_line_width = self.max_line_width.max(shaped.width);
-            let origin = point(text_left - self.scroll.x, y);
 
-            // Current line highlight.
             let is_cursor_row = head_rows.contains(&row);
-            if is_cursor_row && self.selections.len() == 1 && !single {
-                frame.backgrounds.push(fill(
-                    Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
-                    theme.current_line,
-                ));
-            }
-
-            // Indent guides.
             let indent = indents[row - first_row].unwrap_or_else(|| {
                 let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
                 let next = indents[row - first_row..].iter().find_map(|i| *i).unwrap_or(0);
                 prev.min(next)
             });
-            let mut col = 0;
-            while !single && col + TAB_SIZE <= indent.max(1) && col < indent {
-                let x = origin.x + char_width * col as f32;
-                if x >= text_bounds.left() {
-                    frame.guides.push(fill(
-                        Bounds::new(point(x, y), size(px(1.), line_height)),
-                        theme.indent_guide,
+            let breaks = self.line_breaks(row).to_vec();
+            let row_first_drow = self.first_display_row(row);
+            let worst = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).min_by_key(|d| d.severity);
+
+            // Each wrapped segment of the line is its own display row.
+            for seg in 0..=breaks.len() {
+                let drow = row_first_drow + seg;
+                if drow < first_drow || drow >= last_drow {
+                    continue;
+                }
+                let (seg_range, wrap_indent) = wrap::segment(&breaks, seg, dl.text.len());
+                let first_seg = seg == 0;
+                let last_seg = seg == breaks.len();
+                let seg_runs = if breaks.is_empty() { std::mem::take(&mut runs) } else { slice_runs(&runs, seg_range.clone()) };
+                let shaped = text_system.shape_line(
+                    SharedString::from(dl.text[seg_range.clone()].to_string()),
+                    font_size,
+                    &seg_runs,
+                    None,
+                );
+                if !wrapping {
+                    self.max_line_width = self.max_line_width.max(shaped.width);
+                }
+                let y = top + line_height * drow as f32 - self.scroll.y;
+                let base_x = text_left - self.scroll.x;
+                let origin = point(base_x + char_width * wrap_indent as f32, y);
+                // x of a display column of the line, clamped to this segment.
+                let x_of = |col: usize| shaped.x_for_index(col.clamp(seg_range.start, seg_range.end) - seg_range.start);
+                // The part of a line-relative buffer range on this segment (in
+                // display columns), and whether it runs on past the segment.
+                let clip = |start: usize, end: usize, past_line_end: bool| -> Option<(usize, usize, bool)> {
+                    let (ds, de) = (dl.to_display(start), dl.to_display(end));
+                    if ds > seg_range.end || de < seg_range.start || (!last_seg && ds == seg_range.end) {
+                        return None;
+                    }
+                    let (s, e) = (ds.max(seg_range.start), de.min(seg_range.end));
+                    let continues = if last_seg { past_line_end } else { de >= seg_range.end };
+                    (s < e || continues).then_some((s, e, continues))
+                };
+
+                // Current line highlight.
+                if is_cursor_row && self.selections.len() == 1 && !single {
+                    frame.backgrounds.push(fill(
+                        Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
+                        theme.current_line,
                     ));
                 }
-                col += TAB_SIZE;
-            }
 
-            // Search matches.
-            let first_match = self.search_matches.partition_point(|m| m.end < line_start);
-            for (ix, m) in self.search_matches.iter().enumerate().skip(first_match) {
-                if m.start > line_end {
-                    break;
+                // Indent guides.
+                let mut col = 0;
+                while !single && col + TAB_SIZE <= indent.max(1) && col < indent {
+                    let x = base_x + char_width * col as f32;
+                    if x >= text_bounds.left() {
+                        frame.guides.push(fill(
+                            Bounds::new(point(x, y), size(px(1.), line_height)),
+                            theme.indent_guide,
+                        ));
+                    }
+                    col += TAB_SIZE;
                 }
-                let x0 = shaped.x_for_index(dl.to_display(m.start.max(line_start) - line_start));
-                let mut x1 = shaped.x_for_index(dl.to_display(m.end.min(line_end) - line_start));
-                if m.end > line_end {
-                    x1 += char_width * 0.6;
-                }
-                let bounds = Bounds::from_corners(point(origin.x + x0, y + px(1.)), point(origin.x + x1, y + line_height - px(1.)));
-                let quad = if Some(ix) == self.active_match {
-                    gpui::quad(bounds, px(3.), theme.search_active, px(1.), Hsla::from(theme.search_active).alpha(0.9), gpui::BorderStyle::Solid)
-                } else {
-                    fill(bounds, theme.search_match).corner_radii(px(3.))
-                };
-                frame.search.push(quad);
-            }
 
-            // Selections.
-            for sel in &self.selections {
-                let r = sel.range();
-                if sel.is_empty() || r.end < line_start || r.start > line_end {
-                    continue;
+                // Search matches.
+                let first_match = self.search_matches.partition_point(|m| m.end < line_start);
+                for (ix, m) in self.search_matches.iter().enumerate().skip(first_match) {
+                    if m.start > line_end {
+                        break;
+                    }
+                    let Some((s, e, continues)) =
+                        clip(m.start.max(line_start) - line_start, m.end.min(line_end) - line_start, m.end > line_end)
+                    else {
+                        continue;
+                    };
+                    let x0 = x_of(s);
+                    let mut x1 = x_of(e);
+                    if continues {
+                        x1 += char_width * 0.6;
+                    }
+                    let bounds = Bounds::from_corners(point(origin.x + x0, y + px(1.)), point(origin.x + x1, y + line_height - px(1.)));
+                    let quad = if Some(ix) == self.active_match {
+                        gpui::quad(bounds, px(3.), theme.search_active, px(1.), Hsla::from(theme.search_active).alpha(0.9), gpui::BorderStyle::Solid)
+                    } else {
+                        fill(bounds, theme.search_match).corner_radii(px(3.))
+                    };
+                    frame.search.push(quad);
                 }
-                if r.end == line_start && r.start < line_start {
-                    continue;
-                }
-                let s_col = r.start.max(line_start) - line_start;
-                let e_col = r.end.min(line_end) - line_start;
-                let x0 = shaped.x_for_index(dl.to_display(s_col));
-                let mut x1 = shaped.x_for_index(dl.to_display(e_col));
-                if r.end > line_end {
-                    x1 += char_width * 0.6;
-                }
-                if x1 > x0 {
-                    let color = if focused { theme.selection } else { theme.selection_inactive };
-                    frame.selections.push(
-                        fill(
-                            Bounds::from_corners(point(origin.x + x0, y), point(origin.x + x1, y + line_height)),
-                            color,
-                        )
-                        .corner_radii(px(3.)),
-                    );
-                }
-            }
 
-            // Cursors.
-            if focused && self.cursor_visible {
-                for sel in &self.selections {
-                    if self.doc.row_of(sel.head) != row {
+                // Matching brackets (painted with search highlights, under the text).
+                for &b in brackets.iter().filter(|&&b| b >= line_start && b < line_end) {
+                    let col = dl.to_display(b - line_start);
+                    if wrap::segment_of(&breaks, col) != seg {
                         continue;
                     }
-                    let x = shaped.x_for_index(dl.to_display(sel.head - line_start));
-                    frame.cursors.push(
+                    let (x0, x1) = (x_of(col), x_of(dl.to_display(b + 1 - line_start)));
+                    frame.search.push(
                         fill(
-                            Bounds::new(point(origin.x + x - px(1.), y + px(2.)), size(px(2.), line_height - px(4.))),
-                            theme.cursor,
+                            Bounds::from_corners(point(origin.x + x0, y + px(1.)), point(origin.x + x1, y + line_height - px(1.))),
+                            theme.bracket_match,
                         )
-                        .corner_radii(px(1.)),
+                        .corner_radii(px(2.)),
                     );
                 }
-            }
 
-            if single {
-                if self.doc.len() == 0 && !self.placeholder.is_empty() {
-                    let placeholder = text_system.shape_line(
-                        self.placeholder.clone(),
+                // Selections.
+                for sel in &self.selections {
+                    let r = sel.range();
+                    if sel.is_empty() || r.end < line_start || r.start > line_end {
+                        continue;
+                    }
+                    if r.end == line_start && r.start < line_start {
+                        continue;
+                    }
+                    let Some((s, e, continues)) =
+                        clip(r.start.max(line_start) - line_start, r.end.min(line_end) - line_start, r.end > line_end)
+                    else {
+                        continue;
+                    };
+                    let x0 = x_of(s);
+                    let mut x1 = x_of(e);
+                    if continues {
+                        x1 += char_width * 0.6;
+                    }
+                    if x1 > x0 {
+                        let color = if focused { theme.selection } else { theme.selection_inactive };
+                        frame.selections.push(
+                            fill(
+                                Bounds::from_corners(point(origin.x + x0, y), point(origin.x + x1, y + line_height)),
+                                color,
+                            )
+                            .corner_radii(px(3.)),
+                        );
+                    }
+                }
+
+                // Cursors.
+                if focused && self.cursor_visible {
+                    for sel in &self.selections {
+                        if self.doc.row_of(sel.head) != row {
+                            continue;
+                        }
+                        let col = dl.to_display(sel.head - line_start);
+                        if wrap::segment_of(&breaks, col) != seg {
+                            continue;
+                        }
+                        let x = x_of(col);
+                        frame.cursors.push(
+                            fill(
+                                Bounds::new(point(origin.x + x - px(1.), y + px(2.)), size(px(2.), line_height - px(4.))),
+                                theme.cursor,
+                            )
+                            .corner_radii(px(1.)),
+                        );
+                    }
+                }
+
+                if single {
+                    if first_seg && self.doc.len() == 0 && !self.placeholder.is_empty() {
+                        let placeholder = text_system.shape_line(
+                            self.placeholder.clone(),
+                            font_size,
+                            &[TextRun {
+                                len: self.placeholder.len(),
+                                font: editor_font.clone(),
+                                color: theme.text_dim.into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }],
+                            None,
+                        );
+                        frame.lines.push((origin, placeholder));
+                    }
+                    frame.lines.push((origin, shaped));
+                    continue;
+                }
+
+                // Gutter: line number and diagnostic dot, on the line's first row.
+                if first_seg {
+                    let number = SharedString::from((row + 1).to_string());
+                    let number_color = if is_cursor_row { theme.line_number_active } else { theme.line_number };
+                    let number_line = text_system.shape_line(
+                        number.clone(),
                         font_size,
                         &[TextRun {
-                            len: self.placeholder.len(),
+                            len: number.len(),
                             font: editor_font.clone(),
-                            color: theme.text_dim.into(),
+                            color: number_color.into(),
                             background_color: None,
                             underline: None,
                             strikethrough: None,
                         }],
                         None,
                     );
-                    frame.lines.push((origin, placeholder));
-                }
-                frame.lines.push((origin, shaped));
-                continue;
-            }
+                    let nx = bounds.left() + gutter_width - px(18.) - number_line.width;
+                    frame.numbers.push((point(nx, y), number_line));
 
-            // Gutter: line number and diagnostic dot.
-            let number = SharedString::from((row + 1).to_string());
-            let number_color = if is_cursor_row { theme.line_number_active } else { theme.line_number };
-            let number_line = text_system.shape_line(
-                number.clone(),
-                font_size,
-                &[TextRun {
-                    len: number.len(),
-                    font: editor_font.clone(),
-                    color: number_color.into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
-                None,
-            );
-            let nx = bounds.left() + gutter_width - px(18.) - number_line.width;
-            frame.numbers.push((point(nx, y), number_line));
-
-            // Git change bars.
-            let bar_x = bounds.left() + gutter_width - px(GIT_BAR_OFFSET) - px(1.5);
-            for hunk in self.hunks.iter() {
-                let color: Hsla = match hunk.kind {
-                    HunkKind::Added => theme.git_added,
-                    HunkKind::Modified => theme.git_modified,
-                    HunkKind::Deleted => theme.git_deleted,
-                }
-                .into();
-                if hunk.kind == HunkKind::Deleted {
-                    if hunk.new_rows.start == row {
+                    if let Some(worst) = worst {
+                        let dot = px(6.);
                         frame.gutter_marks.push(
-                            fill(Bounds::new(point(bar_x - px(1.5), y - px(3.)), size(px(6.), px(6.))), color)
-                                .corner_radii(px(3.)),
+                            fill(
+                                Bounds::new(point(bounds.left() + px(10.), y + (line_height - dot) / 2.), size(dot, dot)),
+                                severity_color(&theme, worst.severity),
+                            )
+                            .corner_radii(dot / 2.),
                         );
                     }
-                } else if hunk.new_rows.contains(&row) {
-                    let first = row == hunk.new_rows.start;
-                    let last = row + 1 == hunk.new_rows.end;
-                    let top = if first { y + px(1.) } else { y };
-                    let bottom = if last { y + line_height - px(1.) } else { y + line_height };
-                    frame.gutter_marks.push(
-                        fill(Bounds::from_corners(point(bar_x, top), point(bar_x + px(3.), bottom)), color)
-                            .corner_radii(gpui::Corners {
-                                top_left: if first { px(1.5) } else { px(0.) },
-                                top_right: if first { px(1.5) } else { px(0.) },
-                                bottom_left: if last { px(1.5) } else { px(0.) },
-                                bottom_right: if last { px(1.5) } else { px(0.) },
-                            }),
-                    );
                 }
-            }
 
-            if let Some(worst) = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).min_by_key(|d| d.severity) {
-                let color = severity_color(&theme, worst.severity);
-                let dot = px(6.);
-                frame.gutter_marks.push(
-                    fill(
-                        Bounds::new(point(bounds.left() + px(10.), y + (line_height - dot) / 2.), size(dot, dot)),
-                        color,
-                    )
-                    .corner_radii(dot / 2.),
-                );
-
-                // Inline diagnostic message after the line's text.
-                let mut message = worst.message.clone();
-                if message.len() > 160 {
-                    message.truncate(message.floor_char_boundary(160));
-                    message.push('…');
-                }
-                let count = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).count();
-                if count > 1 {
-                    message.push_str(&format!("  (+{})", count - 1));
-                }
-                let msg_size = px(theme.ui_font_size - 0.5);
-                let msg_line = text_system.shape_line(
-                    SharedString::from(message.clone()),
-                    msg_size,
-                    &[TextRun {
-                        len: message.len(),
-                        font: ui_font.clone(),
-                        color: color.alpha(0.9),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                );
-                let x = origin.x + shaped.width + char_width * 3.;
-                let pad = px(8.);
-                let pill_h = line_height - px(4.);
-                frame.inline_bgs.push(
-                    fill(
-                        Bounds::new(point(x - pad, y + px(2.)), size(msg_line.width + pad * 2., pill_h)),
-                        color.alpha(0.1),
-                    )
-                    .corner_radii(px(4.)),
-                );
-                frame.inline_texts.push((point(x, y), msg_line));
-            } else if focused
-                && self.selections.len() == 1
-                && is_cursor_row
-                && let Some((blame_row, _, blame)) = self.blame.as_ref()
-                && *blame_row == row
-            {
-                // Inline blame for the cursor line (only when no diagnostic is shown).
-                let who = match &self.git_file {
-                    _ if blame.uncommitted => "You".to_string(),
-                    Some(g) if g.user_name.as_deref() == Some(blame.author.as_str()) => "You".to_string(),
-                    _ => blame.author.clone(),
-                };
-                let text = if blame.uncommitted {
-                    "You • Uncommitted changes".to_string()
-                } else {
-                    let mut summary = blame.summary.clone();
-                    if summary.len() > 80 {
-                        summary.truncate(summary.floor_char_boundary(80));
-                        summary.push('…');
+                // Git change bars.
+                let bar_x = bounds.left() + gutter_width - px(GIT_BAR_OFFSET) - px(1.5);
+                for hunk in self.hunks.iter() {
+                    let color: Hsla = match hunk.kind {
+                        HunkKind::Added => theme.git_added,
+                        HunkKind::Modified => theme.git_modified,
+                        HunkKind::Deleted => theme.git_deleted,
                     }
-                    format!("{who}, {} • {summary}", git::relative_time(blame.time))
-                };
-                let line = text_system.shape_line(
-                    SharedString::from(text.clone()),
-                    px(theme.ui_font_size - 0.5),
-                    &[TextRun {
-                        len: text.len(),
-                        font: ui_font.clone(),
-                        color: Hsla::from(theme.text_dim).alpha(0.9),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                );
-                frame.inline_texts.push((point(origin.x + shaped.width + char_width * 4., y), line));
-            }
+                    .into();
+                    if hunk.kind == HunkKind::Deleted {
+                        if hunk.new_rows.start == row && first_seg {
+                            frame.gutter_marks.push(
+                                fill(Bounds::new(point(bar_x - px(1.5), y - px(3.)), size(px(6.), px(6.))), color)
+                                    .corner_radii(px(3.)),
+                            );
+                        }
+                    } else if hunk.new_rows.contains(&row) {
+                        let first = row == hunk.new_rows.start && first_seg;
+                        let last = row + 1 == hunk.new_rows.end && last_seg;
+                        let top = if first { y + px(1.) } else { y };
+                        let bottom = if last { y + line_height - px(1.) } else { y + line_height };
+                        frame.gutter_marks.push(
+                            fill(Bounds::from_corners(point(bar_x, top), point(bar_x + px(3.), bottom)), color)
+                                .corner_radii(gpui::Corners {
+                                    top_left: if first { px(1.5) } else { px(0.) },
+                                    top_right: if first { px(1.5) } else { px(0.) },
+                                    bottom_left: if last { px(1.5) } else { px(0.) },
+                                    bottom_right: if last { px(1.5) } else { px(0.) },
+                                }),
+                        );
+                    }
+                }
 
-            frame.lines.push((origin, shaped));
+                // Inline diagnostic or blame after the line's text, on its last row.
+                if !last_seg {
+                    frame.lines.push((origin, shaped));
+                    continue;
+                }
+                if let Some(worst) = worst {
+                    let color = severity_color(&theme, worst.severity);
+                    let mut message = worst.message.clone();
+                    if message.len() > 160 {
+                        message.truncate(message.floor_char_boundary(160));
+                        message.push('…');
+                    }
+                    let count = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).count();
+                    if count > 1 {
+                        message.push_str(&format!("  (+{})", count - 1));
+                    }
+                    let msg_size = px(theme.ui_font_size - 0.5);
+                    let msg_line = text_system.shape_line(
+                        SharedString::from(message.clone()),
+                        msg_size,
+                        &[TextRun {
+                            len: message.len(),
+                            font: ui_font.clone(),
+                            color: color.alpha(0.9),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    let x = origin.x + shaped.width + char_width * 3.;
+                    let pad = px(8.);
+                    let pill_h = line_height - px(4.);
+                    frame.inline_bgs.push(
+                        fill(
+                            Bounds::new(point(x - pad, y + px(2.)), size(msg_line.width + pad * 2., pill_h)),
+                            color.alpha(0.1),
+                        )
+                        .corner_radii(px(4.)),
+                    );
+                    frame.inline_texts.push((point(x, y), msg_line));
+                } else if focused
+                    && self.selections.len() == 1
+                    && is_cursor_row
+                    && let Some((blame_row, _, blame)) = self.blame.as_ref()
+                    && *blame_row == row
+                {
+                    // Inline blame for the cursor line (only when no diagnostic is shown).
+                    let who = match &self.git_file {
+                        _ if blame.uncommitted => "You".to_string(),
+                        Some(g) if g.user_name.as_deref() == Some(blame.author.as_str()) => "You".to_string(),
+                        _ => blame.author.clone(),
+                    };
+                    let text = if blame.uncommitted {
+                        "You • Uncommitted changes".to_string()
+                    } else {
+                        let mut summary = blame.summary.clone();
+                        if summary.len() > 80 {
+                            summary.truncate(summary.floor_char_boundary(80));
+                            summary.push('…');
+                        }
+                        format!("{who}, {} • {summary}", git::relative_time(blame.time))
+                    };
+                    let line = text_system.shape_line(
+                        SharedString::from(text.clone()),
+                        px(theme.ui_font_size - 0.5),
+                        &[TextRun {
+                            len: text.len(),
+                            font: ui_font.clone(),
+                            color: Hsla::from(theme.text_dim).alpha(0.9),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    frame.inline_texts.push((point(origin.x + shaped.width + char_width * 4., y), line));
+                }
+
+                frame.lines.push((origin, shaped));
+            }
         }
 
         if !single {
@@ -2141,9 +2375,9 @@ impl Editor {
         if let Some((track, thumb)) = self.scrollbar_geometry().filter(|_| !single) {
             let hovered_color = if self.scrollbar_drag.is_some() { 0.28 } else { 0.16 };
             frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(hovered_color)).corner_radii(px(4.)));
-            let rows = line_count.max(1) as f32;
+            let rows = display_rows.max(1) as f32;
             for d in &self.doc.diagnostics {
-                let row = self.doc.row_of(d.range.start) as f32;
+                let row = self.first_display_row(self.doc.row_of(d.range.start)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
                     Bounds::new(point(track.right() - px(5.), y), size(px(4.), px(2.))),
@@ -2157,13 +2391,14 @@ impl Editor {
                     HunkKind::Deleted => theme.git_deleted,
                 }
                 .into();
-                let y0 = track.top() + track.size.height * (hunk.new_rows.start as f32 / rows);
-                let h = (track.size.height * (hunk.new_rows.len() as f32 / rows)).max(px(2.));
+                let (d0, d1) = (self.first_display_row(hunk.new_rows.start), self.first_display_row(hunk.new_rows.end));
+                let y0 = track.top() + track.size.height * (d0 as f32 / rows);
+                let h = (track.size.height * (d1.saturating_sub(d0) as f32 / rows)).max(px(2.));
                 frame.scrollbar.push(fill(Bounds::new(point(track.left(), y0), size(px(2.), h)), color));
             }
             let mut last_y = None;
             for m in &self.search_matches {
-                let row = self.doc.row_of(m.start) as f32;
+                let row = self.first_display_row(self.doc.row_of(m.start)) as f32;
                 let y = (track.top() + track.size.height * (row / rows)).round();
                 if last_y == Some(y) {
                     continue;
@@ -2175,7 +2410,7 @@ impl Editor {
                 ));
             }
             for s in &self.selections {
-                let row = self.doc.row_of(s.head) as f32;
+                let row = self.first_display_row(self.doc.row_of(s.head)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
                     Bounds::new(point(track.left() + px(1.), y), size(px(4.), px(2.))),
@@ -2319,6 +2554,31 @@ fn word_range(doc: &Document, offset: usize) -> Range<usize> {
     start..end
 }
 
+/// One display row of a line: its slice of the display text, shaped.
+struct RowShape {
+    line: ShapedLine,
+    dl: DisplayLine,
+    range: Range<usize>,
+    /// Wrap indent before the text.
+    indent: Pixels,
+    /// Whether this is the line's last row.
+    last: bool,
+}
+
+/// The part of `runs` (covering a whole line) that falls in `range`.
+fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for run in runs {
+        let (start, end) = (pos.max(range.start), (pos + run.len).min(range.end));
+        pos += run.len;
+        if start < end {
+            out.push(TextRun { len: end - start, ..run.clone() });
+        }
+    }
+    out
+}
+
 /// A buffer line prepared for display: tabs are expanded to spaces, with a
 /// mapping between buffer columns and display columns (both in bytes).
 pub struct DisplayLine {
@@ -2369,14 +2629,14 @@ impl DisplayLine {
 // ---- Git ------------------------------------------------------------------------
 
 impl Editor {
-    /// The change marker under a gutter position (rows as a fraction, so
+    /// The change marker under a gutter position (display rows as a fraction, so
     /// deletion markers on a row boundary can be hit).
     fn hunk_at(&self, row: f32) -> Option<usize> {
         let deleted = self.hunks.iter().position(|h| {
-            h.kind == HunkKind::Deleted && (row - h.new_rows.start as f32).abs() < 0.35
+            h.kind == HunkKind::Deleted && (row - self.first_display_row(h.new_rows.start) as f32).abs() < 0.35
         });
         deleted.or_else(|| {
-            let r = row.floor().max(0.) as usize;
+            let r = self.line_of_display_row(row.floor().max(0.) as usize).0;
             self.hunks.iter().position(|h| h.kind != HunkKind::Deleted && h.new_rows.contains(&r))
         })
     }
@@ -2477,7 +2737,7 @@ impl Editor {
         let hunk = self.hunks.get(ix)?.clone();
         let layout = self.layout.as_ref()?;
         let theme = Theme::get(cx).clone();
-        let anchor_row = if hunk.kind == HunkKind::Deleted { hunk.new_rows.start } else { hunk.new_rows.end };
+        let anchor_row = self.first_display_row(if hunk.kind == HunkKind::Deleted { hunk.new_rows.start } else { hunk.new_rows.end });
         let top = layout.line_height * anchor_row as f32 - self.scroll.y + px(2.);
         let left = layout.gutter_width - px(4.);
         let width = (layout.bounds.size.width - left - px(28.)).min(px(720.)).max(px(240.));
@@ -2847,12 +3107,14 @@ impl EntityInputHandler for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        self.sync_wrap(window, cx);
         let layout = self.layout.clone()?;
         let range = self.range_from_utf16(&range_utf16);
-        let row = self.doc.row_of(range.start);
-        let y = layout.bounds.top() + layout.line_height * row as f32 - self.scroll.y;
+        let drow = self.display_row_of(range.start);
+        let y = layout.bounds.top() + layout.line_height * drow as f32 - self.scroll.y;
         let x0 = self.x_for_offset(range.start, window, cx);
-        let x1 = self.x_for_offset(range.end.max(range.start), window, cx);
+        let end = range.end.max(range.start);
+        let x1 = if self.display_row_of(end) == drow { self.x_for_offset(end, window, cx) } else { x0 };
         let left = layout.text_left - self.scroll.x;
         Some(Bounds::from_corners(
             point(left + x0, y),
@@ -2950,8 +3212,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::next_change))
             .on_action(cx.listener(Self::previous_change))
             .on_action(cx.listener(Self::toggle_inline_blame))
+            .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

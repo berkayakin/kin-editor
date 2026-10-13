@@ -78,6 +78,7 @@ pub struct Theme {
     pub indent_guide: Rgba,
     pub search_match: Rgba,
     pub search_active: Rgba,
+    pub bracket_match: Rgba,
 
     pub error: Rgba,
     pub warning: Rgba,
@@ -134,6 +135,7 @@ color_keys! {
     "indent_guide" => indent_guide,
     "search_match" => search_match,
     "search_active" => search_active,
+    "bracket_match" => bracket_match,
     "error" => error,
     "warning" => warning,
     "info" => info,
@@ -222,6 +224,7 @@ impl Theme {
             indent_guide: rgba(0x80808020),
             search_match: rgba(0xffcc0040),
             search_active: rgba(0xffcc0080),
+            bracket_match: rgba(0x80808040),
             error: rgba(0xff5555ff),
             warning: rgba(0xffaa00ff),
             info: rgba(0x55aaffff),

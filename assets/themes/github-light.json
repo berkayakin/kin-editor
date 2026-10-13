@@ -24,6 +24,7 @@
     "indent_guide": "#1f232812",
     "search_match": "#d4a72c40",
     "search_active": "#d4a72c80",
+    "bracket_match": "#1f23281f",
     "error": "#cf222e",
     "warning": "#9a6700",
     "info": "#0969da",

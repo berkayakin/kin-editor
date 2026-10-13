@@ -27,9 +27,13 @@ platform-native text rendering (CoreText / DirectWrite).
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
 - Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
+- Matching-bracket highlight (ignores brackets in strings and comments) and an editor right-click menu
+- Soft wrap that keeps indentation, on by default for Markdown and plain text (View → Soft-Wrap
+  toggles it per file)
 - Find/Replace bar with case, whole-word and regex options; Find/Replace in Files with preview
   (searches unsaved buffers too, honors .gitignore)
-- Search Everywhere (double Shift), fuzzy Go to File, Recent Files, Find Action, Go to Line
+- Search Everywhere (double Shift), fuzzy Go to File, Recent Files, Find Action, Go to Line, and
+  File Structure: the current file's functions, classes, headings, selectors or keys
 - Git: clone, init, gutter change markers with rollback, inline blame, file status colors, a Commit panel
   (stage, discard, commit, amend, push), diff viewer, branches, pull and fetch
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
@@ -74,6 +78,7 @@ reachable through Find Action, which shows its shortcut.
 | Recent Files | ⌘E | Ctrl+E |
 | Find Action | ⌘⇧A | Ctrl+Shift+A |
 | Go to Line:Column | ⌘L | Ctrl+G |
+| File Structure | ⌘F12 | Ctrl+F12 |
 | Find / Replace | ⌘F / ⌘R | Ctrl+F / Ctrl+R |
 | Next / previous occurrence | ⌘G / ⌘⇧G, F3 / ⇧F3 | F3 / Shift+F3 |
 | Find / Replace in Files | ⌘⇧F / ⌘⇧R | Ctrl+Shift+F / Ctrl+Shift+R |
@@ -102,14 +107,15 @@ Each window holds one project folder, so several projects can be open side by si
 
 - **Open Folder…** (⌥⌘O / Ctrl+Alt+O) opens the folder in a new window. A window with no
   project yet is reused instead.
-- **Open Folder in This Window…** replaces the window's project. Unsaved edits are saved or
-  discarded first (Kin asks), then its tabs close.
+- **Open Folder in This Window…** replaces the window's project. Its tabs, including unsaved
+  edits, are kept for when you open it again.
 - **Recent Projects…** (also opened by clicking the project name in the title bar) lists recent
   folders. Enter opens one in this window; ⌘↩ / Ctrl+Enter or ⌘/Ctrl-click opens it in a new
   window. The welcome screen's Recent Projects list works the same way.
 - **New Window** (⌘⇧N) opens an empty window.
 - Opening a folder that's already open in another window brings that window forward.
-- Quitting asks about unsaved edits in each window that has them.
+- Quitting or closing a project window doesn't ask about unsaved edits: they're kept and come back
+  with the project's tabs. Windows without a project folder still ask.
 
 These are all in the File menu and Find Action.
 
@@ -119,6 +125,10 @@ Kin reopens the last project folder when started without arguments, lists the la
 folders under Recent Projects (shared by all windows; hover a welcome-screen row to remove it), and remembers
 panel sizes and whether the sidebar and Problems panel are open. This lives in
 `state.json` next to `settings.json` in the config folder.
+
+Each project also reopens with the tabs it had, the active tab and each caret. Unsaved edits
+are kept as well (like VS Code's hot exit) and undo goes back to the file's saved text. These
+live in `sessions/` in the config folder, one file per project.
 
 ## Git
 
@@ -198,6 +208,7 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 | `cursor`, `selection`, `selection_inactive`, `current_line` | editor caret and selection |
 | `line_number`, `line_number_active`, `indent_guide` | gutter and guides |
 | `search_match`, `search_active` | find results |
+| `bracket_match` | the bracket pair around the cursor |
 | `error`, `warning`, `info`, `success` | diagnostics and status |
 | `file_js`, `file_html` | file icons |
 
@@ -209,10 +220,12 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 
 - `src/document.rs` — rope buffer, edits, undo history, file I/O
 - `src/editor.rs` — editor view, input handling and the GPU element that paints it
-- `src/syntax.rs` — tree-sitter parsing and highlighting
+- `src/wrap.rs` — soft wrap: where long lines break into display rows
+- `src/syntax.rs` — tree-sitter parsing, highlighting, bracket matching and file outlines
 - `src/lint/` — built-in JS/HTML linters and the ESLint bridge
 - `src/search.rs`, `src/find_bar.rs`, `src/project_search.rs` — in-file and project search
-- `src/picker.rs` — Search Everywhere, Go to File, Recent Files, Recent Projects, Find Action, Go to Line
+- `src/picker.rs` — Search Everywhere, Go to File, Recent Files, Recent Projects, Find Action,
+  File Structure, Go to Line
 - `src/keymap.rs` — JetBrains-style key bindings
 - `src/git.rs`, `src/git_panel.rs`, `src/diff_view.rs`, `src/branch_picker.rs`, `src/clone_dialog.rs` — Git backend and UI
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
