@@ -57,7 +57,11 @@ platform-native text rendering (CoreText / DirectWrite).
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
 - Image preview: PNG, JPEG, GIF (animated), WebP, BMP, TIFF, ICO, TGA and QOI files open as a
   picture with their dimensions and size (SVG stays text); Git diffs show an image's before and after
-- File tree, tabs, custom title bar, IME support
+- File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
+  Reveal in Finder; tabs, custom title bar, IME support
+- A Settings dialog for every option, with search across its pages; see [Settings](#settings)
+- Automatic updates from GitHub Releases (signed), installed with **Restart to Update**; see
+  [Releases and updates](#releases-and-updates)
 
 ## Running
 
@@ -71,7 +75,7 @@ GPUI's `runtime_shaders` feature is enabled, so no separate Metal toolchain is n
 
 ### App icon
 
-The icon (a white Vidaloka "F" on black) lives in [`assets/app-icon/`](assets/app-icon):
+The icon (a black ‹K› on a lavender, rose and orange gradient) lives in [`assets/app-icon/`](assets/app-icon):
 
 - **macOS:** the Dock icon is set at startup, so it shows even with `cargo run`. To build a
   `Kin.app` that uses `macos/Kin.icns`, run `cargo install cargo-bundle` and then
@@ -102,7 +106,8 @@ Released builds check for updates shortly after launch and every few hours (unle
 `auto_update` is `false`; **Check for Updates…** works either way), download in the background
 and show **Restart to Update** in the status bar. They only install an update whose
 `latest.json` carries a valid signature from the key in `src/updater.rs`. Builds from source
-don't update themselves.
+don't update themselves. **About Kin** (first in the app menu, and in Find Action) shows the
+version and the commit it was built from; **Copy Version** copies both for bug reports.
 
 The macOS app is only ad-hoc signed (no Apple Developer ID), so macOS blocks the first launch
 of a downloaded copy: allow it under System Settings → Privacy & Security → **Open Anyway**, or
@@ -213,8 +218,8 @@ command.
 | Markdown | marksman | `brew install marksman` |
 
 With a server running, its diagnostics replace Kin's built-in syntax check (the other built-in
-rules and ESLint still run). Hover a symbol for its documentation and any problem there;
-completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
+rules and ESLint still run). Hover a symbol for its documentation and any problem there (the
+popover scrolls, and a copy button that appears on hover copies its text); completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
 server or turn one off, see `language_servers` below.
 
@@ -311,7 +316,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `trim_trailing_whitespace` | `false` | on save; lines with a caret are left alone |
 | `insert_final_newline` | `false` | on save |
 | `format_on_save` | `false` | reformat on Save (auto-save never reformats) |
-| `languages` | | per-language overrides of the last five, by the name in the status bar |
+| `languages` | | per-language overrides of the six above, by the name in the status bar |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
@@ -355,8 +360,8 @@ These are all in the File menu and Find Action.
 
 Kin reopens the last project folder when started without arguments, lists the last ten
 folders under Recent Projects (shared by all windows; hover a welcome-screen row to remove it), and remembers
-panel sizes and whether the sidebar, Problems panel, terminal and Git log are open (all but the sidebar start
-closed the first time). This lives in
+panel sizes, whether the sidebar, Problems panel, terminal and Git log are open (all but the sidebar start
+closed the first time), which sidebar view (Files or Commit) shows, the font zoom and the diff layout. This lives in
 `state.json` next to `settings.json` in the config folder.
 
 Each project also reopens with the tabs it had, the active tab and each caret. Unsaved edits
@@ -378,17 +383,18 @@ message instead of hanging; use an SSH agent or a credential helper.
   (Find Action → Toggle Inline Git Blame).
 - **File tree:** changed files are colored with a status letter; folders containing
   changes are tinted.
-- **Commit panel** (⌘K / ⌘0, or the branch button at the left of the status bar, which shows the
-  number of changes): the branch with fetch, pull and push at the top, then staged and unstaged changes with stage, unstage and roll back
-  on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
+- **Commit panel** (⌘K / ⌘0, or the Commit button at the left of the status bar, which shows the
+  number of changes): the branch with fetch, pull and push at the top, then staged and unstaged
+  changes with stage, unstage, open and roll back on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
   staged, everything is committed), or use **Commit and Push**. **Amend** starts from the
   previous message. In a folder that isn't a repository it offers **Initialize Repository**.
 - **Diffs** show side by side or unified (the choice is remembered), with syntax colors and the
   changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
   through changes; collapsed unchanged lines expand on click. Images show the previous and new
   version side by side; other binary files say there's no text diff.
-- **Branches:** the branch is shown in the title bar with ahead/behind counts; click it to
-  switch to a local or remote branch, or type a new name to create one. Hover another branch
+- **Branches:** the Commit panel's header shows the branch, with the number of commits to pull
+  and to push on its Pull and Push buttons. Click the branch (or use **Branches…** in the Git
+  menu) to switch to a local or remote branch, or type a new name to create one. Hover another branch
   for **Merge** (into the current one) and **Rebase** (the current one onto it).
 - **Merge conflicts:** a merge or rebase that stops on conflicts shows a banner in the Commit
   panel with **Abort**. Conflicted files open in the editor, where each conflict is tinted
@@ -469,6 +475,7 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 | `search_match`, `search_active` | find results |
 | `bracket_match` | the bracket pair around the cursor |
 | `error`, `warning`, `info`, `success` | diagnostics and status |
+| `git_added`, `git_modified`, `git_deleted`, `git_untracked`, `git_conflict` | Git gutter bars, file status colors and diffs |
 | `terminal_black` … `terminal_white`, `terminal_bright_black` … `terminal_bright_white` | the terminal's 16 ANSI colors |
 
 `syntax` keys: `plain`, `keyword`, `string`, `number`, `constant`, `function`, `method`,
@@ -477,21 +484,36 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 
 ## Layout
 
+- `src/main.rs` — app setup: fonts, theme, keymap, menus, windows, command-line paths
+- `src/workspace.rs` — window chrome: title bar, file tree, panes and tabs, problems, status bar,
+  modals and file operations
 - `src/document.rs` — rope buffer, edits, undo history, file I/O
 - `src/editor.rs` — editor view, input handling and the GPU element that paints it
 - `src/wrap.rs` — soft wrap: where long lines break into display rows
+- `src/fold.rs`, `src/editor/fold.rs` — code folding regions and fold UI
 - `src/syntax.rs` — tree-sitter parsing, highlighting, bracket matching and file outlines
 - `src/lsp/` — language server client: JSON-RPC transport, protocol types, server discovery
 - `src/editor/lsp.rs` — completion, hover, signature help and LSP requests in the editor
-- `src/lint/` — built-in JS/HTML linters and the ESLint bridge
+- `src/format.rs`, `src/editor/format.rs` — Reformat Code and format on save
+- `src/lint/` — built-in JS/HTML/Markdown linters, tree-sitter syntax errors and the ESLint bridge
 - `src/search.rs`, `src/find_bar.rs`, `src/project_search.rs` — in-file and project search
 - `src/picker.rs` — Search Everywhere, Go to File, Recent Files, Recent Projects, Find Action,
   File Structure, Go to Line
+- `src/terminal.rs` — the integrated terminal
+- `src/run.rs`, `src/editor/run.rs` — run and test targets and the gutter ▶
 - `src/keymap.rs` — JetBrains-style key bindings
-- `src/git.rs`, `src/git_panel.rs`, `src/diff_view.rs`, `src/branch_picker.rs`, `src/clone_dialog.rs` — Git backend and UI
+- `src/git.rs`, `src/git_panel.rs`, `src/diff_view.rs`, `src/git_log.rs`, `src/push_dialog.rs`,
+  `src/branch_picker.rs`, `src/clone_dialog.rs` — Git backend and UI
+- `src/conflict.rs`, `src/editor/conflict.rs` — merge conflict markers and their resolution
+- `src/preview.rs` — image files
+- `src/settings.rs`, `src/editorconfig.rs`, `src/preferences.rs`, `src/preferences/` —
+  `settings.json`, `.editorconfig` and the Settings dialog
+- `src/state.rs` — remembered UI state and per-project sessions
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
-- `src/workspace.rs` — window chrome: title bar, file tree, tabs, problems, status bar
-- `assets/icons/` — rounded, Lucide-style SVG icons embedded into the binary
+- `src/updater.rs`, `.github/workflows/release.yml` — auto-update and the release build
+- `src/about.rs` — the About Kin window
+- `src/ui.rs`, `src/context_menu.rs`, `src/input_dialog.rs` — shared widgets, menus and prompts
+- `src/assets.rs`, `assets/icons/` — rounded, Lucide-style SVG icons and the title font embedded into the binary
 - `assets/file-icons/`, `src/file_icons.rs` — file-type icons ([Charmed Icons](https://github.com/jmesrje/zed-charmed-icons)) and their file-name associations
 - `assets/app-icon/` — the app logo (`logo.svg`) and its per-platform icons
 
