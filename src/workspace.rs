@@ -876,6 +876,27 @@ impl Workspace {
             self.save_as(&SaveAs, window, cx);
             return;
         }
+        // Format on save: only for an explicit Save, like VS Code, so
+        // auto-save never reformats mid-typing.
+        if editor.read(cx).format_on_save() {
+            let task = editor.update(cx, |e, cx| e.format(false, cx));
+            cx.spawn_in(window, async move |this, cx| {
+                let result = task.await;
+                this.update_in(cx, |ws, window, cx| {
+                    if let Err(err) = result {
+                        ws.toast(ToastKind::Info, "Saved without formatting", Some(err), cx);
+                    }
+                    ws.save_editor(&editor, window, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        self.save_editor(&editor, window, cx);
+    }
+
+    fn save_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         match editor.update(cx, |e, cx| e.save(cx)) {
             Ok(()) => {
                 self.auto_save_warned.remove(&editor.entity_id());
@@ -2252,6 +2273,7 @@ impl Workspace {
             ("Find Usages", Box::new(editor::FindUsages)),
             ("Rename…", Box::new(editor::RenameSymbol)),
             ("Show Context Actions", Box::new(editor::ShowContextActions)),
+            ("Reformat Code", Box::new(editor::ReformatCode)),
         ] {
             let (entry, action) = run(MenuEntry::text(label), action);
             add(entry, action);

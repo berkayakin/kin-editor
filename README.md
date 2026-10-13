@@ -27,6 +27,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
   signature help, Go to Declaration, Find Usages, Rename and context actions (quick fixes and
   refactorings); see [Language servers](#language-servers)
+- Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
+  (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
 - Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
@@ -111,6 +113,7 @@ reachable through Find Action, which shows its shortcut.
 | Rename | ⇧F6 | Shift+F6 |
 | Show Context Actions | ⌥↩ | Alt+Enter |
 | Quick Documentation | F1 | Ctrl+Q |
+| Reformat Code | ⌥⌘L | Ctrl+Alt+L |
 
 ### Your own bindings
 
@@ -162,6 +165,16 @@ completion opens as you type (Enter inserts, Tab replaces the rest of the word).
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
 server or turn one off, see `language_servers` below.
 
+## Formatting
+
+**Reformat Code** formats the file, or the selection when the language server supports range
+formatting. Kin picks, in order: a formatter installed in the project (`node_modules/.bin`, e.g.
+Prettier), the language server, then a formatter on PATH: Prettier (JS, TS, CSS, HTML, JSON,
+YAML, Markdown), rustfmt (with the edition from Cargo.toml), gofmt, ruff or black, taplo, shfmt.
+Only the changed lines are replaced, so the caret stays put and one undo reverts it. Formatters
+read their own config (`.prettierrc`, `rustfmt.toml`, `pyproject.toml`…). Set `format_on_save`
+(per language too) to format on Save; choose a formatter per language with `formatters`.
+
 ## Settings
 
 **Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
@@ -182,8 +195,10 @@ picker, Toggle Auto Save).
 | `soft_wrap` | `false` (`true` for Markdown and plain text) | |
 | `trim_trailing_whitespace` | `false` | on save; lines with a caret are left alone |
 | `insert_final_newline` | `false` | on save |
+| `format_on_save` | `false` | reformat on Save (auto-save never reformats) |
 | `languages` | | per-language overrides of the last five, by the name in the status bar |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
+| `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
 
 ```jsonc
 {

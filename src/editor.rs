@@ -1,6 +1,7 @@
 //! The text editor view: multi-cursor editing, keyboard/mouse/IME input and a
 //! custom element that paints only the visible lines straight to the GPU.
 
+mod format;
 mod lsp;
 
 pub use lsp::EditorLspEvent;
@@ -102,6 +103,7 @@ actions!(
         FindUsages,
         RenameSymbol,
         ShowContextActions,
+        ReformatCode,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -3324,6 +3326,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::find_usages))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::show_context_actions))
+            .on_action(cx.listener(Self::reformat_code))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))

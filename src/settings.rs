@@ -41,6 +41,9 @@ pub struct Settings {
     /// Per language: `false` to turn its language server off, or a command
     /// (`["pylsp"]`) to use instead of the built-in choice.
     pub language_servers: HashMap<String, serde_json::Value>,
+    /// Per language: `"language_server"`, a command reading stdin and writing
+    /// stdout (`["black", "-q", "-"]`), or `false` to never format.
+    pub formatters: HashMap<String, serde_json::Value>,
 }
 
 impl Global for Settings {}
@@ -84,6 +87,8 @@ pub struct EditorSettings {
     pub trim_trailing_whitespace: Option<bool>,
     /// End the file with a newline on save.
     pub insert_final_newline: Option<bool>,
+    /// Reformat when saving with Save (not auto-save).
+    pub format_on_save: Option<bool>,
 }
 
 impl EditorSettings {
@@ -95,6 +100,7 @@ impl EditorSettings {
             soft_wrap: self.soft_wrap.or(base.soft_wrap),
             trim_trailing_whitespace: self.trim_trailing_whitespace.or(base.trim_trailing_whitespace),
             insert_final_newline: self.insert_final_newline.or(base.insert_final_newline),
+            format_on_save: self.format_on_save.or(base.format_on_save),
         }
     }
 
@@ -123,9 +129,17 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "editor_line_height",
     "languages",
     "language_servers",
+    "formatters",
 ];
 
-const EDITOR_KEYS: &[&str] = &["tab_size", "hard_tabs", "soft_wrap", "trim_trailing_whitespace", "insert_final_newline"];
+const EDITOR_KEYS: &[&str] = &[
+    "tab_size",
+    "hard_tabs",
+    "soft_wrap",
+    "trim_trailing_whitespace",
+    "insert_final_newline",
+    "format_on_save",
+];
 
 /// Editor options resolved for one file.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -137,6 +151,7 @@ pub struct FileSettings {
     pub soft_wrap: bool,
     pub trim_trailing_whitespace: bool,
     pub insert_final_newline: bool,
+    pub format_on_save: bool,
 }
 
 impl Settings {
@@ -208,6 +223,7 @@ impl Settings {
             soft_wrap: None,
             trim_trailing_whitespace: config.trim_trailing_whitespace,
             insert_final_newline: config.insert_final_newline,
+            format_on_save: None,
         };
         let s = from_config
             .or(language_overrides)
@@ -220,6 +236,7 @@ impl Settings {
             soft_wrap: s.soft_wrap.unwrap_or(false),
             trim_trailing_whitespace: s.trim_trailing_whitespace.unwrap_or(false),
             insert_final_newline: s.insert_final_newline.unwrap_or(false),
+            format_on_save: s.format_on_save.unwrap_or(false),
         }
     }
 }
@@ -327,6 +344,8 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "soft_wrap": false,
   // "trim_trailing_whitespace": false,
   // "insert_final_newline": false,
+  // Reformat on Save (auto-save doesn't reformat while you type).
+  // "format_on_save": false,
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {
@@ -339,6 +358,15 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "language_servers": {
   //   "Python": ["pylsp"],
   //   "Markdown": false
+  // },
+
+  // Reformat Code uses the project's own formatter (e.g. its Prettier), then
+  // the language server, then a formatter on PATH. To choose: a command that
+  // reads stdin and writes stdout ({file} is the file's path),
+  // "language_server", or false.
+  // "formatters": {
+  //   "Python": ["black", "--quiet", "-"],
+  //   "TypeScript": "language_server"
   // }
 }
 "#;

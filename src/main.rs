@@ -7,6 +7,7 @@ mod document;
 mod editor;
 mod editorconfig;
 mod find_bar;
+mod format;
 mod git;
 mod git_panel;
 mod input_dialog;
@@ -86,6 +87,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Toggle Comment", ToggleComment),
                 MenuItem::action("Duplicate Line", DuplicateLine),
                 MenuItem::action("Rename…", RenameSymbol),
+                MenuItem::action("Reformat Code", ReformatCode),
                 MenuItem::separator(),
                 MenuItem::action("Find…", Find),
                 MenuItem::action("Replace…", Replace),

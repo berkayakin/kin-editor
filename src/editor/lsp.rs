@@ -102,7 +102,7 @@ impl Editor {
         self.lsp.store = Some(store);
     }
 
-    fn lsp_server(&self, cx: &gpui::App) -> Option<Arc<Server>> {
+    pub(super) fn lsp_server(&self, cx: &gpui::App) -> Option<Arc<Server>> {
         let path = self.doc.path.as_deref()?;
         self.lsp.store.as_ref()?.upgrade()?.read(cx).server_for(path)
     }
