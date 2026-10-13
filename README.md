@@ -55,6 +55,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Run and test: ▶ in the gutter next to tests and `main` functions (Rust, Go, Python, JS/TS),
   project commands (cargo, npm scripts, go, make, pytest) and your own run configurations, each
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
+- Image preview: PNG, JPEG, GIF (animated), WebP, BMP, TIFF, ICO, TGA and QOI files open as a
+  picture with their dimensions and size (SVG stays text); Git diffs show an image's before and after
 - File tree, tabs, custom title bar, IME support
 
 ## Running
@@ -356,7 +358,8 @@ message instead of hanging; use an SSH agent or a credential helper.
   previous message. In a folder that isn't a repository it offers **Initialize Repository**.
 - **Diffs** show side by side or unified (the choice is remembered), with syntax colors and the
   changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
-  through changes; collapsed unchanged lines expand on click.
+  through changes; collapsed unchanged lines expand on click. Images show the previous and new
+  version side by side; other binary files say there's no text diff.
 - **Branches:** the branch is shown in the title bar with ahead/behind counts; click it to
   switch to a local or remote branch, or type a new name to create one. Hover another branch
   for **Merge** (into the current one) and **Rebase** (the current one onto it).

@@ -1976,6 +1976,10 @@ impl Workspace {
     fn load_diff_base(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
         let Some(path) = editor.read(cx).doc.path.clone() else { return };
+        // Images have no lines to mark.
+        if editor.read(cx).doc.image.is_some() {
+            return;
+        }
         let Ok(rel) = path.strip_prefix(&repo) else {
             editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
             return;
@@ -5035,7 +5039,8 @@ impl Workspace {
         };
 
         let mut right: Vec<AnyElement> = Vec::new();
-        if let Some(e) = editor {
+        // An image tab has no caret, indentation or line endings.
+        if let Some(e) = editor.filter(|e| e.doc.image.is_none()) {
             let (line, col) = e.cursor_position();
             let selected = e.selected_chars();
             let cursors = e.selections().len();

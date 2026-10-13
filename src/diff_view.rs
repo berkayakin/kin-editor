@@ -2,7 +2,11 @@
 //! file in a commit (from the Git log). Side by side or unified, with syntax
 //! colors, changed words emphasized, and Stage / Unstage per change.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, IntoElement, Render,
@@ -14,6 +18,7 @@ use crate::{
     assets::Icon,
     editor::{Cancel, NextChange, PreviousChange},
     git::{self, Change, CommitFile, DiffDocument, DiffLineKind, FileStatus},
+    preview::{self, ImageInfo},
     git_panel::{GitOp, change_color},
     syntax::{Highlight, Language, Syntax},
     theme::Theme,
@@ -43,9 +48,17 @@ pub enum DiffSource {
 /// Syntax spans per line, in tab-expanded byte offsets.
 type LineSpans = Vec<Vec<(Range<usize>, Highlight)>>;
 
+/// The two versions of an image: a temporary copy of each and its details.
+struct ImageSides {
+    before: Option<(PathBuf, ImageInfo)>,
+    after: Option<(PathBuf, ImageInfo)>,
+}
+
 struct Loaded {
     /// Binary content has no meaningful text diff.
     binary: bool,
+    /// Images are compared as pictures.
+    images: Option<ImageSides>,
     doc: DiffDocument,
     old_spans: LineSpans,
     new_spans: LineSpans,
@@ -94,6 +107,16 @@ impl DiffView {
             let loaded = cx
                 .background_executor()
                 .spawn(async move {
+                    if let Some(images) = load_images(&repo, &source) {
+                        return Loaded {
+                            binary: true,
+                            images: Some(images),
+                            doc: DiffDocument::default(),
+                            old_spans: Vec::new(),
+                            new_spans: Vec::new(),
+                            current: Arc::from(""),
+                        };
+                    }
                     let (base, current, path) = match &source {
                         DiffSource::Working { file, staged: true, .. } => (
                             git::head_text(&repo, &file.rel).unwrap_or_default(),
@@ -119,6 +142,7 @@ impl DiffView {
                     if git::is_binary(&base) || git::is_binary(&current) {
                         return Loaded {
                             binary: true,
+                            images: None,
                             doc: DiffDocument::default(),
                             old_spans: Vec::new(),
                             new_spans: Vec::new(),
@@ -128,6 +152,7 @@ impl DiffView {
                     let language = Language::from_path(&path);
                     Loaded {
                         binary: false,
+                        images: None,
                         doc: git::diff_document(&base, &current, context),
                         old_spans: line_spans(language, &base),
                         new_spans: line_spans(language, &current),
@@ -173,6 +198,8 @@ impl DiffView {
     fn content_height(&self) -> gpui::Pixels {
         const CHROME: f32 = 46. + 1. + 2. + 4. + 10.;
         let rows = match &self.loaded {
+            // Room for the pictures.
+            Some(l) if l.images.is_some() => 24,
             Some(l) if !l.doc.changes.is_empty() => self.rows_len(),
             _ => 2,
         };
@@ -228,6 +255,39 @@ impl DiffView {
             cx.notify();
         }
     }
+}
+
+/// For an image file, both versions as temporary files (`None` for other files).
+fn load_images(repo: &Path, source: &DiffSource) -> Option<ImageSides> {
+    let (path, before, after) = match source {
+        DiffSource::Working { file, staged: true, .. } => (
+            file.path.clone(),
+            git::blob_bytes(repo, &format!("HEAD:{}", file.rel)),
+            git::blob_bytes(repo, &format!(":{}", file.rel)),
+        ),
+        DiffSource::Working { file, staged: false, .. } => {
+            let before = if file.unstaged == Some(Change::Untracked) { None } else { git::blob_bytes(repo, &format!(":{}", file.rel)) };
+            (file.path.clone(), before, std::fs::read(&file.path).ok())
+        }
+        DiffSource::Commit { sha, file, .. } => {
+            let old_rel = file.old_rel.as_deref().unwrap_or(&file.rel);
+            let before = (file.change != Change::Added).then(|| git::blob_bytes(repo, &format!("{sha}^:{old_rel}"))).flatten();
+            let after = (file.change != Change::Deleted).then(|| git::blob_bytes(repo, &format!("{sha}:{}", file.rel))).flatten();
+            (repo.join(&file.rel), before, after)
+        }
+    };
+    if !preview::is_image(&path) {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let side = |bytes: Option<Vec<u8>>| {
+        let copy = preview::temp_copy(&bytes?, &extension)?;
+        let mut info = ImageInfo::read(&copy);
+        // The copy is named by its hash; show the real file's format.
+        info.format = ImageInfo::read(&path).format;
+        Some((copy, info))
+    };
+    Some(ImageSides { before: side(before), after: side(after) })
 }
 
 /// Syntax spans per line of `text`, in the tab-expanded offsets the diff uses.
@@ -409,6 +469,7 @@ impl Render for DiffView {
         let rows = self.rows_len();
         let body = match self.loaded.clone() {
             None => div().flex_1().p_4().text_color(theme.text_dim).child("Loading diff…").into_any_element(),
+            Some(loaded) if loaded.images.is_some() => self.render_images(loaded.images.as_ref().unwrap(), &theme).into_any_element(),
             Some(loaded) if loaded.binary => div()
                 .flex_1()
                 .p_4()
@@ -455,6 +516,51 @@ impl Render for DiffView {
 }
 
 impl DiffView {
+    /// Before and after, side by side, scaled down to fit.
+    fn render_images(&self, sides: &ImageSides, theme: &Theme) -> impl IntoElement {
+        let side = |title: &'static str, version: &Option<(PathBuf, ImageInfo)>, missing: &'static str| {
+            let column = div().flex_1().min_w_0().h_full().flex().flex_col().gap_2().p_3();
+            let header = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child(title))
+                .when_some(version.as_ref(), |el, (_, info)| el.child(div().text_color(theme.text_dim).child(info.label())));
+            let picture = match version {
+                Some((path, _)) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .rounded(px(8.))
+                    .bg(theme.background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(gpui::img(path.clone()).size_full().object_fit(gpui::ObjectFit::ScaleDown)),
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .rounded(px(8.))
+                    .bg(theme.background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.))
+                    .text_color(theme.text_dim)
+                    .child(missing),
+            };
+            column.child(header).child(picture)
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(side("Before", &sides.before, "No previous version (new file)"))
+            .child(div().w(px(1.)).h_full().bg(theme.border_subtle))
+            .child(side("After", &sides.after, "Deleted"))
+    }
+
     fn render_row(&self, loaded: &Loaded, ix: usize, side_by_side: bool, current_change: Option<usize>, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let added_bg = Hsla::from(theme.git_added).alpha(0.1);
         let removed_bg = Hsla::from(theme.git_deleted).alpha(0.1);

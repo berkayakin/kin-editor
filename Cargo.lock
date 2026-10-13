@@ -3170,6 +3170,7 @@ dependencies = [
  "futures",
  "gpui",
  "ignore",
+ "image",
  "nucleo-matcher",
  "objc2",
  "objc2-app-kit",

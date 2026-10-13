@@ -1223,6 +1223,13 @@ fn parse_name_status(out: &str) -> Vec<CommitFile> {
     files
 }
 
+/// The raw bytes of a file version (`HEAD:path`, `:path` for the index),
+/// `None` if it isn't there. For images and other binary files.
+pub fn blob_bytes(root: &Path, spec: &str) -> Option<Vec<u8>> {
+    let output = command(root).args(["show", spec]).stderr(Stdio::null()).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
 /// A file's contents at a revision (`sha:path`), `None` if it isn't there.
 pub fn text_at(root: &Path, rev: &str, rel: &str) -> Option<String> {
     run(root, &["show", &format!("{rev}:{rel}")]).ok()

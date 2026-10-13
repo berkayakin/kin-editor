@@ -260,6 +260,8 @@ pub struct Editor {
     gutter_hovered: bool,
     /// Runnable targets for a version (gutter ▶).
     run_cache: Option<(u64, Arc<Vec<crate::run::RunTarget>>)>,
+    /// Format, dimensions and size of an image document (read on first show).
+    image_info: Option<crate::preview::ImageInfo>,
     /// Merge conflicts for a version.
     conflict_cache: Option<(u64, Arc<Vec<crate::conflict::Conflict>>)>,
     /// Accept labels on screen last frame: (bounds, conflict start row, choice).
@@ -320,6 +322,7 @@ impl Editor {
             run_cache: None,
             conflict_cache: None,
             conflict_hits: Vec::new(),
+            image_info: None,
         };
         this.apply_settings(cx);
         this.detect_external_linter();
@@ -3504,6 +3507,9 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(path) = self.doc.image.clone() {
+            return self.render_image(path, cx).into_any_element();
+        }
         let popover = self.render_hunk_popover(cx);
         let lsp_popovers = self.render_lsp_popovers(window, cx);
         let theme = Theme::get(cx);
@@ -3610,6 +3616,47 @@ impl Render for Editor {
             .child(EditorElement { editor: cx.entity() })
             .children(popover)
             .children(lsp_popovers)
+            .into_any_element()
+    }
+}
+
+impl Editor {
+    /// An image file: the picture, scaled down to fit, with its format,
+    /// dimensions and size underneath. No text input reaches it.
+    fn render_image(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        let info = self.image_info.get_or_insert_with(|| crate::preview::ImageInfo::read(&path)).label();
+        div()
+            .id("image")
+            .key_context("ImagePreview")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_6()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(gpui::img(path).size_full().object_fit(gpui::ObjectFit::ScaleDown)),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_t_1()
+                    .border_color(theme.border_subtle)
+                    .text_size(px(12.))
+                    .text_color(theme.text_dim)
+                    .child(info),
+            )
     }
 }
 

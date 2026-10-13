@@ -87,6 +87,9 @@ pub struct Document {
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
+    /// An image shown as a picture: no text is read, edited or written; its
+    /// file is the content (Save As copies it).
+    pub image: Option<PathBuf>,
 }
 
 impl Document {
@@ -95,6 +98,13 @@ impl Document {
     }
 
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        if crate::preview::is_image(path) {
+            std::fs::metadata(path)?;
+            let mut doc = Self::from_text(String::new(), Some(path.to_path_buf()));
+            doc.disk_mtime = mtime(path);
+            doc.image = Some(path.to_path_buf());
+            return Ok(doc);
+        }
         let bytes = std::fs::read(path)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut doc = Self::from_text(text, Some(path.to_path_buf()));
@@ -133,6 +143,7 @@ impl Document {
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
             disk_mtime: None,
+            image: None,
         }
     }
 
@@ -179,6 +190,11 @@ impl Document {
     /// changed. Undo history is cleared since it no longer applies.
     pub fn reload_from_disk(&mut self) -> std::io::Result<bool> {
         let Some(path) = self.path.clone() else { return Ok(false) };
+        if self.image.is_some() {
+            let changed = mtime(&path) != self.disk_mtime;
+            self.disk_mtime = mtime(&path);
+            return Ok(changed);
+        }
         let bytes = std::fs::read(&path)?;
         let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         self.disk_mtime = mtime(&path);
@@ -201,6 +217,15 @@ impl Document {
             .path
             .clone()
             .ok_or_else(|| std::io::Error::other("document has no path"))?;
+        if let Some(source) = self.image.clone() {
+            // Never write text over an image; Save As copies the file.
+            if source != path {
+                std::fs::copy(&source, &path)?;
+                self.image = Some(path.clone());
+            }
+            self.disk_mtime = mtime(&path);
+            return Ok(());
+        }
         let mut text = self.rope.to_string();
         if self.uses_crlf {
             text = text.replace('\n', "\r\n");
@@ -301,6 +326,10 @@ impl Document {
         selections_before: &[Selection],
         kind: EditKind,
     ) -> Vec<Range<usize>> {
+        // Images have no text to edit (Replace in Files, paste…).
+        if self.image.is_some() {
+            return Vec::new();
+        }
         let mut order: Vec<usize> = (0..edits.len()).collect();
         order.sort_by_key(|&i| edits[i].0.start);
 
@@ -556,6 +585,27 @@ fn shift(diagnostics: &mut Vec<Diagnostic>, range: &Range<usize>, new_len: usize
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_documents_are_never_edited_or_overwritten() {
+        let dir = std::env::temp_dir().join(format!("kin-image-doc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pixel.png");
+        let bytes = [0x89u8, b'P', b'N', b'G', 0, 1, 2, 3];
+        std::fs::write(&path, bytes).unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        assert!(doc.image.is_some() && doc.len() == 0);
+        assert!(doc.edit(vec![(0..0, "text".into())], &[], EditKind::Other).is_empty());
+        assert!(!doc.is_dirty());
+        doc.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // Save As copies the picture.
+        let copy = dir.join("copy.png");
+        doc.set_path(copy.clone());
+        doc.save().unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

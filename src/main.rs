@@ -19,6 +19,7 @@ mod keymap;
 mod lint;
 mod lsp;
 mod picker;
+mod preview;
 mod preferences;
 mod run;
 mod project_search;
