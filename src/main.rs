@@ -1,3 +1,4 @@
+mod about;
 mod assets;
 mod branch_picker;
 mod clone_dialog;
@@ -56,6 +57,8 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "Kin".into(),
             items: vec![
+                MenuItem::action("About Kin", about::About),
+                MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::action("Quit Kin", Quit),
@@ -222,6 +225,7 @@ fn main() {
             cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));
             // Quitting asks each window with unsaved edits in turn.
             cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
+            cx.on_action(|_: &about::About, cx| about::open(cx));
             cx.on_action(|_: &NewWindow, cx| {
                 workspace::open_window(None, cx, |_, _, _| {});
             });
@@ -252,8 +256,9 @@ fn main() {
                 last = workspace::open_window(near, cx, move |workspace, window, cx| workspace.set_root(dir, window, cx)).or(last);
             }
             cx.activate(true);
+            // The About window alone doesn't keep Kin running.
             cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
+                if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {
                     cx.quit();
                 }
             })

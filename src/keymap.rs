@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
+    about::About,
     editor::*,
     picker::ActionEntry,
     push_dialog::ConfirmPush,
@@ -83,6 +84,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-alt-shift-up", PreviousChange, e),
         KeyBinding::new("escape", Cancel, Some("DiffView")),
         KeyBinding::new("escape", Cancel, Some("PushDialog")),
+        KeyBinding::new("escape", Cancel, Some("About")),
         KeyBinding::new("enter", ConfirmPush, Some("PushDialog")),
         KeyBinding::new("secondary-enter", ConfirmPush, Some("PushDialog")),
         KeyBinding::new("up", MoveUp, Some("PushDialog")),
@@ -297,6 +299,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Recent Projects…", RecentProjects),
         a("New Window", NewWindow),
         a("Close Window", CloseWindow),
+        a("About Kin", About),
         a("Save", Save),
         a("Save As…", SaveAs),
         a("Toggle Auto Save", ToggleAutoSave),
