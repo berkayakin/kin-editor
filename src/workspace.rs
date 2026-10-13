@@ -3525,6 +3525,8 @@ impl Workspace {
                 .items_center()
                 .pt(top)
                 .bg(gpui::black().opacity(0.18))
+                // Wheel and hover don't reach the editor behind a modal.
+                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|ws, _, window, cx| {
