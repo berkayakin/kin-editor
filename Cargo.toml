@@ -1,0 +1,47 @@
+[package]
+name = "kin"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata.bundle]
+name = "Kin"
+identifier = "dev.kin.editor"
+icon = ["assets/app-icon/macos/Kin.icns", "assets/app-icon/linux/hicolor/*/apps/dev.kin.editor.png"]
+category = "public.app-category.developer-tools"
+short_description = "A small, fast GPU-rendered code editor"
+
+[dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+ignore = "0.4.33"
+nucleo-matcher = "0.3.1"
+oxc_allocator = "0.139.0"
+oxc_ast = "0.139.0"
+oxc_diagnostics = "0.139.0"
+oxc_parser = "0.139.0"
+oxc_semantic = "0.139.0"
+oxc_span = "0.139.0"
+oxc_syntax = "0.139.0"
+regex = "1.13.1"
+ropey = "1.6"
+rumdl = { version = "0.2.79", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
+similar = "3.2.0"
+trash = "5"
+tree-sitter = "0.27.1"
+tree-sitter-go = "0.25.0"
+tree-sitter-html = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-php = "0.25.1"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSData", "NSDictionary", "NSObject", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"

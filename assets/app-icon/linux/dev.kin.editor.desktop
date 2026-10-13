@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kin
+GenericName=Code Editor
+Comment=A small, fast GPU-rendered code editor
+Exec=kin %F
+Icon=dev.kin.editor
+Terminal=false
+Categories=Development;TextEditor;IDE;
+MimeType=text/plain;
+StartupWMClass=dev.kin.editor

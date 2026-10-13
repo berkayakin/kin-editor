@@ -1,0 +1,140 @@
+//! Syntax errors for any language with a tree-sitter grammar: reports the
+//! `ERROR` and `MISSING` nodes the parser produced while recovering.
+
+use tree_sitter::{Language, Node, Parser};
+
+use super::{Diagnostic, Severity};
+
+/// Broken files can produce an error at almost every line; past this many
+/// the rest are noise.
+const MAX_ERRORS: usize = 100;
+
+pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
+    let mut parser = Parser::new();
+    if parser.set_language(language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        // Subtrees without errors are skipped. Recovery can wrap large valid
+        // regions (even the whole file) in an error node; when it holds more
+        // specific errors, report those instead of the wrapper.
+        let descend = if node.is_error() {
+            let nested = (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.has_error()));
+            if !nested {
+                out.push(unexpected(node, text));
+            }
+            nested
+        } else if node.is_missing() {
+            out.push(missing(node));
+            false
+        } else {
+            node.has_error()
+        };
+        if out.len() >= MAX_ERRORS {
+            break;
+        }
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn unexpected(node: Node, text: &str) -> Diagnostic {
+    let range = node.byte_range();
+    // An error node can swallow many lines; underline only its first one.
+    let line_end = text[range.start..range.end]
+        .find('\n')
+        .map_or(range.end, |i| range.start + i);
+    // Name the token only when it is the whole error; in a larger error node
+    // the first token is usually valid code the parser gave up on.
+    let token = first_token(node)
+        .filter(|t| t.byte_range() == range)
+        .map(|t| text[t.byte_range()].trim())
+        .filter(|t| !t.is_empty() && t.len() <= 40 && !t.contains('\n'));
+    let message = match token {
+        Some(token) => format!("Syntax error: unexpected `{token}`"),
+        None => "Syntax error".to_string(),
+    };
+    Diagnostic {
+        range: range.start..line_end,
+        severity: Severity::Error,
+        message,
+        rule: "syntax".into(),
+    }
+}
+
+fn missing(node: Node) -> Diagnostic {
+    let kind = node.kind();
+    let message = if node.is_named() {
+        format!("Syntax error: missing {}", kind.replace('_', " "))
+    } else {
+        format!("Syntax error: missing `{kind}`")
+    };
+    Diagnostic {
+        range: node.byte_range(),
+        severity: Severity::Error,
+        message,
+        rule: "syntax".into(),
+    }
+}
+
+fn first_token(mut node: Node) -> Option<Node> {
+    while node.child_count() > 0 {
+        node = node.child(0)?;
+    }
+    Some(node)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::syntax::{Language, grammar};
+
+    fn errors(language: Language, src: &str) -> Vec<(String, String)> {
+        super::lint(&grammar(language).unwrap(), src)
+            .into_iter()
+            .map(|d| (src[d.range].to_string(), d.message))
+            .collect()
+    }
+
+    #[test]
+    fn valid_code_has_no_errors() {
+        assert!(errors(Language::Rust, "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n").is_empty());
+        assert!(errors(Language::Go, "package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n").is_empty());
+        assert!(errors(Language::Python, "def f(x):\n    return x + 1\n").is_empty());
+        assert!(errors(Language::Php, "<p><?php echo $x; ?></p>\n").is_empty());
+    }
+
+    #[test]
+    fn reports_syntax_errors() {
+        for (language, src) in [
+            (Language::Rust, "fn main() {\n    let x = ;\n}\n"),
+            (Language::Rust, "fn main() {\n    let x = 1\n}\n"),
+            (Language::Go, "package main\n\nfunc main() {\n\tx := \n}\n"),
+            (Language::Python, "def f(x)\n    return x\n"),
+            (Language::Php, "<?php\n$x = ;\n"),
+        ] {
+            let found = errors(language, src);
+            eprintln!("{language:?}: {found:?}");
+            assert!(!found.is_empty(), "{language:?} missed an error in {src:?}");
+        }
+    }
+
+    #[test]
+    fn reports_inner_error_not_file_wide_wrapper() {
+        // Python recovery wraps the whole module in an error node here.
+        let src = "import os\n\ndef f():\n    return 1\n\ndef main()\n    print(1)\n";
+        assert_eq!(errors(Language::Python, src), [("def main()".to_string(), "Syntax error".to_string())]);
+    }
+}

@@ -1,0 +1,3068 @@
+//! The text editor view: multi-cursor editing, keyboard/mouse/IME input and a
+//! custom element that paints only the visible lines straight to the GPU.
+
+use std::{ops::Range, sync::Arc, time::Duration};
+
+use gpui::{
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
+    FontStyle,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, Task, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, font, point, prelude::*, px, relative, size,
+};
+
+use crate::{
+    assets::Icon,
+    document::{Document, EditKind, Selection},
+    git::{self, BlameLine, Hunk, HunkKind},
+    lint::{self, Severity, external::ExternalLinter},
+    theme::Theme,
+};
+
+pub const TAB_SIZE: usize = 4;
+const SCROLLBAR_WIDTH: f32 = 12.0;
+const TEXT_PADDING: f32 = 6.0;
+/// Distance of the git change bar's center from the gutter's right edge.
+const GIT_BAR_OFFSET: f32 = 8.0;
+
+actions!(
+    editor,
+    [
+        MoveLeft,
+        MoveRight,
+        MoveUp,
+        MoveDown,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown,
+        MoveWordLeft,
+        MoveWordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        MoveLineStart,
+        MoveLineEnd,
+        SelectLineStart,
+        SelectLineEnd,
+        MoveDocStart,
+        MoveDocEnd,
+        SelectDocStart,
+        SelectDocEnd,
+        PageUp,
+        PageDown,
+        Backspace,
+        Delete,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToLineStart,
+        Newline,
+        NewlineBelow,
+        Indent,
+        Outdent,
+        SelectAll,
+        SelectLine,
+        Copy,
+        Cut,
+        Paste,
+        Undo,
+        Redo,
+        ToggleComment,
+        DuplicateLine,
+        MoveLineUp,
+        MoveLineDown,
+        SelectNextOccurrence,
+        AddCursorAbove,
+        AddCursorBelow,
+        Cancel,
+        ShowCharacterPalette,
+        DeleteLine,
+        ExtendSelection,
+        ShrinkSelection,
+        UnselectOccurrence,
+        SelectAllOccurrences,
+        ToggleCase,
+        JoinLines,
+        NewlineAbove,
+        ToggleBlockComment,
+        RollbackHunk,
+        NextChange,
+        PreviousChange,
+        ToggleInlineBlame,
+        /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
+        Submit,
+    ]
+);
+
+/// Where an open file lives in a Git repository.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GitFile {
+    pub root: std::path::PathBuf,
+    pub rel: String,
+    /// The repository's `user.name`, shown as "You" in blame.
+    pub user_name: Option<String>,
+}
+
+/// App-wide toggle for inline blame.
+pub struct InlineBlame(pub bool);
+
+impl gpui::Global for InlineBlame {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    /// A full code editor with gutter, linting and scrollbar.
+    Full,
+    /// A one-line text field, used by search inputs.
+    SingleLine,
+    /// A plain multi-line text field without code chrome (commit messages).
+    MultiLine,
+}
+
+pub enum EditorEvent {
+    Edited,
+}
+
+impl EventEmitter<EditorEvent> for Editor {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragMode {
+    Char,
+    Word,
+    Line,
+}
+
+struct Drag {
+    mode: DragMode,
+    /// The unit (char/word/line range) where the drag started.
+    origin: Range<usize>,
+}
+
+/// Geometry from the last frame, used for hit-testing and IME positioning.
+#[derive(Clone)]
+struct LayoutSnapshot {
+    bounds: Bounds<Pixels>,
+    text_left: Pixels,
+    line_height: Pixels,
+    char_width: Pixels,
+    gutter_width: Pixels,
+    rows_per_page: usize,
+}
+
+pub struct Editor {
+    pub doc: Document,
+    mode: EditorMode,
+    placeholder: SharedString,
+    search_matches: Vec<Range<usize>>,
+    active_match: Option<usize>,
+    /// Selections before each ExtendSelection, for ShrinkSelection.
+    expand_stack: Vec<Vec<Selection>>,
+    expanding: bool,
+    selections: Vec<Selection>,
+    /// Index of the most recently added selection.
+    primary: usize,
+    goal_x: Option<Pixels>,
+    focus_handle: FocusHandle,
+    scroll: Point<Pixels>,
+    max_line_width: Pixels,
+    autoscroll: bool,
+    center_on_next_frame: bool,
+    /// Like autoscroll, but centers the cursor when it is off screen.
+    reveal_primary: bool,
+    layout: Option<LayoutSnapshot>,
+    drag: Option<Drag>,
+    scrollbar_drag: Option<Pixels>,
+    marked_range: Option<Range<usize>>,
+    indent_unit: String,
+    cursor_visible: bool,
+    blink_epoch: usize,
+    blink_task: Option<Task<()>>,
+    lint_task: Option<Task<()>>,
+    linted_version: Option<u64>,
+    external: Option<ExternalLinter>,
+    external_error: Option<String>,
+    external_task: Option<Task<()>>,
+    git_file: Option<GitFile>,
+    /// The file's text at HEAD; changes are shown against it.
+    diff_base: Option<Arc<str>>,
+    hunks: Arc<Vec<Hunk>>,
+    diff_task: Option<Task<()>>,
+    /// Index into `hunks` of the change popover that is open.
+    open_hunk: Option<usize>,
+    blame: Option<(usize, u64, BlameLine)>,
+    blame_request: Option<(usize, u64)>,
+    blame_task: Option<Task<()>>,
+}
+
+impl Editor {
+    pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
+        let indent_unit = detect_indent(&doc);
+        let mut this = Self {
+            doc,
+            mode: EditorMode::Full,
+            placeholder: SharedString::default(),
+            search_matches: Vec::new(),
+            active_match: None,
+            expand_stack: Vec::new(),
+            expanding: false,
+            selections: vec![Selection::cursor(0)],
+            primary: 0,
+            goal_x: None,
+            focus_handle: cx.focus_handle(),
+            scroll: Point::default(),
+            max_line_width: px(0.),
+            autoscroll: false,
+            center_on_next_frame: false,
+            reveal_primary: false,
+            layout: None,
+            drag: None,
+            scrollbar_drag: None,
+            marked_range: None,
+            indent_unit,
+            cursor_visible: true,
+            blink_epoch: 0,
+            blink_task: None,
+            lint_task: None,
+            linted_version: None,
+            external: None,
+            external_error: None,
+            external_task: None,
+            git_file: None,
+            diff_base: None,
+            hunks: Arc::new(Vec::new()),
+            diff_task: None,
+            open_hunk: None,
+            blame: None,
+            blame_request: None,
+            blame_task: None,
+        };
+        this.detect_external_linter();
+        this.schedule_lint(Duration::ZERO, cx);
+        this.run_external_linter(cx);
+        this
+    }
+
+    pub fn single_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(Document::empty(), cx);
+        this.mode = EditorMode::SingleLine;
+        this.placeholder = placeholder.into();
+        this
+    }
+
+    pub fn multi_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::single_line(placeholder, cx);
+        this.mode = EditorMode::MultiLine;
+        this
+    }
+
+    pub fn is_single_line(&self) -> bool {
+        self.mode == EditorMode::SingleLine
+    }
+
+    /// Text fields (single- or multi-line) have no gutter, linting or scrollbar.
+    fn is_chromeless(&self) -> bool {
+        self.mode != EditorMode::Full
+    }
+
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_chromeless() {
+            cx.propagate();
+        } else {
+            self.newline_below(&NewlineBelow, window, cx);
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.doc.rope().to_string()
+    }
+
+    /// Replaces the whole text (as one undoable edit) and selects it.
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text = if self.is_single_line() { text.replace('\n', " ") } else { text.to_string() };
+        let before = self.selections.clone();
+        let len = self.doc.len();
+        self.doc.edit(vec![(0..len, text)], &before, EditKind::Other);
+        let len = self.doc.len();
+        self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
+        self.after_edit(cx);
+    }
+
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        let len = self.doc.len();
+        self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
+    }
+
+    /// Selects a range and scrolls it to the middle of the view if needed.
+    pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let (s, e) = (self.doc.clip(range.start), self.doc.clip(range.end));
+        self.set_selections(vec![Selection { anchor: s, head: e }], 0, cx);
+        self.reveal_primary = true;
+    }
+
+    pub fn set_search_highlights(&mut self, matches: Vec<Range<usize>>, active: Option<usize>, cx: &mut Context<Self>) {
+        self.search_matches = matches;
+        self.active_match = active;
+        cx.notify();
+    }
+
+    /// Replaces many ranges in one undoable step (used by Replace All).
+    pub fn replace_ranges(&mut self, edits: Vec<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        if !edits.is_empty() {
+            self.edit_and_remap(edits, EditKind::Other, cx);
+        }
+    }
+
+    fn detect_external_linter(&mut self) {
+        self.external = match (&self.doc.path, self.doc.language) {
+            (Some(path), crate::syntax::Language::JavaScript) => lint::external::find_for(path),
+            _ => None,
+        };
+        self.external_error = None;
+    }
+
+    /// Name of the project linter in use and its last error, if any.
+    pub fn external_linter_status(&self) -> Option<(&'static str, Option<&str>)> {
+        self.external
+            .as_ref()
+            .map(|l| (l.name, self.external_error.as_deref()))
+    }
+
+    fn run_external_linter(&mut self, cx: &mut Context<Self>) {
+        let (Some(linter), Some(path)) = (self.external.clone(), self.doc.path.clone()) else {
+            return;
+        };
+        let rope = self.doc.rope().clone();
+        let version = self.doc.version();
+        self.external_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { linter.run(&path, &rope) })
+                .await;
+            this.update(cx, |editor, cx| {
+                let was_ok = editor.external_error.is_none();
+                match result {
+                    Ok(diagnostics) => {
+                        editor.external_error = None;
+                        if editor.doc.version() == version {
+                            editor.doc.set_external_diagnostics(diagnostics);
+                        }
+                    }
+                    Err(err) => {
+                        editor.external_error = Some(err);
+                        editor.doc.set_external_diagnostics(Vec::new());
+                    }
+                }
+                // Built-in rules fill in whenever the external linter isn't working.
+                if was_ok != editor.external_error.is_none() {
+                    editor.linted_version = None;
+                    editor.schedule_lint(Duration::ZERO, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub fn selections(&self) -> &[Selection] {
+        &self.selections
+    }
+
+    pub fn primary_selection(&self) -> Selection {
+        self.selections[self.primary]
+    }
+
+    /// 1-based (line, column) of the primary cursor, column in characters.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let head = self.primary_selection().head;
+        let row = self.doc.row_of(head);
+        let start = self.doc.line_start(row);
+        let col = self.doc.slice(start..head).chars().count();
+        (row + 1, col + 1)
+    }
+
+    pub fn selected_chars(&self) -> usize {
+        self.selections
+            .iter()
+            .map(|s| {
+                let r = self.doc.rope();
+                r.byte_to_char(s.range().end) - r.byte_to_char(s.range().start)
+            })
+            .sum()
+    }
+
+    pub fn indent_label(&self) -> String {
+        if self.indent_unit == "\t" {
+            "Tabs".into()
+        } else {
+            format!("Spaces: {}", self.indent_unit.len())
+        }
+    }
+
+    /// Moves the cursor to a byte offset and scrolls it into view.
+    pub fn go_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.doc.clip(offset);
+        self.set_selections(vec![Selection::cursor(offset)], 0, cx);
+        self.center_on_next_frame = true;
+        window.focus(&self.focus_handle);
+    }
+
+    /// Sets the text that changes are measured against (HEAD), or clears it
+    /// for files outside a repository or not yet committed.
+    pub fn set_diff_base(&mut self, git_file: Option<GitFile>, base: Option<String>, cx: &mut Context<Self>) {
+        if self.git_file != git_file {
+            self.blame = None;
+            self.blame_request = None;
+        }
+        self.git_file = git_file;
+        self.diff_base = base.map(Arc::from);
+        self.schedule_diff(Duration::ZERO, cx);
+    }
+
+    fn schedule_diff(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let Some(base) = self.diff_base.clone() else {
+            if !self.hunks.is_empty() {
+                self.hunks = Arc::new(Vec::new());
+                self.open_hunk = None;
+                cx.notify();
+            }
+            return;
+        };
+        let rope = self.doc.rope().clone();
+        let version = self.doc.version();
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let hunks = cx
+                .background_executor()
+                .spawn(async move { git::diff_hunks(&base, &rope.to_string()) })
+                .await;
+            this.update(cx, |editor, cx| {
+                if editor.doc.version() == version {
+                    editor.hunks = Arc::new(hunks);
+                    if editor.open_hunk.is_some_and(|i| i >= editor.hunks.len()) {
+                        editor.open_hunk = None;
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Re-reads the file if it changed on disk and has no unsaved edits
+    /// (e.g. after a checkout, pull or discard).
+    pub fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.doc.is_dirty() {
+            return;
+        }
+        match self.doc.reload_from_disk() {
+            Ok(true) => {
+                let selections = self.clamp_selections(self.selections.clone());
+                self.set_selections(selections, 0, cx);
+                self.autoscroll = false;
+                self.linted_version = None;
+                self.schedule_lint(Duration::ZERO, cx);
+                self.schedule_diff(Duration::ZERO, cx);
+                cx.emit(EditorEvent::Edited);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(_) => {}
+        }
+    }
+
+    pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
+        self.doc.save()?;
+        self.doc.finalize_transaction();
+        self.schedule_lint(Duration::ZERO, cx);
+        self.run_external_linter(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.doc.set_path(path);
+        self.detect_external_linter();
+        self.linted_version = None;
+        self.schedule_lint(Duration::ZERO, cx);
+    }
+
+    // ---- Selection management ----------------------------------------------
+
+    fn set_selections(&mut self, mut selections: Vec<Selection>, primary: usize, cx: &mut Context<Self>) {
+        let primary_sel = selections[primary.min(selections.len() - 1)];
+        selections.sort_by_key(|s| s.range().start);
+        // Merge overlapping selections.
+        let mut merged: Vec<Selection> = Vec::with_capacity(selections.len());
+        for sel in selections {
+            if let Some(last) = merged.last_mut() {
+                let lr = last.range();
+                let sr = sel.range();
+                if sr.start < lr.end || (sr.start == lr.end && (sel.is_empty() && last.is_empty())) {
+                    let start = lr.start.min(sr.start);
+                    let end = lr.end.max(sr.end);
+                    *last = if last.reversed() {
+                        Selection { anchor: end, head: start }
+                    } else {
+                        Selection { anchor: start, head: end }
+                    };
+                    continue;
+                }
+            }
+            merged.push(sel);
+        }
+        self.primary = merged
+            .iter()
+            .position(|s| s.range().start <= primary_sel.range().start && primary_sel.range().end <= s.range().end)
+            .unwrap_or(merged.len() - 1);
+        self.selections = merged;
+        if !std::mem::take(&mut self.expanding) {
+            self.expand_stack.clear();
+        }
+        self.marked_range = None;
+        self.autoscroll = true;
+        self.cursor_visible = true;
+        self.blink_epoch += 1;
+        self.blink_task = None;
+        cx.notify();
+    }
+
+    fn move_selections(
+        &mut self,
+        extend: bool,
+        cx: &mut Context<Self>,
+        mut f: impl FnMut(&Self, &Selection) -> usize,
+    ) {
+        let selections = self
+            .selections
+            .iter()
+            .map(|s| {
+                let head = f(self, s);
+                if extend {
+                    Selection { anchor: s.anchor, head }
+                } else {
+                    Selection::cursor(head)
+                }
+            })
+            .collect();
+        self.goal_x = None;
+        self.set_selections(selections, self.primary, cx);
+    }
+
+    // ---- Editing -----------------------------------------------------------
+
+    /// Applies one edit per selection. The closure returns the replaced range,
+    /// the new text, and where the cursor lands within the new text (`None`
+    /// selects the whole inserted text).
+    fn edit_selections(
+        &mut self,
+        kind: EditKind,
+        cx: &mut Context<Self>,
+        mut f: impl FnMut(&Document, &Selection) -> (Range<usize>, String, Option<usize>),
+    ) {
+        let before = self.selections.clone();
+        let mut edits = Vec::with_capacity(before.len());
+        let mut placements = Vec::with_capacity(before.len());
+        for sel in &before {
+            let (range, text, cursor) = f(&self.doc, sel);
+            placements.push(cursor);
+            edits.push((range, text));
+        }
+        let new_ranges = self.doc.edit(edits, &before, kind);
+        let selections = new_ranges
+            .into_iter()
+            .zip(placements)
+            .map(|(r, place)| match place {
+                Some(off) => Selection::cursor(r.start + off),
+                None => Selection { anchor: r.start, head: r.end },
+            })
+            .collect();
+        self.goal_x = None;
+        self.set_selections(selections, self.primary, cx);
+        self.after_edit(cx);
+    }
+
+    /// Applies arbitrary edits and then remaps all selections through them.
+    fn edit_and_remap(
+        &mut self,
+        mut edits: Vec<(Range<usize>, String)>,
+        kind: EditKind,
+        cx: &mut Context<Self>,
+    ) {
+        edits.sort_by_key(|e| e.0.start);
+        edits.dedup_by(|a, b| a.0 == b.0);
+        let map = |offset: usize, edits: &[(Range<usize>, String)]| {
+            let mut delta: isize = 0;
+            for (r, t) in edits {
+                if r.start > offset {
+                    break;
+                }
+                if r.is_empty() || r.end <= offset {
+                    // Insertions at or before the offset, and replacements
+                    // entirely before it, shift it.
+                    delta += t.len() as isize - r.len() as isize;
+                } else {
+                    // Offset inside a replaced range: clamp into the new text.
+                    let start = (r.start as isize + delta) as usize;
+                    return start + t.len().min(offset - r.start);
+                }
+            }
+            (offset as isize + delta).max(0) as usize
+        };
+        let before = self.selections.clone();
+        let selections: Vec<Selection> = before
+            .iter()
+            .map(|s| Selection { anchor: map(s.anchor, &edits), head: map(s.head, &edits) })
+            .collect();
+        self.doc.edit(edits, &before, kind);
+        self.goal_x = None;
+        self.set_selections(selections, self.primary, cx);
+        self.after_edit(cx);
+    }
+
+    fn after_edit(&mut self, cx: &mut Context<Self>) {
+        self.doc.set_selections_after(&self.selections);
+        self.schedule_lint(Duration::from_millis(150), cx);
+        self.schedule_diff(Duration::from_millis(120), cx);
+        cx.emit(EditorEvent::Edited);
+        cx.notify();
+    }
+
+    fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let kind = if text.contains(char::is_whitespace) || text.len() > 1 {
+            EditKind::Other
+        } else {
+            EditKind::Typing
+        };
+        let typed = text.to_string();
+        self.edit_selections(kind, cx, |doc, sel| {
+            let range = sel.range();
+            let mut chars = typed.chars();
+            let single = match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            };
+            if let Some(c) = single {
+                let next = doc.char_at(range.end);
+                // Type over an auto-inserted closing character.
+                if sel.is_empty() && matches!(c, ')' | ']' | '}' | '"' | '\'' | '`') && next == Some(c) {
+                    return (range.end..range.end + 1, c.to_string(), Some(1));
+                }
+                if let Some(close) = closing_pair(c) {
+                    if !sel.is_empty() {
+                        // Wrap the selection.
+                        let inner = doc.slice(range.clone());
+                        let len = inner.len();
+                        return (range, format!("{c}{inner}{close}"), Some(len + 2));
+                    }
+                    let prev = doc.char_before(range.start);
+                    let next_ok = next.is_none_or(|n| n.is_whitespace() || matches!(n, ')' | ']' | '}' | ',' | ';' | '>'));
+                    let is_quote = matches!(c, '"' | '\'' | '`');
+                    let prev_ok = !is_quote || prev.is_none_or(|p| !p.is_alphanumeric() && p != c);
+                    if next_ok && prev_ok {
+                        return (range, format!("{c}{close}"), Some(1));
+                    }
+                }
+            }
+            let len = typed.len();
+            (range, typed.clone(), Some(len))
+        });
+    }
+
+    fn schedule_lint(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if !self.doc.language.is_lintable() {
+            self.doc.set_builtin_diagnostics(Vec::new());
+            return;
+        }
+        let syntax_only = self.external.is_some() && self.external_error.is_none();
+        let version = self.doc.version();
+        if self.linted_version == Some(version) {
+            return;
+        }
+        let rope = self.doc.rope().clone();
+        let language = self.doc.language;
+        let path = self.doc.path.clone();
+        self.lint_task = Some(cx.spawn(async move |this, cx| {
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+            let diagnostics = cx
+                .background_executor()
+                .spawn(async move { lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only) })
+                .await;
+            this.update(cx, |editor, cx| {
+                if editor.doc.version() == version {
+                    editor.doc.set_builtin_diagnostics(diagnostics);
+                    editor.linted_version = Some(version);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn restart_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let epoch = self.blink_epoch;
+        self.blink_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(530)).await;
+                let keep_going = this
+                    .update_in(cx, |editor, window, cx| {
+                        if editor.blink_epoch != epoch {
+                            return false;
+                        }
+                        if editor.focus_handle.is_focused(window) && window.is_window_active() {
+                            editor.cursor_visible = !editor.cursor_visible;
+                            cx.notify();
+                        } else if !editor.cursor_visible {
+                            editor.cursor_visible = true;
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // ---- Geometry ---------------------------------------------------------
+
+    fn editor_font(&self, cx: &App) -> Font {
+        let theme = Theme::get(cx);
+        match self.mode {
+            EditorMode::Full => font(theme.mono_font.clone()),
+            EditorMode::SingleLine | EditorMode::MultiLine => font(theme.ui_font.clone()),
+        }
+    }
+
+    fn font_size(&self, cx: &App) -> Pixels {
+        let theme = Theme::get(cx);
+        match self.mode {
+            EditorMode::Full => px(theme.editor_font_size),
+            EditorMode::SingleLine | EditorMode::MultiLine => px(theme.ui_font_size + 0.5),
+        }
+    }
+
+    fn line_height(&self, cx: &App) -> Pixels {
+        match self.mode {
+            EditorMode::Full => px(Theme::get(cx).editor_line_height),
+            EditorMode::SingleLine | EditorMode::MultiLine => px(20.),
+        }
+    }
+
+    fn shape_plain(&self, row: usize, window: &mut Window, cx: &App) -> (ShapedLine, DisplayLine) {
+        let theme = Theme::get(cx);
+        let dl = DisplayLine::new(&self.doc.line_text(row));
+        let run = TextRun {
+            len: dl.text.len(),
+            font: self.editor_font(cx),
+            color: theme.text.into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if dl.text.is_empty() { vec![] } else { vec![run] };
+        let line = window.text_system().shape_line(
+            SharedString::from(dl.text.clone()),
+            self.font_size(cx),
+            &runs,
+            None,
+        );
+        (line, dl)
+    }
+
+    fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
+        let row = self.doc.row_of(offset);
+        let (line, dl) = self.shape_plain(row, window, cx);
+        line.x_for_index(dl.to_display(offset - self.doc.line_start(row)))
+    }
+
+    fn offset_for_row_x(&self, row: usize, x: Pixels, window: &mut Window, cx: &App) -> usize {
+        let (line, dl) = self.shape_plain(row, window, cx);
+        let display = line.closest_index_for_x(x);
+        self.doc.line_start(row) + dl.to_buffer(display)
+    }
+
+    fn offset_for_position(&self, position: Point<Pixels>, window: &mut Window, cx: &App) -> usize {
+        let Some(layout) = self.layout.clone() else {
+            return 0;
+        };
+        let y = position.y - layout.bounds.top() + self.scroll.y;
+        if y < px(0.) {
+            return 0;
+        }
+        let row = (y / layout.line_height).floor() as usize;
+        if row >= self.doc.line_count() {
+            return self.doc.len();
+        }
+        let x = position.x - layout.text_left + self.scroll.x;
+        self.offset_for_row_x(row, x.max(px(0.)), window, cx)
+    }
+
+    fn vertical_target(&self, sel: &Selection, rows: isize, goal: Pixels, window: &mut Window, cx: &App) -> usize {
+        let row = self.doc.row_of(sel.head) as isize + rows;
+        if row < 0 {
+            0
+        } else if row as usize >= self.doc.line_count() {
+            self.doc.len()
+        } else {
+            self.offset_for_row_x(row as usize, goal, window, cx)
+        }
+    }
+
+    fn move_vertically(&mut self, rows: isize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let goals: Vec<Pixels> = self
+            .selections
+            .iter()
+            .map(|s| match self.goal_x {
+                Some(g) if self.selections.len() == 1 => g,
+                _ => self.x_for_offset(s.head, window, cx),
+            })
+            .collect();
+        let selections: Vec<Selection> = self
+            .selections
+            .iter()
+            .zip(&goals)
+            .map(|(s, &goal)| {
+                let start = if !extend && !s.is_empty() {
+                    let r = s.range();
+                    let at = if rows < 0 { r.start } else { r.end };
+                    Selection::cursor(at)
+                } else {
+                    *s
+                };
+                let head = self.vertical_target(&start, rows, goal, window, cx);
+                if extend {
+                    Selection { anchor: s.anchor, head }
+                } else {
+                    Selection::cursor(head)
+                }
+            })
+            .collect();
+        let goal = goals[self.primary];
+        self.set_selections(selections, self.primary, cx);
+        self.goal_x = Some(goal);
+    }
+
+    // ---- Actions -------------------------------------------------------------
+
+    fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| {
+            if s.is_empty() { this.doc.prev_char_boundary(s.head) } else { s.range().start }
+        });
+    }
+
+    fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| {
+            if s.is_empty() { this.doc.next_char_boundary(s.head) } else { s.range().end }
+        });
+    }
+
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| this.doc.prev_char_boundary(s.head));
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| this.doc.next_char_boundary(s.head));
+    }
+
+    fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        self.move_vertically(-1, false, window, cx);
+    }
+
+    fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        self.move_vertically(1, false, window, cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vertically(-1, true, window, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_vertically(1, true, window, cx);
+    }
+
+    fn page_up(&mut self, _: &PageUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        let rows = self.layout.as_ref().map_or(20, |l| l.rows_per_page) as isize;
+        if let Some(l) = &self.layout {
+            self.scroll.y = (self.scroll.y - l.line_height * rows as f32).max(px(0.));
+        }
+        self.move_vertically(-rows, false, window, cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        let rows = self.layout.as_ref().map_or(20, |l| l.rows_per_page) as isize;
+        if let Some(l) = &self.layout {
+            self.scroll.y += l.line_height * rows as f32;
+        }
+        self.move_vertically(rows, false, window, cx);
+    }
+
+    fn move_word_left(&mut self, _: &MoveWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| word_left(&this.doc, s.head));
+    }
+
+    fn move_word_right(&mut self, _: &MoveWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| word_right(&this.doc, s.head));
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| word_left(&this.doc, s.head));
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| word_right(&this.doc, s.head));
+    }
+
+    fn smart_home(&self, offset: usize) -> usize {
+        let row = self.doc.row_of(offset);
+        let start = self.doc.line_start(row);
+        let text = self.doc.line_text(row);
+        let indent = text.len() - text.trim_start().len();
+        if offset == start + indent { start } else { start + indent }
+    }
+
+    fn move_line_start(&mut self, _: &MoveLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| this.smart_home(s.head));
+    }
+
+    fn move_line_end(&mut self, _: &MoveLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(false, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+    }
+
+    fn select_line_start(&mut self, _: &SelectLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| this.smart_home(s.head));
+    }
+
+    fn select_line_end(&mut self, _: &SelectLineEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selections(true, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+    }
+
+    fn move_doc_start(&mut self, _: &MoveDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_selections(vec![Selection::cursor(0)], 0, cx);
+    }
+
+    fn move_doc_end(&mut self, _: &MoveDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_selections(vec![Selection::cursor(self.doc.len())], 0, cx);
+    }
+
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        let anchor = self.primary_selection().anchor;
+        self.set_selections(vec![Selection { anchor, head: 0 }], 0, cx);
+    }
+
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        let anchor = self.primary_selection().anchor;
+        let head = self.doc.len();
+        self.set_selections(vec![Selection { anchor, head }], 0, cx);
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        let len = self.doc.len();
+        self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
+        self.autoscroll = false;
+    }
+
+    fn select_line(&mut self, _: &SelectLine, _: &mut Window, cx: &mut Context<Self>) {
+        let selections = self
+            .selections
+            .iter()
+            .map(|s| {
+                let r = s.range();
+                let start = self.doc.line_start(self.doc.row_of(r.start));
+                let end_row = self.doc.row_of(r.end);
+                let end = (self.doc.line_end(end_row) + 1).min(self.doc.len());
+                Selection { anchor: start, head: end }
+            })
+            .collect();
+        self.set_selections(selections, self.primary, cx);
+    }
+
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        let unit = self.indent_unit.clone();
+        self.edit_selections(EditKind::Deleting, cx, |doc, s| {
+            if !s.is_empty() {
+                return (s.range(), String::new(), Some(0));
+            }
+            let head = s.head;
+            let row_start = doc.line_start(doc.row_of(head));
+            let before = doc.slice(row_start..head);
+            // Delete a whole indent level when in leading whitespace.
+            if !before.is_empty() && unit != "\t" && before.chars().all(|c| c == ' ') {
+                let n = (before.len() - 1) % unit.len() + 1;
+                return (head - n..head, String::new(), Some(0));
+            }
+            // Delete an auto-inserted pair together.
+            let prev = doc.char_before(head);
+            if let (Some(p), Some(n)) = (prev, doc.char_at(head))
+                && closing_pair(p) == Some(n)
+            {
+                return (head - p.len_utf8()..head + n.len_utf8(), String::new(), Some(0));
+            }
+            (doc.prev_char_boundary(head)..head, String::new(), Some(0))
+        });
+    }
+
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selections(EditKind::Deleting, cx, |doc, s| {
+            let r = if s.is_empty() { s.head..doc.next_char_boundary(s.head) } else { s.range() };
+            (r, String::new(), Some(0))
+        });
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let r = if s.is_empty() { word_left(doc, s.head)..s.head } else { s.range() };
+            (r, String::new(), Some(0))
+        });
+    }
+
+    fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let r = if s.is_empty() { s.head..word_right(doc, s.head) } else { s.range() };
+            (r, String::new(), Some(0))
+        });
+    }
+
+    fn delete_to_line_start(&mut self, _: &DeleteToLineStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let r = if s.is_empty() {
+                let start = doc.line_start(doc.row_of(s.head));
+                if start == s.head { doc.prev_char_boundary(s.head)..s.head } else { start..s.head }
+            } else {
+                s.range()
+            };
+            (r, String::new(), Some(0))
+        });
+    }
+
+    fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        let unit = self.indent_unit.clone();
+        let is_html = self.doc.language == crate::syntax::Language::Html;
+        let is_python = self.doc.language == crate::syntax::Language::Python;
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let r = s.range();
+            let row = doc.row_of(r.start);
+            let line = doc.line_text(row);
+            let line_start = doc.line_start(row);
+            let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            let before = doc.slice(line_start..r.start);
+            let before_trim = before.trim_end();
+            let prev = before_trim.chars().last();
+            let next = doc.char_at(r.end);
+            let opens_html_tag = is_html && prev == Some('>') && !before_trim.ends_with("/>") && {
+                let tag_start = before_trim.rfind('<');
+                tag_start.is_some_and(|i| {
+                    let tag = &before_trim[i..];
+                    !tag.starts_with("</") && !tag.starts_with("<!")
+                })
+            };
+            // Python blocks open with a trailing `:` (`def f():`, `if x:`).
+            let opens_python_block = is_python && prev == Some(':') && !before.trim_start().starts_with('#');
+            let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_python_block;
+            let closes_next = match prev {
+                Some('{') => next == Some('}'),
+                Some('[') => next == Some(']'),
+                Some('(') => next == Some(')'),
+                Some('>') => opens_html_tag && doc.slice(r.end..(r.end + 2).min(doc.len())) == "</",
+                _ => false,
+            };
+            if opens && closes_next {
+                let inner = format!("\n{indent}{unit}");
+                let text = format!("{inner}\n{indent}");
+                (r, text, Some(inner.len()))
+            } else if opens {
+                let text = format!("\n{indent}{unit}");
+                let len = text.len();
+                (r, text, Some(len))
+            } else {
+                let text = format!("\n{indent}");
+                let len = text.len();
+                (r, text, Some(len))
+            }
+        });
+    }
+
+    fn newline_below(&mut self, _: &NewlineBelow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        self.move_selections(false, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+        self.newline(&Newline, window, cx);
+    }
+
+    /// Rows covered by selections, as merged row ranges.
+    fn selected_row_blocks(&self) -> Vec<Range<usize>> {
+        let mut blocks: Vec<Range<usize>> = Vec::new();
+        for s in &self.selections {
+            let r = s.range();
+            let start = self.doc.row_of(r.start);
+            let mut end = self.doc.row_of(r.end);
+            // A selection ending at column 0 doesn't include that row.
+            if end > start && self.doc.line_start(end) == r.end {
+                end -= 1;
+            }
+            match blocks.last_mut() {
+                Some(last) if start <= last.end => last.end = last.end.max(end + 1),
+                _ => blocks.push(start..end + 1),
+            }
+        }
+        blocks
+    }
+
+    fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_chromeless() {
+            cx.propagate();
+            return;
+        }
+        if self.selections.iter().all(|s| s.is_empty()) {
+            let unit = self.indent_unit.clone();
+            self.edit_selections(EditKind::Other, cx, |doc, s| {
+                let text = if unit == "\t" {
+                    "\t".to_string()
+                } else {
+                    let row_start = doc.line_start(doc.row_of(s.head));
+                    let col = DisplayLine::new(&doc.slice(row_start..s.head)).text.chars().count();
+                    " ".repeat(unit.len() - col % unit.len())
+                };
+                let len = text.len();
+                (s.range(), text, Some(len))
+            });
+            return;
+        }
+        let mut edits = Vec::new();
+        for block in self.selected_row_blocks() {
+            for row in block {
+                if !self.doc.line_text(row).trim().is_empty() {
+                    let at = self.doc.line_start(row);
+                    edits.push((at..at, self.indent_unit.clone()));
+                }
+            }
+        }
+        self.edit_and_remap(edits, EditKind::Other, cx);
+    }
+
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_chromeless() {
+            cx.propagate();
+            return;
+        }
+        let mut edits = Vec::new();
+        let width = if self.indent_unit == "\t" { TAB_SIZE } else { self.indent_unit.len() };
+        for block in self.selected_row_blocks() {
+            for row in block {
+                let text = self.doc.line_text(row);
+                let at = self.doc.line_start(row);
+                let n = if text.starts_with('\t') {
+                    1
+                } else {
+                    text.chars().take(width).take_while(|c| *c == ' ').count()
+                };
+                if n > 0 {
+                    edits.push((at..at + n, String::new()));
+                }
+            }
+        }
+        self.edit_and_remap(edits, EditKind::Other, cx);
+    }
+
+    fn toggle_comment(&mut self, _: &ToggleComment, _: &mut Window, cx: &mut Context<Self>) {
+        let language = self.doc.language;
+        let mut edits = Vec::new();
+        for block in self.selected_row_blocks() {
+            let rows: Vec<usize> = block.clone().filter(|&r| !self.doc.line_text(r).trim().is_empty()).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            match language.line_comment() {
+                Some(prefix) => {
+                    let token = prefix.trim_end();
+                    let all_commented = rows.iter().all(|&r| self.doc.line_text(r).trim_start().starts_with(token));
+                    let min_indent = rows
+                        .iter()
+                        .map(|&r| {
+                            let t = self.doc.line_text(r);
+                            t.len() - t.trim_start().len()
+                        })
+                        .min()
+                        .unwrap_or(0);
+                    for &r in &rows {
+                        let t = self.doc.line_text(r);
+                        let start = self.doc.line_start(r);
+                        if all_commented {
+                            let indent = t.len() - t.trim_start().len();
+                            let len = if t[indent..].starts_with(prefix) { prefix.len() } else { token.len() };
+                            edits.push((start + indent..start + indent + len, String::new()));
+                        } else {
+                            edits.push((start + min_indent..start + min_indent, prefix.to_string()));
+                        }
+                    }
+                }
+                None if language == crate::syntax::Language::Html => {
+                    let all_commented = rows.iter().all(|&r| {
+                        let t = self.doc.line_text(r);
+                        let t = t.trim();
+                        t.starts_with("<!--") && t.ends_with("-->")
+                    });
+                    for &r in &rows {
+                        let t = self.doc.line_text(r);
+                        let start = self.doc.line_start(r);
+                        let indent = t.len() - t.trim_start().len();
+                        let end = start + t.trim_end().len();
+                        if all_commented {
+                            let body = t.trim();
+                            let open = if body.starts_with("<!-- ") { 5 } else { 4 };
+                            let close = if body.ends_with(" -->") { 4 } else { 3 };
+                            edits.push((end - close..end, String::new()));
+                            edits.push((start + indent..start + indent + open, String::new()));
+                        } else {
+                            edits.push((end..end, " -->".into()));
+                            edits.push((start + indent..start + indent, "<!-- ".into()));
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if !edits.is_empty() {
+            self.edit_and_remap(edits, EditKind::Other, cx);
+        }
+    }
+
+    fn duplicate_line(&mut self, _: &DuplicateLine, _: &mut Window, cx: &mut Context<Self>) {
+        // Each block's text is inserted after it; cursors move onto the copy.
+        let blocks = self.selected_row_blocks();
+        let mut edits = Vec::new();
+        let mut shifts: Vec<(usize, usize)> = Vec::new(); // (block end, cumulative shift)
+        let mut total = 0;
+        for block in &blocks {
+            let start = self.doc.line_start(block.start);
+            let end = self.doc.line_end(block.end - 1);
+            let text = format!("\n{}", self.doc.slice(start..end));
+            total += text.len();
+            shifts.push((end, total));
+            edits.push((end..end, text));
+        }
+        let before = self.selections.clone();
+        let selections = before
+            .iter()
+            .map(|s| {
+                let shift = shifts
+                    .iter()
+                    .find(|(end, _)| s.range().end <= *end)
+                    .map_or(total, |(_, shift)| *shift);
+                Selection { anchor: s.anchor + shift, head: s.head + shift }
+            })
+            .collect();
+        self.doc.edit(edits, &before, EditKind::Other);
+        self.set_selections(selections, self.primary, cx);
+        self.after_edit(cx);
+    }
+
+    fn move_lines(&mut self, up: bool, cx: &mut Context<Self>) {
+        let blocks = self.selected_row_blocks();
+        let last_row = self.doc.line_count() - 1;
+        if (up && blocks.first().is_some_and(|b| b.start == 0)) || (!up && blocks.last().is_some_and(|b| b.end - 1 >= last_row)) {
+            return;
+        }
+        let mut edits = Vec::new();
+        let mut shifts: Vec<(Range<usize>, isize)> = Vec::new();
+        for block in &blocks {
+            let block_start = self.doc.line_start(block.start);
+            let block_end = self.doc.line_end(block.end - 1);
+            let block_text = self.doc.slice(block_start..block_end);
+            if up {
+                let prev_start = self.doc.line_start(block.start - 1);
+                let prev_text = self.doc.line_text(block.start - 1);
+                edits.push((prev_start..block_end, format!("{block_text}\n{prev_text}")));
+                shifts.push((block_start..block_end + 1, -(prev_text.len() as isize + 1)));
+            } else {
+                let next_end = self.doc.line_end(block.end);
+                let next_text = self.doc.line_text(block.end);
+                edits.push((block_start..next_end, format!("{next_text}\n{block_text}")));
+                shifts.push((block_start..block_end + 1, next_text.len() as isize + 1));
+            }
+        }
+        let before = self.selections.clone();
+        let selections = before
+            .iter()
+            .map(|s| {
+                let shift = shifts
+                    .iter()
+                    .find(|(r, _)| r.contains(&s.range().start))
+                    .map_or(0, |(_, d)| *d);
+                Selection {
+                    anchor: (s.anchor as isize + shift) as usize,
+                    head: (s.head as isize + shift) as usize,
+                }
+            })
+            .collect();
+        self.doc.edit(edits, &before, EditKind::Other);
+        self.set_selections(selections, self.primary, cx);
+        self.after_edit(cx);
+    }
+
+    fn move_line_up(&mut self, _: &MoveLineUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_lines(true, cx);
+    }
+
+    fn move_line_down(&mut self, _: &MoveLineDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_lines(false, cx);
+    }
+
+    fn select_next_occurrence(&mut self, _: &SelectNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        let primary = self.primary_selection();
+        if primary.is_empty() {
+            let selections = self
+                .selections
+                .iter()
+                .map(|s| {
+                    let r = word_range(&self.doc, s.head);
+                    Selection { anchor: r.start, head: r.end }
+                })
+                .collect();
+            self.set_selections(selections, self.primary, cx);
+            return;
+        }
+        let needle = self.doc.slice(primary.range());
+        let haystack = self.doc.rope().to_string();
+        let from = self.selections.iter().map(|s| s.range().end).max().unwrap_or(0);
+        let found = haystack[from..]
+            .find(&needle)
+            .map(|i| i + from)
+            .or_else(|| haystack.find(&needle))
+            .filter(|&i| !self.selections.iter().any(|s| s.range().start == i));
+        if let Some(start) = found {
+            let mut selections = self.selections.clone();
+            selections.push(Selection { anchor: start, head: start + needle.len() });
+            let primary = selections.len() - 1;
+            self.set_selections(selections, primary, cx);
+        }
+    }
+
+    fn add_cursor_vertical(&mut self, rows: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let primary = self.primary_selection();
+        let goal = self.goal_x.unwrap_or_else(|| self.x_for_offset(primary.head, window, cx));
+        let edge = if rows < 0 {
+            self.selections.iter().min_by_key(|s| s.head).copied()
+        } else {
+            self.selections.iter().max_by_key(|s| s.head).copied()
+        }
+        .unwrap_or(primary);
+        let row = self.doc.row_of(edge.head) as isize + rows;
+        if row < 0 || row as usize >= self.doc.line_count() {
+            return;
+        }
+        let head = self.offset_for_row_x(row as usize, goal, window, cx);
+        let mut selections = self.selections.clone();
+        selections.push(Selection::cursor(head));
+        let primary_ix = selections.len() - 1;
+        self.set_selections(selections, primary_ix, cx);
+        self.goal_x = Some(goal);
+    }
+
+    fn add_cursor_above(&mut self, _: &AddCursorAbove, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_cursor_vertical(-1, window, cx);
+    }
+
+    fn add_cursor_below(&mut self, _: &AddCursorBelow, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_cursor_vertical(1, window, cx);
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if self.open_hunk.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let p = self.primary_selection();
+        if self.is_single_line() || (self.selections.len() == 1 && p.is_empty()) {
+            // Nothing to collapse: let the parent (find bar, modal) handle Escape.
+            cx.propagate();
+            return;
+        }
+        let sel = if self.selections.len() > 1 { p } else { Selection::cursor(p.head) };
+        self.set_selections(vec![sel], 0, cx);
+    }
+
+    fn copy_text(&self) -> (String, bool) {
+        if self.selections.iter().all(|s| s.is_empty()) {
+            // Copy whole lines when nothing is selected.
+            let mut out = String::new();
+            for block in self.selected_row_blocks() {
+                let start = self.doc.line_start(block.start);
+                let end = self.doc.line_end(block.end - 1);
+                out.push_str(&self.doc.slice(start..end));
+                out.push('\n');
+            }
+            (out, true)
+        } else {
+            let parts: Vec<String> = self.selections.iter().map(|s| self.doc.slice(s.range())).collect();
+            (parts.join("\n"), false)
+        }
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let (text, _) = self.copy_text();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        let (text, whole_lines) = self.copy_text();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if whole_lines {
+            let mut edits = Vec::new();
+            for block in self.selected_row_blocks() {
+                let start = self.doc.line_start(block.start);
+                let end = (self.doc.line_end(block.end - 1) + 1).min(self.doc.len());
+                edits.push((start..end, String::new()));
+            }
+            self.edit_and_remap(edits, EditKind::Other, cx);
+        } else {
+            self.edit_selections(EditKind::Other, cx, |_, s| (s.range(), String::new(), Some(0)));
+        }
+    }
+
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        let mut text = text.replace("\r\n", "\n");
+        if self.is_single_line() {
+            text = text.trim_end_matches('\n').replace('\n', " ");
+        }
+        let lines: Vec<&str> = text.trim_end_matches('\n').split('\n').collect();
+        let n = self.selections.len();
+        if n > 1 && lines.len() == n {
+            let mut i = 0;
+            self.edit_selections(EditKind::Other, cx, |_, s| {
+                let t = lines[i].to_string();
+                i += 1;
+                let len = t.len();
+                (s.range(), t, Some(len))
+            });
+        } else {
+            let len = text.len();
+            self.edit_selections(EditKind::Other, cx, |_, s| (s.range(), text.clone(), Some(len)));
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selections) = self.doc.undo() {
+            let selections = self.clamp_selections(selections);
+            self.set_selections(selections, 0, cx);
+            self.schedule_lint(Duration::from_millis(150), cx);
+            self.schedule_diff(Duration::from_millis(120), cx);
+            cx.emit(EditorEvent::Edited);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selections) = self.doc.redo() {
+            let selections = self.clamp_selections(selections);
+            self.set_selections(selections, 0, cx);
+            self.schedule_lint(Duration::from_millis(150), cx);
+            self.schedule_diff(Duration::from_millis(120), cx);
+            cx.emit(EditorEvent::Edited);
+        }
+    }
+
+    fn clamp_selections(&self, selections: Vec<Selection>) -> Vec<Selection> {
+        let mut s: Vec<Selection> = selections
+            .into_iter()
+            .map(|s| Selection { anchor: self.doc.clip(s.anchor), head: self.doc.clip(s.head) })
+            .collect();
+        if s.is_empty() {
+            s.push(Selection::cursor(0));
+        }
+        s
+    }
+
+    fn show_character_palette(&mut self, _: &ShowCharacterPalette, window: &mut Window, _: &mut Context<Self>) {
+        window.show_character_palette();
+    }
+
+    // ---- Mouse ---------------------------------------------------------------
+
+    fn scrollbar_geometry(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+        let l = self.layout.as_ref()?;
+        let viewport = l.bounds.size.height;
+        let content = l.line_height * self.doc.line_count() as f32 + viewport - l.line_height;
+        if content <= viewport {
+            return None;
+        }
+        let track = Bounds::new(
+            point(l.bounds.right() - px(SCROLLBAR_WIDTH), l.bounds.top()),
+            size(px(SCROLLBAR_WIDTH), viewport),
+        );
+        let thumb_h = (viewport * (viewport / content)).max(px(28.));
+        let max_scroll = content - viewport;
+        let t = (self.scroll.y / max_scroll).clamp(0., 1.);
+        let thumb = Bounds::new(
+            point(track.left() + px(2.), track.top() + (viewport - thumb_h) * t),
+            size(px(SCROLLBAR_WIDTH - 4.), thumb_h),
+        );
+        Some((track, thumb))
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        let Some(layout) = self.layout.clone() else { return };
+
+        if let Some((track, thumb)) = self.scrollbar_geometry()
+            && track.contains(&event.position)
+        {
+            if thumb.contains(&event.position) {
+                self.scrollbar_drag = Some(event.position.y - thumb.top());
+            } else {
+                self.scrollbar_drag = Some(thumb.size.height / 2.);
+                self.drag_scrollbar_to(event.position.y, cx);
+            }
+            return;
+        }
+
+        // Clicking a change marker in the gutter toggles its popover.
+        let bar_x = layout.bounds.left() + layout.gutter_width - px(GIT_BAR_OFFSET);
+        if !self.is_chromeless() && (event.position.x - bar_x).abs() < px(6.) {
+            let y = event.position.y - layout.bounds.top() + self.scroll.y;
+            let row_f = y / layout.line_height;
+            if let Some(ix) = self.hunk_at(row_f) {
+                self.open_hunk = if self.open_hunk == Some(ix) { None } else { Some(ix) };
+                cx.notify();
+                return;
+            }
+        }
+        self.open_hunk = None;
+
+        let offset = self.offset_for_position(event.position, window, cx);
+        let in_gutter = event.position.x < layout.bounds.left() + layout.gutter_width;
+        let (mode, unit) = if in_gutter || event.click_count >= 3 {
+            (DragMode::Line, self.line_range(offset))
+        } else if event.click_count == 2 {
+            (DragMode::Word, word_range(&self.doc, offset))
+        } else {
+            (DragMode::Char, offset..offset)
+        };
+
+        if event.modifiers.shift {
+            let p = self.primary_selection();
+            let head = if offset < p.anchor { unit.start } else { unit.end };
+            let mut selections = self.selections.clone();
+            selections[self.primary] = Selection { anchor: p.anchor, head };
+            self.set_selections(selections, self.primary, cx);
+            self.drag = Some(Drag { mode, origin: p.anchor..p.anchor });
+        } else {
+            let sel = Selection { anchor: unit.start, head: unit.end };
+            if event.modifiers.alt {
+                let mut selections = self.selections.clone();
+                selections.push(sel);
+                let ix = selections.len() - 1;
+                self.set_selections(selections, ix, cx);
+            } else {
+                self.set_selections(vec![sel], 0, cx);
+            }
+            self.drag = Some(Drag { mode, origin: unit });
+        }
+        self.goal_x = None;
+        self.autoscroll = false;
+        self.restart_blink(window, cx);
+    }
+
+    fn line_range(&self, offset: usize) -> Range<usize> {
+        let row = self.doc.row_of(offset);
+        let start = self.doc.line_start(row);
+        let end = (self.doc.line_end(row) + 1).min(self.doc.len());
+        start..end
+    }
+
+    fn drag_scrollbar_to(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        let (Some(grab), Some((track, thumb)), Some(l)) = (self.scrollbar_drag, self.scrollbar_geometry(), self.layout.as_ref()) else {
+            return;
+        };
+        let viewport = l.bounds.size.height;
+        let content = l.line_height * self.doc.line_count() as f32 + viewport - l.line_height;
+        let range = track.size.height - thumb.size.height;
+        if range <= px(0.) {
+            return;
+        }
+        let t = ((y - grab - track.top()) / range).clamp(0., 1.);
+        self.scroll.y = (content - viewport) * t;
+        cx.notify();
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            self.scrollbar_drag = None;
+            return;
+        }
+        if self.scrollbar_drag.is_some() {
+            self.drag_scrollbar_to(event.position.y, cx);
+            return;
+        }
+        let Some(drag) = self.drag.as_ref() else { return };
+        let (mode, origin) = (drag.mode, drag.origin.clone());
+        let offset = self.offset_for_position(event.position, window, cx);
+        let unit = match mode {
+            DragMode::Char => offset..offset,
+            DragMode::Word => word_range(&self.doc, offset),
+            DragMode::Line => self.line_range(offset),
+        };
+        let sel = if offset < origin.start {
+            Selection { anchor: origin.end, head: unit.start }
+        } else {
+            Selection { anchor: origin.start, head: unit.end.max(origin.end) }
+        };
+        let mut selections = self.selections.clone();
+        selections[self.primary] = sel;
+        self.set_selections(selections, self.primary, cx);
+        // Only scroll when the pointer leaves the viewport.
+        self.autoscroll = self
+            .layout
+            .as_ref()
+            .is_some_and(|l| !l.bounds.contains(&event.position));
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.drag = None;
+        self.scrollbar_drag = None;
+    }
+
+    fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let line_height = self.layout.as_ref().map_or(px(20.), |l| l.line_height);
+        let mut delta = event.delta.pixel_delta(line_height);
+        // Lock to the dominant axis to avoid diagonal jitter on trackpads.
+        if delta.x.abs() > delta.y.abs() {
+            delta.y = px(0.);
+        } else {
+            delta.x = px(0.);
+        }
+        self.scroll.y -= delta.y;
+        self.scroll.x -= delta.x;
+        self.clamp_scroll();
+        cx.notify();
+    }
+
+    fn clamp_scroll(&mut self) {
+        let Some(l) = self.layout.as_ref() else { return };
+        let max_y = l.line_height * (self.doc.line_count().saturating_sub(1)) as f32;
+        self.scroll.y = self.scroll.y.clamp(px(0.), max_y.max(px(0.)));
+        let text_width = l.bounds.right() - l.text_left - px(SCROLLBAR_WIDTH);
+        let max_x = (self.max_line_width + l.char_width * 4. - text_width).max(px(0.));
+        self.scroll.x = self.scroll.x.clamp(px(0.), max_x);
+    }
+
+    // ---- Frame layout ------------------------------------------------------------
+
+    fn layout_frame(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> FrameLayout {
+        let theme = Theme::get(cx).clone();
+        let focused = self.focus_handle.is_focused(window) && window.is_window_active();
+        // Text fields skip the code chrome; only one-line fields center vertically.
+        let single = self.is_chromeless();
+        let font_size = self.font_size(cx);
+        let line_height = self.line_height(cx);
+        let editor_font = self.editor_font(cx);
+        // Single-line fields center their one row vertically.
+        let top = if self.is_single_line() {
+            bounds.top() + ((bounds.size.height - line_height) / 2.).max(px(0.))
+        } else {
+            bounds.top()
+        };
+        let text_system = window.text_system().clone();
+        let font_id = text_system.resolve_font(&editor_font);
+        let char_width = text_system
+            .advance(font_id, font_size, 'm')
+            .map(|s| s.width)
+            .unwrap_or(font_size * 0.6);
+
+        let line_count = self.doc.line_count();
+        let digits = line_count.to_string().len().max(3);
+        let gutter_width = if single { px(0.) } else { char_width * digits as f32 + px(44.) };
+        let text_bounds = Bounds::from_corners(
+            point(bounds.left() + gutter_width, bounds.top()),
+            bounds.bottom_right(),
+        );
+        let text_left = text_bounds.left() + if single { px(0.) } else { px(TEXT_PADDING) };
+        let rows_per_page = ((bounds.size.height / line_height).floor() as usize).saturating_sub(2).max(1);
+
+        self.layout = Some(LayoutSnapshot {
+            bounds,
+            text_left,
+            line_height,
+            char_width,
+            gutter_width,
+            rows_per_page,
+        });
+
+        // Keep the primary cursor visible after keyboard navigation.
+        if std::mem::take(&mut self.reveal_primary) {
+            let row = self.doc.row_of(self.primary_selection().head) as f32;
+            let visible = self.scroll.y..self.scroll.y + bounds.size.height - line_height;
+            if !visible.contains(&(line_height * row)) {
+                self.center_on_next_frame = true;
+            } else {
+                self.autoscroll = true;
+            }
+        }
+        if std::mem::take(&mut self.center_on_next_frame) && !single {
+            let row = self.doc.row_of(self.primary_selection().head);
+            self.scroll.y = (line_height * row as f32 - bounds.size.height / 3.).max(px(0.));
+            self.scroll.x = px(0.);
+        } else if std::mem::take(&mut self.autoscroll) {
+            let head = self.primary_selection().head;
+            let row = self.doc.row_of(head);
+            let margin = line_height * 3.;
+            let top = line_height * row as f32;
+            let viewport = bounds.size.height;
+            if top - margin < self.scroll.y {
+                self.scroll.y = (top - margin).max(px(0.));
+            } else if top + line_height + margin > self.scroll.y + viewport {
+                self.scroll.y = top + line_height + margin - viewport;
+            }
+            let x = self.x_for_offset(head, window, cx);
+            let text_width = bounds.right() - text_left - if single { px(0.) } else { px(SCROLLBAR_WIDTH) };
+            if x < self.scroll.x + char_width * 2. {
+                self.scroll.x = (x - char_width * 4.).max(px(0.));
+            } else if x > self.scroll.x + text_width - char_width * 3. {
+                self.scroll.x = x - text_width + char_width * 6.;
+            }
+        }
+        self.clamp_scroll();
+
+        let first_row = (self.scroll.y / line_height).floor() as usize;
+        let visible_rows = (bounds.size.height / line_height).ceil() as usize + 1;
+        let last_row = (first_row + visible_rows).min(line_count);
+        let first_row = first_row.min(last_row);
+        let range_start = self.doc.line_start(first_row);
+        let range_end = if last_row == 0 { 0 } else { self.doc.line_end(last_row - 1) };
+        let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
+        let diagnostics: Vec<&lint::Diagnostic> = self
+            .doc
+            .diagnostics
+            .iter()
+            .filter(|d| d.range.start <= range_end && d.range.end >= range_start)
+            .collect();
+
+        let head_rows: Vec<usize> = self
+            .selections
+            .iter()
+            .filter(|s| s.is_empty())
+            .map(|s| self.doc.row_of(s.head))
+            .collect();
+
+        let mut frame = FrameLayout {
+            text_bounds,
+            line_height,
+            ..Default::default()
+        };
+        let ui_font = font(theme.ui_font.clone());
+
+        // Indentation (in columns) for indent guides.
+        let indents: Vec<Option<usize>> = (first_row..last_row)
+            .map(|row| {
+                let t = self.doc.line_text(row);
+                if t.trim().is_empty() {
+                    None
+                } else {
+                    Some(DisplayLine::new(&t[..t.len() - t.trim_start().len()]).text.len())
+                }
+            })
+            .collect();
+
+        let mut hl_ix = 0;
+        for row in first_row..last_row {
+            let y = top + line_height * row as f32 - self.scroll.y;
+            let line_start = self.doc.line_start(row);
+            let text = self.doc.line_text(row);
+            let line_end = line_start + text.len();
+            let dl = DisplayLine::new(&text);
+
+            // Build styled runs from highlight spans and diagnostics.
+            while hl_ix < highlights.len() && highlights[hl_ix].0.end <= line_start {
+                hl_ix += 1;
+            }
+            let mut cuts: Vec<usize> = vec![0, text.len()];
+            for (r, _) in highlights[hl_ix..].iter().take_while(|(r, _)| r.start < line_end) {
+                cuts.push(r.start.saturating_sub(line_start).min(text.len()));
+                cuts.push(r.end.saturating_sub(line_start).min(text.len()));
+            }
+            let row_diags: Vec<&&lint::Diagnostic> = diagnostics
+                .iter()
+                .filter(|d| d.range.start <= line_end && d.range.end > line_start)
+                .collect();
+            for d in &row_diags {
+                cuts.push(d.range.start.saturating_sub(line_start).min(text.len()));
+                cuts.push(d.range.end.saturating_sub(line_start).min(text.len()));
+            }
+            cuts.sort_unstable();
+            cuts.dedup();
+
+            let mut runs = Vec::with_capacity(cuts.len());
+            let mut h = hl_ix;
+            for w in cuts.windows(2) {
+                let (s, e) = (w[0], w[1]);
+                let abs = line_start + s;
+                while h < highlights.len() && highlights[h].0.end <= abs {
+                    h += 1;
+                }
+                let kind = highlights
+                    .get(h)
+                    .filter(|(r, _)| r.start <= abs && abs < r.end)
+                    .map(|(_, k)| *k)
+                    .unwrap_or_default();
+                let mut run_font = editor_font.clone();
+                if kind == crate::syntax::Highlight::Comment && theme.italic_comments {
+                    run_font.style = FontStyle::Italic;
+                }
+                let severity = row_diags
+                    .iter()
+                    .filter(|d| d.range.start <= abs && abs < d.range.end)
+                    .map(|d| d.severity)
+                    .min();
+                let len = dl.to_display(e) - dl.to_display(s);
+                if len == 0 {
+                    continue;
+                }
+                runs.push(TextRun {
+                    len,
+                    font: run_font,
+                    color: theme.highlight_color(kind),
+                    background_color: None,
+                    underline: severity.map(|sev| UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(severity_color(&theme, sev)),
+                        wavy: true,
+                    }),
+                    strikethrough: None,
+                });
+            }
+            let shaped = text_system.shape_line(SharedString::from(dl.text.clone()), font_size, &runs, None);
+            self.max_line_width = self.max_line_width.max(shaped.width);
+            let origin = point(text_left - self.scroll.x, y);
+
+            // Current line highlight.
+            let is_cursor_row = head_rows.contains(&row);
+            if is_cursor_row && self.selections.len() == 1 && !single {
+                frame.backgrounds.push(fill(
+                    Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
+                    theme.current_line,
+                ));
+            }
+
+            // Indent guides.
+            let indent = indents[row - first_row].unwrap_or_else(|| {
+                let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
+                let next = indents[row - first_row..].iter().find_map(|i| *i).unwrap_or(0);
+                prev.min(next)
+            });
+            let mut col = 0;
+            while !single && col + TAB_SIZE <= indent.max(1) && col < indent {
+                let x = origin.x + char_width * col as f32;
+                if x >= text_bounds.left() {
+                    frame.guides.push(fill(
+                        Bounds::new(point(x, y), size(px(1.), line_height)),
+                        theme.indent_guide,
+                    ));
+                }
+                col += TAB_SIZE;
+            }
+
+            // Search matches.
+            let first_match = self.search_matches.partition_point(|m| m.end < line_start);
+            for (ix, m) in self.search_matches.iter().enumerate().skip(first_match) {
+                if m.start > line_end {
+                    break;
+                }
+                let x0 = shaped.x_for_index(dl.to_display(m.start.max(line_start) - line_start));
+                let mut x1 = shaped.x_for_index(dl.to_display(m.end.min(line_end) - line_start));
+                if m.end > line_end {
+                    x1 += char_width * 0.6;
+                }
+                let bounds = Bounds::from_corners(point(origin.x + x0, y + px(1.)), point(origin.x + x1, y + line_height - px(1.)));
+                let quad = if Some(ix) == self.active_match {
+                    gpui::quad(bounds, px(3.), theme.search_active, px(1.), Hsla::from(theme.search_active).alpha(0.9), gpui::BorderStyle::Solid)
+                } else {
+                    fill(bounds, theme.search_match).corner_radii(px(3.))
+                };
+                frame.search.push(quad);
+            }
+
+            // Selections.
+            for sel in &self.selections {
+                let r = sel.range();
+                if sel.is_empty() || r.end < line_start || r.start > line_end {
+                    continue;
+                }
+                if r.end == line_start && r.start < line_start {
+                    continue;
+                }
+                let s_col = r.start.max(line_start) - line_start;
+                let e_col = r.end.min(line_end) - line_start;
+                let x0 = shaped.x_for_index(dl.to_display(s_col));
+                let mut x1 = shaped.x_for_index(dl.to_display(e_col));
+                if r.end > line_end {
+                    x1 += char_width * 0.6;
+                }
+                if x1 > x0 {
+                    let color = if focused { theme.selection } else { theme.selection_inactive };
+                    frame.selections.push(
+                        fill(
+                            Bounds::from_corners(point(origin.x + x0, y), point(origin.x + x1, y + line_height)),
+                            color,
+                        )
+                        .corner_radii(px(3.)),
+                    );
+                }
+            }
+
+            // Cursors.
+            if focused && self.cursor_visible {
+                for sel in &self.selections {
+                    if self.doc.row_of(sel.head) != row {
+                        continue;
+                    }
+                    let x = shaped.x_for_index(dl.to_display(sel.head - line_start));
+                    frame.cursors.push(
+                        fill(
+                            Bounds::new(point(origin.x + x - px(1.), y + px(2.)), size(px(2.), line_height - px(4.))),
+                            theme.cursor,
+                        )
+                        .corner_radii(px(1.)),
+                    );
+                }
+            }
+
+            if single {
+                if self.doc.len() == 0 && !self.placeholder.is_empty() {
+                    let placeholder = text_system.shape_line(
+                        self.placeholder.clone(),
+                        font_size,
+                        &[TextRun {
+                            len: self.placeholder.len(),
+                            font: editor_font.clone(),
+                            color: theme.text_dim.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    frame.lines.push((origin, placeholder));
+                }
+                frame.lines.push((origin, shaped));
+                continue;
+            }
+
+            // Gutter: line number and diagnostic dot.
+            let number = SharedString::from((row + 1).to_string());
+            let number_color = if is_cursor_row { theme.line_number_active } else { theme.line_number };
+            let number_line = text_system.shape_line(
+                number.clone(),
+                font_size,
+                &[TextRun {
+                    len: number.len(),
+                    font: editor_font.clone(),
+                    color: number_color.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let nx = bounds.left() + gutter_width - px(18.) - number_line.width;
+            frame.numbers.push((point(nx, y), number_line));
+
+            // Git change bars.
+            let bar_x = bounds.left() + gutter_width - px(GIT_BAR_OFFSET) - px(1.5);
+            for hunk in self.hunks.iter() {
+                let color: Hsla = match hunk.kind {
+                    HunkKind::Added => theme.git_added,
+                    HunkKind::Modified => theme.git_modified,
+                    HunkKind::Deleted => theme.git_deleted,
+                }
+                .into();
+                if hunk.kind == HunkKind::Deleted {
+                    if hunk.new_rows.start == row {
+                        frame.gutter_marks.push(
+                            fill(Bounds::new(point(bar_x - px(1.5), y - px(3.)), size(px(6.), px(6.))), color)
+                                .corner_radii(px(3.)),
+                        );
+                    }
+                } else if hunk.new_rows.contains(&row) {
+                    let first = row == hunk.new_rows.start;
+                    let last = row + 1 == hunk.new_rows.end;
+                    let top = if first { y + px(1.) } else { y };
+                    let bottom = if last { y + line_height - px(1.) } else { y + line_height };
+                    frame.gutter_marks.push(
+                        fill(Bounds::from_corners(point(bar_x, top), point(bar_x + px(3.), bottom)), color)
+                            .corner_radii(gpui::Corners {
+                                top_left: if first { px(1.5) } else { px(0.) },
+                                top_right: if first { px(1.5) } else { px(0.) },
+                                bottom_left: if last { px(1.5) } else { px(0.) },
+                                bottom_right: if last { px(1.5) } else { px(0.) },
+                            }),
+                    );
+                }
+            }
+
+            if let Some(worst) = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).min_by_key(|d| d.severity) {
+                let color = severity_color(&theme, worst.severity);
+                let dot = px(6.);
+                frame.gutter_marks.push(
+                    fill(
+                        Bounds::new(point(bounds.left() + px(10.), y + (line_height - dot) / 2.), size(dot, dot)),
+                        color,
+                    )
+                    .corner_radii(dot / 2.),
+                );
+
+                // Inline diagnostic message after the line's text.
+                let mut message = worst.message.clone();
+                if message.len() > 160 {
+                    message.truncate(message.floor_char_boundary(160));
+                    message.push('…');
+                }
+                let count = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).count();
+                if count > 1 {
+                    message.push_str(&format!("  (+{})", count - 1));
+                }
+                let msg_size = px(theme.ui_font_size - 0.5);
+                let msg_line = text_system.shape_line(
+                    SharedString::from(message.clone()),
+                    msg_size,
+                    &[TextRun {
+                        len: message.len(),
+                        font: ui_font.clone(),
+                        color: color.alpha(0.9),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                let x = origin.x + shaped.width + char_width * 3.;
+                let pad = px(8.);
+                let pill_h = line_height - px(4.);
+                frame.inline_bgs.push(
+                    fill(
+                        Bounds::new(point(x - pad, y + px(2.)), size(msg_line.width + pad * 2., pill_h)),
+                        color.alpha(0.1),
+                    )
+                    .corner_radii(px(4.)),
+                );
+                frame.inline_texts.push((point(x, y), msg_line));
+            } else if focused
+                && self.selections.len() == 1
+                && is_cursor_row
+                && let Some((blame_row, _, blame)) = self.blame.as_ref()
+                && *blame_row == row
+            {
+                // Inline blame for the cursor line (only when no diagnostic is shown).
+                let who = match &self.git_file {
+                    _ if blame.uncommitted => "You".to_string(),
+                    Some(g) if g.user_name.as_deref() == Some(blame.author.as_str()) => "You".to_string(),
+                    _ => blame.author.clone(),
+                };
+                let text = if blame.uncommitted {
+                    "You • Uncommitted changes".to_string()
+                } else {
+                    let mut summary = blame.summary.clone();
+                    if summary.len() > 80 {
+                        summary.truncate(summary.floor_char_boundary(80));
+                        summary.push('…');
+                    }
+                    format!("{who}, {} • {summary}", git::relative_time(blame.time))
+                };
+                let line = text_system.shape_line(
+                    SharedString::from(text.clone()),
+                    px(theme.ui_font_size - 0.5),
+                    &[TextRun {
+                        len: text.len(),
+                        font: ui_font.clone(),
+                        color: Hsla::from(theme.text_dim).alpha(0.9),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                frame.inline_texts.push((point(origin.x + shaped.width + char_width * 4., y), line));
+            }
+
+            frame.lines.push((origin, shaped));
+        }
+
+        if !single {
+            self.request_blame(window, cx);
+        }
+
+        // Scrollbar with diagnostic and search markers.
+        if let Some((track, thumb)) = self.scrollbar_geometry().filter(|_| !single) {
+            let hovered_color = if self.scrollbar_drag.is_some() { 0.28 } else { 0.16 };
+            frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(hovered_color)).corner_radii(px(4.)));
+            let rows = line_count.max(1) as f32;
+            for d in &self.doc.diagnostics {
+                let row = self.doc.row_of(d.range.start) as f32;
+                let y = track.top() + track.size.height * (row / rows);
+                frame.scrollbar.push(fill(
+                    Bounds::new(point(track.right() - px(5.), y), size(px(4.), px(2.))),
+                    severity_color(&theme, d.severity),
+                ));
+            }
+            for hunk in self.hunks.iter() {
+                let color: Hsla = match hunk.kind {
+                    HunkKind::Added => theme.git_added,
+                    HunkKind::Modified => theme.git_modified,
+                    HunkKind::Deleted => theme.git_deleted,
+                }
+                .into();
+                let y0 = track.top() + track.size.height * (hunk.new_rows.start as f32 / rows);
+                let h = (track.size.height * (hunk.new_rows.len() as f32 / rows)).max(px(2.));
+                frame.scrollbar.push(fill(Bounds::new(point(track.left(), y0), size(px(2.), h)), color));
+            }
+            let mut last_y = None;
+            for m in &self.search_matches {
+                let row = self.doc.row_of(m.start) as f32;
+                let y = (track.top() + track.size.height * (row / rows)).round();
+                if last_y == Some(y) {
+                    continue;
+                }
+                last_y = Some(y);
+                frame.scrollbar.push(fill(
+                    Bounds::new(point(track.left() + px(3.), y), size(px(6.), px(2.))),
+                    Hsla::from(theme.search_active).alpha(0.8),
+                ));
+            }
+            for s in &self.selections {
+                let row = self.doc.row_of(s.head) as f32;
+                let y = track.top() + track.size.height * (row / rows);
+                frame.scrollbar.push(fill(
+                    Bounds::new(point(track.left() + px(1.), y), size(px(4.), px(2.))),
+                    theme.accent,
+                ));
+            }
+        }
+
+        if self.blink_task.is_none() {
+            self.restart_blink(window, cx);
+        }
+        frame
+    }
+}
+
+fn severity_color(theme: &Theme, severity: Severity) -> Hsla {
+    match severity {
+        Severity::Error => theme.error,
+        Severity::Warning => theme.warning,
+        Severity::Info => theme.info,
+    }
+    .into()
+}
+
+fn closing_pair(c: char) -> Option<char> {
+    match c {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '"' => Some('"'),
+        '\'' => Some('\''),
+        '`' => Some('`'),
+        _ => None,
+    }
+}
+
+fn detect_indent(doc: &Document) -> String {
+    let (mut tabs, mut spaces2, mut spaces4) = (0, 0, 0);
+    for row in 0..doc.line_count().min(500) {
+        let t = doc.line_text(row);
+        if t.starts_with('\t') {
+            tabs += 1;
+        } else {
+            let n = t.len() - t.trim_start_matches(' ').len();
+            if n > 0 && !t.trim().is_empty() {
+                if n % 4 == 0 {
+                    spaces4 += 1;
+                } else if n % 2 == 0 {
+                    spaces2 += 1;
+                }
+            }
+        }
+    }
+    if tabs > spaces2 + spaces4 {
+        "\t".into()
+    } else if spaces2 > spaces4 / 2 && spaces2 > 0 {
+        "  ".into()
+    } else if spaces4 == 0 && doc.language == crate::syntax::Language::Html {
+        "  ".into()
+    } else if spaces4 == 0 && doc.language == crate::syntax::Language::Go {
+        // gofmt indents with tabs.
+        "\t".into()
+    } else {
+        "    ".into()
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CharKind {
+    Word,
+    Space,
+    Punct,
+    Newline,
+}
+
+fn char_kind(c: char) -> CharKind {
+    if c == '\n' {
+        CharKind::Newline
+    } else if c.is_whitespace() {
+        CharKind::Space
+    } else if c.is_alphanumeric() || c == '_' || c == '$' {
+        CharKind::Word
+    } else {
+        CharKind::Punct
+    }
+}
+
+fn word_left(doc: &Document, mut o: usize) -> usize {
+    while let Some(c) = doc.char_before(o) {
+        if char_kind(c) == CharKind::Space { o -= c.len_utf8() } else { break }
+    }
+    if let Some(c) = doc.char_before(o) {
+        if c == '\n' {
+            return o - 1;
+        }
+        let k = char_kind(c);
+        while let Some(c) = doc.char_before(o) {
+            if char_kind(c) == k { o -= c.len_utf8() } else { break }
+        }
+    }
+    o
+}
+
+fn word_right(doc: &Document, mut o: usize) -> usize {
+    while let Some(c) = doc.char_at(o) {
+        if char_kind(c) == CharKind::Space { o += c.len_utf8() } else { break }
+    }
+    if let Some(c) = doc.char_at(o) {
+        if c == '\n' {
+            return o + 1;
+        }
+        let k = char_kind(c);
+        while let Some(c) = doc.char_at(o) {
+            if char_kind(c) == k { o += c.len_utf8() } else { break }
+        }
+    }
+    o
+}
+
+fn word_range(doc: &Document, offset: usize) -> Range<usize> {
+    let kind = match (doc.char_at(offset), doc.char_before(offset)) {
+        (Some(c), _) if char_kind(c) == CharKind::Word => CharKind::Word,
+        (_, Some(c)) if char_kind(c) == CharKind::Word => CharKind::Word,
+        (Some(c), _) if c != '\n' => char_kind(c),
+        _ => return offset..offset,
+    };
+    let mut start = offset;
+    while let Some(c) = doc.char_before(start) {
+        if char_kind(c) == kind { start -= c.len_utf8() } else { break }
+    }
+    let mut end = offset;
+    while let Some(c) = doc.char_at(end) {
+        if char_kind(c) == kind { end += c.len_utf8() } else { break }
+    }
+    start..end
+}
+
+/// A buffer line prepared for display: tabs are expanded to spaces, with a
+/// mapping between buffer columns and display columns (both in bytes).
+pub struct DisplayLine {
+    pub text: String,
+    map: Option<Vec<usize>>,
+}
+
+impl DisplayLine {
+    pub fn new(line: &str) -> Self {
+        if !line.contains('\t') {
+            return Self { text: line.to_string(), map: None };
+        }
+        let mut text = String::with_capacity(line.len() + 16);
+        let mut map = Vec::with_capacity(line.len() + 1);
+        let mut col = 0;
+        for ch in line.chars() {
+            for _ in 0..ch.len_utf8() {
+                map.push(text.len());
+            }
+            if ch == '\t' {
+                let n = TAB_SIZE - col % TAB_SIZE;
+                text.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            } else {
+                text.push(ch);
+                col += 1;
+            }
+        }
+        map.push(text.len());
+        Self { text, map: Some(map) }
+    }
+
+    pub fn to_display(&self, col: usize) -> usize {
+        match &self.map {
+            None => col.min(self.text.len()),
+            Some(m) => m[col.min(m.len() - 1)],
+        }
+    }
+
+    pub fn to_buffer(&self, display: usize) -> usize {
+        match &self.map {
+            None => display.min(self.text.len()),
+            Some(m) => m.partition_point(|&d| d < display).min(m.len() - 1),
+        }
+    }
+}
+
+// ---- Git ------------------------------------------------------------------------
+
+impl Editor {
+    /// The change marker under a gutter position (rows as a fraction, so
+    /// deletion markers on a row boundary can be hit).
+    fn hunk_at(&self, row: f32) -> Option<usize> {
+        let deleted = self.hunks.iter().position(|h| {
+            h.kind == HunkKind::Deleted && (row - h.new_rows.start as f32).abs() < 0.35
+        });
+        deleted.or_else(|| {
+            let r = row.floor().max(0.) as usize;
+            self.hunks.iter().position(|h| h.kind != HunkKind::Deleted && h.new_rows.contains(&r))
+        })
+    }
+
+    /// The change at the cursor, preferring an open popover.
+    fn current_hunk(&self) -> Option<usize> {
+        self.open_hunk.or_else(|| {
+            let row = self.doc.row_of(self.primary_selection().head);
+            self.hunks.iter().position(|h| {
+                h.new_rows.contains(&row) || (h.kind == HunkKind::Deleted && (h.new_rows.start == row || h.new_rows.start == row + 1))
+            })
+        })
+    }
+
+    fn rollback_hunk(&mut self, _: &RollbackHunk, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(hunk) = self.current_hunk().and_then(|i| self.hunks.get(i)).cloned() else {
+            return;
+        };
+        let line_count = self.doc.line_count();
+        let start = self.doc.line_start(hunk.new_rows.start.min(line_count));
+        let end = if hunk.new_rows.end >= line_count { self.doc.len() } else { self.doc.line_start(hunk.new_rows.end) };
+        let mut text = hunk.old_text.clone();
+        // Keep the file's final-newline state when the hunk reaches the end.
+        if end == self.doc.len() && !self.doc.rope().to_string().ends_with('\n') && text.ends_with('\n') {
+            text.pop();
+        }
+        self.open_hunk = None;
+        self.edit_and_remap(vec![(start..end, text)], EditKind::Other, cx);
+    }
+
+    fn jump_to_change(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.hunks.is_empty() {
+            return;
+        }
+        let row = self.doc.row_of(self.primary_selection().head);
+        let starts: Vec<usize> = self.hunks.iter().map(|h| h.new_rows.start).collect();
+        let target = if forward {
+            starts.iter().copied().find(|&s| s > row).unwrap_or(starts[0])
+        } else {
+            starts.iter().rev().copied().find(|&s| s < row).unwrap_or(*starts.last().unwrap())
+        };
+        let offset = self.doc.line_start(target.min(self.doc.line_count() - 1));
+        let ix = self.hunks.iter().position(|h| h.new_rows.start == target);
+        if self.open_hunk.is_some() {
+            self.open_hunk = ix;
+        }
+        self.select_range(offset..offset, cx);
+    }
+
+    fn next_change(&mut self, _: &NextChange, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_change(true, cx);
+    }
+
+    fn previous_change(&mut self, _: &PreviousChange, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_change(false, cx);
+    }
+
+    fn toggle_inline_blame(&mut self, _: &ToggleInlineBlame, _: &mut Window, cx: &mut Context<Self>) {
+        let on = cx.try_global::<InlineBlame>().is_none_or(|b| b.0);
+        cx.set_global(InlineBlame(!on));
+        cx.refresh_windows();
+    }
+
+    /// Fetches blame for the cursor line after it settles for a moment.
+    fn request_blame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let enabled = cx.try_global::<InlineBlame>().is_none_or(|b| b.0);
+        let Some(git_file) = self.git_file.clone().filter(|_| enabled) else {
+            return;
+        };
+        if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || self.diff_base.is_none() {
+            return;
+        }
+        let row = self.doc.row_of(self.primary_selection().head);
+        let version = self.doc.version();
+        if self.blame_request == Some((row, version)) {
+            return;
+        }
+        self.blame_request = Some((row, version));
+        let rope = self.doc.rope().clone();
+        self.blame_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(350)).await;
+            let blame = cx
+                .background_executor()
+                .spawn(async move { git::blame_line(&git_file.root, &git_file.rel, row, &rope.to_string()) })
+                .await;
+            this.update(cx, |editor, cx| {
+                if editor.blame_request == Some((row, version)) {
+                    editor.blame = blame.map(|b| (row, version, b));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn render_hunk_popover(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let ix = self.open_hunk?;
+        let hunk = self.hunks.get(ix)?.clone();
+        let layout = self.layout.as_ref()?;
+        let theme = Theme::get(cx).clone();
+        let anchor_row = if hunk.kind == HunkKind::Deleted { hunk.new_rows.start } else { hunk.new_rows.end };
+        let top = layout.line_height * anchor_row as f32 - self.scroll.y + px(2.);
+        let left = layout.gutter_width - px(4.);
+        let width = (layout.bounds.size.width - left - px(28.)).min(px(720.)).max(px(240.));
+        let (title, color): (String, Hsla) = match hunk.kind {
+            HunkKind::Added => (format!("{} added line{}", hunk.new_rows.len(), plural(hunk.new_rows.len())), theme.git_added.into()),
+            HunkKind::Modified => (format!("{} changed line{}", hunk.new_rows.len(), plural(hunk.new_rows.len())), theme.git_modified.into()),
+            HunkKind::Deleted => (format!("{} deleted line{}", hunk.old_rows.len(), plural(hunk.old_rows.len())), theme.git_deleted.into()),
+        };
+        let button = |id: &'static str, icon: Icon, tip: &'static str| {
+            div()
+                .id(id)
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
+                .child(crate::ui::icon_el(icon, px(14.), theme.text_muted.into()))
+        };
+        let old_lines: Vec<String> = hunk.old_text.lines().map(|l| l.replace('\t', "    ")).collect();
+        Some(
+            div()
+                .id("hunk-popover")
+                .absolute()
+                .top(top)
+                .left(left)
+                .w(width)
+                .flex()
+                .flex_col()
+                .bg(theme.elevated)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(px(8.))
+                .shadow_lg()
+                .overflow_hidden()
+                .text_size(px(12.5))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .h(px(32.))
+                        .px_2()
+                        .border_b_1()
+                        .border_color(theme.border_subtle)
+                        .child(div().size(px(8.)).rounded_full().bg(color))
+                        .child(div().flex_1().pl_1().text_color(theme.text_muted).child(title))
+                        .child(button("hunk-rollback", Icon::Undo, "Rollback Lines").on_click(cx.listener(|e, _, w, cx| e.rollback_hunk(&RollbackHunk, w, cx))))
+                        .child(button("hunk-prev", Icon::ChevronUp, "Previous Change").on_click(cx.listener(|e, _, _, cx| e.jump_to_change(false, cx))))
+                        .child(button("hunk-next", Icon::ChevronDown, "Next Change").on_click(cx.listener(|e, _, _, cx| e.jump_to_change(true, cx))))
+                        .child(button("hunk-close", Icon::X, "Close (Esc)").on_click(cx.listener(|e, _, _, cx| {
+                            e.open_hunk = None;
+                            cx.notify();
+                        }))),
+                )
+                .child(if old_lines.is_empty() {
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_color(theme.text_dim)
+                        .child("New lines — nothing to show from HEAD")
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("hunk-old-lines")
+                        .max_h(px(240.))
+                        .overflow_y_scroll()
+                        .py_1()
+                        .font_family(theme.mono_font.clone())
+                        .text_size(px(theme.editor_font_size - 1.))
+                        .children(old_lines.into_iter().map(|line| {
+                            div()
+                                .flex()
+                                .px_2()
+                                .bg(Hsla::from(theme.git_deleted).alpha(0.1))
+                                .child(div().w(px(16.)).flex_shrink_0().text_color(theme.git_deleted).child("−"))
+                                .child(div().text_color(theme.text_muted).whitespace_nowrap().child(line))
+                        }))
+                        .into_any_element()
+                })
+                .into_any_element(),
+        )
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+// ---- JetBrains-style editing actions ----------------------------------------
+
+impl Editor {
+    fn delete_line(&mut self, _: &DeleteLine, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            self.set_text("", cx);
+            return;
+        }
+        let mut edits = Vec::new();
+        for block in self.selected_row_blocks() {
+            let mut start = self.doc.line_start(block.start);
+            let mut end = self.doc.line_start(block.end);
+            if block.end >= self.doc.line_count() {
+                // Last line: remove the newline before it instead.
+                end = self.doc.len();
+                start = start.saturating_sub(1);
+            }
+            edits.push((start..end, String::new()));
+        }
+        self.edit_and_remap(edits, EditKind::Other, cx);
+    }
+
+    fn extend_selection(&mut self, _: &ExtendSelection, _: &mut Window, cx: &mut Context<Self>) {
+        let before = self.selections.clone();
+        let len = self.doc.len();
+        let expanded: Vec<Selection> = before
+            .iter()
+            .map(|s| {
+                let r = s.range();
+                if r.is_empty() {
+                    let w = word_range(&self.doc, r.start);
+                    if !w.is_empty() {
+                        return Selection { anchor: w.start, head: w.end };
+                    }
+                }
+                let next = self.doc.syntax().expand(r.clone()).unwrap_or(0..len);
+                Selection { anchor: next.start, head: next.end }
+            })
+            .collect();
+        if expanded == before {
+            return;
+        }
+        self.expand_stack.push(before);
+        self.expanding = true;
+        self.set_selections(expanded, self.primary, cx);
+    }
+
+    fn shrink_selection(&mut self, _: &ShrinkSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.expand_stack.pop() {
+            self.expanding = true;
+            let primary = self.primary.min(previous.len() - 1);
+            self.set_selections(previous, primary, cx);
+        }
+    }
+
+    fn unselect_occurrence(&mut self, _: &UnselectOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selections.len() < 2 {
+            return;
+        }
+        let mut selections = self.selections.clone();
+        selections.remove(self.primary);
+        let primary = self.primary.saturating_sub(1).min(selections.len() - 1);
+        self.set_selections(selections, primary, cx);
+    }
+
+    fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        let p = self.primary_selection();
+        let range = if p.is_empty() { word_range(&self.doc, p.head) } else { p.range() };
+        if range.is_empty() {
+            return;
+        }
+        let needle = self.doc.slice(range.clone());
+        let haystack = self.doc.rope().to_string();
+        let selections: Vec<Selection> = haystack
+            .match_indices(&needle)
+            .map(|(i, _)| Selection { anchor: i, head: i + needle.len() })
+            .collect();
+        let primary = selections.iter().position(|s| s.anchor == range.start).unwrap_or(0);
+        self.set_selections(selections, primary, cx);
+    }
+
+    fn toggle_case(&mut self, _: &ToggleCase, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let range = if s.is_empty() { word_range(doc, s.head) } else { s.range() };
+            let text = doc.slice(range.clone());
+            let new = if text.chars().any(char::is_lowercase) {
+                text.to_uppercase()
+            } else {
+                text.to_lowercase()
+            };
+            (range, new, None)
+        });
+    }
+
+    fn join_lines(&mut self, _: &JoinLines, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            return;
+        }
+        let mut edits = Vec::new();
+        for block in self.selected_row_blocks() {
+            let last = if block.len() == 1 { block.start + 1 } else { block.end - 1 };
+            for row in block.start..last.min(self.doc.line_count() - 1) {
+                let current = self.doc.line_text(row);
+                let next = self.doc.line_text(row + 1);
+                let trimmed_current = current.trim_end();
+                let next_trimmed = next.trim_start();
+                let start = self.doc.line_start(row) + trimmed_current.len();
+                let end = self.doc.line_start(row + 1) + (next.len() - next_trimmed.len());
+                let glue = if next_trimmed.is_empty()
+                    || trimmed_current.is_empty()
+                    || next_trimmed.starts_with([')', ']', '}', ',', ';', '.'])
+                    || trimmed_current.ends_with(['(', '[', '{'])
+                {
+                    ""
+                } else {
+                    " "
+                };
+                edits.push((start..end, glue.to_string()));
+            }
+        }
+        self.edit_and_remap(edits, EditKind::Other, cx);
+    }
+
+    fn newline_above(&mut self, _: &NewlineAbove, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_single_line() {
+            cx.propagate();
+            return;
+        }
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let row = doc.row_of(s.head);
+            let start = doc.line_start(row);
+            let line = doc.line_text(row);
+            let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            let len = indent.len();
+            (start..start, format!("{indent}\n"), Some(len))
+        });
+    }
+
+    fn toggle_block_comment(&mut self, _: &ToggleBlockComment, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((open, close)) = self.doc.language.block_comment() else {
+            return;
+        };
+        self.edit_selections(EditKind::Other, cx, |doc, s| {
+            let range = s.range();
+            let text = doc.slice(range.clone());
+            if s.is_empty() {
+                return (range, format!("{open}{close}"), Some(open.len()));
+            }
+            let (o, c) = (open.trim_end(), close.trim_start());
+            if text.starts_with(o) && text.ends_with(c) && text.len() >= o.len() + c.len() {
+                let inner = &text[o.len()..text.len() - c.len()];
+                let inner = inner.strip_prefix(' ').unwrap_or(inner);
+                let inner = inner.strip_suffix(' ').unwrap_or(inner);
+                (range, inner.to_string(), None)
+            } else {
+                (range, format!("{open}{text}{close}"), None)
+            }
+        });
+    }
+}
+
+// ---- IME / platform text input ---------------------------------------------
+
+impl Editor {
+    fn to_utf16(&self, offset: usize) -> usize {
+        let r = self.doc.rope();
+        r.char_to_utf16_cu(r.byte_to_char(offset.min(r.len_bytes())))
+    }
+
+    fn from_utf16(&self, offset: usize) -> usize {
+        let r = self.doc.rope();
+        let ch = r.utf16_cu_to_char(offset.min(r.len_utf16_cu()));
+        r.char_to_byte(ch)
+    }
+
+    fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.from_utf16(r.start)..self.from_utf16(r.end)
+    }
+
+    fn range_to_utf16(&self, r: &Range<usize>) -> Range<usize> {
+        self.to_utf16(r.start)..self.to_utf16(r.end)
+    }
+}
+
+impl EntityInputHandler for Editor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.doc.slice(range))
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+        let s = self.primary_selection();
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&s.range()),
+            reversed: s.reversed(),
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let explicit = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone());
+        match explicit {
+            Some(range) => {
+                // IME commit: replace the composed range only.
+                let before = self.selections.clone();
+                let new = self.doc.edit(vec![(range, text.to_string())], &before, EditKind::Other);
+                let end = new[0].end;
+                self.set_selections(vec![Selection::cursor(end)], 0, cx);
+                self.after_edit(cx);
+            }
+            None => self.insert(text, cx),
+        }
+        self.marked_range = None;
+        self.restart_blink(window, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or_else(|| self.primary_selection().range());
+        let before = self.selections.clone();
+        let new = self.doc.edit(vec![(range, new_text.to_string())], &before, EditKind::Other);
+        let new_range = new[0].clone();
+        let sel = match new_selected_range_utf16 {
+            Some(r) => {
+                let base = self.to_utf16(new_range.start);
+                let s = self.from_utf16(base + r.start);
+                let e = self.from_utf16(base + r.end);
+                Selection { anchor: s, head: e }
+            }
+            None => Selection::cursor(new_range.end),
+        };
+        self.set_selections(vec![sel], 0, cx);
+        self.marked_range = (!new_text.is_empty()).then_some(new_range);
+        self.after_edit(cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let layout = self.layout.clone()?;
+        let range = self.range_from_utf16(&range_utf16);
+        let row = self.doc.row_of(range.start);
+        let y = layout.bounds.top() + layout.line_height * row as f32 - self.scroll.y;
+        let x0 = self.x_for_offset(range.start, window, cx);
+        let x1 = self.x_for_offset(range.end.max(range.start), window, cx);
+        let left = layout.text_left - self.scroll.x;
+        Some(Bounds::from_corners(
+            point(left + x0, y),
+            point(left + x1, y + layout.line_height),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let offset = self.offset_for_position(point, window, cx);
+        Some(self.to_utf16(offset))
+    }
+}
+
+impl Focusable for Editor {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for Editor {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let popover = self.render_hunk_popover(cx);
+        let theme = Theme::get(cx);
+        div()
+            .id("editor")
+            .key_context("Editor")
+            .track_focus(&self.focus_handle)
+            .map(|el| match self.mode {
+                EditorMode::Full => el.size_full().bg(theme.background),
+                EditorMode::SingleLine => el.w_full().h(px(20.)),
+                EditorMode::MultiLine => el.size_full(),
+            })
+            .on_action(cx.listener(Self::move_left))
+            .on_action(cx.listener(Self::move_right))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::move_word_left))
+            .on_action(cx.listener(Self::move_word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::move_line_start))
+            .on_action(cx.listener(Self::move_line_end))
+            .on_action(cx.listener(Self::select_line_start))
+            .on_action(cx.listener(Self::select_line_end))
+            .on_action(cx.listener(Self::move_doc_start))
+            .on_action(cx.listener(Self::move_doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_line_start))
+            .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::newline_below))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::select_line))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::duplicate_line))
+            .on_action(cx.listener(Self::move_line_up))
+            .on_action(cx.listener(Self::move_line_down))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::add_cursor_above))
+            .on_action(cx.listener(Self::add_cursor_below))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::show_character_palette))
+            .on_action(cx.listener(Self::delete_line))
+            .on_action(cx.listener(Self::extend_selection))
+            .on_action(cx.listener(Self::shrink_selection))
+            .on_action(cx.listener(Self::unselect_occurrence))
+            .on_action(cx.listener(Self::select_all_occurrences))
+            .on_action(cx.listener(Self::toggle_case))
+            .on_action(cx.listener(Self::join_lines))
+            .on_action(cx.listener(Self::newline_above))
+            .on_action(cx.listener(Self::toggle_block_comment))
+            .on_action(cx.listener(Self::rollback_hunk))
+            .on_action(cx.listener(Self::next_change))
+            .on_action(cx.listener(Self::previous_change))
+            .on_action(cx.listener(Self::toggle_inline_blame))
+            .on_action(cx.listener(Self::submit))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .relative()
+            .child(EditorElement { editor: cx.entity() })
+            .children(popover)
+    }
+}
+
+// ---- Element ---------------------------------------------------------------------
+
+#[derive(Default)]
+pub struct FrameLayout {
+    text_bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    backgrounds: Vec<PaintQuad>,
+    guides: Vec<PaintQuad>,
+    search: Vec<PaintQuad>,
+    selections: Vec<PaintQuad>,
+    lines: Vec<(Point<Pixels>, ShapedLine)>,
+    cursors: Vec<PaintQuad>,
+    numbers: Vec<(Point<Pixels>, ShapedLine)>,
+    gutter_marks: Vec<PaintQuad>,
+    inline_bgs: Vec<PaintQuad>,
+    inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
+    scrollbar: Vec<PaintQuad>,
+    hitbox: Option<Hitbox>,
+}
+
+struct EditorElement {
+    editor: Entity<Editor>,
+}
+
+impl IntoElement for EditorElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for EditorElement {
+    type RequestLayoutState = ();
+    type PrepaintState = FrameLayout;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> FrameLayout {
+        let mut frame = self
+            .editor
+            .update(cx, |editor, cx| editor.layout_frame(bounds, window, cx));
+        frame.hitbox = Some(window.insert_hitbox(frame.text_bounds, HitboxBehavior::Normal));
+        frame
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        frame: &mut FrameLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.editor.read(cx).focus_handle.clone();
+        window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.editor.clone()), cx);
+        if let Some(hitbox) = frame.hitbox.as_ref() {
+            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
+
+        let line_height = frame.line_height;
+        for q in frame.backgrounds.drain(..) {
+            window.paint_quad(q);
+        }
+        window.with_content_mask(Some(ContentMask { bounds: frame.text_bounds }), |window| {
+            for q in frame.guides.drain(..) {
+                window.paint_quad(q);
+            }
+            for q in frame.search.drain(..) {
+                window.paint_quad(q);
+            }
+            for q in frame.selections.drain(..) {
+                window.paint_quad(q);
+            }
+            for q in frame.inline_bgs.drain(..) {
+                window.paint_quad(q);
+            }
+            for (origin, line) in &frame.lines {
+                line.paint(*origin, line_height, window, cx).ok();
+            }
+            for (origin, line) in &frame.inline_texts {
+                line.paint(*origin, line_height, window, cx).ok();
+            }
+            for q in frame.cursors.drain(..) {
+                window.paint_quad(q);
+            }
+        });
+        for (origin, line) in &frame.numbers {
+            line.paint(*origin, line_height, window, cx).ok();
+        }
+        for q in frame.gutter_marks.drain(..) {
+            window.paint_quad(q);
+        }
+        for q in frame.scrollbar.drain(..) {
+            window.paint_quad(q);
+        }
+    }
+}
