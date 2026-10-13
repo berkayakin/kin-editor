@@ -19,6 +19,7 @@ mod keymap;
 mod lint;
 mod lsp;
 mod picker;
+mod preferences;
 mod run;
 mod project_search;
 mod search;
@@ -39,7 +40,7 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
+        CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings,
         ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
@@ -54,7 +55,6 @@ fn menus() -> Vec<Menu> {
             name: "Kin".into(),
             items: vec![
                 MenuItem::action("Settings…", OpenSettings),
-                MenuItem::action("Keymap…", OpenKeymap),
                 MenuItem::separator(),
                 MenuItem::action("Quit Kin", Quit),
             ],

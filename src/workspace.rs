@@ -45,8 +45,9 @@ use crate::{
     run::{self, RunTarget},
     terminal::{RunState, TerminalEvent, TerminalView},
     theme::{self, Theme},
+    preferences::{self, Preferences, PreferencesEvent},
     theme_picker::{ThemePicker, ThemePickerEvent},
-    ui::{binding_label, icon_button, icon_el, kbd, tooltip_view},
+    ui::{binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
 };
 
 actions!(
@@ -94,6 +95,7 @@ actions!(
         GoToLine,
         FileStructure,
         OpenSettings,
+        OpenSettingsFile,
         OpenKeymap,
         RestartLanguageServer,
         IncreaseFontSize,
@@ -304,6 +306,7 @@ enum Modal {
     Branches(Entity<BranchPicker>),
     Input(Entity<InputDialog>),
     Clone(Entity<CloneDialog>),
+    Preferences(Entity<Preferences>),
 }
 
 /// How long two Shift taps may be apart to count as a double Shift.
@@ -401,6 +404,8 @@ pub struct Workspace {
     session_task: Option<Task<()>>,
     /// Language servers for this window's files.
     lsp: Entity<LspStore>,
+    /// The Preferences page shown last, to reopen there.
+    preferences_page: preferences::Page,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -560,6 +565,7 @@ impl Workspace {
             close_confirmed: false,
             session_task: None,
             lsp,
+            preferences_page: preferences::Page::Appearance,
             _subscriptions: vec![find_subscription, git_subscription, log_subscription, activation, quit, settings_observer, lsp_subscription, lsp_observer],
         };
         // Problems with settings.json / keymap.json found at startup.
@@ -1343,6 +1349,29 @@ impl Workspace {
     }
 
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.modal, Some(Modal::Preferences(_))) {
+            self.close_modal(window, cx);
+            return;
+        }
+        self.close_modal(window, cx);
+        let preferences = cx.new(|cx| Preferences::new(self.preferences_page, window, cx));
+        self.modal_subscription = Some(cx.subscribe_in(&preferences, window, |ws, _, event: &PreferencesEvent, window, cx| match event {
+            PreferencesEvent::OpenSettingsFile => {
+                ws.close_modal(window, cx);
+                ws.open_settings_file(&OpenSettingsFile, window, cx);
+            }
+            PreferencesEvent::OpenKeymapFile => {
+                ws.close_modal(window, cx);
+                ws.open_keymap(&OpenKeymap, window, cx);
+            }
+            PreferencesEvent::Problems(problems) => ws.report_config_problems(problems.clone(), cx),
+            PreferencesEvent::Dismissed => ws.close_modal(window, cx),
+        }));
+        self.modal = Some(Modal::Preferences(preferences));
+        cx.notify();
+    }
+
+    fn open_settings_file(&mut self, _: &OpenSettingsFile, window: &mut Window, cx: &mut Context<Self>) {
         self.open_config_file(Settings::path(), settings::SETTINGS_TEMPLATE, window, cx);
     }
 
@@ -2669,6 +2698,12 @@ impl Workspace {
     }
 
     fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Text typed into Preferences a moment ago still gets saved.
+        if let Some(Modal::Preferences(preferences)) = &self.modal {
+            let preferences = preferences.clone();
+            self.preferences_page = preferences.read(cx).page();
+            preferences.update(cx, |p, cx| p.flush(cx));
+        }
         // Leaving the theme picker without confirming undoes the preview.
         if let Some(Modal::Theme(picker)) = &self.modal {
             let picker = picker.read(cx);
@@ -3513,6 +3548,7 @@ impl Workspace {
             Modal::Branches(b) => b.clone().into_any_element(),
             Modal::Input(i) => i.clone().into_any_element(),
             Modal::Clone(c) => c.clone().into_any_element(),
+            Modal::Preferences(p) => p.clone().into_any_element(),
         };
         let top = (window.viewport_size().height * 0.12).max(px(TITLEBAR_HEIGHT + 12.));
         // Deferred above the other deferred layers (resize handles), so they
@@ -3546,7 +3582,7 @@ impl Workspace {
                         div()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(content),
-                    )
+                    ),
             )
             .with_priority(1)
             .into_any_element(),
@@ -5151,6 +5187,19 @@ impl Workspace {
                 .mx(px(3.))
                 .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
             )
+            // Windows and Linux have no app menu, so Settings needs a way in.
+            .child(
+                self.icon_button(
+                    "open-settings",
+                    Icon::Settings,
+                    matches!(self.modal, Some(Modal::Preferences(_))),
+                    cx,
+                    |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx),
+                )
+                .size(px(22.))
+                .mx(px(3.))
+                .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx)),
+            )
     }
 
     fn update_window_title(&mut self, window: &mut Window, cx: &App) {
@@ -5213,6 +5262,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_to_line))
             .on_action(cx.listener(Self::file_structure))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_settings_file))
             .on_action(cx.listener(Self::restart_language_server))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::split_right))
@@ -5465,19 +5515,6 @@ fn welcome_row(
 }
 
 /// An on/off pill like a native switch.
-fn switch(on: bool, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .w(px(28.))
-        .h(px(16.))
-        .p(px(2.))
-        .rounded_full()
-        .when(on, |el| el.bg(theme.accent).justify_end())
-        .when(!on, |el| el.bg(theme.active))
-        .child(div().size(px(12.)).rounded_full().bg(if on { theme.background } else { theme.text_dim }))
-}
-
 /// A stable tint per project name for its monogram.
 fn monogram_color(name: &str, theme: &Theme) -> Hsla {
     let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];

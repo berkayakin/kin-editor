@@ -32,6 +32,25 @@ pub enum Language {
 }
 
 impl Language {
+    /// Every language, in the order Preferences lists them.
+    pub const ALL: [Language; 15] = [
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Tsx,
+        Language::Html,
+        Language::Css,
+        Language::Rust,
+        Language::Go,
+        Language::Python,
+        Language::Php,
+        Language::Shell,
+        Language::Json,
+        Language::Yaml,
+        Language::Toml,
+        Language::Markdown,
+        Language::PlainText,
+    ];
+
     pub fn from_path(path: &Path) -> Self {
         // Well-known files whose name, not extension, gives the language.
         match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {

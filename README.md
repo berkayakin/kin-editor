@@ -140,9 +140,11 @@ reachable through Find Action, which shows its shortcut.
 
 ### Your own bindings
 
-**Keymap…** (in the app menu and Find Action) opens `keymap.json` in the config folder. Its
-bindings are added on top of the built-in keymap, apply when you save, and show in menus and
-Find Action:
+Change a shortcut in **Settings → Keymap**: click an action and press the new keys (Esc
+cancels, **No Shortcut** removes it, the undo button restores the built-in keys). These go into
+`keymap.json` in the config folder, which **Open keymap.json** (on that page and in Find Action)
+opens for editing by hand. Its bindings are added on top of the built-in keymap, apply when you
+save, and show in menus and Find Action:
 
 ```jsonc
 [
@@ -255,10 +257,17 @@ PATH work as in the terminal.
 
 ## Settings
 
-**Settings…** (⌘, / Ctrl+Alt+S) opens `settings.json`, created with every option commented out.
-Changes apply when you save (or when you come back to Kin after editing it elsewhere). Comments
-and trailing commas are fine, and Kin keeps them when it updates a value itself (the theme
-picker, Toggle Auto Save).
+**Settings…** (⌘, / Ctrl+Alt+S, or the gear at the right of the status bar) opens the Settings
+dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
+wrapping), Saving, Languages (per-language options, language server and formatter), Keymap and
+Terminal & Run. The search field looks through all of them; with it focused, ↑/↓ switch
+pages. Changes apply right away. An option you changed has an undo button next to its name,
+which puts the default back.
+
+Everything is stored in `settings.json`. **Open settings.json** (at the bottom of the dialog and
+in Find Action) opens it, created with every option commented out. Edits to the file apply when
+you save (or when you come back to Kin after editing it elsewhere). Comments and trailing commas
+are fine, and Kin keeps them when it changes a value itself.
 
 | Setting | Default | |
 | --- | --- | --- |

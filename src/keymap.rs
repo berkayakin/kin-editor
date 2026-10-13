@@ -8,6 +8,7 @@ use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, KeyBindingMetaIndex, NoAction};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     editor::*,
@@ -16,7 +17,7 @@ use crate::{
     settings::strip_jsonc,
     theme::{self, config_dir},
     workspace::{
-        CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine,
+        CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine, OpenSettingsFile,
         CloseWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
@@ -88,6 +89,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("up", MoveUp, Some("GitLog")),
         KeyBinding::new("down", MoveDown, Some("GitLog")),
         KeyBinding::new("escape", Cancel, Some("ContextMenu")),
+        KeyBinding::new("escape", Cancel, Some("Preferences")),
         KeyBinding::new("up", MoveUp, Some("ContextMenu")),
         KeyBinding::new("down", MoveDown, Some("ContextMenu")),
         KeyBinding::new("enter", Newline, Some("ContextMenu")),
@@ -340,8 +342,10 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Previous Change", PreviousChange),
         a("Toggle Inline Git Blame", ToggleInlineBlame),
         a("Soft-Wrap", ToggleSoftWrap),
-        a("Settings", OpenSettings),
-        a("Keymap", OpenKeymap),
+        a("Settings…", OpenSettings),
+        a("Preferences…", OpenSettings),
+        a("Open settings.json", OpenSettingsFile),
+        a("Open keymap.json", OpenKeymap),
         a("Increase Font Size", IncreaseFontSize),
         a("Decrease Font Size", DecreaseFontSize),
         a("Reset Font Size", ResetFontSize),
@@ -468,6 +472,18 @@ fn user_bindings(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
     (out, problems)
 }
 
+/// The comment at the top of `keymap.json`.
+const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in JetBrains keymap.
+// Changes apply when you save this file.
+//
+// Keys: "cmd-shift-d", "ctrl-alt-l", "f5", or two strokes like "cmd-k cmd-s".
+//       "secondary" means Cmd on macOS and Ctrl elsewhere.
+// Actions: a name from Find Action ("Duplicate Line or Selection") or an
+//          action id ("editor::DuplicateLine"). null removes a built-in binding.
+// Context: "Editor" for the code editor; leave it out to bind everywhere
+//          (bindings in a more specific context still win there).
+"#;
+
 /// Written by Open Keymap when there's no file yet.
 pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the built-in JetBrains keymap.
 // Changes apply when you save this file.
@@ -488,3 +504,154 @@ pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the bu
   // }
 ]
 "#;
+
+// ---- Editing keymap.json (Preferences) --------------------------------------------
+
+/// What Preferences does to an action's shortcut.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShortcutChange {
+    /// Use these keys (`unparse`d, e.g. "cmd-shift-d") instead of the current ones.
+    Set(String),
+    /// Leave the action without a shortcut.
+    Remove,
+    /// Back to the built-in shortcuts.
+    Reset,
+}
+
+/// The keys of a binding as written in `keymap.json`.
+pub fn binding_keys(binding: &KeyBinding) -> String {
+    binding.keystrokes().iter().map(|k| k.unparse()).collect::<Vec<_>>().join(" ")
+}
+
+/// Changes an action's shortcut in `keymap.json`. `name` is its Find Action
+/// name, which is what gets written. The file is rewritten (its header
+/// comment is kept); a file that doesn't parse is left alone.
+pub fn change_shortcut(name: &str, action: &dyn Action, change: ShortcutChange, cx: &App) -> Result<(), String> {
+    let path = keymap_path().ok_or("no config directory")?;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut sections: Vec<Value> = if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&strip_jsonc(&text)).map_err(|e| format!("keymap.json has an error: {e}"))?
+    };
+    let by_label: HashMap<&'static str, Box<dyn Action>> =
+        action_entries().into_iter().map(|e| (e.name, e.action)).collect();
+    let refers = |value: &str| match by_label.get(value) {
+        Some(a) => a.partial_eq(action),
+        None => cx.build_action(value, None).is_ok_and(|a| a.partial_eq(action)),
+    };
+    let defaults: Vec<(String, Option<String>)> = bindings()
+        .iter()
+        .filter(|b| b.action().partial_eq(action))
+        .map(|b| (binding_keys(b), b.predicate().map(|p| p.to_string())))
+        .collect();
+    apply_shortcut_change(&mut sections, refers, name, &defaults, &change);
+    let json = serde_json::to_string_pretty(&sections).map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, format!("{KEYMAP_HEADER}{json}\n")).map_err(|e| e.to_string())
+}
+
+/// The bindings object of the section for `context`, added when missing.
+fn section_bindings<'a>(sections: &'a mut Vec<Value>, context: Option<&str>) -> &'a mut serde_json::Map<String, Value> {
+    let matches = |section: &Value| {
+        let found = section.get("context").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty());
+        found == context
+    };
+    let ix = match sections.iter().position(matches) {
+        Some(ix) => ix,
+        None => {
+            let mut section = serde_json::Map::new();
+            if let Some(context) = context {
+                section.insert("context".into(), context.into());
+            }
+            sections.push(Value::Object(section));
+            sections.len() - 1
+        }
+    };
+    let section = sections[ix].as_object_mut().expect("sections are objects");
+    if !section.get("bindings").is_some_and(Value::is_object) {
+        section.insert("bindings".into(), Value::Object(Default::default()));
+    }
+    section.get_mut("bindings").and_then(Value::as_object_mut).expect("inserted above")
+}
+
+/// The edit behind [`change_shortcut`]: `refers` tells whether an action name
+/// in the file means this action, `defaults` are its built-in keys and contexts.
+fn apply_shortcut_change(
+    sections: &mut Vec<Value>,
+    refers: impl Fn(&str) -> bool,
+    name: &str,
+    defaults: &[(String, Option<String>)],
+    change: &ShortcutChange,
+) {
+    sections.retain(Value::is_object);
+    // The user's own bindings for the action go; the change decides what's next.
+    for section in sections.iter_mut() {
+        if let Some(bindings) = section.get_mut("bindings").and_then(Value::as_object_mut) {
+            bindings.retain(|_, v| !v.as_str().is_some_and(&refers));
+        }
+    }
+    let new_keys = match change {
+        ShortcutChange::Set(keys) => Some(keys.as_str()),
+        _ => None,
+    };
+    for (keys, context) in defaults {
+        let bindings = section_bindings(sections, context.as_deref());
+        if *change == ShortcutChange::Reset || new_keys == Some(keys.as_str()) {
+            // Bring the built-in binding back if it was turned off.
+            if bindings.get(keys).is_some_and(Value::is_null) {
+                bindings.shift_remove(keys);
+            }
+        } else if !bindings.contains_key(keys) {
+            bindings.insert(keys.clone(), Value::Null);
+        }
+    }
+    if let Some(keys) = new_keys
+        && !defaults.iter().any(|(k, _)| k == keys)
+    {
+        // Where the built-in binding lives, so it applies in the same places.
+        let context = defaults.first().and_then(|(_, c)| c.as_deref());
+        section_bindings(sections, context).insert(keys.to_string(), name.into());
+    }
+    sections.retain(|s| s.get("bindings").and_then(Value::as_object).is_none_or(|b| !b.is_empty()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn edits_shortcuts() {
+        let refers = |v: &str| v == "Duplicate" || v == "editor::DuplicateLine";
+        let defaults = vec![("cmd-d".to_string(), Some("Editor".to_string()))];
+        let mut sections = vec![json!({"bindings": {"f5": "Run", "cmd-1": "editor::DuplicateLine"}})];
+
+        let set = ShortcutChange::Set("cmd-shift-d".into());
+        apply_shortcut_change(&mut sections, refers, "Duplicate", &defaults, &set);
+        assert_eq!(
+            sections,
+            vec![
+                json!({"bindings": {"f5": "Run"}}),
+                json!({"context": "Editor", "bindings": {"cmd-d": null, "cmd-shift-d": "Duplicate"}}),
+            ]
+        );
+
+        // Setting the built-in keys again needs no entries of its own.
+        let back = ShortcutChange::Set("cmd-d".into());
+        apply_shortcut_change(&mut sections, refers, "Duplicate", &defaults, &back);
+        assert_eq!(sections, vec![json!({"bindings": {"f5": "Run"}})]);
+
+        apply_shortcut_change(&mut sections, refers, "Duplicate", &defaults, &ShortcutChange::Remove);
+        assert_eq!(sections[1], json!({"context": "Editor", "bindings": {"cmd-d": null}}));
+        apply_shortcut_change(&mut sections, refers, "Duplicate", &defaults, &ShortcutChange::Reset);
+        assert_eq!(sections, vec![json!({"bindings": {"f5": "Run"}})]);
+
+        // An action without built-in keys binds everywhere.
+        let mut sections = Vec::new();
+        apply_shortcut_change(&mut sections, |_| false, "Git Log", &[], &ShortcutChange::Set("f9".into()));
+        assert_eq!(sections, vec![json!({"bindings": {"f9": "Git Log"}})]);
+    }
+}

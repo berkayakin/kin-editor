@@ -61,6 +61,20 @@ pub fn toggle(id: &'static str, label: &'static str, active: bool, tooltip: &'st
         .child(label)
 }
 
+/// An on/off switch (draw only; the caller handles clicks).
+pub fn switch(on: bool, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .w(px(28.))
+        .h(px(16.))
+        .p(px(2.))
+        .rounded_full()
+        .when(on, |el| el.bg(theme.accent).justify_end())
+        .when(!on, |el| el.bg(theme.active))
+        .child(div().size(px(12.)).rounded_full().bg(if on { theme.background } else { theme.text_dim }))
+}
+
 pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: &App) -> Stateful<Div> {
     let theme = Theme::get(cx);
     div()

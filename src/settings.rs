@@ -1,6 +1,6 @@
 //! User preferences in `settings.json`. The file may contain comments and
-//! trailing commas; when Kin changes a key (the theme, auto-save) it rewrites
-//! only that key's value, so comments and formatting survive.
+//! trailing commas; when Kin changes a key (Preferences, the theme picker) it
+//! rewrites only that key's entry, so comments and formatting survive.
 //!
 //! Editor options resolve per file: built-in language defaults, then the
 //! top-level settings, then `languages.<Name>` overrides, then `.editorconfig`.
@@ -13,6 +13,7 @@ use std::{
 
 use gpui::{App, Global};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     editorconfig::EditorConfig,
@@ -218,14 +219,100 @@ impl Settings {
     }
 
     /// Sets one top-level key in `settings.json`, keeping everything else.
-    pub fn set(key: &str, value: serde_json::Value) -> std::io::Result<()> {
+    pub fn set(key: &str, value: Value) -> std::io::Result<()> {
+        Self::update(key, |_| Some(value))
+    }
+
+    /// Removes a top-level key, so the option goes back to its default.
+    pub fn remove(key: &str) -> std::io::Result<()> {
+        Self::update(key, |_| None)
+    }
+
+    /// Rewrites one top-level key from its current value in the file (`None`
+    /// when absent); returning `None` removes it. A file that doesn't parse is
+    /// left alone, so a typo can't turn into lost settings.
+    pub fn update(key: &str, f: impl FnOnce(Option<Value>) -> Option<Value>) -> std::io::Result<()> {
         let path = Self::path().ok_or_else(|| std::io::Error::other("no config directory"))?;
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let current = if text.trim().is_empty() {
+            None
+        } else {
+            match serde_json::from_str::<Value>(&strip_jsonc(&text)) {
+                Ok(Value::Object(mut map)) => map.remove(key),
+                Ok(_) => return Err(std::io::Error::other("settings.json should contain an object")),
+                Err(err) => return Err(std::io::Error::other(format!("settings.json has an error: {err}"))),
+            }
+        };
+        let updated = match f(current) {
+            Some(value) => {
+                let text = if text.trim().is_empty() { "{\n}\n".to_string() } else { text.clone() };
+                set_top_level_key(&text, key, &format_value(&value, 2))
+            }
+            None => remove_top_level_key(&text, key),
+        };
+        if updated == text {
+            return Ok(());
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let text = if text.trim().is_empty() { "{\n}\n".to_string() } else { text };
-        std::fs::write(&path, set_top_level_key(&text, key, &value.to_string()))
+        std::fs::write(&path, updated)
+    }
+
+    /// Whether `key` is set in the top level of `settings.json`.
+    pub fn is_set(&self, key: &str) -> bool {
+        match key {
+            "theme" => self.theme.is_some(),
+            "auto_save" => self.auto_save.is_some(),
+            "auto_save_delay" => self.auto_save_delay.is_some(),
+            "editor_font_family" => self.editor_font_family.is_some(),
+            "editor_font_size" => self.editor_font_size.is_some(),
+            "editor_line_height" => self.editor_line_height.is_some(),
+            "tab_size" => self.editor.tab_size.is_some(),
+            "hard_tabs" => self.editor.hard_tabs.is_some(),
+            "soft_wrap" => self.editor.soft_wrap.is_some(),
+            "trim_trailing_whitespace" => self.editor.trim_trailing_whitespace.is_some(),
+            "insert_final_newline" => self.editor.insert_final_newline.is_some(),
+            "format_on_save" => self.editor.format_on_save.is_some(),
+            "terminal_shell" => self.terminal_shell.is_some(),
+            "run_configurations" => !self.run_configurations.is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Sets (`Some`) or clears one option in `languages.<language>`.
+    pub fn set_language_option(language: Language, key: &str, value: Option<Value>) -> std::io::Result<()> {
+        Self::update_language_entry("languages", language, |entry| {
+            let mut options = entry.and_then(|v| v.as_object().cloned()).unwrap_or_default();
+            match value {
+                Some(value) => options.insert(key.to_string(), value),
+                None => options.shift_remove(key),
+            };
+            (!options.is_empty()).then_some(Value::Object(options))
+        })
+    }
+
+    /// Rewrites `<key>.<language name>` in a per-language map (`languages`,
+    /// `language_servers`, `formatters`), dropping the map once it's empty.
+    pub fn update_language_entry(
+        key: &str,
+        language: Language,
+        f: impl FnOnce(Option<Value>) -> Option<Value>,
+    ) -> std::io::Result<()> {
+        Self::update(key, |map| {
+            let mut map = map.and_then(|v| v.as_object().cloned()).unwrap_or_default();
+            let name = language.name().to_string();
+            // Replacing in place keeps the language where it was in the file.
+            match f(map.get(&name).cloned()) {
+                Some(value) => {
+                    map.insert(name, value);
+                }
+                None => {
+                    map.shift_remove(&name);
+                }
+            }
+            (!map.is_empty()).then_some(Value::Object(map))
+        })
     }
 
     /// Editor options for a file of `language` at `path`.
@@ -328,6 +415,21 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
     }
     cx.set_global(ConfigStamps { settings: settings_time, keymap: keymap_time });
     problems
+}
+
+/// Applies `settings.json` now, after Kin changed it itself (a quick second
+/// write can share the first one's modified time).
+pub fn reload_now(cx: &mut App) -> Vec<String> {
+    let keymap = cx.try_global::<ConfigStamps>().and_then(|s| s.keymap);
+    cx.set_global(ConfigStamps { settings: None, keymap });
+    reload_if_changed(cx)
+}
+
+/// Applies `keymap.json` now, after Kin changed it itself.
+pub fn reload_keymap_now(cx: &mut App) -> Vec<String> {
+    let settings = cx.try_global::<ConfigStamps>().and_then(|s| s.settings);
+    cx.set_global(ConfigStamps { settings, keymap: None });
+    reload_if_changed(cx)
 }
 
 /// Problems found at startup, shown by the first window and then cleared.
@@ -511,6 +613,106 @@ fn skip_value(text: &str, start: usize) -> usize {
     i
 }
 
+/// Formats a value for `settings.json`: short lists and objects of plain
+/// values on one line, anything nested spread over lines and indented to
+/// sit under a key at `indent` columns.
+pub fn format_value(value: &Value, indent: usize) -> String {
+    let plain = |v: &Value| !matches!(v, Value::Array(_) | Value::Object(_));
+    let inline = match value {
+        Value::Array(items) if items.is_empty() => return "[]".into(),
+        Value::Object(map) if map.is_empty() => return "{}".into(),
+        Value::Array(items) if items.iter().all(plain) => {
+            Some(format!("[{}]", items.iter().map(Value::to_string).collect::<Vec<_>>().join(", ")))
+        }
+        Value::Object(map) if map.values().all(plain) => {
+            let entries: Vec<String> = map.iter().map(|(k, v)| format!("{}: {v}", Value::from(k.as_str()))).collect();
+            Some(format!("{{ {} }}", entries.join(", ")))
+        }
+        Value::Array(_) | Value::Object(_) => None,
+        plain => return plain.to_string(),
+    };
+    if let Some(line) = inline.filter(|l| indent + l.len() <= 90) {
+        return line;
+    }
+    let pad = " ".repeat(indent + 2);
+    let close = " ".repeat(indent);
+    match value {
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(|v| format!("{pad}{}", format_value(v, indent + 2))).collect();
+            format!("[\n{}\n{close}]", items.join(",\n"))
+        }
+        Value::Object(map) => {
+            let entries: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{pad}{}: {}", Value::from(k.as_str()), format_value(v, indent + 2)))
+                .collect();
+            format!("{{\n{}\n{close}}}", entries.join(",\n"))
+        }
+        _ => unreachable!("plain values returned above"),
+    }
+}
+
+/// Removes `"key": value` from the top-level object of a JSONC document,
+/// with its comma and, when it had the line to itself, its line.
+pub fn remove_top_level_key(text: &str, key: &str) -> String {
+    let bytes = text.as_bytes();
+    let open = skip_trivia(text, 0);
+    if bytes.get(open) != Some(&b'{') {
+        return text.to_string();
+    }
+    let mut i = open + 1;
+    let mut previous_end = None;
+    loop {
+        i = skip_trivia(text, i);
+        if bytes.get(i) != Some(&b'"') {
+            return text.to_string();
+        }
+        let key_start = i;
+        let key_end = skip_string(bytes, i);
+        let found: Option<String> = serde_json::from_str(&text[i..key_end]).ok();
+        let colon = skip_trivia(text, key_end);
+        if bytes.get(colon) != Some(&b':') {
+            return text.to_string();
+        }
+        let value_start = skip_trivia(text, colon + 1);
+        let value_end = skip_value(text, value_start);
+        let after = skip_trivia(text, value_end);
+        if found.as_deref() == Some(key) {
+            let mut start = key_start;
+            let mut end = value_end;
+            // The comma that separated this entry goes too: its own, or for
+            // the last entry the previous one's.
+            let mut stray_comma = None;
+            if bytes.get(after) == Some(&b',') {
+                end = after + 1;
+                while matches!(bytes.get(end), Some(b' ' | b'\t')) {
+                    end += 1;
+                }
+            } else if let Some(previous) = previous_end {
+                let comma = skip_trivia(text, previous);
+                if bytes.get(comma) == Some(&b',') {
+                    stray_comma = Some(comma);
+                }
+            }
+            let line_start = text[..start].rfind('\n').map_or(0, |n| n + 1);
+            let line_end = text[end..].find('\n').map_or(text.len(), |n| end + n);
+            if text[line_start..start].trim().is_empty() && text[end..line_end].trim().is_empty() {
+                start = line_start;
+                end = (line_end + 1).min(text.len());
+            }
+            return match stray_comma {
+                Some(c) => format!("{}{}{}", &text[..c], &text[c + 1..start], &text[end..]),
+                None => format!("{}{}", &text[..start], &text[end..]),
+            };
+        }
+        previous_end = Some(value_end);
+        i = after;
+        if bytes.get(i) == Some(&b',') {
+            i += 1;
+        }
+    }
+}
+
 /// Replaces (or adds) `"key": value` in the top-level object of a JSONC
 /// document, leaving the rest of the text untouched.
 pub fn set_top_level_key(text: &str, key: &str, value: &str) -> String {
@@ -627,6 +829,39 @@ mod tests {
         assert_eq!(Settings::parse(&trailing).unwrap(), Settings::default());
         assert!(trailing.contains("\"b\": 2"), "{trailing}");
         assert_eq!(set_top_level_key("", "theme", "\"A\""), "{\n  \"theme\": \"A\"\n}\n");
+    }
+
+    #[test]
+    fn removes_keys_keeping_the_rest() {
+        let text = "{\n  // my theme\n  \"theme\": \"Nord\",\n  \"tab_size\": 2, // two\n  \"soft_wrap\": true\n}\n";
+        assert_eq!(remove_top_level_key(text, "theme"), "{\n  // my theme\n  \"tab_size\": 2, // two\n  \"soft_wrap\": true\n}\n");
+        // The last entry takes the previous entry's comma with it.
+        let last = remove_top_level_key(text, "soft_wrap");
+        assert_eq!(last, "{\n  // my theme\n  \"theme\": \"Nord\",\n  \"tab_size\": 2 // two\n}\n");
+        assert!(Settings::parse(&last).is_ok());
+        // A comment after the comma stays.
+        let middle = remove_top_level_key(text, "tab_size");
+        assert!(middle.contains("// two") && Settings::parse(&middle).unwrap().editor.tab_size.is_none(), "{middle}");
+        assert_eq!(remove_top_level_key("{\"a\": 1}", "a"), "{}");
+        assert_eq!(remove_top_level_key(text, "missing"), text);
+        let nested = "{\"languages\": {\"Go\": {\"theme\": 1}}}";
+        assert_eq!(remove_top_level_key(nested, "theme"), nested);
+        // Only one of several entries on a line.
+        assert_eq!(remove_top_level_key("{ \"a\": 1, \"b\": 2 }", "a"), "{ \"b\": 2 }");
+    }
+
+    #[test]
+    fn formats_values_readably() {
+        use serde_json::json;
+        assert_eq!(format_value(&json!(["fish", "--login"]), 2), r#"["fish", "--login"]"#);
+        assert_eq!(format_value(&json!({"tab_size": 2}), 4), r#"{ "tab_size": 2 }"#);
+        let languages = json!({"Go": {"tab_size": 8}, "Rust": {"soft_wrap": true}});
+        assert_eq!(
+            format_value(&languages, 2),
+            "{\n    \"Go\": { \"tab_size\": 8 },\n    \"Rust\": { \"soft_wrap\": true }\n  }"
+        );
+        let text = set_top_level_key("{\n}\n", "languages", &format_value(&languages, 2));
+        assert_eq!(Settings::parse(&text).unwrap().languages["Go"].tab_size, Some(8));
     }
 
     #[test]

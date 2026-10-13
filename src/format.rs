@@ -27,7 +27,7 @@ pub struct Formatter {
 /// Command-line formatters per language, in order of preference. `{file}`
 /// is replaced with the file's path (formatters use it to find their
 /// config and to pick a parser).
-fn candidates(language: Language) -> &'static [(&'static str, &'static [&'static str])] {
+pub fn candidates(language: Language) -> &'static [(&'static str, &'static [&'static str])] {
     const PRETTIER: (&str, &[&str]) = ("prettier", &["--stdin-filepath", "{file}"]);
     match language {
         Language::JavaScript
