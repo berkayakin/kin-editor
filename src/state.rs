@@ -61,7 +61,22 @@ impl SessionState {
 pub struct ProjectSession {
     pub root: PathBuf,
     pub tabs: Vec<TabSession>,
+    /// Index into `tabs` of the focused tab.
     pub active: usize,
+    /// Split panes; absent for a single pane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<PaneLayout>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct PaneLayout {
+    /// Stacked rather than side by side.
+    pub column: bool,
+    /// Each pane's share of the space.
+    pub sizes: Vec<f32>,
+    /// Each pane's active tab, counted within the pane.
+    pub active: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
@@ -75,6 +90,19 @@ pub struct TabSession {
     /// The whole text, when the buffer had unsaved edits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsaved: Option<String>,
+    /// Which pane the tab is in.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pane: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub pinned: bool,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl ProjectSession {
@@ -137,10 +165,11 @@ mod tests {
         let session = ProjectSession {
             root: "/work/kin".into(),
             tabs: vec![
-                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, unsaved: None },
-                TabSession { path: None, cursor: 0, unsaved: Some("draft".into()) },
+                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, unsaved: None, pane: 0, pinned: true },
+                TabSession { path: None, cursor: 0, unsaved: Some("draft".into()), pane: 1, pinned: false },
             ],
             active: 1,
+            layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);

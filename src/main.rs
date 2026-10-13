@@ -35,7 +35,7 @@ use crate::{
     editor::*,
     workspace::{
         CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings,
-        ResetFontSize, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        ResetFontSize, SplitDown, SplitRight, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -122,6 +122,9 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Increase Font Size", IncreaseFontSize),
                 MenuItem::action("Decrease Font Size", DecreaseFontSize),
                 MenuItem::action("Reset Font Size", ResetFontSize),
+                MenuItem::separator(),
+                MenuItem::action("Split and Move Right", SplitRight),
+                MenuItem::action("Split and Move Down", SplitDown),
                 MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),

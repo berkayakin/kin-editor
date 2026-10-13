@@ -14,7 +14,7 @@ use gpui::{
     MouseUpEvent, PathPromptOptions, Pixels, PromptLevel, Render,
     SharedString, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
     WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions, div, img, point,
-    prelude::*, px, rgb, size, uniform_list,
+    prelude::*, px, relative, rgb, size, uniform_list,
 };
 
 use crate::{
@@ -38,7 +38,7 @@ use crate::{
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, project_files},
-    state::{ProjectSession, SessionState, TabSession},
+    state::{PaneLayout, ProjectSession, SessionState, TabSession},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
     terminal::{TerminalEvent, TerminalView},
@@ -67,6 +67,12 @@ actions!(
         ToggleTerminal,
         NewTerminal,
         CloseTerminal,
+        SplitRight,
+        SplitDown,
+        NextPane,
+        CloseOtherTabs,
+        CloseAllTabs,
+        TogglePinTab,
         Quit,
         Find,
         Replace,
@@ -152,6 +158,8 @@ enum Edge {
     Problems,
     /// The file tree's right edge.
     Sidebar,
+    /// The divider after pane `n`.
+    Pane(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +199,65 @@ enum PendingInput {
     RenameSymbol { server: Arc<Server>, path: PathBuf, position: Position, current: String },
 }
 
+/// A group of tabs with its own tab bar; panes sit side by side or stacked.
+struct Pane {
+    tabs: Vec<Entity<Editor>>,
+    active: usize,
+}
+
+impl Pane {
+    fn new() -> Self {
+        Self { tabs: Vec::new(), active: 0 }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaneAxis {
+    /// Side by side.
+    Row,
+    /// Stacked.
+    Column,
+}
+
+/// A tab being dragged to a new place or pane.
+#[derive(Clone)]
+struct DraggedTab {
+    editor: Entity<Editor>,
+    name: SharedString,
+}
+
+/// What the drag shows under the pointer.
+struct DraggedTabView(SharedString);
+
+impl Render for DraggedTabView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        div()
+            .px_3()
+            .py_1()
+            .rounded(px(6.))
+            .bg(theme.elevated)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_lg()
+            .text_size(px(theme.ui_font_size))
+            .text_color(theme.text)
+            .child(self.0.clone())
+    }
+}
+
+/// Tab context menu commands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabAction {
+    Close,
+    CloseOthers,
+    CloseAll,
+    CloseToTheRight,
+    TogglePin,
+    SplitRight,
+    SplitDown,
+}
+
 /// What a context menu item does.
 enum MenuAction {
     Tree(TreeAction),
@@ -198,6 +265,7 @@ enum MenuAction {
     Run(Box<dyn gpui::Action>),
     /// A language server's fix or refactoring.
     CodeAction(Arc<Server>, CodeAction),
+    Tab(TabAction, Entity<Editor>),
 }
 
 impl Clone for MenuAction {
@@ -206,6 +274,7 @@ impl Clone for MenuAction {
             MenuAction::Tree(action) => MenuAction::Tree(action.clone()),
             MenuAction::Run(action) => MenuAction::Run(action.boxed_clone()),
             MenuAction::CodeAction(server, action) => MenuAction::CodeAction(server.clone(), action.clone()),
+            MenuAction::Tab(action, editor) => MenuAction::Tab(*action, editor.clone()),
         }
     }
 }
@@ -252,8 +321,19 @@ pub struct Workspace {
     expanded: HashSet<PathBuf>,
     entries: Vec<TreeEntry>,
     tree_scroll: UniformListScrollHandle,
+    /// Every open editor, in any pane (for saving, searching, sessions).
     tabs: Vec<Entity<Editor>>,
-    active: usize,
+    panes: Vec<Pane>,
+    active_pane: usize,
+    pane_axis: PaneAxis,
+    /// Each pane's share of the space, summing to 1.
+    pane_sizes: Vec<f32>,
+    /// Bounds of the pane area last frame, for divider drags.
+    panes_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// The two shares around the divider being dragged.
+    pane_drag_pair: f32,
+    /// Pinned tabs stay first and survive Close Others / Close All.
+    pinned: HashSet<EntityId>,
     show_sidebar: bool,
     show_problems: bool,
     /// Height of the bottom panel (Problems or Terminal; one shows at a time).
@@ -406,7 +486,13 @@ impl Workspace {
             entries: Vec::new(),
             tree_scroll: UniformListScrollHandle::new(),
             tabs: Vec::new(),
-            active: 0,
+            panes: vec![Pane::new()],
+            active_pane: 0,
+            pane_axis: PaneAxis::Row,
+            pane_sizes: vec![1.0],
+            panes_bounds: Default::default(),
+            pane_drag_pair: 0.,
+            pinned: HashSet::new(),
             show_sidebar: state.show_sidebar.unwrap_or(true),
             show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
             show_terminal: state.show_terminal.unwrap_or(false),
@@ -472,12 +558,8 @@ impl Workspace {
             self.set_root(path, window, cx);
             return;
         }
-        if let Some(ix) = self
-            .tabs
-            .iter()
-            .position(|t| t.read(cx).doc.path.as_deref() == Some(path.as_path()))
-        {
-            self.activate(ix, window, cx);
+        if let Some(editor) = self.tabs.iter().find(|t| t.read(cx).doc.path.as_deref() == Some(path.as_path())).cloned() {
+            self.activate_editor(&editor, window, cx);
             return;
         }
         match Document::open(&path) {
@@ -514,20 +596,37 @@ impl Workspace {
         } else {
             self.load_diff_base(&editor, cx);
         }
-        let ix = (self.active + 1).min(self.tabs.len());
-        self.tabs.insert(ix, editor);
-        self.activate(ix, window, cx);
+        self.tabs.push(editor.clone());
+        let pane = &mut self.panes[self.active_pane];
+        // After the current tab, but never among pinned ones.
+        let pinned = pane.tabs.iter().filter(|t| self.pinned.contains(&t.entity_id())).count();
+        let at = if pane.tabs.is_empty() { 0 } else { (pane.active + 1).max(pinned).min(pane.tabs.len()) };
+        pane.tabs.insert(at, editor);
+        self.activate_in(self.active_pane, at, window, cx);
     }
 
-    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self.tabs.get(ix).cloned() {
-            if let Some(previous) = self.tabs.get(self.active).cloned()
+    /// Shows an open editor in its pane and focuses it.
+    fn activate_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((pane, ix)) = self.locate(editor) {
+            self.activate_in(pane, ix, window, cx);
+        }
+    }
+
+    /// The pane holding `editor` and its index there.
+    fn locate(&self, editor: &Entity<Editor>) -> Option<(usize, usize)> {
+        self.panes.iter().enumerate().find_map(|(p, pane)| pane.tabs.iter().position(|t| t == editor).map(|ix| (p, ix)))
+    }
+
+    fn activate_in(&mut self, pane: usize, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.panes.get(pane).and_then(|p| p.tabs.get(ix)).cloned() {
+            if let Some(previous) = self.active_editor().cloned()
                 && previous != editor
                 && matches!(self.auto_save, AutoSave::AfterDelay | AutoSave::OnFocusChange)
             {
                 self.auto_save(&previous, cx);
             }
-            self.active = ix;
+            self.active_pane = pane;
+            self.panes[pane].active = ix;
             window.focus(&editor.focus_handle(cx));
             if let Some(path) = editor.read(cx).doc.path.clone() {
                 self.recent.retain(|p| p != &path);
@@ -543,7 +642,8 @@ impl Workspace {
     }
 
     fn active_editor(&self) -> Option<&Entity<Editor>> {
-        self.tabs.get(self.active)
+        let pane = self.panes.get(self.active_pane)?;
+        pane.tabs.get(pane.active)
     }
 
     // ---- File tree --------------------------------------------------------------
@@ -589,23 +689,40 @@ impl Workspace {
         let Some(root) = self.root.clone() else { return Ok(()) };
         let mut tabs = Vec::new();
         let mut active = 0;
-        for (ix, tab) in self.tabs.iter().enumerate() {
-            let e = tab.read(cx);
-            let dirty = e.doc.is_dirty();
-            // An untitled buffer without edits has nothing to bring back.
-            if e.doc.path.is_none() && !dirty {
-                continue;
+        let mut pane_active = Vec::new();
+        for (pane_ix, pane) in self.panes.iter().enumerate() {
+            let mut active_in_pane = 0;
+            let mut count = 0;
+            for (ix, tab) in pane.tabs.iter().enumerate() {
+                let e = tab.read(cx);
+                let dirty = e.doc.is_dirty();
+                // An untitled buffer without edits has nothing to bring back.
+                if e.doc.path.is_none() && !dirty {
+                    continue;
+                }
+                if ix == pane.active {
+                    active_in_pane = count;
+                    if pane_ix == self.active_pane {
+                        active = tabs.len();
+                    }
+                }
+                count += 1;
+                tabs.push(TabSession {
+                    path: e.doc.path.clone(),
+                    cursor: e.primary_selection().head,
+                    unsaved: dirty.then(|| e.doc.rope().to_string()),
+                    pane: pane_ix,
+                    pinned: self.pinned.contains(&tab.entity_id()),
+                });
             }
-            if ix == self.active {
-                active = tabs.len();
-            }
-            tabs.push(TabSession {
-                path: e.doc.path.clone(),
-                cursor: e.primary_selection().head,
-                unsaved: dirty.then(|| e.doc.rope().to_string()),
-            });
+            pane_active.push(active_in_pane);
         }
-        ProjectSession { root, tabs, active }.save()
+        let layout = (self.panes.len() > 1).then(|| PaneLayout {
+            column: self.pane_axis == PaneAxis::Column,
+            sizes: self.pane_sizes.clone(),
+            active: pane_active,
+        });
+        ProjectSession { root, tabs, active, layout }.save()
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -644,12 +761,65 @@ impl Workspace {
                     e.replace_ranges(vec![(0..len, text)], cx);
                 });
             }
+            // Into the pane it was in, creating panes as needed.
+            while self.panes.len() <= tab.pane.min(7) {
+                self.panes.push(Pane::new());
+                self.pane_sizes.push(0.);
+            }
+            self.active_pane = tab.pane.min(7);
+            if tab.pinned {
+                self.pinned.insert(editor.entity_id());
+            }
             self.add_tab(editor.clone(), window, cx);
             editor.update(cx, |e, cx| e.go_to(tab.cursor.min(e.doc.len()), window, cx));
         }
-        if !self.tabs.is_empty() {
-            self.activate(session.active.min(self.tabs.len() - 1), window, cx);
+        // Panes left empty (their files are gone) aren't worth keeping.
+        self.drop_empty_panes();
+        if let Some(layout) = session.layout.filter(|l| l.sizes.len() == self.panes.len()) {
+            self.pane_axis = if layout.column { PaneAxis::Column } else { PaneAxis::Row };
+            self.pane_sizes = layout.sizes;
+            for (pane, active) in self.panes.iter_mut().zip(layout.active) {
+                pane.active = active.min(pane.tabs.len().saturating_sub(1));
+            }
+        } else {
+            self.pane_sizes = vec![1. / self.panes.len() as f32; self.panes.len()];
         }
+        if let Some(editor) = self.tabs_in_order().get(session.active).cloned() {
+            self.activate_editor(&editor, window, cx);
+        }
+    }
+
+    /// Tabs in pane order, as the session lists them.
+    fn tabs_in_order(&self) -> Vec<Entity<Editor>> {
+        self.panes.iter().flat_map(|p| p.tabs.iter().cloned()).collect()
+    }
+
+    /// Removes empty panes (keeping at least one) and rebalances sizes.
+    fn drop_empty_panes(&mut self) {
+        let mut ix = 0;
+        while ix < self.panes.len() {
+            if self.panes.len() > 1 && self.panes[ix].tabs.is_empty() {
+                self.remove_pane(ix);
+            } else {
+                ix += 1;
+            }
+        }
+    }
+
+    fn remove_pane(&mut self, ix: usize) {
+        self.panes.remove(ix);
+        let freed = if ix < self.pane_sizes.len() { self.pane_sizes.remove(ix) } else { 0. };
+        // The neighbor takes the space.
+        if let Some(size) = self.pane_sizes.get_mut(ix.saturating_sub(1).min(self.panes.len().saturating_sub(1))) {
+            *size += freed;
+        }
+        if self.panes.len() == 1 {
+            self.pane_sizes = vec![1.0];
+        }
+        if self.active_pane >= ix && self.active_pane > 0 {
+            self.active_pane -= 1;
+        }
+        self.active_pane = self.active_pane.min(self.panes.len() - 1);
     }
 
     /// Changes the recent projects list shared by all windows. It's re-read
@@ -861,7 +1031,10 @@ impl Workspace {
         self.show_find = false;
         self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
         self.tabs.clear();
-        self.active = 0;
+        self.panes = vec![Pane::new()];
+        self.active_pane = 0;
+        self.pane_sizes = vec![1.0];
+        self.pinned.clear();
         self.session_task = None;
         self.terminals.clear();
         self.show_terminal = false;
@@ -1045,8 +1218,8 @@ impl Workspace {
             });
         }
         // Opening files switched tabs; go back to where the user was.
-        if let Some(ix) = active.and_then(|a| self.tabs.iter().position(|t| t == &a)) {
-            self.activate(ix, window, cx);
+        if let Some(active) = active {
+            self.activate_editor(&active, window, cx);
         }
         applied
     }
@@ -1280,9 +1453,9 @@ impl Workspace {
                         }
                     }
                     // Untitled files need a name first; show the first one.
-                    if let Some(ix) = ws.tabs.iter().position(|t| t.read(cx).doc.is_dirty()) {
-                        ws.activate(ix, window, cx);
-                        if ws.tabs[ix].read(cx).doc.path.is_none() {
+                    if let Some(dirty) = ws.tabs.iter().find(|t| t.read(cx).doc.is_dirty()).cloned() {
+                        ws.activate_editor(&dirty, window, cx);
+                        if dirty.read(cx).doc.path.is_none() {
                             ws.save_as(&SaveAs, window, cx);
                         }
                     } else {
@@ -1352,11 +1525,13 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab_at(self.active, window, cx);
+        if let Some(editor) = self.active_editor().cloned() {
+            self.close_editor(&editor, window, cx);
+        }
     }
 
-    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.tabs.get(ix).cloned() else { return };
+    fn close_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = editor.clone();
         if self.auto_save != AutoSave::Off {
             self.auto_save(&editor, cx);
         }
@@ -1376,7 +1551,7 @@ impl Workspace {
                         if editor.read(cx).doc.path.is_some() && editor.update(cx, |e, cx| e.save(cx)).is_ok() {
                             ws.remove_tab(&editor, window, cx);
                         } else {
-                            ws.activate(ws.tabs.iter().position(|t| t == &editor).unwrap_or(0), window, cx);
+                            ws.activate_editor(&editor, window, cx);
                             ws.save_as(&SaveAs, window, cx);
                         }
                     }
@@ -1394,36 +1569,227 @@ impl Workspace {
     fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tabs.iter().position(|t| t == editor) else { return };
         self.tabs.remove(ix);
+        self.pinned.remove(&editor.entity_id());
+        let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
         if let Some(path) = editor.read(cx).doc.path.clone() {
             self.lsp.update(cx, |s, _| s.did_close(&path));
         }
         self.schedule_session_save(cx);
         self.auto_save_tasks.remove(&editor.entity_id());
         self.auto_save_warned.remove(&editor.entity_id());
+        if let Some((pane_ix, tab_ix)) = self.locate(editor) {
+            let pane = &mut self.panes[pane_ix];
+            pane.tabs.remove(tab_ix);
+            if tab_ix < pane.active || pane.active >= pane.tabs.len() {
+                pane.active = pane.active.saturating_sub(1);
+            }
+            // A pane closes with its last tab (unless it's the only one).
+            if pane.tabs.is_empty() && self.panes.len() > 1 {
+                self.remove_pane(pane_ix);
+            }
+        }
         if self.tabs.is_empty() {
-            self.active = 0;
             self.show_find = false;
             self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
             window.focus(&self.focus_handle);
-        } else {
-            if ix < self.active || self.active >= self.tabs.len() {
-                self.active = self.active.saturating_sub(1);
+        } else if was_active_pane || self.active_editor().is_none() {
+            let pane = self.active_pane;
+            match self.panes[pane].tabs.is_empty() {
+                true => window.focus(&self.focus_handle),
+                false => self.activate_in(pane, self.panes[pane].active, window, cx),
             }
-            self.activate(self.active, window, cx);
         }
         cx.notify();
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + 1) % self.tabs.len(), window, cx);
+        let pane = &self.panes[self.active_pane];
+        if !pane.tabs.is_empty() {
+            let ix = (pane.active + 1) % pane.tabs.len();
+            self.activate_in(self.active_pane, ix, window, cx);
         }
     }
 
     fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            self.activate((self.active + self.tabs.len() - 1) % self.tabs.len(), window, cx);
+        let pane = &self.panes[self.active_pane];
+        if !pane.tabs.is_empty() {
+            let ix = (pane.active + pane.tabs.len() - 1) % pane.tabs.len();
+            self.activate_in(self.active_pane, ix, window, cx);
         }
+    }
+
+    // ---- Panes and tab management ---------------------------------------------------------
+
+    fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split(PaneAxis::Row, window, cx);
+    }
+
+    fn split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split(PaneAxis::Column, window, cx);
+    }
+
+    /// Split and Move: a new pane after the current one takes the current
+    /// tab (or starts empty when that's the pane's only tab). A file has one
+    /// editor, so it isn't duplicated.
+    fn split(&mut self, axis: PaneAxis, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.len() >= 6 {
+            return;
+        }
+        // One direction at a time: splitting the other way re-flows the panes.
+        self.pane_axis = axis;
+        let source = self.active_pane;
+        let moving = (self.panes[source].tabs.len() > 1).then(|| self.active_editor().cloned()).flatten();
+        let at = source + 1;
+        self.panes.insert(at, Pane::new());
+        // The new pane takes half of the current one's space.
+        let half = self.pane_sizes[source] / 2.;
+        self.pane_sizes[source] = half;
+        self.pane_sizes.insert(at, half);
+        self.active_pane = at;
+        match moving {
+            Some(editor) => self.move_tab(&editor, at, None, window, cx),
+            None => window.focus(&self.focus_handle),
+        }
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// Moves a tab to `pane` (before index `before`, or at the end).
+    fn move_tab(&mut self, editor: &Entity<Editor>, pane: usize, before: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((from, ix)) = self.locate(editor) else { return };
+        let mut before = before;
+        self.panes[from].tabs.remove(ix);
+        if from == pane && before.is_some_and(|b| b > ix) {
+            before = before.map(|b| b - 1);
+        }
+        let source = &mut self.panes[from];
+        if ix < source.active || source.active >= source.tabs.len() {
+            source.active = source.active.saturating_sub(1);
+        }
+        let target = &mut self.panes[pane];
+        let at = before.unwrap_or(target.tabs.len()).min(target.tabs.len());
+        target.tabs.insert(at, editor.clone());
+        self.keep_pinned_first(pane);
+        let target_pane = pane;
+        // The source pane closes if that was its last tab.
+        let editor = editor.clone();
+        if from != target_pane && self.panes[from].tabs.is_empty() && self.panes.len() > 1 {
+            self.remove_pane(from);
+        }
+        self.activate_editor(&editor, window, cx);
+        self.schedule_session_save(cx);
+    }
+
+    fn next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        let next = (self.active_pane + 1) % self.panes.len();
+        self.active_pane = next;
+        match self.panes[next].tabs.get(self.panes[next].active).cloned() {
+            Some(editor) => self.activate_editor(&editor, window, cx),
+            None => window.focus(&self.focus_handle),
+        }
+        cx.notify();
+    }
+
+    /// Pinned tabs first, in their order.
+    fn keep_pinned_first(&mut self, pane: usize) {
+        let active = self.panes[pane].tabs.get(self.panes[pane].active).cloned();
+        let pinned = &self.pinned;
+        self.panes[pane].tabs.sort_by_key(|t| !pinned.contains(&t.entity_id()));
+        if let Some(active) = active {
+            self.panes[pane].active = self.panes[pane].tabs.iter().position(|t| t == &active).unwrap_or(0);
+        }
+    }
+
+    fn toggle_pin_tab(&mut self, _: &TogglePinTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned() {
+            self.run_tab_action(TabAction::TogglePin, &editor, window, cx);
+        }
+    }
+
+    fn close_other_tabs(&mut self, _: &CloseOtherTabs, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned() {
+            self.run_tab_action(TabAction::CloseOthers, &editor, window, cx);
+        }
+    }
+
+    fn close_all_tabs(&mut self, _: &CloseAllTabs, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned() {
+            self.run_tab_action(TabAction::CloseAll, &editor, window, cx);
+        }
+    }
+
+    fn run_tab_action(&mut self, action: TabAction, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((pane, ix)) = self.locate(editor) else { return };
+        let others = |ws: &Self, keep: &dyn Fn(usize, &Entity<Editor>) -> bool| -> Vec<Entity<Editor>> {
+            ws.panes[pane]
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| !keep(*i, t) && !ws.pinned.contains(&t.entity_id()))
+                .map(|(_, t)| t.clone())
+                .collect()
+        };
+        let to_close = match action {
+            TabAction::Close => vec![editor.clone()],
+            TabAction::CloseOthers => others(self, &|_, t| t == editor),
+            TabAction::CloseAll => others(self, &|_, _| false),
+            TabAction::CloseToTheRight => others(self, &|i, _| i <= ix),
+            TabAction::TogglePin => {
+                let id = editor.entity_id();
+                if !self.pinned.remove(&id) {
+                    self.pinned.insert(id);
+                }
+                self.keep_pinned_first(pane);
+                self.schedule_session_save(cx);
+                cx.notify();
+                return;
+            }
+            TabAction::SplitRight | TabAction::SplitDown => {
+                self.activate_editor(editor, window, cx);
+                let axis = if action == TabAction::SplitRight { PaneAxis::Row } else { PaneAxis::Column };
+                self.split(axis, window, cx);
+                return;
+            }
+        };
+        for editor in to_close {
+            self.close_editor(&editor, window, cx);
+        }
+    }
+
+    fn open_tab_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let pinned = self.pinned.contains(&editor.entity_id());
+        let path = editor.read(cx).doc.path.clone();
+        let mut entries = Vec::new();
+        let mut actions = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<MenuAction>| {
+            entries.push(entry);
+            actions.push(action);
+        };
+        let tab = |action: TabAction| Some(MenuAction::Tab(action, editor.clone()));
+        add(MenuEntry::item("Close", Icon::X).shortcut(binding_label(&CloseTab, window)), tab(TabAction::Close));
+        add(MenuEntry::text("Close Others"), tab(TabAction::CloseOthers));
+        add(MenuEntry::text("Close All"), tab(TabAction::CloseAll));
+        add(MenuEntry::text("Close Tabs to the Right"), tab(TabAction::CloseToTheRight));
+        add(MenuEntry::Separator, None);
+        add(MenuEntry::item(if pinned { "Unpin Tab" } else { "Pin Tab" }, Icon::Pin), tab(TabAction::TogglePin));
+        add(MenuEntry::Separator, None);
+        add(
+            MenuEntry::item("Split and Move Right", Icon::SplitRight).shortcut(binding_label(&SplitRight, window)),
+            tab(TabAction::SplitRight),
+        );
+        add(
+            MenuEntry::item("Split and Move Down", Icon::SplitDown).shortcut(binding_label(&SplitDown, window)),
+            tab(TabAction::SplitDown),
+        );
+        if let Some(path) = path {
+            add(MenuEntry::Separator, None);
+            add(MenuEntry::item("Copy Path", Icon::Clipboard), Some(MenuAction::Tree(TreeAction::CopyPath(path.clone()))));
+            add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(MenuAction::Tree(TreeAction::Reveal(path))));
+        }
+        self.show_context_menu(entries, actions, position, None, window, cx);
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -1812,6 +2178,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// After `open_window`'s setup: start the shell for a terminal panel that
+    /// was open last time, now that the project (its folder) is known.
+    fn window_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_terminal && self.terminals.is_empty() {
+            let focused = self.active_editor().cloned();
+            self.new_terminal(&NewTerminal, window, cx);
+            // Keep the editor focused, as it was before quitting.
+            if let Some(editor) = focused {
+                window.focus(&editor.focus_handle(cx));
+            }
+        }
+    }
+
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = self.terminals.get(self.active_terminal) {
             window.focus(&terminal.focus_handle(cx));
@@ -1872,11 +2251,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn render_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Reopened at launch: start a shell the first time it shows.
-        if self.terminals.is_empty() {
-            self.new_terminal(&NewTerminal, window, cx);
-        }
+    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // A panel reopened at launch gets its shell in `window_ready`.
         let theme = Theme::get(cx).clone();
         let tabs: Vec<AnyElement> = self
             .terminals
@@ -2439,6 +2815,7 @@ impl Workspace {
                     Some(MenuAction::Tree(action)) => ws.run_tree_action(action, window, cx),
                     Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
                     Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
+                    Some(MenuAction::Tab(action, editor)) => ws.run_tab_action(action, &editor, window, cx),
                     None => {}
                 }
             }
@@ -3249,6 +3626,7 @@ impl Workspace {
         let group: gpui::SharedString = match edge {
             Edge::Problems => "resize-problems".into(),
             Edge::Sidebar => "resize-sidebar".into(),
+            Edge::Pane(ix) => format!("resize-pane-{ix}").into(),
         };
         let line = div()
             .when(active, |el| el.bg(theme.accent))
@@ -3272,6 +3650,23 @@ impl Workspace {
                 .justify_center()
                 .cursor(CursorStyle::ResizeLeftRight)
                 .child(line.w(px(2.)).h_full()),
+            Edge::Pane(_) if self.pane_axis == PaneAxis::Row => handle
+                .top_0()
+                .bottom_0()
+                .right(px(-3.))
+                .w(px(6.))
+                .justify_center()
+                .cursor(CursorStyle::ResizeLeftRight)
+                .child(line.w(px(2.)).h_full()),
+            Edge::Pane(_) => handle
+                .left_0()
+                .right_0()
+                .bottom(px(-3.))
+                .h(px(6.))
+                .flex_col()
+                .justify_center()
+                .cursor(CursorStyle::ResizeUpDown)
+                .child(line.h(px(2.)).w_full()),
         };
         handle.on_mouse_down(
             MouseButton::Left,
@@ -3280,6 +3675,14 @@ impl Workspace {
                 let (start, size) = match edge {
                     Edge::Problems => (e.position.y, ws.problems_height),
                     Edge::Sidebar => (e.position.x, ws.sidebar_width),
+                    Edge::Pane(ix) => {
+                        let bounds = ws.panes_bounds.get();
+                        ws.pane_drag_pair = ws.pane_sizes[ix] + ws.pane_sizes.get(ix + 1).copied().unwrap_or(0.);
+                        match ws.pane_axis {
+                            PaneAxis::Row => (e.position.x, bounds.size.width * ws.pane_sizes[ix]),
+                            PaneAxis::Column => (e.position.y, bounds.size.height * ws.pane_sizes[ix]),
+                        }
+                    }
                 };
                 ws.resizing = Some(Resize { edge, start, size });
                 cx.notify();
@@ -3315,10 +3718,13 @@ impl Workspace {
             .child(label)
     }
 
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_bar(&self, pane_ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let pane = &self.panes[pane_ix];
+        let focused_pane = pane_ix == self.active_pane;
+        let accent: Hsla = theme.accent.into();
         div()
-            .id("tabs")
+            .id(("tabs", pane_ix))
             .flex()
             .flex_row()
             .flex_shrink_0()
@@ -3328,19 +3734,26 @@ impl Workspace {
             .border_b_1()
             .border_color(theme.border)
             .overflow_x_scroll()
-            .children(self.tabs.iter().enumerate().map(|(ix, editor)| {
+            // Dropping on the bar's empty part moves the tab to the end.
+            .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
+                ws.move_tab(&dragged.editor, pane_ix, None, window, cx);
+            }))
+            .children(pane.tabs.iter().enumerate().map(|(ix, editor)| {
                 let e = editor.read(cx);
-                let active = ix == self.active;
+                let active = ix == pane.active;
+                let pinned = self.pinned.contains(&editor.entity_id());
                 let dirty = e.doc.is_dirty();
                 let errors = e.doc.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
                 let (icon, color) = match e.doc.path.as_deref() {
                     Some(p) => file_icon(p, &theme),
                     None => (Icon::File, theme.text_muted.into()),
                 };
-                let name_color: Hsla = if active { theme.text.into() } else { theme.text_muted.into() };
-                let group = SharedString::from(format!("tab-{ix}"));
+                let name = e.doc.file_name();
+                let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
+                let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
+                let (for_close, for_menu, for_drag, for_unpin) = (editor.clone(), editor.clone(), editor.clone(), editor.clone());
                 div()
-                    .id(("tab", ix))
+                    .id(SharedString::from(format!("tab-{pane_ix}-{ix}")))
                     .group(group.clone())
                     .flex()
                     .items_center()
@@ -3354,18 +3767,34 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |el| el.bg(theme.background))
                     .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
-                    .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+                    .on_click(cx.listener(move |ws, _, window, cx| ws.activate_in(pane_ix, ix, window, cx)))
                     .on_mouse_down(
                         MouseButton::Middle,
-                        cx.listener(move |ws, _, window, cx| ws.close_tab_at(ix, window, cx)),
+                        cx.listener(move |ws, _, window, cx| ws.close_editor(&for_close, window, cx)),
                     )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |ws, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            ws.open_tab_menu(for_menu.clone(), event.position, window, cx);
+                        }),
+                    )
+                    .on_drag(DraggedTab { editor: for_drag, name: name.clone().into() }, |tab, _, _, cx| {
+                        cx.new(|_| DraggedTabView(tab.name.clone()))
+                    })
+                    // A drop lands before this tab; the accent edge shows where.
+                    .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(accent))
+                    .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
+                        cx.stop_propagation();
+                        ws.move_tab(&dragged.editor, pane_ix, Some(ix), window, cx);
+                    }))
                     .child(icon_el(icon, px(14.), color))
-                    .child(div().text_color(name_color).child(e.doc.file_name()))
+                    .child(div().text_color(name_color).child(name))
                     // Files with errors get a small dot rather than a recolored name.
                     .when(errors > 0, |el| el.child(div().size(px(6.)).rounded_full().bg(theme.error)))
                     .child(
                         div()
-                            .id(("close", ix))
+                            .id(SharedString::from(format!("close-{pane_ix}-{ix}")))
                             .size(px(20.))
                             .flex()
                             .items_center()
@@ -3374,10 +3803,14 @@ impl Workspace {
                             .hover(|s| s.bg(theme.active))
                             .on_click(cx.listener(move |ws, _, window, cx| {
                                 cx.stop_propagation();
-                                ws.close_tab_at(ix, window, cx)
+                                // A pinned tab's pin unpins it; otherwise this closes.
+                                let action = if ws.pinned.contains(&for_unpin.entity_id()) { TabAction::TogglePin } else { TabAction::Close };
+                                ws.run_tab_action(action, &for_unpin, window, cx);
                             }))
                             .map(|el| {
-                                if dirty {
+                                if pinned {
+                                    el.child(icon_el(Icon::Pin, px(12.), theme.text_muted.into()))
+                                } else if dirty {
                                     // A dot that turns into a close button on hover.
                                     el.child(
                                         div()
@@ -3404,6 +3837,83 @@ impl Workspace {
                             }),
                     )
             }))
+    }
+
+    /// The editor area: panes side by side or stacked, with dividers.
+    fn render_panes(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = self.panes_bounds.clone();
+        div()
+            .relative()
+            .flex()
+            .size_full()
+            .when(self.pane_axis == PaneAxis::Column, |el| el.flex_col())
+            .child(
+                gpui::canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .children((0..self.panes.len()).map(|ix| self.render_pane(ix, window, cx)))
+    }
+
+    fn render_pane(&self, pane_ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::get(cx).clone();
+        let pane = &self.panes[pane_ix];
+        let share = relative(self.pane_sizes.get(pane_ix).copied().unwrap_or(1.));
+        let content: AnyElement = match pane.tabs.get(pane.active) {
+            Some(editor) => editor.clone().into_any_element(),
+            None if self.panes.len() == 1 => self.render_welcome(window, cx).into_any_element(),
+            None => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .bg(theme.background)
+                .text_color(theme.text_dim)
+                .child("No open files")
+                .child(div().text_size(px(12.)).child("Open a file, or drag a tab here"))
+                .into_any_element(),
+        };
+        let multiple = self.panes.len() > 1;
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .map(|el| match self.pane_axis {
+                PaneAxis::Row => el.h_full().w(share),
+                PaneAxis::Column => el.w_full().h(share),
+            })
+            .when(multiple && pane_ix > 0, |el| match self.pane_axis {
+                PaneAxis::Row => el.border_l_1().border_color(theme.border),
+                PaneAxis::Column => el.border_t_1().border_color(theme.border),
+            })
+            .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, cx)))
+            .when(self.show_find && pane_ix == self.active_pane && !pane.tabs.is_empty(), |el| {
+                el.child(self.find_bar.clone())
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    // Clicking into a pane makes it the current one.
+                    .capture_any_mouse_down(cx.listener(move |ws, _, window, cx| {
+                        if ws.active_pane != pane_ix {
+                            let active = ws.panes[pane_ix].active;
+                            ws.active_pane = pane_ix;
+                            ws.activate_in(pane_ix, active, window, cx);
+                        }
+                    }))
+                    .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
+                        ws.move_tab(&dragged.editor, pane_ix, None, window, cx);
+                    }))
+                    .child(content),
+            )
+            .when(pane_ix + 1 < self.panes.len(), |el| el.child(self.resize_handle(Edge::Pane(pane_ix), cx)))
+            .into_any_element()
     }
 
     fn render_welcome(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4079,6 +4589,21 @@ impl Workspace {
                 let max = (viewport.width - px(320.)).max(px(160.));
                 self.sidebar_width = (resize.size + (event.position.x - resize.start)).clamp(px(160.), max);
             }
+            Edge::Pane(ix) if ix + 1 < self.pane_sizes.len() => {
+                let bounds = self.panes_bounds.get();
+                let (total, delta) = match self.pane_axis {
+                    PaneAxis::Row => (bounds.size.width, event.position.x - resize.start),
+                    PaneAxis::Column => (bounds.size.height, event.position.y - resize.start),
+                };
+                if total > px(0.) {
+                    let pair = self.pane_drag_pair;
+                    // Every pane keeps at least a tenth of the space.
+                    let share = ((resize.size + delta) / total).clamp(0.1, (pair - 0.1).max(0.1));
+                    self.pane_sizes[ix] = share;
+                    self.pane_sizes[ix + 1] = pair - share;
+                }
+            }
+            Edge::Pane(_) => {}
         }
         cx.notify();
     }
@@ -4086,6 +4611,7 @@ impl Workspace {
     fn on_root_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.resizing.take().is_some() {
             self.save_state();
+            self.schedule_session_save(cx);
             cx.notify();
         }
     }
@@ -4328,11 +4854,8 @@ impl Render for Workspace {
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
-        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(window, cx).into_any_element());
-        let center: AnyElement = match self.active_editor() {
-            Some(editor) => editor.clone().into_any_element(),
-            None => self.render_welcome(window, cx).into_any_element(),
-        };
+        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(cx).into_any_element());
+        let panes = self.render_panes(window, cx).into_any_element();
 
         div()
             .id("workspace")
@@ -4363,6 +4886,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::restart_language_server))
             .on_action(cx.listener(Self::toggle_terminal))
+            .on_action(cx.listener(Self::split_right))
+            .on_action(cx.listener(Self::split_down))
+            .on_action(cx.listener(Self::next_pane))
+            .on_action(cx.listener(Self::close_other_tabs))
+            .on_action(cx.listener(Self::close_all_tabs))
+            .on_action(cx.listener(Self::toggle_pin_tab))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(Self::open_keymap))
@@ -4393,6 +4922,8 @@ impl Render for Workspace {
                 el.cursor(match r.edge {
                     Edge::Problems => CursorStyle::ResizeUpDown,
                     Edge::Sidebar => CursorStyle::ResizeLeftRight,
+                    Edge::Pane(_) if self.pane_axis == PaneAxis::Row => CursorStyle::ResizeLeftRight,
+                    Edge::Pane(_) => CursorStyle::ResizeUpDown,
                 })
             })
             .relative()
@@ -4417,9 +4948,7 @@ impl Render for Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .when(!self.tabs.is_empty(), |el| el.child(self.render_tabs(cx)))
-                            .when(self.show_find && !self.tabs.is_empty(), |el| el.child(self.find_bar.clone()))
-                            .child(div().flex_1().min_h_0().overflow_hidden().child(center))
+                            .child(div().flex_1().min_h_0().overflow_hidden().child(panes))
                             .when(self.show_problems, |el| el.child(self.render_problems(cx)))
                             .when(self.show_terminal, |el| el.child(terminal_panel.unwrap())),
                     ),
@@ -4497,7 +5026,12 @@ pub fn open_window(
             return None;
         }
     };
-    window.update(cx, setup).ok();
+    window
+        .update(cx, |ws, window, cx| {
+            setup(ws, window, cx);
+            ws.window_ready(window, cx);
+        })
+        .ok();
     Some(window)
 }
 

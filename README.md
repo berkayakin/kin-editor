@@ -46,6 +46,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste; shell keys like Ctrl+R reach the shell
+- Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
+  move them between panes; pinned tabs; a tab menu with Close Others / All / to the Right
 - File tree, tabs, custom title bar, IME support
 
 ## Running
@@ -100,6 +102,8 @@ reachable through Find Action, which shows its shortcut.
 | Add caret above / below | ⌥⌘↑ / ⌥⌘↓ | Ctrl+Alt+↑ / ↓ |
 | Project sidebar / Problems | ⌘1 / ⌘6 | Alt+1 / Alt+6 |
 | Terminal (open, focus, hide) | ⌥F12 | Alt+F12 |
+| Split and Move Right / Down | ⌘\\ / ⌘⇧\\ | Ctrl+\\ / Ctrl+Shift+\\ |
+| Next pane | ⌥⇥ | — |
 | New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
 | Copy / paste / clear (in the terminal) | ⌘C / ⌘V / ⌘K | Ctrl+Shift+C / Ctrl+Shift+V / — |
 | Close tab / next / previous | ⌘W / ⌃→ / ⌃← | Ctrl+F4 / Alt+→ / Alt+← |
@@ -179,6 +183,18 @@ YAML, Markdown), rustfmt (with the edition from Cargo.toml), gofmt, ruff or blac
 Only the changed lines are replaced, so the caret stays put and one undo reverts it. Formatters
 read their own config (`.prettierrc`, `rustfmt.toml`, `pyproject.toml`…). Set `format_on_save`
 (per language too) to format on Save; choose a formatter per language with `formatters`.
+
+## Panes and tabs
+
+**Split and Move Right / Down** (View menu, a tab's right-click menu, or ⌘\\ / ⌘⇧\\) moves the
+current tab into a new pane; if it's the pane's only tab, the new pane starts empty for the next
+file you open. A file has one editor, so it isn't shown in two panes at once. Drag a tab to
+reorder it, onto another pane's tab bar or editor to move it there; a pane closes with its last
+tab. Drag the line between panes to resize them.
+
+Right-click a tab for Close, Close Others, Close All, Close Tabs to the Right, Pin Tab and the
+split commands. Pinned tabs stay first, show a pin (click it to unpin) and are kept by Close
+Others / Close All. The panes, their tabs, sizes and pins come back with the project.
 
 ## Terminal
 
