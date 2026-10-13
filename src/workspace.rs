@@ -422,7 +422,6 @@ impl Workspace {
             GitPanelEvent::Run(op) => ws.run_git(op.clone(), window, cx),
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
-            GitPanelEvent::ShowBranches => ws.git_branches(&GitBranches, window, cx),
         });
         let git_log = cx.new(GitLog::new);
         let log_subscription = cx.subscribe_in(&git_log, window, |ws, _, event: &GitLogEvent, window, cx| match event {
@@ -1860,15 +1859,6 @@ impl Workspace {
         } else {
             self.show_commit(&ShowCommit, window, cx);
         }
-    }
-
-    fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
-        self.sidebar_mode = mode;
-        if mode == SidebarMode::Commit {
-            self.refresh_git(cx);
-        }
-        self.save_state();
-        cx.notify();
     }
 
     // ---- Git -------------------------------------------------------------------------
@@ -3734,67 +3724,76 @@ impl Workspace {
             .child(icon_el(icon, px(15.), color.into()))
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The Commit view's header: branch (opens Branches…), fetch, pull, push.
+    fn render_git_toolbar(&self, cx: &mut Context<Self>) -> [AnyElement; 4] {
         let theme = Theme::get(cx).clone();
-        let changes = self.git_status.files.len();
-        let tab = |id: &'static str, icon: Icon, label: String, count: Option<usize>, mode: SidebarMode, cx: &mut Context<Self>| {
-            let active = self.sidebar_mode == mode;
+        let s = &self.git_status;
+        let branch = s.branch.clone().unwrap_or_else(|| match &s.head_oid {
+            Some(oid) => format!("{} (detached)", &oid[..7.min(oid.len())]),
+            None => "No commits yet".into(),
+        });
+        let button = |id: &'static str, icon: Icon, tip: &'static str, count: u32, op: GitOp, cx: &mut Context<Self>| {
             div()
                 .id(id)
                 .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .gap_0p5()
+                .h(px(24.))
+                .min_w(px(24.))
+                .px_1()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .hover(|st| st.bg(theme.hover))
+                .tooltip(move |_, cx| tooltip_view(tip, cx))
+                .on_click(cx.listener(move |ws, _, window, cx| ws.run_git(op.clone(), window, cx)))
+                .child(icon_el(icon, px(14.), theme.text_muted.into()))
+                .when(count > 0, |el| el.child(count.to_string()))
+                .into_any_element()
+        };
+        [
+            div()
+                .id("sidebar-branch")
+                .flex()
                 .items_center()
                 .gap_1p5()
-                .h(px(26.))
-                .px_2()
-                .rounded(px(6.))
+                .flex_1()
+                .min_w_0()
+                .h(px(24.))
+                .px_1p5()
+                .rounded(px(5.))
                 .cursor_pointer()
-                .text_size(px(12.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(if active { theme.text } else { theme.text_dim })
-                .when(active, |el| el.bg(theme.active))
-                .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
-                .on_click(cx.listener(move |ws, _, _, cx| ws.set_sidebar_mode(mode, cx)))
-                .child(icon_el(icon, px(14.), if active { theme.text.into() } else { theme.text_dim.into() }))
-                .child(div().truncate().child(label))
-                .when_some(count.filter(|n| *n > 0), |el, n| {
-                    el.child(
-                        div()
-                            .px_1p5()
-                            .rounded_full()
-                            .bg(theme.active)
-                            .text_size(px(11.))
-                            .text_color(theme.text_muted)
-                            .child(n.to_string()),
-                    )
-                })
-        };
-        // The Git tab is labeled with the current branch, next to its changes.
-        let git_label = if self.repo.is_some() {
-            self.git_status.branch.clone().unwrap_or_else(|| match &self.git_status.head_oid {
-                Some(oid) => oid.chars().take(7).collect(),
-                None => "Commit".into(),
-            })
-        } else {
-            "Commit".into()
-        };
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h(px(TAB_HEIGHT))
-            .px_1p5()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border_subtle)
-            .child(tab("sidebar-files", Icon::FolderTree, "Files".into(), None, SidebarMode::Files, cx))
-            .child(tab(
-                "sidebar-commit",
-                if self.repo.is_some() { Icon::GitBranch } else { Icon::GitCommit },
-                git_label,
-                Some(changes),
-                SidebarMode::Commit,
-                cx,
-            ));
+                .text_size(px(12.5))
+                .hover(|st| st.bg(theme.hover))
+                .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
+                .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
+                .child(icon_el(Icon::GitBranch, px(14.), theme.text_dim.into()))
+                .child(div().truncate().text_color(theme.text).child(branch))
+                .into_any_element(),
+            button("sidebar-fetch", Icon::Refresh, "Fetch", 0, GitOp::Fetch, cx),
+            button("sidebar-pull", Icon::ArrowDown, "Update Project (Pull)", s.behind, GitOp::Pull, cx),
+            button("sidebar-push", Icon::ArrowUp, "Push", s.ahead, GitOp::Push, cx),
+        ]
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        // Files and Commit are switched from the status bar; only Commit has a header (its branch).
+        let header = (self.sidebar_mode == SidebarMode::Commit && self.repo.is_some()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .h(px(TAB_HEIGHT))
+                .px_1p5()
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(theme.border)
+                .children(self.render_git_toolbar(cx))
+        });
 
         let body: AnyElement = if self.sidebar_mode == SidebarMode::Commit {
             div().flex_1().min_h_0().child(self.git_panel.clone()).into_any_element()
@@ -3881,6 +3880,7 @@ impl Workspace {
             )
             .track_scroll(self.tree_scroll.clone())
             .flex_1()
+            .pt_1p5()
             .pb_2()
             // Right-clicking empty space targets the project root.
             .on_mouse_down(
@@ -3919,7 +3919,7 @@ impl Workspace {
             .bg(theme.panel)
             .border_r_1()
             .border_color(theme.border)
-            .child(header)
+            .children(header)
             .child(body)
             // Deferred so the grab area sits above the editor it overlaps.
             .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx)))
@@ -4976,6 +4976,9 @@ impl Workspace {
             editor.map_or(0, |e| e.doc.diagnostics.iter().filter(|d| d.severity == sev).count())
         };
         let (errors, warnings, infos) = (count(Severity::Error), count(Severity::Warning), count(Severity::Info));
+        let files_on = self.show_sidebar && self.sidebar_mode == SidebarMode::Files;
+        let commit_on = self.show_sidebar && self.sidebar_mode == SidebarMode::Commit;
+        let changes = self.git_status.files.len();
 
         let item = |child: AnyElement| {
             div()
@@ -5073,18 +5076,36 @@ impl Workspace {
             .flex_shrink_0()
             .h(px(STATUSBAR_HEIGHT))
             .w_full()
-            .px_1()
+            .px_1p5()
             .bg(theme.panel)
             .border_t_1()
             .border_color(theme.border)
             .text_size(px(12.))
             .text_color(theme.text_muted)
+            // The sidebar's views, like JetBrains tool window buttons: a click shows that view,
+            // or hides the sidebar when it's the one showing.
             .child(
-                self.icon_button("toggle-sidebar", Icon::PanelLeft, self.show_sidebar, cx, |ws, _, window, cx| {
+                self.icon_button("toggle-sidebar", Icon::FolderTree, files_on, cx, |ws, _, window, cx| {
                     ws.toggle_sidebar(&ToggleSidebar, window, cx)
                 })
                 .size(px(22.))
-                .tooltip(|window, cx| status_tooltip("Toggle Sidebar", &ToggleSidebar, window, cx)),
+                .mx(px(3.))
+                .when(files_on, |el| el.bg(theme.active))
+                .tooltip(|window, cx| status_tooltip("Project", &ToggleSidebar, window, cx)),
+            )
+            .child(
+                self.icon_button("toggle-commit", Icon::GitBranch, commit_on, cx, |ws, _, window, cx| {
+                    ws.toggle_commit(&ToggleCommit, window, cx)
+                })
+                .h(px(22.))
+                .mx(px(3.))
+                .w_auto()
+                .min_w(px(22.))
+                .px_1()
+                .gap_1()
+                .when(commit_on, |el| el.bg(theme.active).text_color(theme.text))
+                .when(changes > 0, |el| el.child(changes.to_string()))
+                .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx)),
             )
             .child(
                 div()
@@ -5121,6 +5142,7 @@ impl Workspace {
                         ws.toggle_git_log(&ToggleGitLog, window, cx)
                     })
                     .size(px(22.))
+                    .mx(px(3.))
                     .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
                 )
             })
@@ -5129,6 +5151,7 @@ impl Workspace {
                     ws.toggle_terminal(&ToggleTerminal, window, cx)
                 })
                 .size(px(22.))
+                .mx(px(3.))
                 .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
             )
             .child(
@@ -5136,6 +5159,7 @@ impl Workspace {
                     ws.toggle_problems(&ToggleProblems, window, cx)
                 })
                 .size(px(22.))
+                .mx(px(3.))
                 .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
             )
     }

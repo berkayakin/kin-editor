@@ -340,7 +340,8 @@ message instead of hanging; use an SSH agent or a credential helper.
   (Find Action → Toggle Inline Git Blame).
 - **File tree:** changed files are colored with a status letter; folders containing
   changes are tinted.
-- **Commit panel** (⌘K / ⌘0): staged and unstaged changes with stage, unstage and roll back
+- **Commit panel** (⌘K / ⌘0, or the branch button at the left of the status bar, which shows the
+  number of changes): the branch with fetch, pull and push at the top, then staged and unstaged changes with stage, unstage and roll back
   on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
   staged, everything is committed), or use **Commit and Push**. **Amend** starts from the
   previous message. In a folder that isn't a repository it offers **Initialize Repository**.

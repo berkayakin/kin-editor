@@ -71,7 +71,6 @@ pub enum GitPanelEvent {
     Run(GitOp),
     OpenDiff { file: FileStatus, staged: bool },
     OpenFile(PathBuf),
-    ShowBranches,
 }
 
 pub struct GitPanel {
@@ -359,57 +358,6 @@ impl GitPanel {
             })
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx).clone();
-        let s = &self.status;
-        let branch = s.branch.clone().unwrap_or_else(|| match &s.head_oid {
-            Some(oid) => format!("{} (detached)", &oid[..7.min(oid.len())]),
-            None => "No commits yet".into(),
-        });
-        let counter = |n: u32| (n > 0).then(|| div().text_size(px(11.)).text_color(theme.text_muted).child(n.to_string()));
-        div()
-            .flex()
-            .items_center()
-            .gap_0p5()
-            .h(px(34.))
-            .px_2()
-            .border_b_1()
-            .border_color(theme.border_subtle)
-            .child(
-                div()
-                    .id("panel-branch")
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .min_w_0()
-                    .flex_1()
-                    .h(px(26.))
-                    .px_1p5()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|st| st.bg(theme.hover))
-                    .tooltip(|_, cx| tooltip_view("Branches…", cx))
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::ShowBranches)))
-                    .child(icon_el(Icon::GitBranch, px(14.), theme.text_muted.into()))
-                    .child(div().truncate().text_color(theme.text).child(branch)),
-            )
-            .child(self.small_button("git-fetch", Icon::Refresh, "Fetch", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::Run(GitOp::Fetch)))))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(self.small_button("git-pull", Icon::ArrowDown, "Update Project (Pull)", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::Run(GitOp::Pull)))))
-                    .children(counter(s.behind)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(self.small_button("git-push", Icon::ArrowUp, "Push", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::Run(GitOp::Push)))))
-                    .children(counter(s.ahead)),
-            )
-    }
-
     /// A stopped merge or rebase: what's left, and Abort / Continue.
     fn render_state_banner(&self, state: RepoState, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
@@ -620,8 +568,7 @@ impl Render for GitPanel {
             }
         }
 
-        root.child(self.render_toolbar(cx))
-            .when_some(self.busy.clone(), |el, busy| {
+        root.when_some(self.busy.clone(), |el, busy| {
                 el.child(
                     div()
                         .flex()
