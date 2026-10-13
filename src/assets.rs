@@ -92,6 +92,7 @@ impl AssetSource for Assets {
         Ok(ICONS
             .iter()
             .chain(IMAGES)
+            .chain(crate::file_icons::FILE_ICONS)
             .find(|(p, _)| *p == path)
             .map(|(_, bytes)| Cow::Borrowed(*bytes)))
     }
@@ -100,6 +101,7 @@ impl AssetSource for Assets {
         Ok(ICONS
             .iter()
             .chain(IMAGES)
+            .chain(crate::file_icons::FILE_ICONS)
             .filter(|(p, _)| p.starts_with(path))
             .map(|(p, _)| SharedString::from(*p))
             .collect())

@@ -599,8 +599,7 @@ impl Render for Picker {
                                     }));
                                 match item {
                                     Item::File { path, name, dir, name_hl, dir_hl } => {
-                                        let (icon, color) = crate::ui::file_icon(path, &theme);
-                                        row.child(icon_el(icon, px(15.), color))
+                                        row.child(crate::ui::file_icon(path, px(16.), &theme))
                                             .child(
                                                 div()
                                                     .flex_shrink_0()
@@ -617,7 +616,7 @@ impl Render for Picker {
                                             )
                                     }
                                     Item::Project { name, dir, name_hl, dir_hl, .. } => row
-                                        .child(icon_el(Icon::Folder, px(15.), theme.text_muted.into()))
+                                        .child(crate::ui::folder_icon(false, px(16.), &theme))
                                         .child(
                                             div()
                                                 .flex_shrink_0()

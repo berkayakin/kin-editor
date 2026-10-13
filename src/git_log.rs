@@ -2,7 +2,7 @@
 //! filter, and the selected commit's message and changed files. With a file
 //! set, it's that file's history (following renames).
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{ops::Range, path::{Path, PathBuf}, sync::Arc};
 
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, IntoElement,
@@ -15,7 +15,7 @@ use crate::{
     diff_view::DiffSource,
     editor::{Editor, EditorEvent, MoveDown, MoveUp},
     git::{self, CommitFile, LogEntry},
-    git_panel::{change_color, file_icon_for},
+    git_panel::change_color,
     theme::Theme,
     ui::{icon_el, input_box, tooltip_view},
 };
@@ -396,7 +396,7 @@ impl GitLog {
                     .child(format!("{} FILE{}", files.len(), if files.len() == 1 { "" } else { "S" })),
             )
             .children(files.into_iter().enumerate().map(|(ix, file)| {
-                let (icon, icon_color) = file_icon_for(&PathBuf::from(&file.rel), &theme);
+                let icon = crate::ui::file_icon(Path::new(&file.rel), px(15.), &theme);
                 let name = file.rel.rsplit('/').next().unwrap_or(&file.rel).to_string();
                 let dir = file.rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
                 let color = change_color(&theme, file.change);
@@ -415,7 +415,7 @@ impl GitLog {
                         .hover(|s| s.bg(theme.hover))
                         .tooltip(|_, cx| tooltip_view("Show Diff", cx))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(GitLogEvent::OpenDiff(source.clone()))))
-                        .child(icon_el(icon, px(14.), icon_color))
+                        .child(icon)
                         .child(div().flex_shrink_0().text_color(color).child(name))
                         .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_dim).child(dir))
                         .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(color).child(file.change.letter())),

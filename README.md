@@ -423,7 +423,6 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 | `search_match`, `search_active` | find results |
 | `bracket_match` | the bracket pair around the cursor |
 | `error`, `warning`, `info`, `success` | diagnostics and status |
-| `file_js`, `file_html` | file icons |
 | `terminal_black` … `terminal_white`, `terminal_bright_black` … `terminal_bright_white` | the terminal's 16 ANSI colors |
 
 `syntax` keys: `plain`, `keyword`, `string`, `number`, `constant`, `function`, `method`,
@@ -447,6 +446,7 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
 - `src/workspace.rs` — window chrome: title bar, file tree, tabs, problems, status bar
 - `assets/icons/` — rounded, Lucide-style SVG icons embedded into the binary
+- `assets/file-icons/`, `src/file_icons.rs` — file-type icons ([Charmed Icons](https://github.com/jmesrje/zed-charmed-icons)) and their file-name associations
 - `assets/app-icon/` — the app logo (`logo.svg`) and its per-platform icons
 
 ## License
@@ -461,3 +461,8 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
+
+Bundled third-party assets keep their own licenses: file-type icons from
+[Charmed Icons](https://github.com/littensy/charmed-icons) by littensy and jmesrje (MIT,
+[`assets/file-icons/LICENSE`](assets/file-icons/LICENSE)) and the Vidaloka font (SIL Open Font
+License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)).

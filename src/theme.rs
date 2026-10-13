@@ -85,9 +85,6 @@ pub struct Theme {
     pub info: Rgba,
     pub success: Rgba,
 
-    pub file_js: Rgba,
-    pub file_html: Rgba,
-
     pub git_added: Rgba,
     pub git_modified: Rgba,
     pub git_deleted: Rgba,
@@ -158,8 +155,6 @@ color_keys! {
     "warning" => warning,
     "info" => info,
     "success" => success,
-    "file_js" => file_js,
-    "file_html" => file_html,
     "git_added" => git_added,
     "git_modified" => git_modified,
     "git_deleted" => git_deleted,
@@ -268,8 +263,6 @@ impl Theme {
             warning: rgba(0xffaa00ff),
             info: rgba(0x55aaffff),
             success: rgba(0x55cc55ff),
-            file_js: rgba(0xe5c07bff),
-            file_html: rgba(0xf0855bff),
             git_added: rgba(0x55cc55ff),
             git_modified: rgba(0x55aaffff),
             git_deleted: rgba(0xff5555ff),

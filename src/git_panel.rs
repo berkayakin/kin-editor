@@ -98,7 +98,6 @@ pub fn change_color(theme: &Theme, change: Change) -> Hsla {
     .into()
 }
 
-pub use crate::ui::file_icon as file_icon_for;
 
 impl GitPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -233,7 +232,7 @@ impl GitPanel {
             file.unstaged.unwrap_or(Change::Modified)
         };
         let color = change_color(&theme, change);
-        let (icon, icon_color) = file_icon_for(&file.path, &theme);
+        let icon = crate::ui::file_icon(&file.path, px(15.), &theme);
         let name = file.rel.rsplit('/').next().unwrap_or(&file.rel).to_string();
         let dir = file.rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         let is_selected = self.selected.as_ref().is_some_and(|(r, s)| *r == file.rel && *s == staged);
@@ -269,7 +268,7 @@ impl GitPanel {
                     }
                     cx.notify();
                 }))
-                .child(icon_el(icon, px(14.), icon_color))
+                .child(icon)
                 .child(
                     div()
                         .flex_shrink_0()

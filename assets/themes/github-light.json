@@ -29,8 +29,6 @@
     "warning": "#9a6700",
     "info": "#0969da",
     "success": "#1a7f37",
-    "file_js": "#b08800",
-    "file_html": "#e34c26",
     "git_added": "#1a7f37",
     "git_modified": "#0969da",
     "git_deleted": "#cf222e",

@@ -28,8 +28,6 @@
     "warning": "#e3b16a",
     "info": "#b3a5d4",
     "success": "#9cbf7d",
-    "file_js": "#e5c07b",
-    "file_html": "#f0855b",
     "git_added": "#9cbf7d",
     "git_modified": "#9aa8cf",
     "git_deleted": "#ef6f62",

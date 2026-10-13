@@ -2,28 +2,18 @@
 
 use gpui::{
     AnyView, App, Context, Div, Entity, Focusable, Hsla, IntoElement, ParentElement, Pixels,
-    Render, SharedString, Stateful, Styled, Window, div, prelude::*, px, svg,
+    Img, Render, SharedString, Stateful, Styled, Window, div, img, prelude::*, px, svg,
 };
 
-use crate::{assets::Icon, editor::Editor, syntax::Language, theme::Theme};
+use crate::{assets::Icon, editor::Editor, file_icons, theme::Theme};
 
-/// The icon and tint for a file, by language.
-pub fn file_icon(path: &std::path::Path, theme: &Theme) -> (Icon, Hsla) {
-    match Language::from_path(path) {
-        Language::JavaScript => (Icon::FileCode, theme.file_js.into()),
-        Language::Html => (Icon::CodeXml, theme.file_html.into()),
-        Language::TypeScript
-        | Language::Tsx
-        | Language::Css
-        | Language::Rust
-        | Language::Go
-        | Language::Python
-        | Language::Php
-        | Language::Shell => (Icon::FileCode, theme.text_muted.into()),
-        Language::Json | Language::Yaml | Language::Toml => (Icon::Braces, theme.text_muted.into()),
-        Language::Markdown => (Icon::FileText, theme.text_muted.into()),
-        Language::PlainText => (Icon::File, theme.text_dim.into()),
-    }
+/// The file-type icon for `path`, in the pack's own colors (see `file_icons`).
+pub fn file_icon(path: &std::path::Path, size: Pixels, theme: &Theme) -> Img {
+    img(file_icons::file(path, theme.appearance)).size(size).flex_shrink_0()
+}
+
+pub fn folder_icon(open: bool, size: Pixels, theme: &Theme) -> Img {
+    img(file_icons::folder(open, theme.appearance)).size(size).flex_shrink_0()
 }
 
 pub fn icon_el(icon: Icon, size: Pixels, color: Hsla) -> impl IntoElement {

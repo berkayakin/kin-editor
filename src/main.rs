@@ -7,6 +7,7 @@ mod diff_view;
 mod document;
 mod editor;
 mod editorconfig;
+mod file_icons;
 mod find_bar;
 mod fold;
 mod format;

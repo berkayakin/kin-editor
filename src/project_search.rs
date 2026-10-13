@@ -372,7 +372,7 @@ impl Render for ProjectSearch {
                         };
                         let hl = (m.line_range.start - start).min(shown_text.len())..(m.line_range.end - start).min(shown_text.len());
                         let file_name = m.relative.rsplit(['/', '\\']).next().unwrap_or(&m.relative).to_string();
-                        let (icon, color) = crate::ui::file_icon(&m.path, &theme);
+                        let icon = crate::ui::file_icon(&m.path, px(13.), &theme);
                         let is_selected = ix == selected;
                         div()
                             .id(ix)
@@ -417,7 +417,7 @@ impl Render for ProjectSearch {
                                     .flex_shrink_0()
                                     .text_size(px(12.))
                                     .text_color(theme.text_dim)
-                                    .child(icon_el(icon, px(12.), color))
+                                    .child(icon)
                                     .child(format!("{file_name} {}", m.line + 1)),
                             )
                     })

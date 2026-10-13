@@ -14,7 +14,7 @@ use crate::{
     assets::Icon,
     editor::{Cancel, NextChange, PreviousChange},
     git::{self, Change, CommitFile, DiffDocument, DiffLineKind, FileStatus},
-    git_panel::{GitOp, change_color, file_icon_for},
+    git_panel::{GitOp, change_color},
     syntax::{Highlight, Language, Syntax},
     theme::Theme,
     ui::{icon_el, modal_panel, text_button, tooltip_view},
@@ -275,7 +275,7 @@ impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let (path, rel, change) = self.file_label();
-        let (icon, icon_color) = file_icon_for(&path, &theme);
+        let file_icon = crate::ui::file_icon(&path, px(16.), &theme);
         let (added, removed) = self.loaded.as_ref().map_or((0, 0), |l| (l.doc.added, l.doc.removed));
         let deleted = change == Change::Deleted;
         let icon_button = |id: &'static str, icon: Icon, tip: &'static str| {
@@ -321,7 +321,7 @@ impl Render for DiffView {
             .border_b_1()
             .border_color(theme.border)
             .child(icon_el(Icon::GitCompare, px(15.), theme.text_muted.into()))
-            .child(icon_el(icon, px(15.), icon_color))
+            .child(file_icon)
             .child(div().flex_shrink_0().font_weight(FontWeight::SEMIBOLD).child(rel.clone()))
             .child(
                 div()

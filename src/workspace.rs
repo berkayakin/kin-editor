@@ -3821,11 +3821,7 @@ impl Workspace {
                                 None => theme.text_muted.into(),
                             };
                             let is_open = e.is_dir && expanded.contains(&e.path);
-                            let (icon, color) = if e.is_dir {
-                                (if is_open { Icon::FolderOpen } else { Icon::Folder }, Hsla::from(theme.text_muted))
-                            } else {
-                                file_icon(&e.path, theme)
-                            };
+                            let icon = if e.is_dir { folder_icon(is_open, px(16.), theme) } else { file_icon(&e.path, px(16.), theme) };
                             div().w_full().px_1p5().child(div()
                                 .id(ix)
                                 .w_full()
@@ -3864,7 +3860,7 @@ impl Workspace {
                                             ))
                                         }),
                                 )
-                                .child(icon_el(icon, px(15.), color))
+                                .child(icon)
                                 .child(div().flex_1().min_w_0().truncate().text_color(name_color).child(e.name.clone()))
                                 .when_some(change.filter(|_| !e.is_dir), |el, c| {
                                     el.child(
@@ -4053,10 +4049,7 @@ impl Workspace {
                 let pinned = self.pinned.contains(&editor.entity_id());
                 let dirty = e.doc.is_dirty();
                 let errors = e.doc.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-                let (icon, color) = match e.doc.path.as_deref() {
-                    Some(p) => file_icon(p, &theme),
-                    None => (Icon::File, theme.text_muted.into()),
-                };
+                let icon = file_icon(e.doc.path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
                 let name = e.doc.file_name();
                 let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
                 let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
@@ -4097,7 +4090,7 @@ impl Workspace {
                         cx.stop_propagation();
                         ws.move_tab(&dragged.editor, pane_ix, Some(ix), window, cx);
                     }))
-                    .child(icon_el(icon, px(14.), color))
+                    .child(icon)
                     .child(div().text_color(name_color).child(name))
                     // Files with errors get a small dot rather than a recolored name.
                     .when(errors > 0, |el| el.child(div().size(px(6.)).rounded_full().bg(theme.error)))
@@ -4454,7 +4447,7 @@ impl Workspace {
         if !files.is_empty() {
             recent = recent.child(div().h(px(8.))).child(section_label("Recent Files", &theme)).child(
                 card(&theme).p_1().children(files.into_iter().enumerate().map(|(ix, path)| {
-                    let (icon, color) = file_icon(&path, &theme);
+                    let icon = file_icon(&path, px(15.), &theme);
                     let rel = self.display_rel(&path);
                     let open = path.clone();
                     div()
@@ -4468,7 +4461,7 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.hover))
                         .on_click(cx.listener(move |ws, _, window, cx| ws.open_path(open.clone(), window, cx)))
-                        .child(icon_el(icon, px(14.), color))
+                        .child(icon)
                         .child(div().truncate().text_color(theme.text_muted).child(rel))
                 })),
             );
@@ -5041,21 +5034,10 @@ impl Workspace {
             right.push(item(e.indent_label().into_any_element()).into_any_element());
             right.push(item(if e.doc.uses_crlf { "CRLF" } else { "LF" }.into_any_element()).into_any_element());
             let (icon, color) = match e.doc.language {
-                Language::JavaScript => (Icon::Braces, Hsla::from(theme.file_js)),
-                Language::Html => (Icon::CodeXml, Hsla::from(theme.file_html)),
-                Language::TypeScript
-                | Language::Tsx
-                | Language::Css
-                | Language::Rust
-                | Language::Go
-                | Language::Python
-                | Language::Php
-                | Language::Shell
-                | Language::Json
-                | Language::Yaml
-                | Language::Toml => (Icon::Braces, Hsla::from(theme.text_muted)),
+                Language::Html => (Icon::CodeXml, Hsla::from(theme.text_muted)),
                 Language::Markdown => (Icon::FileText, Hsla::from(theme.text_muted)),
                 Language::PlainText => (Icon::FileText, theme.text_dim.into()),
+                _ => (Icon::Braces, Hsla::from(theme.text_muted)),
             };
             right.push(
                 item(
@@ -5308,7 +5290,7 @@ impl Render for Workspace {
     }
 }
 
-use crate::ui::file_icon;
+use crate::ui::{file_icon, folder_icon};
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
@@ -5493,7 +5475,7 @@ fn switch(on: bool, theme: &Theme) -> impl IntoElement {
 
 /// A stable tint per project name for its monogram.
 fn monogram_color(name: &str, theme: &Theme) -> Hsla {
-    let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.file_js, theme.file_html, theme.git_added, theme.git_modified];
+    let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     palette[hash as usize % palette.len()].into()
 }
