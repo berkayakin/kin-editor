@@ -4836,7 +4836,8 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(cx))),
+                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(cx)))
+                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(cx))),
             )
             .child(
                 div()
@@ -4873,6 +4874,38 @@ impl Workspace {
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
             .child(name)
+    }
+
+    /// The current branch beside the project name. Clicking opens Branches….
+    fn render_branch_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        div()
+            .id("branch-chip")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(26.))
+            .max_w(px(240.))
+            .px_1p5()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .text_color(theme.text_muted)
+            .hover(|st| st.bg(theme.hover).text_color(theme.text))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
+            .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
+            .child(icon_el(Icon::GitBranch, px(13.), theme.text_dim.into()))
+            .child(div().truncate().child(self.branch_label()))
+    }
+
+    /// The checked-out branch, or what HEAD is when it isn't one.
+    fn branch_label(&self) -> String {
+        let s = &self.git_status;
+        s.branch.clone().unwrap_or_else(|| match &s.head_oid {
+            Some(oid) => format!("{} (detached)", &oid[..7.min(oid.len())]),
+            None => "No commits yet".into(),
+        })
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -4982,10 +5015,7 @@ impl Workspace {
     fn render_git_toolbar(&self, cx: &mut Context<Self>) -> [AnyElement; 4] {
         let theme = Theme::get(cx).clone();
         let s = &self.git_status;
-        let branch = s.branch.clone().unwrap_or_else(|| match &s.head_oid {
-            Some(oid) => format!("{} (detached)", &oid[..7.min(oid.len())]),
-            None => "No commits yet".into(),
-        });
+        let branch = self.branch_label();
         let button = |id: &'static str, icon: Icon, tip: &'static str, count: u32, op: GitOp, cx: &mut Context<Self>| {
             div()
                 .id(id)

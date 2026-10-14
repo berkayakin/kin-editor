@@ -628,8 +628,9 @@ message instead of hanging; use an SSH agent or a credential helper.
   changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
   through changes; collapsed unchanged lines expand on click. Images show the previous and new
   version side by side; other binary files say there's no text diff.
-- **Branches:** the Commit panel's header shows the branch, with the number of commits to pull
-  and to push on its Pull and Push buttons. Click the branch (or use **Branches…** in the Git
+- **Branches:** the title bar shows the current branch next to the project name; the Commit
+  panel's header shows it too, with the number of commits to pull and to push on its Pull and
+  Push buttons. Click the branch (or use **Branches…** in the Git
   menu) to switch to a local or remote branch, or type a new name to create one. Hover another branch
   for **Merge** (into the current one) and **Rebase** (the current one onto it).
 - **Merge conflicts:** a merge or rebase that stops on conflicts shows a banner in the Commit
