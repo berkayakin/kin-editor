@@ -40,9 +40,11 @@ pub struct SessionState {
     /// Folders trusted to run what they configure (see `trust.rs`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_folders: Vec<PathBuf>,
-    /// Welcome Setup was finished (`false`: shown but not finished yet).
+    /// Welcome Setup was finished (Get Started or Escape). Only finishing it
+    /// sets this; the older `onboarded` key was also set by guessing from
+    /// existing files, so installs that never saw the setup missed it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub onboarded: Option<bool>,
+    pub welcome_done: Option<bool>,
     /// Where the last moved or resized window was, for the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
@@ -69,25 +71,15 @@ impl SessionState {
         config_dir().map(|d| d.join("state.json"))
     }
 
-    /// Whether Welcome Setup should show: on a fresh install, until it's
-    /// finished. An install that already has settings or state counts as set up.
+    /// Whether Welcome Setup should show: until it's been finished once, on
+    /// any platform and whatever else is in the config folder.
     pub fn needs_onboarding() -> bool {
-        let mut state = Self::load();
-        if let Some(done) = state.onboarded {
-            return !done;
-        }
-        let exists = |path: Option<PathBuf>| path.is_some_and(|p| p.exists());
-        let fresh = !exists(Self::path()) && !exists(crate::settings::Settings::path());
-        state.onboarded = Some(!fresh);
-        if let Err(err) = state.save() {
-            eprintln!("couldn't save window state: {err}");
-        }
-        fresh
+        Self::load().welcome_done != Some(true)
     }
 
     pub fn set_onboarded() {
         let mut state = Self::load();
-        state.onboarded = Some(true);
+        state.welcome_done = Some(true);
         if let Err(err) = state.save() {
             eprintln!("couldn't save window state: {err}");
         }

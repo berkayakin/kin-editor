@@ -1130,7 +1130,7 @@ impl Workspace {
             recent_projects: saved.recent_projects,
             trusted_folders: saved.trusted_folders,
             window: saved.window,
-            onboarded: saved.onboarded,
+            welcome_done: saved.welcome_done,
         };
         if let Err(err) = state.save() {
             eprintln!("couldn't save window state: {err}");
