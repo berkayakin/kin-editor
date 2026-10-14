@@ -114,6 +114,7 @@ actions!(
         PreviousChange,
         ToggleInlineBlame,
         ToggleSoftWrap,
+        ToggleMarkdownPreview,
         ShowCompletions,
         QuickDocumentation,
         GoToDeclaration,
@@ -262,6 +263,14 @@ pub struct Editor {
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
     /// File Structure's symbols for a document version (breadcrumbs, sticky scroll).
     outline_cache: Option<(u64, Arc<Vec<crate::syntax::Symbol>>)>,
+    /// Markdown: the rendered preview shows beside the text.
+    md_preview: bool,
+    md_cache: Option<(u64, Arc<Vec<crate::markdown_preview::Block>>)>,
+    md_scroll: gpui::ScrollHandle,
+    /// The preview's text size, relative to the UI font.
+    md_zoom: f32,
+    /// ⌘-scrolling not yet turned into a zoom step (trackpads send small deltas).
+    md_zoom_rest: f32,
     /// Pinned lines of sticky scroll, as last painted: bounds and where to go.
     sticky_rows: Vec<(Bounds<Pixels>, usize)>,
     /// The pointer is over the gutter, so fold arrows show.
@@ -327,6 +336,11 @@ impl Editor {
             fold_cache: None,
             fold_pills: Vec::new(),
             outline_cache: None,
+            md_preview: false,
+            md_cache: None,
+            md_scroll: gpui::ScrollHandle::new(),
+            md_zoom: 1.,
+            md_zoom_rest: 0.,
             sticky_rows: Vec::new(),
             gutter_hovered: false,
             run_cache: None,
@@ -1019,6 +1033,108 @@ impl Editor {
     }
 
     // ---- Soft wrap -------------------------------------------------------------
+
+    fn toggle_markdown_preview(&mut self, _: &ToggleMarkdownPreview, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == EditorMode::Full && self.doc.language == crate::syntax::Language::Markdown {
+            self.md_preview = !self.md_preview;
+            cx.notify();
+        }
+    }
+
+    /// The preview beside a Markdown file, parsed again when the text changes.
+    fn render_markdown_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let version = self.doc.version();
+        let blocks = match &self.md_cache {
+            Some((v, blocks)) if *v == version => blocks.clone(),
+            _ => {
+                let blocks = Arc::new(crate::markdown_preview::parse(&self.doc.rope().to_string()));
+                self.md_cache = Some((version, blocks.clone()));
+                blocks
+            }
+        };
+        let theme = Theme::get(cx).clone();
+        let base = self.doc.path.as_deref().and_then(std::path::Path::parent);
+        let zoom = self.md_zoom;
+        let step = |id: &'static str, icon: crate::assets::Icon, delta: f32, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .on_click(cx.listener(move |e, _, _, cx| e.zoom_preview(delta, cx)))
+                .child(crate::ui::icon_el(icon, px(12.), theme.text_muted.into()))
+        };
+        // − 100% + at the top right; the percentage resets.
+        let zoom_bar = div()
+            .absolute()
+            .top(px(6.))
+            .right(px(10.))
+            .flex()
+            .items_center()
+            .p(px(2.))
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.elevated)
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .child(step("md-zoom-out", crate::assets::Icon::Minus, -0.1, cx))
+            .child(
+                div()
+                    .id("md-zoom-reset")
+                    .min_w(px(40.))
+                    .flex()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .tooltip(|_, cx| crate::ui::tooltip_view("Reset Zoom", cx))
+                    .on_click(cx.listener(|e, _, _, cx| e.zoom_preview(1. - e.md_zoom, cx)))
+                    .child(format!("{}%", (zoom * 100.).round())),
+            )
+            .child(step("md-zoom-in", crate::assets::Icon::Plus, 0.1, cx));
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .id("markdown-preview")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.md_scroll)
+                    .bg(theme.background)
+                    .px_6()
+                    .py_5()
+                    // ⌘/Ctrl + wheel zooms, like a browser.
+                    .on_scroll_wheel(cx.listener(|e, event: &gpui::ScrollWheelEvent, _, cx| {
+                        if event.modifiers.secondary() {
+                            cx.stop_propagation();
+                            e.md_zoom_rest += f32::from(event.delta.pixel_delta(px(20.)).y);
+                            // About one wheel notch per step.
+                            while e.md_zoom_rest.abs() >= 20. {
+                                let up = e.md_zoom_rest > 0.;
+                                e.md_zoom_rest -= if up { 20. } else { -20. };
+                                e.zoom_preview(if up { 0.1 } else { -0.1 }, cx);
+                            }
+                        }
+                    }))
+                    .child(crate::markdown_preview::render(&blocks, crate::markdown_preview::Draw { base, zoom }, cx)),
+            )
+            .child(zoom_bar)
+    }
+
+    fn zoom_preview(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let zoom = ((self.md_zoom + delta) * 10.).round() / 10.;
+        self.md_zoom = zoom.clamp(0.5, 3.);
+        cx.notify();
+    }
 
     fn toggle_soft_wrap(&mut self, _: &ToggleSoftWrap, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_chromeless() {
@@ -3569,8 +3685,37 @@ impl Render for Editor {
         }
         let popover = self.render_hunk_popover(cx);
         let lsp_popovers = self.render_lsp_popovers(window, cx);
+        let markdown = self.mode == EditorMode::Full && self.doc.language == crate::syntax::Language::Markdown;
+        let preview = (markdown && self.md_preview).then(|| self.render_markdown_preview(cx).into_any_element());
+        let preview_toggle = markdown.then(|| {
+            let theme = Theme::get(cx);
+            let on = self.md_preview;
+            div()
+                .id("markdown-preview-toggle")
+                .absolute()
+                .top(px(6.))
+                .right(px(SCROLLBAR_WIDTH + 6.))
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.border)
+                .bg(if on { Hsla::from(theme.accent_soft) } else { Hsla::from(theme.elevated) })
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .tooltip(move |_, cx| crate::ui::tooltip_view(if on { "Hide Preview" } else { "Show Preview" }, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|e, _, window, cx| e.toggle_markdown_preview(&ToggleMarkdownPreview, window, cx)))
+                .child(crate::ui::icon_el(
+                    crate::assets::Icon::SplitRight,
+                    px(13.),
+                    if on { theme.accent.into() } else { theme.text_muted.into() },
+                ))
+        });
         let theme = Theme::get(cx);
-        div()
+        let view = div()
             .id("editor")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
@@ -3645,6 +3790,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::previous_change))
             .on_action(cx.listener(Self::toggle_inline_blame))
             .on_action(cx.listener(Self::toggle_soft_wrap))
+            .on_action(cx.listener(Self::toggle_markdown_preview))
             .on_action(cx.listener(Self::show_completions))
             .on_action(cx.listener(Self::quick_documentation))
             .on_action(cx.listener(Self::go_to_declaration))
@@ -3675,7 +3821,12 @@ impl Render for Editor {
             .child(EditorElement { editor: cx.entity() })
             .children(popover)
             .children(lsp_popovers)
-            .into_any_element()
+            .children(preview_toggle);
+        match preview {
+            // Side by side: the text keeps its own events; the preview only scrolls and links.
+            Some(preview) => div().size_full().flex().child(view.flex_1().min_w_0()).child(preview).into_any_element(),
+            None => view.into_any_element(),
+        }
     }
 }
 

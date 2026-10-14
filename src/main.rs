@@ -21,6 +21,7 @@ mod input_dialog;
 mod keymap;
 mod lint;
 mod lsp;
+mod markdown_preview;
 mod onboarding;
 mod picker;
 mod preview;

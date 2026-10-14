@@ -44,6 +44,11 @@ platform-native text rendering (CoreText / DirectWrite).
 - Matching-bracket highlight (ignores brackets in strings and comments) and an editor right-click menu
 - Soft wrap that keeps indentation, on by default for Markdown and plain text (View → Soft-Wrap
   toggles it per file)
+- Markdown preview: the button at the top right of a Markdown file (or **Toggle Markdown Preview**,
+  ⌘K V / Ctrl+K V in the VS Code and Zed keymaps) shows the rendered document beside the text,
+  updated as you type: headings, emphasis, lists and task lists, quotes, tables, highlighted code
+  blocks, local images; links open in the browser. Zoom it with the − / + control at its top right
+  (click the percentage to reset) or ⌘/Ctrl + scroll
 - Find/Replace bar with case, whole-word and regex options; Find/Replace in Files with preview
   (searches unsaved buffers too, honors .gitignore)
 - Search Everywhere (double Shift), fuzzy Go to File (git-ignored files included, ignored folders
