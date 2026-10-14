@@ -29,6 +29,9 @@ pub enum Language {
     Toml,
     Markdown,
     PlainText,
+    /// A language an extension adds: an index into `crate::extensions`'
+    /// registry, stable while Kin runs.
+    Extension(u16),
 }
 
 impl Language {
@@ -51,7 +54,27 @@ impl Language {
         Language::PlainText,
     ];
 
+    /// The built-in languages, then the extensions', then plain text.
+    pub fn all() -> Vec<Language> {
+        let mut all: Vec<Language> = Language::ALL.into_iter().filter(|l| *l != Language::PlainText).collect();
+        all.extend(crate::extensions::languages().into_iter().map(Language::Extension));
+        all.push(Language::PlainText);
+        all
+    }
+
+    /// An extension's language naming this very file, else the built-in
+    /// language for `path`, else an extension's by extension.
     pub fn from_path(path: &Path) -> Self {
+        if let Some(ix) = crate::extensions::language_for_file_name(path) {
+            return Language::Extension(ix);
+        }
+        match Self::built_in(path) {
+            Language::PlainText => crate::extensions::language_for_path(path).map_or(Language::PlainText, Language::Extension),
+            language => language,
+        }
+    }
+
+    fn built_in(path: &Path) -> Self {
         // Well-known files whose name, not extension, gives the language.
         match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {
             ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".profile" | ".zshrc"
@@ -101,6 +124,15 @@ impl Language {
             Language::Toml => "TOML",
             Language::Markdown => "Markdown",
             Language::PlainText => "Plain Text",
+            Language::Extension(ix) => crate::extensions::language(ix).map_or("Plain Text", |l| l.name),
+        }
+    }
+
+    /// The extension's definition, for an extension language.
+    pub fn extension(self) -> Option<&'static crate::extensions::LanguageDef> {
+        match self {
+            Language::Extension(ix) => crate::extensions::language(ix),
+            _ => None,
         }
     }
 
@@ -120,6 +152,7 @@ impl Language {
             | Language::Json => Some("// "),
             Language::Python | Language::Shell | Language::Yaml | Language::Toml => Some("# "),
             Language::Html | Language::Css | Language::Markdown | Language::PlainText => None,
+            Language::Extension(_) => self.extension().and_then(|l| l.line_comment),
         }
     }
 
@@ -135,6 +168,7 @@ impl Language {
             | Language::Json => Some(("/* ", " */")),
             Language::Html | Language::Markdown => Some(("<!-- ", " -->")),
             Language::Python | Language::Shell | Language::Yaml | Language::Toml | Language::PlainText => None,
+            Language::Extension(_) => self.extension().and_then(|l| l.block_comment),
         }
     }
 }
@@ -160,6 +194,7 @@ pub fn grammar(language: Language) -> Option<TsLanguage> {
         // Block structure only; inline syntax is a second grammar (see `Syntax`).
         Language::Markdown => tree_sitter_md::LANGUAGE.into(),
         Language::PlainText => return None,
+        Language::Extension(_) => return language.extension()?.grammar(),
     })
 }
 
@@ -256,7 +291,7 @@ const RUST_EXTRA_HIGHLIGHTS: &str = r#"
 [(integer_literal) (float_literal)] @number
 "#;
 
-struct LangConfig {
+pub(crate) struct LangConfig {
     language: TsLanguage,
     query: Query,
     /// Highlight per capture index, resolved once.
@@ -265,17 +300,22 @@ struct LangConfig {
 
 impl LangConfig {
     fn new(language: TsLanguage, source: &str) -> Self {
-        let query = Query::new(&language, source).expect("invalid highlight query");
+        Self::build(language, source).expect("invalid highlight query")
+    }
+
+    /// For an extension's query, which may not fit its grammar.
+    pub(crate) fn build(language: TsLanguage, source: &str) -> Result<Self, String> {
+        let query = Query::new(&language, source).map_err(|e| format!("highlights.scm, line {}: {}", e.row + 1, e.message))?;
         let captures = query
             .capture_names()
             .iter()
             .map(|n| Highlight::from_capture(n))
             .collect();
-        Self {
+        Ok(Self {
             language,
             query,
             captures,
-        }
+        })
     }
 }
 
@@ -373,24 +413,33 @@ pub struct Symbol {
 }
 
 /// Outline queries capture `@name` inside a `@definition.<kind>` node, the
-/// convention of tree-sitter's tags queries.
-struct OutlineConfig {
+/// convention of tree-sitter's tags queries, or inside an `@item` (Zed's
+/// `outline.scm`, whose kind comes from the node).
+pub(crate) struct OutlineConfig {
     query: Query,
     /// Per capture index: `Some(kind)` for definitions, `None` otherwise.
     kinds: Vec<Option<&'static str>>,
     name: u32,
+    /// Zed's `@context`: the keywords around the name (`pub`, `fn`), which
+    /// say what an `@item` is.
+    context: Option<u32>,
 }
 
 impl OutlineConfig {
     fn new(language: TsLanguage, source: &str) -> Self {
-        let query = Query::new(&language, source).expect("invalid outline query");
+        Self::build(language, source).expect("invalid outline query")
+    }
+
+    pub(crate) fn build(language: TsLanguage, source: &str) -> Result<Self, String> {
+        let query = Query::new(&language, source).map_err(|e| format!("outline query, line {}: {}", e.row + 1, e.message))?;
         let kinds = query
             .capture_names()
             .iter()
-            .map(|n| n.strip_prefix("definition.").map(symbol_kind))
+            .map(|n| if *n == "item" { Some("symbol") } else { n.strip_prefix("definition.").map(symbol_kind) })
             .collect();
-        let name = query.capture_index_for_name("name").expect("outline query without @name");
-        Self { query, kinds, name }
+        let name = query.capture_index_for_name("name").ok_or("the outline query has no @name")?;
+        let context = query.capture_index_for_name("context");
+        Ok(Self { query, kinds, name, context })
     }
 }
 
@@ -428,6 +477,49 @@ fn node_kind_label(kind: &str) -> Option<&'static str> {
         "const_item" | "static_item" => "constant",
         _ => return None,
     })
+}
+
+/// A kind for an outline `@item` from the keywords before its name.
+fn context_kind(words: &[String]) -> Option<&'static str> {
+    words.iter().find_map(|word| {
+        Some(match word.as_str() {
+            "fn" | "func" | "function" | "def" | "defp" | "fun" | "sub" | "proc" => "function",
+            "defmacro" | "defmacrop" | "macro" | "macro_rules!" => "macro",
+            "struct" => "struct",
+            "class" | "object" | "record" => "class",
+            "enum" => "enum",
+            "interface" | "protocol" => "interface",
+            "trait" | "typeclass" => "trait",
+            "impl" | "instance" | "extension" => "impl",
+            "mod" | "module" | "defmodule" | "namespace" | "package" => "module",
+            "type" | "typealias" | "newtype" | "data" => "type",
+            "const" | "static" => "constant",
+            "test" => "test",
+            _ => return None,
+        })
+    })
+}
+
+/// A kind for an outline `@item` (any grammar), from its node's name.
+fn guess_kind(node: &str) -> &'static str {
+    const KINDS: [(&str, &str); 15] = [
+        ("method", "method"),
+        ("field", "field"),
+        ("argument", "field"),
+        ("constructor", "constructor"),
+        ("function", "function"),
+        ("class", "class"),
+        ("struct", "struct"),
+        ("enum", "enum"),
+        ("interface", "interface"),
+        ("protocol", "interface"),
+        ("trait", "trait"),
+        ("impl", "impl"),
+        ("module", "module"),
+        ("namespace", "module"),
+        ("macro", "macro"),
+    ];
+    KINDS.iter().find(|(word, _)| node.contains(word)).map_or("symbol", |(_, kind)| kind)
 }
 
 /// Rust's tags query only references impl blocks; as containers they make
@@ -520,6 +612,7 @@ fn outline_config(language: Language) -> Option<&'static OutlineConfig> {
         Language::Yaml => &YAML,
         Language::Toml => &TOML,
         Language::Html | Language::PlainText => return None,
+        Language::Extension(_) => return language.extension()?.outline_config(),
     })
 }
 
@@ -543,6 +636,7 @@ fn config(language: Language) -> Option<&'static LangConfig> {
         Language::Toml => &TOML,
         Language::Markdown => &MARKDOWN,
         Language::PlainText => return None,
+        Language::Extension(_) => return language.extension()?.highlight_config(),
     })
 }
 
@@ -668,11 +762,21 @@ impl Syntax {
         while let Some(m) = matches.next() {
             let mut def = None;
             let mut name = None;
+            let context: Vec<String> = m
+                .captures()
+                .iter()
+                .filter(|c| Some(c.index) == config.context && c.node.byte_range().len() < 40)
+                .map(|c| rope.byte_slice(c.node.byte_range()).to_string())
+                .collect();
             for c in m.captures() {
                 if c.index == config.name {
                     name = Some(c.node.byte_range());
                 } else if let Some(kind) = config.kinds[c.index as usize] {
-                    def = Some((c.node.byte_range(), node_kind_label(c.node.kind()).unwrap_or(kind)));
+                    let kind = match kind {
+                        "symbol" => context_kind(&context).unwrap_or_else(|| guess_kind(c.node.kind())),
+                        kind => node_kind_label(c.node.kind()).unwrap_or(kind),
+                    };
+                    def = Some((c.node.byte_range(), kind));
                 }
             }
             if let (Some((range, kind)), Some(name)) = (def, name) {

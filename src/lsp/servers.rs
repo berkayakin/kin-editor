@@ -21,7 +21,20 @@ pub struct ServerSpec {
     pub root_markers: &'static [&'static str],
 }
 
+/// For a language whose server is only a command in `language_servers`.
+pub static CUSTOM: ServerSpec = ServerSpec {
+    id: "custom",
+    candidates: &[],
+    install: "Check the command in language_servers (settings.json)",
+    root_markers: &[],
+};
+
+/// The server for `language`: an extension's when one provides it (for a
+/// built-in language too), else the built-in choice.
 pub fn spec(language: Language) -> Option<&'static ServerSpec> {
+    if let Some(spec) = crate::extensions::server_for(language.name()) {
+        return Some(spec);
+    }
     static RUST: ServerSpec = ServerSpec {
         id: "rust-analyzer",
         candidates: &[("rust-analyzer", &[])],
@@ -111,7 +124,7 @@ pub fn spec(language: Language) -> Option<&'static ServerSpec> {
         Language::Toml => &TOML,
         Language::Shell => &SHELL,
         Language::Markdown => &MARKDOWN,
-        Language::PlainText => return None,
+        Language::PlainText | Language::Extension(_) => return None,
     })
 }
 
@@ -136,6 +149,7 @@ pub fn language_id(language: Language, path: &Path) -> &'static str {
         Language::Toml => "toml",
         Language::Markdown => "markdown",
         Language::PlainText => "plaintext",
+        Language::Extension(_) => language.extension().map_or("plaintext", |l| l.id),
     }
 }
 

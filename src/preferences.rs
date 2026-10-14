@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::{
     assets::Icon,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp},
+    extensions::{self, ExtensionInfo, ExtensionsChanged},
     format,
     lsp::servers,
     settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings},
@@ -43,14 +44,23 @@ pub enum Page {
     Editor,
     Saving,
     Languages,
+    Extensions,
     Keymap,
     Terminal,
     Updates,
 }
 
 impl Page {
-    const ALL: [Page; 7] =
-        [Page::Appearance, Page::Editor, Page::Saving, Page::Languages, Page::Keymap, Page::Terminal, Page::Updates];
+    const ALL: [Page; 8] = [
+        Page::Appearance,
+        Page::Editor,
+        Page::Saving,
+        Page::Languages,
+        Page::Extensions,
+        Page::Keymap,
+        Page::Terminal,
+        Page::Updates,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -58,6 +68,7 @@ impl Page {
             Page::Editor => "Editor",
             Page::Saving => "Saving",
             Page::Languages => "Languages",
+            Page::Extensions => "Extensions",
             Page::Keymap => "Keymap",
             Page::Terminal => "Terminal & Run",
             Page::Updates => "Updates",
@@ -70,6 +81,7 @@ impl Page {
             Page::Editor => "Font, indentation and line wrapping",
             Page::Saving => "When files are saved and what saving does",
             Page::Languages => "Per-language options, language servers and formatters",
+            Page::Extensions => "More languages, themes and snippets; Zed's extensions work too",
             Page::Keymap => "A base keymap to start from, and shortcuts for every action on top",
             Page::Terminal => "The terminal's shell and your own Run configurations",
             Page::Updates => "Getting new versions of Kin",
@@ -82,6 +94,7 @@ impl Page {
             Page::Editor => Icon::Type,
             Page::Saving => Icon::Save,
             Page::Languages => Icon::Braces,
+            Page::Extensions => Icon::Puzzle,
             Page::Keymap => Icon::Keyboard,
             Page::Terminal => Icon::Terminal,
             Page::Updates => Icon::Download,
@@ -408,6 +421,10 @@ pub struct Preferences {
     /// one's list for this frame.
     menu_anchors: [Rc<Cell<Bounds<Pixels>>>; 5],
     overlay: Option<AnyElement>,
+    /// Extensions page: the Git URL to install from, and how the last install went.
+    extension_url: Entity<Editor>,
+    extension_status: Option<(bool, String)>,
+    installing: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -423,7 +440,10 @@ impl Preferences {
         let server_command = cx.new(|cx| Editor::single_line("Command and arguments", cx));
         let formatter_command = cx.new(|cx| Editor::single_line("Command and arguments ({file} is the file's path)", cx));
         let keymap = cx.new(|cx| KeymapPage::new(window, cx));
+        let extension_url = cx.new(|cx| Editor::single_line("Git URL of an extension (Zed extensions work too)", cx));
         let mut subscriptions = vec![
+            // A grammar finished building, an extension came or went.
+            cx.observe_global::<ExtensionsChanged>(|_, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &EditorEvent, cx| {
                 this.menu = None;
                 this.scroll.set_offset(point(px(0.), px(0.)));
@@ -457,6 +477,9 @@ impl Preferences {
             commit_task: None,
             menu_anchors: Default::default(),
             overlay: None,
+            extension_url,
+            extension_status: None,
+            installing: false,
             _subscriptions: subscriptions,
         };
         for run in &settings.run_configurations {
@@ -1010,6 +1033,7 @@ impl Preferences {
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             Page::Languages => return self.render_languages(window, cx).into_any_element(),
+            Page::Extensions => return self.render_extensions(window, cx).into_any_element(),
             Page::Keymap => {
                 let theme = Theme::get(cx).clone();
                 let row = self.render_setting(Setting::BaseKeymap, window, cx);
@@ -1057,7 +1081,7 @@ impl Preferences {
                 groups.push(section(page.title(), rows, &theme).into_any_element());
             }
         }
-        let languages: Vec<Language> = Language::ALL
+        let languages: Vec<Language> = Language::all()
             .into_iter()
             .filter(|l| {
                 let name = l.name().to_lowercase();
@@ -1067,8 +1091,9 @@ impl Preferences {
         if !languages.is_empty() {
             let rows = languages
                 .into_iter()
-                .map(|language| {
-                    jump_row(("pref-find-lang", language as usize), Icon::Braces, language.name(), "Language settings", &theme)
+                .enumerate()
+                .map(|(ix, language)| {
+                    jump_row(("pref-find-lang", ix), Icon::Braces, language.name(), "Language settings", &theme)
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.show_page(Page::Languages, window, cx);
                             this.select_language(language, cx);
@@ -1605,6 +1630,209 @@ impl Preferences {
             )
     }
 
+    // ---- Extensions ----------------------------------------------------------------
+
+    fn install_from_git(&mut self, cx: &mut Context<Self>) {
+        let url = self.extension_url.read(cx).text().trim().to_string();
+        if url.is_empty() {
+            self.extension_status = Some((true, "Enter the URL of the extension's Git repository".into()));
+            cx.notify();
+            return;
+        }
+        self.installing = true;
+        self.extension_status = Some((false, format!("Installing from {url}…")));
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async move { extensions::install_git(&url) }).await;
+            this.update(cx, |this, cx| this.installed(result, cx)).ok();
+        });
+        task.detach();
+    }
+
+    fn install_from_folder(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Install".into()),
+        });
+        let task = cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut paths))) = paths.await
+                && let Some(path) = paths.pop()
+            {
+                this.update(cx, |this, cx| this.installed(extensions::install_folder(&path), cx)).ok();
+            }
+        });
+        task.detach();
+    }
+
+    fn installed(&mut self, result: Result<String, String>, cx: &mut Context<Self>) {
+        self.installing = false;
+        self.extension_status = Some(match result {
+            Ok(name) => {
+                self.extension_url.update(cx, |e, cx| e.set_text("", cx));
+                extensions::reload(cx);
+                (false, format!("Installed {name}"))
+            }
+            Err(err) => (true, err),
+        });
+        cx.notify();
+    }
+
+    fn uninstall(&mut self, extension: ExtensionInfo, window: &mut Window, cx: &mut Context<Self>) {
+        let linked = extension.path.is_symlink();
+        let detail = if linked { "Its folder stays where it is." } else { "Its folder goes to the Trash." };
+        let answer = window.prompt(gpui::PromptLevel::Warning, &format!("Remove {}?", extension.name), Some(detail), &["Remove", "Cancel"], cx);
+        let task = cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let result = extensions::uninstall(&extension.path);
+            this.update(cx, |this, cx| {
+                this.extension_status = Some(match result {
+                    Ok(()) => (false, format!("Removed {}", extension.name)),
+                    Err(err) => (true, err),
+                });
+                extensions::reload(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+    }
+
+    fn render_extensions(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let installing = self.installing;
+        let install = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(input_box(&self.extension_url, Some(Icon::Link), window, cx)))
+                    .child(text_button("ext-install-git", "Install", true, cx).when(!installing, |el| {
+                        el.on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.install_from_git(cx)))
+                    }))
+                    .child(
+                        text_button("ext-install-folder", "Install from Folder…", false, cx)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.install_from_folder(cx))),
+                    ),
+            )
+            .when_some(self.extension_status.clone(), |el, (error, text)| {
+                el.child(div().text_size(px(12.)).text_color(if error { theme.error } else { theme.text_dim }).child(text))
+            });
+
+        let installed = extensions::installed();
+        let rows: Vec<AnyElement> = if installed.is_empty() {
+            vec![
+                div()
+                    .px_3()
+                    .py_2p5()
+                    .text_size(px(12.5))
+                    .text_color(theme.text_dim)
+                    .child("No extensions yet. An extension can add a language (grammar, highlighting, outline, comments, language server, formatter), themes and snippets.")
+                    .into_any_element(),
+            ]
+        } else {
+            installed
+                .into_iter()
+                .enumerate()
+                .map(|(ix, extension)| self.render_extension(ix, extension, &theme, cx))
+                .collect()
+        };
+
+        let folder = extensions::extensions_dir().map(|d| theme::display_path(&d)).unwrap_or_default();
+        self.body()
+            .child(section("Install", vec![install.into_any_element()], &theme))
+            .child(section("Installed", rows, &theme))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).text_color(theme.text_dim).child(format!("Extensions live in {folder}")))
+                    .child(text_button("ext-reload", "Reload", false, cx).on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.extension_status = None;
+                        extensions::reload(cx);
+                        cx.notify();
+                    })))
+                    .child(text_button("ext-folder", "Open Extensions Folder", false, cx).on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                        if let Some(dir) = extensions::extensions_dir() {
+                            let _ = std::fs::create_dir_all(&dir);
+                            cx.open_url(&format!("file://{}", dir.display()));
+                        }
+                    }))),
+            )
+    }
+
+    fn render_extension(&self, ix: usize, extension: ExtensionInfo, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut provides: Vec<String> = Vec::new();
+        if !extension.languages.is_empty() {
+            provides.push(extension.languages.join(", "));
+        }
+        if extension.themes > 0 {
+            provides.push(if extension.themes == 1 { "1 theme".into() } else { format!("{} themes", extension.themes) });
+        }
+        if extension.snippets {
+            provides.push("snippets".into());
+        }
+        provides.extend(extension.servers.iter().map(|s| format!("server: {s}")));
+        let status: Option<(Hsla, String)> = if !extension.building.is_empty() {
+            Some((theme.text_dim.into(), format!("Building the {} grammar…", extension.building.join(", "))))
+        } else {
+            extension.problems.first().map(|p| {
+                let more = extension.problems.len() - 1;
+                (theme.warning.into(), if more > 0 { format!("{p} (+{more})") } else { p.clone() })
+            })
+        };
+        let problems = extension.problems.join("\n");
+        let header = format!("{}{}", extension.name, if extension.version.is_empty() { String::new() } else { format!("  {}", extension.version) });
+        div()
+            .flex()
+            .items_start()
+            .gap_2p5()
+            .px_3()
+            .py_2p5()
+            .child(div().pt(px(2.)).child(icon_el(Icon::Puzzle, px(15.), theme.text_muted.into())))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(header))
+                    .when(!extension.description.is_empty(), |el| {
+                        el.child(div().text_size(px(12.5)).text_color(theme.text_muted).child(extension.description.clone()))
+                    })
+                    .when(!provides.is_empty(), |el| el.child(div().text_size(px(12.)).text_color(theme.text_dim).child(provides.join(" · "))))
+                    .when_some(status, |el, (color, text)| {
+                        el.child(
+                            div()
+                                .id(("ext-status", ix))
+                                .text_size(px(12.))
+                                .text_color(color)
+                                .truncate()
+                                .child(text)
+                                .when(!problems.is_empty(), |el| el.tooltip(move |_, cx| tooltip_view(problems.clone(), cx))),
+                        )
+                    }),
+            )
+            .child(
+                icon_button(("ext-remove", ix), Icon::Trash, theme.text_muted.into(), cx)
+                    .tooltip(|_, cx| tooltip_view("Remove", cx))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.uninstall(extension.clone(), window, cx))),
+            )
+            .into_any_element()
+    }
+
     fn render_runs(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let rows: Vec<AnyElement> = self
@@ -1668,10 +1896,10 @@ impl Preferences {
                 || settings.formatters.contains_key(l.name())
         };
         let chosen = self.language;
-        let list: Vec<AnyElement> = Language::ALL.into_iter().map(|language| {
+        let list: Vec<AnyElement> = Language::all().into_iter().enumerate().map(|(ix, language)| {
             let selected = language == chosen;
             div()
-                .id(("pref-lang", language as usize))
+                .id(("pref-lang", ix))
                 .flex()
                 .items_center()
                 .gap_2()

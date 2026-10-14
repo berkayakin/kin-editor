@@ -10,6 +10,7 @@ mod debugger;
 mod diff_view;
 mod document;
 mod editor;
+mod extensions;
 mod editorconfig;
 mod encoding;
 mod file_icons;
@@ -52,7 +53,7 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings,
+        CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings, OpenExtensions,
         ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
@@ -71,6 +72,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Extensions…", OpenExtensions),
                 MenuItem::action("Welcome Setup…", WelcomeSetup),
                 MenuItem::action("Install 'kin' Shell Command", InstallShellCommand),
                 MenuItem::separator(),
@@ -262,6 +264,9 @@ fn main() {
         // Settings first: the theme and key bindings come from them.
         let problems = settings::init(cx);
         cx.set_global(settings::StartupProblems(problems));
+        // Before the theme, which may come from an extension, and before any
+        // file opens, whose language may too.
+        extensions::reload(cx);
         theme::init(cx);
         updater::init(cx);
         cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));

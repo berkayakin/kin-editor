@@ -16,7 +16,8 @@ platform-native text rendering (CoreText / DirectWrite).
 
 - Rope-backed buffer (`ropey`) with undo/redo; only visible lines are shaped and painted
 - Tree-sitter syntax highlighting for JavaScript/JSX, TypeScript/TSX, HTML (including `<script>` blocks),
-  CSS, Rust, Go, Python, PHP, shell scripts, JSON, YAML, TOML and Markdown
+  CSS, Rust, Go, Python, PHP, shell scripts, JSON, YAML, TOML and Markdown; any other language
+  through [extensions](#extensions), which use Zed's format (Zed's language and theme extensions work)
 - Linting off the main thread:
   - **JavaScript** — syntax errors plus `no-unused-vars`, `no-undef`, `no-const-assign`,
     `no-dupe-keys`, `eqeqeq`, `use-isnan`, `no-cond-assign`, `no-debugger`, `no-var` (built on oxc)
@@ -426,6 +427,89 @@ Nothing is downloaded; the adapters come from your system:
 One session runs at a time. Attaching to Python injects debugpy into the process, which macOS can
 block; attaching to Node turns on its inspector (port 9229 unless it was started with `--inspect`).
 
+## Extensions
+
+Extensions add languages, themes and snippets without rebuilding Kin. They use
+[Zed's extension format](https://zed.dev/docs/extensions/developing-extensions), so Zed's language
+and theme extensions work as they are, and VS Code snippet files too.
+
+**Install** from **Settings → Extensions** (or **Extensions…** in the Kin menu and Find Action):
+paste the URL of an extension's Git repository and press **Install**, or **Install from Folder…**
+for one on disk, which is used in place (for making your own: edit it, then **Reload**). Each
+extension is listed with what it adds and any problems; the trash button removes it. Extensions live
+in `~/.config/kin/extensions/<id>/`; copying a folder there and choosing **Reload Extensions** works
+too.
+
+An extension is a folder like this (Zed's layout; every part is optional):
+
+```text
+my-extension/
+  extension.toml
+  languages/mylang/config.toml
+  languages/mylang/highlights.scm     tree-sitter highlight query
+  languages/mylang/outline.scm        File Structure, breadcrumbs, sticky scroll
+  themes/*.json                       Kin themes, or Zed theme families
+  snippets/<language id>.json         VS Code / Zed snippets
+```
+
+```toml
+# extension.toml
+id = "mylang"
+name = "MyLang"
+version = "0.1.0"
+description = "MyLang support"
+authors = ["You <you@example.com>"]
+
+# The grammar: fetched from a repository at a commit (as in Zed), or
+# without `repository`, the sources in grammars/mylang/ (src/parser.c…).
+[grammars.mylang]
+repository = "https://github.com/someone/tree-sitter-mylang"
+rev = "0123456789abcdef0123456789abcdef01234567"
+# path = "dialect"   # the grammar's folder inside the repository
+
+# A language server for this extension's languages, or for a built-in one
+# (it then replaces Kin's choice). Zed extensions find their server in
+# code; Kin runs `command`, else a well-known server's command (zls,
+# gleam lsp, nil, lua-language-server, haskell-language-server…), else the
+# server's id as a program. With several servers for a language, the first
+# one installed runs. Settings' "language_servers" can always override.
+[language_servers.mylang-ls]
+name = "MyLang LS"
+languages = ["MyLang"]
+command = "mylang-ls"
+args = ["--stdio"]
+install = "brew install mylang-ls"   # shown when it isn't found
+```
+
+```toml
+# languages/mylang/config.toml
+name = "MyLang"                 # as the status bar and settings' "languages" call it
+grammar = "mylang"
+path_suffixes = ["ml", "MyLangfile"]   # extensions or whole file names
+line_comments = ["// "]
+block_comment = ["/* ", " */"]
+tab_size = 2
+hard_tabs = false
+formatter = ["mylang-fmt", "-"] # Kin only: reads stdin, writes stdout ({file} is the path)
+```
+
+Without `highlights.scm` (or `outline.scm`), the grammar's own `queries/highlights.scm` (and
+`tags.scm`) are used. A language from an extension gets highlighting, File Structure, breadcrumbs,
+sticky scroll, syntax errors in Problems, comment toggling, its indentation, snippets, its
+language server and formatter, and a row in **Settings → Languages**. Built-in languages win for
+their file extensions, except that a language naming an exact file (`docker-compose.yml`) gets it.
+
+Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
+Catppuccin themes, installed from their repositories.
+
+Grammars are compiled the first time with your C compiler (`cc`; on macOS the Xcode command line
+tools: `xcode-select --install`), in the background; files of that language are highlighted when
+it's done. Fetching uses `git`. Zed extensions' WebAssembly code (slash commands, downloading
+servers) isn't run.
+
+Kin reads Zed's extension format for compatibility; it isn't affiliated with or endorsed by Zed
+Industries. Extensions come from their authors' repositories, under their own licenses.
+
 ## Settings
 
 The first time Kin starts, **Welcome Setup** asks for the basics: a theme (applied as you click),
@@ -435,8 +519,8 @@ Open it again any time from the Kin menu or Find Action (**Welcome Setup**).
 
 **Settings…** (⌘, / Ctrl+Alt+S, or the gear at the right of the status bar) opens the Settings
 dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
-wrapping), Saving, Languages (per-language options, language server and formatter), Keymap and
-Terminal & Run. The search field looks through all of them; with it focused, ↑/↓ switch
+wrapping), Saving, Languages (per-language options, language server and formatter),
+[Extensions](#extensions), Keymap, Terminal & Run and Updates. The search field looks through all of them; with it focused, ↑/↓ switch
 pages. Changes apply right away. An option you changed has an undo button next to its name,
 which puts the default back.
 

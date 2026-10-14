@@ -27,7 +27,7 @@ use crate::{
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
-        AddLogpoint,
+        AddLogpoint, OpenExtensions, ReloadExtensions,
         ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, SelectOpenedFile, InstallShellCommand,
     },
 };
@@ -750,6 +750,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Toggle Inline Git Blame", ToggleInlineBlame),
         a("Soft-Wrap", ToggleSoftWrap),
         a("Settings…", OpenSettings),
+        a("Extensions…", OpenExtensions),
+        a("Reload Extensions", ReloadExtensions),
         a("Preferences…", OpenSettings),
         a("Check for Updates…", CheckForUpdates),
         a("Open settings.json", OpenSettingsFile),

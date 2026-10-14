@@ -229,11 +229,16 @@ impl Document {
         let language = Language::from_path(&path);
         self.path = Some(path);
         if language != self.language {
-            self.language = language;
-            self.syntax = Syntax::new(language, &self.rope);
-            self.set_builtin_diagnostics(Vec::new());
-            self.set_external_diagnostics(Vec::new());
+            self.set_language(language);
         }
+    }
+
+    /// Parses again as `language` (an extension's grammar can arrive later).
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
+        self.syntax = Syntax::new(language, &self.rope);
+        self.set_builtin_diagnostics(Vec::new());
+        self.set_external_diagnostics(Vec::new());
     }
 
     /// Replaces the contents with the file on disk. Returns whether anything

@@ -214,20 +214,22 @@ impl LspStore {
     /// Which server handles `language` for `path`, and a user-configured
     /// command if any. None when disabled or there is no server.
     fn server_key(&self, language: Language, path: &Path, cx: &App) -> Option<(ServerKey, Option<Vec<String>>)> {
-        let spec = servers::spec(language)?;
+        let custom = match Settings::get(cx).language_servers.get(language.name()) {
+            Some(Value::Bool(false)) => return None,
+            Some(Value::Array(command)) => Some(command.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()),
+            _ => None,
+        };
+        // A command in settings works for languages without a server of their own.
+        let spec = servers::spec(language).or(custom.is_some().then_some(&servers::CUSTOM))?;
         let root = servers::root_for(spec, path, self.workspace_root.as_deref());
-        match Settings::get(cx).language_servers.get(language.name()) {
-            Some(Value::Bool(false)) => None,
-            Some(Value::Array(command)) => {
-                let command: Vec<String> = command.iter().filter_map(Value::as_str).map(str::to_string).collect();
-                Some((ServerKey { id: format!("custom:{}", command.join(" ")), root }, Some(command)))
-            }
-            _ => Some((ServerKey { id: spec.id.to_string(), root }, None)),
+        match custom {
+            Some(command) => Some((ServerKey { id: format!("custom:{}", command.join(" ")), root }, Some(command))),
+            None => Some((ServerKey { id: spec.id.to_string(), root }, None)),
         }
     }
 
     fn start(&mut self, key: ServerKey, language: Language, custom: Option<Vec<String>>, file: PathBuf, cx: &mut Context<Self>) {
-        let Some(spec) = servers::spec(language) else { return };
+        let Some(spec) = servers::spec(language).or(custom.is_some().then_some(&servers::CUSTOM)) else { return };
         self.servers.insert(key.clone(), ServerState::Finding);
         cx.notify();
         let task = cx.spawn(async move |this, cx| {

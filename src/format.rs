@@ -46,17 +46,20 @@ pub fn candidates(language: Language) -> &'static [(&'static str, &'static [&'st
         ],
         Language::Toml => &[("taplo", &["fmt", "-"])],
         Language::Shell => &[("shfmt", &["-filename", "{file}"])],
-        Language::Php | Language::PlainText => &[],
+        Language::Php | Language::PlainText | Language::Extension(_) => &[],
     }
 }
 
 /// The formatter for `file`: a configured command, or the first installed
 /// candidate (in the project's `node_modules/.bin`, then on the search path).
 pub fn find(language: Language, file: &Path, configured: Option<&[String]>) -> Option<Formatter> {
+    // Settings, else the extension that adds the language.
+    let configured = configured.or_else(|| language.extension()?.formatter.as_deref());
     if let Some(command) = configured {
         let custom = servers::custom(command)?;
         let name = command.first()?.clone();
-        return Some(Formatter { name, program: custom.program, args: custom.args, project_local: true });
+        let args = custom.args.iter().map(|a| expand(a, file)).collect();
+        return Some(Formatter { name, program: custom.program, args, project_local: true });
     }
     for (name, args) in candidates(language) {
         let local = file

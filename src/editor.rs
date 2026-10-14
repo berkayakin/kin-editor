@@ -679,6 +679,22 @@ impl Editor {
         Ok(())
     }
 
+    /// Extensions changed: the file may have a language now, or a grammar
+    /// for it. True when it was parsed again.
+    pub fn refresh_language(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(path) = self.doc.path.clone() else { return false };
+        let language = crate::syntax::Language::from_path(&path);
+        if language == self.doc.language && language.extension().is_none() {
+            return false;
+        }
+        self.doc.set_language(language);
+        self.apply_settings(cx);
+        self.linted_version = None;
+        self.schedule_lint(Duration::ZERO, cx);
+        cx.notify();
+        true
+    }
+
     pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.doc.set_path(path);
         self.apply_settings(cx);

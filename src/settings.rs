@@ -167,6 +167,13 @@ impl EditorSettings {
             Language::Html | Language::Json | Language::Yaml => s.tab_size = Some(2),
             // Prose reads better wrapped; code keeps its lines (JetBrains does the same).
             Language::Markdown | Language::PlainText => s.soft_wrap = Some(true),
+            // What the extension's config.toml says.
+            Language::Extension(_) => {
+                if let Some(def) = language.extension() {
+                    s.tab_size = def.tab_size;
+                    s.hard_tabs = def.hard_tabs;
+                }
+            }
             _ => {}
         }
         s

@@ -423,23 +423,36 @@ impl ThemeRegistry {
             let file: ThemeFile = serde_json::from_str(source).expect("invalid built-in theme");
             files.push((file, None));
         }
-        if let Some(dir) = themes_dir()
-            && let Ok(read) = std::fs::read_dir(&dir)
-        {
+        // Extensions' themes, then the user's own, which win.
+        let mut dirs = crate::extensions::theme_dirs();
+        dirs.extend(themes_dir());
+        for dir in dirs {
+            let Ok(read) = std::fs::read_dir(&dir) else { continue };
             let mut paths: Vec<PathBuf> = read
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.extension().is_some_and(|e| e == "json"))
                 .collect();
             paths.sort();
             for path in paths {
-                match std::fs::read_to_string(&path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|s| serde_json::from_str::<ThemeFile>(&s).map_err(|e| e.to_string()))
-                {
-                    Ok(file) => {
-                        // A user theme with a built-in's name replaces it.
-                        files.retain(|(f, _)| f.name != file.name);
-                        files.push((file, Some(path)));
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", file_label(&path)));
+                        continue;
+                    }
+                };
+                // A Zed theme family (several themes), else Kin's format.
+                let parsed = match zed_theme_family(&text) {
+                    Some(family) => Ok(family),
+                    None => serde_json::from_str::<ThemeFile>(&text).map(|file| vec![file]).map_err(|e| e.to_string()),
+                };
+                match parsed {
+                    Ok(themes) => {
+                        for file in themes {
+                            // A theme with a built-in's name replaces it.
+                            files.retain(|(f, _)| f.name != file.name);
+                            files.push((file, Some(path.clone())));
+                        }
                     }
                     Err(e) => errors.push(format!("{}: {e}", file_label(&path))),
                 }
@@ -464,6 +477,98 @@ impl ThemeRegistry {
     pub fn find(&self, name: &str) -> Option<&ThemeEntry> {
         self.entries.iter().find(|e| e.theme.name.as_ref() == name)
     }
+}
+
+/// Zed's theme files: a family of themes, each with a `style` of dotted keys
+/// (`editor.background`), `players` (cursor, selection) and a `syntax` of
+/// `{ "color": … }`. What has no counterpart comes from the base theme.
+fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
+    let family: serde_json::Value = serde_json::from_str(text).ok()?;
+    let themes = family.get("themes")?.as_array()?;
+    let mut out = Vec::new();
+    for theme in themes {
+        let style = theme.get("style")?;
+        let color = |key: &str| style.get(key).and_then(|v| v.as_str()).filter(|c| parse_color(c).is_some()).map(str::to_string);
+        let mut colors = HashMap::new();
+        let mut put = |kin: &str, zed: &[&str]| {
+            if let Some(value) = zed.iter().find_map(|k| color(k)) {
+                colors.insert(kin.to_string(), value);
+            }
+        };
+        put("background", &["editor.background", "background"]);
+        put("panel", &["panel.background", "background"]);
+        put("elevated", &["elevated_surface.background", "surface.background"]);
+        put("border", &["border"]);
+        put("border_subtle", &["border.variant", "border"]);
+        put("hover", &["element.hover", "ghost_element.hover"]);
+        put("active", &["element.selected", "element.active", "ghost_element.selected"]);
+        put("text", &["text", "editor.foreground"]);
+        put("text_muted", &["text.muted"]);
+        put("text_dim", &["text.placeholder", "text.disabled"]);
+        put("accent", &["text.accent", "icon.accent"]);
+        put("accent_soft", &["element.selected"]);
+        put("current_line", &["editor.active_line.background"]);
+        put("line_number", &["editor.line_number"]);
+        put("line_number_active", &["editor.active_line_number"]);
+        put("indent_guide", &["editor.indent_guide"]);
+        put("search_match", &["search.match_background"]);
+        put("search_active", &["search.match_background"]);
+        put("bracket_match", &["editor.document_highlight.bracket_background"]);
+        put("error", &["error"]);
+        put("warning", &["warning"]);
+        put("info", &["info"]);
+        put("success", &["success"]);
+        put("git_added", &["created", "version_control.added"]);
+        put("git_modified", &["modified", "version_control.modified"]);
+        put("git_deleted", &["deleted", "version_control.deleted"]);
+        put("git_untracked", &["created", "version_control.added"]);
+        put("git_conflict", &["conflict", "version_control.conflict"]);
+        for name in ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"] {
+            put(&format!("terminal_{name}"), &[&format!("terminal.ansi.{name}")]);
+            put(&format!("terminal_bright_{name}"), &[&format!("terminal.ansi.bright_{name}")]);
+        }
+        let player = style.get("players").and_then(|p| p.get(0));
+        let player_color = |key: &str| player.and_then(|p| p.get(key)).and_then(|v| v.as_str()).map(str::to_string);
+        colors.extend(player_color("cursor").map(|c| ("cursor".to_string(), c)));
+        colors.extend(player_color("selection").map(|c| ("selection".to_string(), c)));
+
+        let syntax_style = style.get("syntax");
+        let syntax_color = |key: &str| {
+            syntax_style.and_then(|s| s.get(key)).and_then(|s| s.get("color")).and_then(|v| v.as_str()).map(str::to_string)
+        };
+        let mut syntax = HashMap::new();
+        for (kin, zed) in [
+            ("plain", &["variable", "primary"][..]),
+            ("keyword", &["keyword"]),
+            ("string", &["string"]),
+            ("number", &["number", "constant"]),
+            ("constant", &["constant", "boolean"]),
+            ("function", &["function"]),
+            ("method", &["function.method", "function"]),
+            ("property", &["property"]),
+            ("type", &["type"]),
+            ("variable_builtin", &["variable.special", "variable"]),
+            ("comment", &["comment"]),
+            ("operator", &["operator"]),
+            ("punctuation", &["punctuation", "punctuation.bracket"]),
+            ("tag", &["tag"]),
+            ("attribute", &["attribute"]),
+            ("escape", &["string.escape", "string.special"]),
+        ] {
+            if let Some(value) = zed.iter().find_map(|k| syntax_color(k)) {
+                syntax.insert(kin.to_string(), value);
+            }
+        }
+        out.push(ThemeFile {
+            name: theme.get("name")?.as_str()?.to_string(),
+            appearance: theme.get("appearance").and_then(|a| a.as_str()).map(str::to_string),
+            extends: None,
+            italic_comments: None,
+            colors,
+            syntax,
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn file_label(path: &Path) -> String {
@@ -731,6 +836,31 @@ pub fn zoom(delta: Option<f32>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_zed_theme_families() {
+        let family = r##"{
+            "name": "Sea", "author": "x",
+            "themes": [
+                { "name": "Sea Dark", "appearance": "dark", "style": {
+                    "editor.background": "#101820ff", "text": "#e0e0e0", "border": "#303840",
+                    "terminal.ansi.red": "#ff5555", "players": [{ "cursor": "#ffcc00", "selection": "#ffcc0033" }],
+                    "syntax": { "keyword": { "color": "#ff79c6", "font_weight": 700 }, "comment": { "color": "#6272a4" } }
+                } },
+                { "name": "Sea Light", "appearance": "light", "style": {} }
+            ]
+        }"##;
+        let themes = zed_theme_family(family).unwrap();
+        assert_eq!(themes.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Sea Dark", "Sea Light"]);
+        let dark = &themes[0];
+        assert_eq!(dark.colors["background"], "#101820ff");
+        assert_eq!(dark.colors["cursor"], "#ffcc00");
+        assert_eq!(dark.colors["terminal_red"], "#ff5555");
+        assert_eq!(dark.syntax["keyword"], "#ff79c6");
+        let theme = resolve(dark, &builtins(), &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert_eq!(theme.background, parse_color("#101820ff").unwrap());
+        assert!(zed_theme_family("{\"name\": \"not a family\"}").is_none());
+    }
 
     fn builtins() -> HashMap<String, ThemeFile> {
         BUILTIN

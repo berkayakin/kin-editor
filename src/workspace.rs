@@ -31,6 +31,7 @@ use crate::{
     push_dialog::{PushDialog, PushDialogEvent},
     git_log::{GitLog, GitLogEvent},
     debugger::{DebugEvent, DebugSession, launch},
+    extensions,
     editor::{
         self, Cancel, Editor, EditorBreakpointMenu, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent,
         EditorRunEvent, GitFile,
@@ -91,6 +92,8 @@ actions!(
         AttachToProcess,
         AddConditionalBreakpoint,
         AddLogpoint,
+        OpenExtensions,
+        ReloadExtensions,
         Resume,
         PauseProgram,
         StepOver,
@@ -578,6 +581,8 @@ impl Workspace {
         });
         // An update finished downloading: show Restart to Update.
         let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
+        // Extensions reloaded, or a grammar finished building.
+        let extensions_observer = cx.observe_global::<extensions::ExtensionsChanged>(|ws, cx| ws.extensions_changed(cx));
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -682,6 +687,7 @@ impl Workspace {
                 quit,
                 settings_observer,
                 updater_observer,
+                extensions_observer,
                 lsp_subscription,
                 lsp_observer,
                 cx.observe_window_bounds(window, |ws, window, cx| ws.remember_placement(window, cx)),
@@ -1703,6 +1709,18 @@ impl Workspace {
         }));
         self.modal = Some(Modal::Preferences(preferences));
         cx.notify();
+    }
+
+    /// Extensions…: the Extensions page of Settings.
+    fn open_extensions(&mut self, _: &OpenExtensions, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        self.preferences_page = preferences::Page::Extensions;
+        self.open_settings(&OpenSettings, window, cx);
+    }
+
+    fn reload_extensions(&mut self, _: &ReloadExtensions, _: &mut Window, cx: &mut Context<Self>) {
+        extensions::reload(cx);
+        self.toast(ToastKind::Success, "Extensions reloaded", None, cx);
     }
 
     fn open_settings_file(&mut self, _: &OpenSettingsFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -2857,6 +2875,19 @@ impl Workspace {
             .ok();
         });
         task.detach();
+        cx.notify();
+    }
+
+    /// Open files may have a language now, or one with a grammar.
+    fn extensions_changed(&mut self, cx: &mut Context<Self>) {
+        for editor in self.tabs.clone() {
+            if editor.update(cx, |e, cx| e.refresh_language(cx)) {
+                self.lsp.update(cx, |s, cx| s.register(&editor, cx));
+            }
+        }
+        if let Some(message) = cx.global::<extensions::ExtensionsChanged>().message.clone() {
+            self.toast(ToastKind::Info, message, None, cx);
+        }
         cx.notify();
     }
 
@@ -6776,6 +6807,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::attach_to_process))
             .on_action(cx.listener(Self::add_conditional_breakpoint))
             .on_action(cx.listener(Self::add_logpoint))
+            .on_action(cx.listener(Self::open_extensions))
+            .on_action(cx.listener(Self::reload_extensions))
             .on_action(cx.listener(Self::resume))
             .on_action(cx.listener(Self::pause_program))
             .on_action(cx.listener(Self::step_over))

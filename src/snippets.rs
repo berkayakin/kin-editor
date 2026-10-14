@@ -68,6 +68,7 @@ fn language_id(language: Language) -> &'static str {
         Language::Toml => "toml",
         Language::Markdown => "markdown",
         Language::PlainText => "plaintext",
+        Language::Extension(_) => language.extension().map_or("plaintext", |l| l.id),
     }
 }
 
@@ -78,11 +79,12 @@ pub fn snippets_dir() -> Option<PathBuf> {
 /// The user's snippets for `language`. Read on each use: the files are small,
 /// and edits to them apply right away.
 pub fn user_snippets(language: Language) -> Vec<UserSnippet> {
-    let Some(dir) = snippets_dir() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    // The user's own and extensions' (Zed and VS Code use the same files).
+    let mut dirs: Vec<PathBuf> = snippets_dir().into_iter().collect();
+    dirs.extend(crate::extensions::snippet_dirs());
     let id = language_id(language);
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    for entry in dirs.iter().filter_map(|dir| std::fs::read_dir(dir).ok()).flatten().flatten() {
         let path = entry.path();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let global = name.ends_with(".code-snippets");

@@ -54,7 +54,8 @@ pub fn lint(language: Language, text: &str, path: Option<&std::path::Path>, synt
         | Language::Shell
         | Language::Json
         | Language::Yaml
-        | Language::Toml => syntax::grammar(language).map_or_else(Vec::new, |g| syntax_errors::lint(&g, text)),
+        | Language::Toml
+        | Language::Extension(_) => syntax::grammar(language).map_or_else(Vec::new, |g| syntax_errors::lint(&g, text)),
         Language::Markdown => markdown::lint(text, path),
         Language::PlainText => Vec::new(),
     };
