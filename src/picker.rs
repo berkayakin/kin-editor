@@ -42,6 +42,8 @@ pub enum PickerMode {
     Locations,
     /// Run configurations; see [`Picker::set_run_targets`].
     Run,
+    /// The same list, to debug instead (only targets that can be).
+    Debug,
     /// Symbols across the project from the language servers; the workspace
     /// answers [`PickerEvent::SymbolQuery`] with [`Picker::set_locations`].
     Symbols,
@@ -74,6 +76,7 @@ pub enum PickerEvent {
     /// Symbols mode: the query changed.
     SymbolQuery(String),
     Run(RunTarget),
+    Debug(RunTarget),
     Dismissed,
 }
 
@@ -162,6 +165,7 @@ impl Picker {
             PickerMode::Structure => "Search symbols",
             PickerMode::Locations => "Filter",
             PickerMode::Run => "Run configuration",
+            PickerMode::Debug => "Debug configuration",
             PickerMode::Symbols => "Search symbols in the project",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
@@ -411,7 +415,7 @@ impl Picker {
             items.extend(scored.into_iter().take(limit).map(|(_, i)| i));
         }
 
-        if self.mode == PickerMode::Run {
+        if matches!(self.mode, PickerMode::Run | PickerMode::Debug) {
             let targets = self.run_targets.clone();
             let mut scored: Vec<(u32, Item)> = Vec::new();
             for (ix, target) in targets.iter().enumerate() {
@@ -504,7 +508,10 @@ impl Picker {
             }
             Some(Item::Action { ix, .. }) => cx.emit(PickerEvent::RunAction(self.actions[*ix].action.boxed_clone())),
             Some(Item::Symbol { ix, .. }) => cx.emit(PickerEvent::GoTo(self.symbols[*ix].0.offset)),
-            Some(Item::Run { ix, .. }) => cx.emit(PickerEvent::Run(self.run_targets[*ix].clone())),
+            Some(Item::Run { ix, .. }) => {
+                let target = self.run_targets[*ix].clone();
+                cx.emit(if self.mode == PickerMode::Debug { PickerEvent::Debug(target) } else { PickerEvent::Run(target) })
+            }
             Some(Item::Location { ix }) => cx.emit(PickerEvent::OpenLocation {
                 location: self.locations[*ix].location.clone(),
                 encoding: self.locations[*ix].encoding,
@@ -577,6 +584,7 @@ impl Render for Picker {
             PickerMode::Structure => ("File Structure", Icon::Braces, ""),
             PickerMode::Locations => ("", Icon::Search, ""),
             PickerMode::Run => ("Run", Icon::Play, ""),
+            PickerMode::Debug => ("Debug", Icon::Bug, ""),
             PickerMode::Symbols => ("Symbols", Icon::Braces, ""),
         };
         let title: SharedString = match &self.title {
@@ -686,7 +694,8 @@ impl Render for Picker {
                                     }
                                     Item::Run { ix, hl } => {
                                         let target = &run_targets[*ix];
-                                        row.child(icon_el(Icon::Play, px(13.), theme.success.into()))
+                                        let icon = if mode == PickerMode::Debug { Icon::Bug } else { Icon::Play };
+                                        row.child(icon_el(icon, px(13.), theme.success.into()))
                                             .child(
                                                 div()
                                                     .flex_shrink_0()

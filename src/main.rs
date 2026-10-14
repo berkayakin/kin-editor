@@ -5,6 +5,8 @@ mod cli;
 mod clone_dialog;
 mod conflict;
 mod context_menu;
+mod dap;
+mod debugger;
 mod diff_view;
 mod document;
 mod editor;
@@ -56,6 +58,7 @@ use crate::{
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
         ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol, InstallShellCommand,
+        DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut,
     },
 };
 
@@ -160,6 +163,15 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Run…", RunConfiguration),
                 MenuItem::action("Run at Caret", RunAtCaret),
                 MenuItem::action("Stop", StopRun),
+                MenuItem::separator(),
+                MenuItem::action("Debug at Caret", DebugAtCaret),
+                MenuItem::action("Debug…", DebugConfiguration),
+                MenuItem::action("Toggle Line Breakpoint", ToggleBreakpoint),
+                MenuItem::action("Resume Program", Resume),
+                MenuItem::action("Pause Program", PauseProgram),
+                MenuItem::action("Step Over", StepOver),
+                MenuItem::action("Step Into", StepInto),
+                MenuItem::action("Step Out", StepOut),
             ],
         },
         Menu {

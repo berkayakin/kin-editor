@@ -30,7 +30,8 @@ use crate::{
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     push_dialog::{PushDialog, PushDialogEvent},
     git_log::{GitLog, GitLogEvent},
-    editor::{self, Cancel, Editor, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent, EditorRunEvent, GitFile},
+    debugger::{DebugEvent, DebugSession},
+    editor::{self, Cancel, Editor, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent, EditorRunEvent, GitFile},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
@@ -43,7 +44,7 @@ use crate::{
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, openable_files},
-    state::{PaneLayout, ProjectSession, SessionState, TabSession, WindowPlacement},
+    state::{FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, WindowPlacement},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
     run::{self, RunTarget},
@@ -83,6 +84,13 @@ actions!(
         RunConfiguration,
         Rerun,
         StopRun,
+        DebugConfiguration,
+        Resume,
+        PauseProgram,
+        StepOver,
+        StepInto,
+        StepOut,
+        ToggleDebugPanel,
         CloseOtherTabs,
         CloseAllTabs,
         TogglePinTab,
@@ -298,6 +306,8 @@ enum MenuAction {
     /// Status bar: save with these line endings (true: CRLF).
     LineEndings(bool, Entity<Editor>),
     Encoding(TextEncoding, Entity<Editor>),
+    /// A gutter ▶'s Run (false) or Debug (true).
+    Launch(RunTarget, bool),
 }
 
 impl Clone for MenuAction {
@@ -309,6 +319,7 @@ impl Clone for MenuAction {
             MenuAction::Tab(action, editor) => MenuAction::Tab(*action, editor.clone()),
             MenuAction::LineEndings(crlf, editor) => MenuAction::LineEndings(*crlf, editor.clone()),
             MenuAction::Encoding(encoding, editor) => MenuAction::Encoding(*encoding, editor.clone()),
+            MenuAction::Launch(target, debug) => MenuAction::Launch(target.clone(), *debug),
         }
     }
 }
@@ -384,6 +395,14 @@ pub struct Workspace {
 
     /// For Rerun.
     last_run: Option<RunTarget>,
+    /// The debug session (running or finished) whose panel shows in the bottom area.
+    debug: Option<(Entity<DebugSession>, Subscription)>,
+    show_debug: bool,
+    last_debug: Option<RunTarget>,
+    /// Where the debug session is paused (file, 1-based line), to mark it in that file's editor.
+    debug_location: Option<(PathBuf, u32)>,
+    /// Breakpoints of files that aren't open; open files keep theirs in their documents.
+    breakpoints: HashMap<PathBuf, Vec<usize>>,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -508,6 +527,9 @@ impl Workspace {
                 eprintln!("couldn't save the session: {err}");
             }
             ws.lsp.update(cx, |s, _| s.shutdown_all());
+            if let Some((session, _)) = ws.debug.take() {
+                session.update(cx, |s, cx| s.stop(cx));
+            }
             async {}
         });
         let this = cx.entity().downgrade();
@@ -580,6 +602,11 @@ impl Workspace {
             tree_drop: None,
 
             last_run: None,
+            debug: None,
+            show_debug: false,
+            last_debug: None,
+            debug_location: None,
+            breakpoints: HashMap::new(),
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
             resizing: None,
@@ -717,8 +744,22 @@ impl Workspace {
             ws.on_editor_lsp_event(event, window, cx);
         }));
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
-            ws.run_target(event.0.clone(), window, cx);
+            ws.on_run_event(event, window, cx);
         }));
+        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
+            ws.breakpoints_changed(&editor, cx);
+        }));
+        // Breakpoints it had while closed, and the paused line if it's here.
+        let path = editor.read(cx).doc.path.clone();
+        if let Some(path) = path {
+            if let Some(rows) = self.breakpoints.remove(&path) {
+                editor.update(cx, |e, cx| e.set_breakpoint_rows(&rows, cx));
+            }
+            if let Some((at, line)) = self.debug_location.clone().filter(|(at, _)| *at == path) {
+                let _ = at;
+                editor.update(cx, |e, cx| e.set_debug_line(Some(line.saturating_sub(1) as usize), cx));
+            }
+        }
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
             ws.run_git(event.0.clone(), window, cx);
         }));
@@ -791,8 +832,10 @@ impl Workspace {
         self.expanded.clear();
         self.expanded.insert(root.clone());
         // The folders that were open last time, if they still exist.
+        self.breakpoints.clear();
         if let Some(session) = ProjectSession::load(&root) {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
+            self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.rows.clone())).collect();
         }
         self.root = Some(root);
         self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
@@ -864,7 +907,13 @@ impl Workspace {
         let mut expanded: Vec<PathBuf> =
             self.expanded.iter().filter_map(|p| p.strip_prefix(&root).ok()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect();
         expanded.sort();
-        ProjectSession { root, tabs, active, layout, expanded }.save()
+        let mut breakpoints: Vec<FileBreakpoints> = self
+            .all_breakpoints(cx)
+            .into_iter()
+            .filter_map(|(path, rows)| Some(FileBreakpoints { path: path.strip_prefix(&root).ok()?.to_path_buf(), rows }))
+            .collect();
+        breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
+        ProjectSession { root, tabs, active, layout, expanded, breakpoints }.save()
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -1333,6 +1382,12 @@ impl Workspace {
         self.terminals.clear();
         self.split_terminal = None;
         self.show_terminal = false;
+        if let Some((session, _)) = self.debug.take() {
+            session.update(cx, |s, cx| s.stop(cx));
+        }
+        self.show_debug = false;
+        self.debug_location = None;
+        self.breakpoints.clear();
         self.lsp.update(cx, |s, _| {
             s.shutdown_all();
             s.set_root(None);
@@ -1921,6 +1976,10 @@ impl Workspace {
         let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
         if let Some(path) = editor.read(cx).doc.path.clone() {
             self.lsp.update(cx, |s, _| s.did_close(&path));
+            let rows = editor.read(cx).breakpoint_rows();
+            if !rows.is_empty() {
+                self.breakpoints.insert(path, rows);
+            }
         }
         self.schedule_session_save(cx);
         self.auto_save_tasks.remove(&editor.entity_id());
@@ -2639,6 +2698,7 @@ impl Workspace {
         self.show_problems = !self.show_problems;
         if self.show_problems {
             self.show_git_log = false;
+            self.show_debug = false;
         }
         if self.show_problems && self.show_terminal {
             self.show_terminal = false;
@@ -2660,6 +2720,7 @@ impl Workspace {
             self.show_terminal = true;
             self.show_problems = false;
             self.show_git_log = false;
+            self.show_debug = false;
             if self.terminals.is_empty() {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
@@ -2707,6 +2768,7 @@ impl Workspace {
         self.show_git_log = true;
         self.show_problems = false;
         self.show_terminal = false;
+        self.show_debug = false;
         self.git_log.update(cx, |l, cx| l.reload(cx));
         self.git_log.read(cx).focus_filter(window, cx);
     }
@@ -2781,6 +2843,7 @@ impl Workspace {
                 self.show_terminal = true;
                 self.show_problems = false;
                 self.show_git_log = false;
+                self.show_debug = false;
                 if focus {
                     self.focus_terminal(window, cx);
                 }
@@ -2828,21 +2891,232 @@ impl Workspace {
 
     /// Stop (⌘F2 / Ctrl+F2): interrupts the newest running program.
     fn stop_run(&mut self, _: &StopRun, _: &mut Window, cx: &mut Context<Self>) {
+        // A debug session is what's running, if there is one.
+        if let Some(session) = self.debug.as_ref().map(|(s, _)| s.clone()).filter(|s| s.read(cx).is_active()) {
+            session.update(cx, |s, cx| s.stop(cx));
+            return;
+        }
         let running = self.terminals.iter().rev().find(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running)).cloned();
         if let Some(terminal) = running {
             terminal.update(cx, |t, cx| t.interrupt(cx));
         }
     }
 
+    // ---- Debugging --------------------------------------------------------------------
+
+    /// A gutter ▶ (Run or Debug, as a menu when both work), or Run / Debug at caret.
+    fn on_run_event(&mut self, event: &EditorRunEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let target = event.target.clone();
+        match event.menu_at {
+            Some(position) if target.debug.is_some() => {
+                let name = target.name.trim_start_matches("Run ").trim_start_matches("Test ").to_string();
+                let entries = vec![
+                    MenuEntry::item(format!("Run {name}"), Icon::Play).shortcut(binding_label(&editor::RunAtCaret, window)),
+                    MenuEntry::item(format!("Debug {name}"), Icon::Bug).shortcut(binding_label(&editor::DebugAtCaret, window)),
+                ];
+                let actions = vec![Some(MenuAction::Launch(target.clone(), false)), Some(MenuAction::Launch(target, true))];
+                self.show_context_menu(entries, actions, position, None, window, cx);
+            }
+            _ if event.debug => self.debug_target(target, window, cx),
+            _ => self.run_target(target, window, cx),
+        }
+    }
+
+    /// Starts debugging `target` in the Debug panel; one session at a time.
+    fn debug_target(&mut self, target: RunTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if target.debug.is_none() {
+            self.toast(ToastKind::Info, "This can't be debugged", Some("Rust, Go and Python tests and programs can be".into()), cx);
+            return;
+        }
+        // What's debugged is what's on screen.
+        for editor in self.tabs.clone() {
+            if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+                editor.update(cx, |e, cx| e.save(cx)).ok();
+            }
+        }
+        if let Some((old, _)) = self.debug.take() {
+            old.update(cx, |s, cx| s.stop(cx));
+        }
+        self.clear_debug_location(cx);
+        let breakpoints = self.all_breakpoints(cx);
+        let session = cx.new(|cx| DebugSession::new(target.clone(), breakpoints, cx));
+        let subscription = cx.subscribe_in(&session, window, |ws, _, event: &DebugEvent, window, cx| ws.on_debug_event(event, window, cx));
+        self.debug = Some((session, subscription));
+        self.last_debug = Some(target);
+        self.show_debug = true;
+        self.show_problems = false;
+        self.show_terminal = false;
+        self.show_git_log = false;
+        cx.notify();
+    }
+
+    fn on_debug_event(&mut self, event: &DebugEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            DebugEvent::Stopped { path, line } => {
+                self.clear_debug_location(cx);
+                self.debug_location = Some((path.clone(), *line));
+                self.open_at(path.clone(), Some(*line), None, window, cx);
+                if let Some(editor) = self.tab_for(path, cx) {
+                    editor.update(cx, |e, cx| e.set_debug_line(Some(line.saturating_sub(1) as usize), cx));
+                }
+                // A breakpoint hit brings Kin forward, like JetBrains.
+                window.activate_window();
+            }
+            DebugEvent::Resumed | DebugEvent::Ended => self.clear_debug_location(cx),
+            DebugEvent::Hide => {
+                self.show_debug = false;
+                self.focus_active(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_debug_location(&mut self, cx: &mut Context<Self>) {
+        if let Some((path, _)) = self.debug_location.take()
+            && let Some(editor) = self.tab_for(&path, cx)
+        {
+            editor.update(cx, |e, cx| e.set_debug_line(None, cx));
+        }
+    }
+
+    /// Every breakpoint: open files' (which move with edits) and the rest.
+    fn all_breakpoints(&self, cx: &App) -> HashMap<PathBuf, Vec<usize>> {
+        let mut all = self.breakpoints.clone();
+        for editor in &self.tabs {
+            let e = editor.read(cx);
+            if let Some(path) = e.doc.path.clone() {
+                let rows = e.breakpoint_rows();
+                if rows.is_empty() {
+                    all.remove(&path);
+                } else {
+                    all.insert(path, rows);
+                }
+            }
+        }
+        all
+    }
+
+    fn breakpoints_changed(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let (path, rows) = {
+            let e = editor.read(cx);
+            (e.doc.path.clone(), e.breakpoint_rows())
+        };
+        if let (Some(path), Some((session, _))) = (path, &self.debug) {
+            session.update(cx, |s, _| s.set_breakpoints(path, rows));
+        }
+        self.schedule_session_save(cx);
+    }
+
+    fn debug_session(&self) -> Option<Entity<DebugSession>> {
+        self.debug.as_ref().map(|(s, _)| s.clone())
+    }
+
+    /// Resume (⌥⌘R / F9; F5 in VS Code and Zed): continue, or with nothing
+    /// to continue, debug the last configuration again (else at the caret).
+    fn resume(&mut self, _: &Resume, window: &mut Window, cx: &mut Context<Self>) {
+        match self.debug_session() {
+            Some(session) if session.read(cx).is_paused() => session.update(cx, |s, cx| s.resume(cx)),
+            Some(session) if session.read(cx).is_active() => {}
+            _ => match self.last_debug.clone() {
+                Some(target) => self.debug_target(target, window, cx),
+                None => window.dispatch_action(Box::new(editor::DebugAtCaret), cx),
+            },
+        }
+    }
+
+    fn pause_program(&mut self, _: &PauseProgram, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.debug_session() {
+            session.update(cx, |s, cx| s.pause(cx));
+        }
+    }
+
+    fn step_over(&mut self, _: &StepOver, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.debug_session() {
+            session.update(cx, |s, cx| s.step_over(cx));
+        }
+    }
+
+    fn step_into(&mut self, _: &StepInto, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.debug_session() {
+            session.update(cx, |s, cx| s.step_into(cx));
+        }
+    }
+
+    fn step_out(&mut self, _: &StepOut, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.debug_session() {
+            session.update(cx, |s, cx| s.step_out(cx));
+        }
+    }
+
+    fn toggle_debug_panel(&mut self, _: &ToggleDebugPanel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.debug.is_none() {
+            self.toast(ToastKind::Info, "Not debugging", Some("Start with Debug at Caret or Debug… in the Run menu".into()), cx);
+            return;
+        }
+        self.show_debug = !self.show_debug;
+        if self.show_debug {
+            self.show_problems = false;
+            self.show_terminal = false;
+            self.show_git_log = false;
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_debug_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (session, _) = self.debug.as_ref()?;
+        let theme = Theme::get(cx).clone();
+        Some(
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .h(self.problems_height)
+                .flex_shrink_0()
+                .bg(theme.background)
+                .border_t_1()
+                .border_color(theme.border)
+                .child(session.clone())
+                .child(self.resize_handle(Edge::Problems, cx)),
+        )
+    }
+
     /// Run… (⌃⌥R / Alt+Shift+F10): the project's configurations and the current file.
     fn run_configuration(&mut self, _: &RunConfiguration, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(targets) = self.configurations(self.last_run.clone(), cx) else { return };
+        self.close_modal(window, cx);
+        self.open_picker(PickerMode::Run, window, cx);
+        if let Some(Modal::Picker(picker)) = &self.modal {
+            picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
+        }
+    }
+
+    /// Debug… (⌃⌥D / Alt+Shift+F9): the configurations that can be debugged.
+    fn debug_configuration(&mut self, _: &DebugConfiguration, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut targets) = self.configurations(self.last_debug.clone(), cx) else { return };
+        targets.retain(|t| t.debug.is_some());
+        if targets.is_empty() {
+            self.toast(ToastKind::Info, "Nothing to debug here", Some("Rust, Go and Python tests and programs can be debugged".into()), cx);
+            return;
+        }
+        self.close_modal(window, cx);
+        self.open_picker(PickerMode::Debug, window, cx);
+        if let Some(Modal::Picker(picker)) = &self.modal {
+            picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
+        }
+    }
+
+    /// Run… and Debug…'s list: settings' configurations, the project's, the
+    /// current file's; `last` first. None (after a notice) when there's nothing.
+    fn configurations(&mut self, last: Option<RunTarget>, cx: &mut Context<Self>) -> Option<Vec<RunTarget>> {
         let root = self
             .root
             .clone()
             .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)));
         let Some(root) = root else {
             self.toast(ToastKind::Info, "Open a folder or a file to run something", None, cx);
-            return;
+            return None;
         };
         let current = self.active_editor().and_then(|e| {
             let doc = &e.read(cx).doc;
@@ -2857,6 +3131,7 @@ impl Workspace {
                 cwd: c.cwd.as_ref().map(|d| root.join(d)).unwrap_or_else(|| root.clone()),
                 row: None,
                 rows: 0..0,
+                debug: None,
             })
             .collect();
         targets.extend(run::project_targets(&root, current.as_ref().map(|(p, l)| (p.as_path(), *l))));
@@ -2865,20 +3140,16 @@ impl Workspace {
             let file = editor.update(cx, |e, _| e.run_targets());
             targets.extend(file.iter().filter(|t| !targets.iter().any(|o| o.command == t.command)).cloned().collect::<Vec<_>>());
         }
-        // The last run comes first, so Enter repeats it.
-        if let Some(last) = self.last_run.clone() {
+        // The last one comes first, so Enter repeats it.
+        if let Some(last) = last {
             targets.retain(|t| t.command != last.command || t.cwd != last.cwd);
             targets.insert(0, last);
         }
         if targets.is_empty() {
             self.toast(ToastKind::Info, "Nothing to run here", Some("Add run_configurations to settings.json".into()), cx);
-            return;
+            return None;
         }
-        self.close_modal(window, cx);
-        self.open_picker(PickerMode::Run, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modal {
-            picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
-        }
+        Some(targets)
     }
 
     fn close_terminal(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -3168,6 +3439,10 @@ impl Workspace {
             PickerEvent::Run(target) => {
                 ws.close_modal(window, cx);
                 ws.run_target(target.clone(), window, cx);
+            }
+            PickerEvent::Debug(target) => {
+                ws.close_modal(window, cx);
+                ws.debug_target(target.clone(), window, cx);
             }
             PickerEvent::OpenLocation { location, encoding } => {
                 ws.close_modal(window, cx);
@@ -3609,6 +3884,8 @@ impl Workspace {
                         cx.notify();
                     }),
                     Some(MenuAction::Encoding(encoding, editor)) => ws.choose_encoding(encoding, editor, window, cx),
+                    Some(MenuAction::Launch(target, true)) => ws.debug_target(target, window, cx),
+                    Some(MenuAction::Launch(target, false)) => ws.run_target(target, window, cx),
                     None => {}
                 }
             }
@@ -6121,6 +6398,16 @@ impl Workspace {
                     .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
                 )
             })
+            .when(self.debug.is_some(), |el| {
+                el.child(
+                    self.icon_button("toggle-debug", Icon::Bug, self.show_debug, cx, |ws, _, window, cx| {
+                        ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
+                    })
+                    .size(px(22.))
+                    .mx(px(3.))
+                    .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
+                )
+            })
             .child(
                 self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
                     ws.toggle_terminal(&ToggleTerminal, window, cx)
@@ -6252,6 +6539,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::split_terminal))
             .on_action(cx.listener(Self::select_opened_file))
+            .on_action(cx.listener(Self::debug_configuration))
+            .on_action(cx.listener(Self::resume))
+            .on_action(cx.listener(Self::pause_program))
+            .on_action(cx.listener(Self::step_over))
+            .on_action(cx.listener(Self::step_into))
+            .on_action(cx.listener(Self::step_out))
+            .on_action(cx.listener(Self::toggle_debug_panel))
             .on_action(cx.listener(Self::install_shell_command))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
@@ -6300,7 +6594,8 @@ impl Render for Workspace {
                             .child(div().flex_1().min_h_0().overflow_hidden().child(panes))
                             .when(self.show_problems, |el| el.child(self.render_problems(cx)))
                             .when(self.show_terminal, |el| el.child(terminal_panel.unwrap()))
-                            .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx))),
+                            .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx)))
+                            .when(self.show_debug, |el| el.children(self.render_debug_panel(cx))),
                     ),
             )
             .child(self.render_statusbar(cx)))

@@ -1,17 +1,31 @@
-//! The gutter's ▶ buttons and Run at caret: runnable functions and tests
-//! in the file (see `crate::run`), run by the workspace in a Run tab.
+//! The gutter's ▶ buttons, Run and Debug at caret (runnable functions and
+//! tests in the file, see `crate::run`, run by the workspace in a Run tab
+//! or a debug session), and the file's breakpoints.
 
 use std::sync::Arc;
 
-use gpui::{Context, Window};
+use gpui::{Context, Pixels, Point, Window};
 
-use super::{Editor, EditorLspEvent};
-use crate::run::{self, RunTarget};
+use super::{Editor, EditorLspEvent, EditorMode};
+use crate::{
+    run::{self, RunTarget},
+    syntax::Language,
+};
 
-/// Run this (from a gutter ▶ or Run at caret).
-pub struct EditorRunEvent(pub RunTarget);
+/// Run or debug this (from a gutter ▶, Run or Debug at caret).
+pub struct EditorRunEvent {
+    pub target: RunTarget,
+    pub debug: bool,
+    /// A ▶ was clicked here: offer Run and Debug.
+    pub menu_at: Option<Point<Pixels>>,
+}
 
 impl gpui::EventEmitter<EditorRunEvent> for Editor {}
+
+/// This file's breakpoints changed (a running debug session needs them).
+pub struct EditorBreakpointsChanged;
+
+impl gpui::EventEmitter<EditorBreakpointsChanged> for Editor {}
 
 impl Editor {
     /// What can run in this file (cached per version).
@@ -36,20 +50,81 @@ impl Editor {
         self.run_targets().iter().find(|t| t.row == Some(row)).cloned()
     }
 
-    /// Run at caret (⌃⇧R / Ctrl+Shift+F10): the innermost test or function
-    /// around the caret, else the file's first runnable thing.
-    pub(super) fn run_at_caret(&mut self, _: &super::RunAtCaret, _: &mut Window, cx: &mut Context<Self>) {
+    /// The innermost test or function around the caret, else the file's
+    /// first runnable thing (only debuggable ones when `debug`).
+    fn target_at_caret(&mut self, debug: bool) -> Option<RunTarget> {
         let row = self.doc.row_of(self.primary_selection().head);
         let targets = self.run_targets();
-        let target = targets
+        let usable = |t: &&RunTarget| !debug || t.debug.is_some();
+        targets
             .iter()
+            .filter(usable)
             .filter(|t| t.rows.contains(&row))
             .min_by_key(|t| t.rows.len())
-            .or_else(|| targets.first())
-            .cloned();
-        match target {
-            Some(target) => cx.emit(EditorRunEvent(target)),
+            .or_else(|| targets.iter().find(usable))
+            .cloned()
+    }
+
+    /// Run at caret (⌃⇧R / Ctrl+Shift+F10).
+    pub(super) fn run_at_caret(&mut self, _: &super::RunAtCaret, _: &mut Window, cx: &mut Context<Self>) {
+        match self.target_at_caret(false) {
+            Some(target) => cx.emit(EditorRunEvent { target, debug: false, menu_at: None }),
             None => cx.emit(EditorLspEvent::Message("Nothing to run here".into())),
+        }
+    }
+
+    /// Debug at caret (⌃⇧D / Ctrl+Shift+F9).
+    pub(super) fn debug_at_caret(&mut self, _: &super::DebugAtCaret, _: &mut Window, cx: &mut Context<Self>) {
+        match self.target_at_caret(true) {
+            Some(target) => cx.emit(EditorRunEvent { target, debug: true, menu_at: None }),
+            None => cx.emit(EditorLspEvent::Message("Nothing to debug here".into())),
+        }
+    }
+
+    // ---- Breakpoints ---------------------------------------------------------------
+
+    /// Breakpoints only go where a debugger can stop.
+    pub(super) fn can_break(&self) -> bool {
+        self.mode == EditorMode::Full
+            && self.doc.path.is_some()
+            && matches!(self.doc.language, Language::Rust | Language::Go | Language::Python)
+    }
+
+    pub(super) fn toggle_breakpoint_at(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.doc.toggle_breakpoint(row);
+        cx.emit(EditorBreakpointsChanged);
+        cx.notify();
+    }
+
+    /// Toggle Line Breakpoint (⌘F8 / F9) on the caret's line.
+    pub(super) fn toggle_breakpoint(&mut self, _: &super::ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_break() {
+            cx.emit(EditorLspEvent::Message("Breakpoints work in Rust, Go and Python files".into()));
+            return;
+        }
+        let mut rows: Vec<usize> = self.selections.iter().map(|s| self.doc.row_of(s.head)).collect();
+        rows.dedup();
+        for row in rows {
+            self.doc.toggle_breakpoint(row);
+        }
+        cx.emit(EditorBreakpointsChanged);
+        cx.notify();
+    }
+
+    pub fn breakpoint_rows(&self) -> Vec<usize> {
+        self.doc.breakpoint_rows()
+    }
+
+    pub fn set_breakpoint_rows(&mut self, rows: &[usize], cx: &mut Context<Self>) {
+        self.doc.set_breakpoint_rows(rows);
+        cx.notify();
+    }
+
+    /// Highlights the line a debug session paused on (None: running or done).
+    pub fn set_debug_line(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        if self.debug_line != row {
+            self.debug_line = row;
+            cx.notify();
         }
     }
 }

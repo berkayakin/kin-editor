@@ -70,6 +70,8 @@ platform-native text rendering (CoreText / DirectWrite).
   folds are kept with the project
 - Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
   move them between panes; pinned tabs; a tab menu with Close Others / All / to the Right
+- Debugger for Rust, Go and Python (lldb-dap, Delve, debugpy): breakpoints in the gutter,
+  stepping, frames, variables, watches and an evaluating console; see [Debugging](#debugging)
 - Run and test: ▶ in the gutter next to tests and `main` functions (Rust, Go, Python, JS/TS),
   project commands (cargo, npm scripts, go, make, pytest) and your own run configurations, each
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
@@ -201,6 +203,9 @@ The table below is the JetBrains keymap.
 | Run… / Run again | ⌃⌥R / ⌃R | Alt+Shift+F10 / Shift+F10 |
 | Run test or function at caret | ⌃⇧R | Ctrl+Shift+F10 |
 | Stop | ⌘F2 | Ctrl+F2 |
+| Debug… / Debug at caret | ⌃⌥D / ⌃⇧D | Alt+Shift+F9 / Ctrl+Shift+F9 |
+| Toggle line breakpoint | ⌘F8 | Ctrl+F8 |
+| Resume / Step Over / Into / Out | ⌥⌘R / F8 / F7 / ⇧F8 | F9 / F8 / F7 / Shift+F8 |
 | Split and Move Right / Down | ⌘\\ / ⌘⇧\\ | Ctrl+\\ / Ctrl+Shift+\\ |
 | Next pane | ⌥⇥ | — |
 | New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
@@ -365,6 +370,35 @@ Unsaved files are saved first. Add your own commands in `settings.json`:
 
 `cwd` is relative to the project folder. Commands run through your login shell, so aliases and
 PATH work as in the terminal.
+
+## Debugging
+
+Rust, Go and Python tests and programs can run under a debugger, through the
+[Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/) (the one VS Code and Zed use):
+
+- **Breakpoints**: click a line number (it becomes a red dot) or use **Toggle Line Breakpoint**
+  (⌘F8 / Ctrl+F8; F9 in the VS Code and Zed keymaps). They move with their lines as you edit and are
+  kept with the project.
+- **Start**: click a gutter ▶ and pick **Debug**, use **Debug at Caret** (⌃⇧D / Ctrl+Shift+F9) or
+  **Debug…** (⌃⌥D / Alt+Shift+F9) for the project's configurations, or the Run menu. Unsaved files
+  are saved first; Rust is built with cargo (its output shows in the console).
+- **The Debug panel** (bottom area; the bug button in the status bar brings it back) shows the
+  stepping toolbar, the paused thread's frames (click one to see its line and variables), variables
+  you can expand, watch expressions, and a console with the program's output that also evaluates
+  expressions in the selected frame. The line the program is paused on is highlighted.
+- **Stepping**: Resume ⌥⌘R / F9, Step Over F8, Step Into F7, Step Out ⇧F8, Stop ⌘F2 (in the VS Code
+  and Zed keymaps: F5, F10, F11, ⇧F11, ⇧F5, and Pause F6). F5 also starts debugging again.
+
+Nothing is downloaded; the adapters come from your system:
+
+| Language | Adapter | Install |
+| --- | --- | --- |
+| Rust | `lldb-dap` (with Rust's own formatters, so `String`, `Vec` and `Option` read naturally) | Xcode's command line tools (`xcode-select --install`) or LLVM |
+| Go | Delve (`dlv dap`) | `go install github.com/go-delve/delve/cmd/dlv@latest` |
+| Python | debugpy, in the project's `.venv` / `venv` or `python3` | `python3 -m pip install debugpy` |
+
+One session runs at a time. Breakpoints are plain line breakpoints (no conditions or logpoints yet),
+and attaching to a running process isn't supported.
 
 ## Settings
 

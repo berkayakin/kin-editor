@@ -20,6 +20,21 @@ pub struct RunTarget {
     pub row: Option<usize>,
     /// Lines it spans (the function or block), for Run at caret.
     pub rows: std::ops::Range<usize>,
+    /// How to start it under a debugger instead, when that's possible.
+    pub debug: Option<DebugSpec>,
+}
+
+/// What a debug session starts (see `crate::debugger`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebugSpec {
+    /// Rust: cargo builds it (`build …` or `test --no-run …`), then lldb-dap
+    /// runs the executable it made with `args`.
+    Cargo { build: Vec<String>, args: Vec<String> },
+    /// Go, through Delve: mode "debug" (a main package) or "test", the
+    /// package folder (or a file), and the program's arguments.
+    Go { mode: &'static str, program: PathBuf, args: Vec<String> },
+    /// Python, through debugpy: a script, or a module (pytest) with arguments.
+    Python { program: Option<PathBuf>, module: Option<String>, args: Vec<String> },
 }
 
 /// Quotes for a POSIX shell when needed.
@@ -39,14 +54,31 @@ fn node_text<'a>(node: Node, text: &'a str) -> &'a str {
     &text[node.byte_range()]
 }
 
-fn target(name: String, command: String, cwd: &Path, node: Node, header: Node) -> RunTarget {
+fn target(name: String, command: String, cwd: &Path, node: Node, header: Node, debug: Option<DebugSpec>) -> RunTarget {
     RunTarget {
         name,
         command,
         cwd: cwd.to_path_buf(),
         row: Some(header.start_position().row),
         rows: node.start_position().row..node.end_position().row + 1,
+        debug,
     }
+}
+
+/// `[package] name` from a Cargo.toml (the default binary's name).
+fn cargo_package_name(crate_dir: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in manifest.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package
+            && let Some(value) = line.strip_prefix("name").map(str::trim_start).and_then(|l| l.strip_prefix('='))
+        {
+            return Some(value.trim().trim_matches(['"', '\'']).to_string());
+        }
+    }
+    None
 }
 
 /// Runnable things in a file, for the gutter and Run at caret.
@@ -96,6 +128,30 @@ fn rust_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
         String::new()
     };
     let module = rust_module_path(path, &crate_dir);
+    // Which compile target a debug build picks: one executable, so lldb has
+    // exactly one program to run.
+    let package = cargo_package_name(&crate_dir);
+    let cargo_target: Vec<String> = if rel_str.starts_with("tests/") {
+        vec!["--test".into(), stem.clone()]
+    } else if rel_str.starts_with("src/bin/") {
+        vec!["--bin".into(), stem.clone()]
+    } else if rel_str.starts_with("examples/") {
+        vec!["--example".into(), stem.clone()]
+    } else if rel_str != "src/main.rs" && crate_dir.join("src/lib.rs").is_file() {
+        vec!["--lib".into()]
+    } else {
+        package.iter().flat_map(|p| ["--bin".to_string(), p.clone()]).collect()
+    };
+    let debug_test = |filter: &str, exact: bool| {
+        let mut build = vec!["test".to_string(), "--no-run".into()];
+        build.extend(cargo_target.clone());
+        let mut args = vec![filter.to_string()];
+        if exact {
+            args.push("--exact".into());
+        }
+        args.push("--nocapture".into());
+        Some(DebugSpec::Cargo { build, args })
+    };
 
     fn has_test_attr(node: Node, text: &str) -> bool {
         let mut prev = node.prev_named_sibling();
@@ -137,19 +193,24 @@ fn rust_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
                     &crate_dir,
                     node,
                     name,
+                    debug_test(&filter, true),
                 ));
             }
             "function_item" if ident == "main" && mods.is_empty() && is_main_file => {
                 let run = if target_flag.contains("--test") { String::new() } else { target_flag.clone() };
                 let label = if stem == "main" { "main" } else { stem.as_str() };
-                out.push(target(format!("Run '{label}'"), format!("cargo run{run}"), &crate_dir, node, name));
+                let mut build = vec!["build".to_string()];
+                build.extend(cargo_target.clone());
+                let debug = Some(DebugSpec::Cargo { build, args: Vec::new() });
+                out.push(target(format!("Run '{label}'"), format!("cargo run{run}"), &crate_dir, node, name, debug));
             }
             "mod_item"
                 if node.child_by_field_name("body").is_some()
                     && (node_text(node, text).contains("#[test") || has_cfg_test(node, text)) =>
             {
                 let filter = full.join("::");
-                out.push(target(format!("Tests in '{ident}'"), format!("cargo test{target_flag} -- {}", sh_quote(&filter)), &crate_dir, node, name));
+                let command = format!("cargo test{target_flag} -- {}", sh_quote(&filter));
+                out.push(target(format!("Tests in '{ident}'"), command, &crate_dir, node, name, debug_test(&filter, false)));
             }
             _ => {}
         }
@@ -171,16 +232,25 @@ fn go_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
         let Some(name) = node.child_by_field_name("name") else { continue };
         let ident = node_text(name, text);
         if is_test_file && (ident.starts_with("Test") || ident.starts_with("Benchmark") || ident.starts_with("Example")) {
-            let flag = if ident.starts_with("Benchmark") { "-bench" } else { "-run" };
+            let bench = ident.starts_with("Benchmark");
+            let flag = if bench { "-bench" } else { "-run" };
+            let pattern = format!("^{ident}$");
+            let args = if bench {
+                vec!["-test.run".into(), "^$".into(), "-test.bench".into(), pattern.clone()]
+            } else {
+                vec!["-test.run".into(), pattern.clone()]
+            };
             out.push(target(
                 format!("Test '{ident}'"),
-                format!("go test {flag} {} .", sh_quote(&format!("^{ident}$"))),
+                format!("go test {flag} {} .", sh_quote(&pattern)),
                 dir,
                 node,
                 name,
+                Some(DebugSpec::Go { mode: "test", program: dir.to_path_buf(), args }),
             ));
         } else if ident == "main" && is_main_package {
-            out.push(target("Run 'main'".into(), "go run .".into(), dir, node, name));
+            let debug = Some(DebugSpec::Go { mode: "debug", program: dir.to_path_buf(), args: Vec::new() });
+            out.push(target("Run 'main'".into(), "go run .".into(), dir, node, name, debug));
         }
     }
 }
@@ -198,7 +268,8 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                 let Some(name) = node.child_by_field_name("name") else { continue };
                 let ident = node_text(name, text);
                 if ident.starts_with("test") {
-                    out.push(target(format!("Test '{ident}'"), format!("python3 -m pytest {file}::{ident}"), dir, node, name));
+                    let debug = pytest(path, &[ident]);
+                    out.push(target(format!("Test '{ident}'"), format!("python3 -m pytest {file}::{ident}"), dir, node, name, debug));
                 }
             }
             "class_definition" => {
@@ -207,7 +278,8 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                 if !class.starts_with("Test") {
                     continue;
                 }
-                out.push(target(format!("Tests in '{class}'"), format!("python3 -m pytest {file}::{class}"), dir, node, name));
+                let debug = pytest(path, &[class]);
+                out.push(target(format!("Tests in '{class}'"), format!("python3 -m pytest {file}::{class}"), dir, node, name, debug));
                 let Some(body) = node.child_by_field_name("body") else { continue };
                 let mut c = body.walk();
                 for method in body.named_children(&mut c) {
@@ -222,16 +294,28 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                     let Some(mname) = method.child_by_field_name("name") else { continue };
                     let m = node_text(mname, text);
                     if m.starts_with("test") {
-                        out.push(target(format!("Test '{m}'"), format!("python3 -m pytest {file}::{class}::{m}"), dir, method, mname));
+                        let debug = pytest(path, &[class, m]);
+                        out.push(target(format!("Test '{m}'"), format!("python3 -m pytest {file}::{class}::{m}"), dir, method, mname, debug));
                     }
                 }
             }
             "if_statement" if node_text(node, text).starts_with("if __name__") => {
-                out.push(target("Run file".into(), format!("python3 {file}"), dir, node, node));
+                let debug = Some(DebugSpec::Python { program: Some(path.to_path_buf()), module: None, args: Vec::new() });
+                out.push(target("Run file".into(), format!("python3 {file}"), dir, node, node, debug));
             }
             _ => {}
         }
     }
+}
+
+/// Debugging a pytest node (`file::Class::test`).
+fn pytest(path: &Path, parts: &[&str]) -> Option<DebugSpec> {
+    let mut id = path.to_string_lossy().into_owned();
+    for part in parts {
+        id.push_str("::");
+        id.push_str(part);
+    }
+    Some(DebugSpec::Python { program: None, module: Some("pytest".into()), args: vec![id] })
 }
 
 // ---- JavaScript / TypeScript -------------------------------------------------------
@@ -276,7 +360,7 @@ fn js_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
             _ => format!("node --test --test-name-pattern={} {file}", sh_quote(&pattern)),
         };
         let label = if base == "describe" { format!("Tests in '{title}'") } else { format!("Test '{title}'") };
-        out.push(target(label, command, &package_dir, node, node));
+        out.push(target(label, command, &package_dir, node, node, None));
     }
 }
 
@@ -286,17 +370,24 @@ fn js_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
 /// current file.
 pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<RunTarget> {
     let mut out = Vec::new();
-    let mut add = |name: String, command: String, cwd: &Path| {
-        out.push(RunTarget { name, command, cwd: cwd.to_path_buf(), row: None, rows: 0..0 });
+    let mut add = |name: String, command: String, cwd: &Path, debug: Option<DebugSpec>| {
+        out.push(RunTarget { name, command, cwd: cwd.to_path_buf(), row: None, rows: 0..0, debug });
     };
+    let cargo = |build: &[&str]| Some(DebugSpec::Cargo { build: build.iter().map(|s| s.to_string()).collect(), args: Vec::new() });
     if root.join("Cargo.toml").is_file() {
-        add("cargo run".into(), "cargo run".into(), root);
-        add("cargo test".into(), "cargo test".into(), root);
-        add("cargo build".into(), "cargo build".into(), root);
+        // The default binary by name, so the debug build makes one executable.
+        let run_debug = match cargo_package_name(root) {
+            Some(bin) if root.join("src/main.rs").is_file() => cargo(&["build", "--bin", &bin]),
+            _ => None,
+        };
+        add("cargo run".into(), "cargo run".into(), root, run_debug);
+        add("cargo test".into(), "cargo test".into(), root, None);
+        add("cargo build".into(), "cargo build".into(), root, None);
         if let Ok(bins) = std::fs::read_dir(root.join("src/bin")) {
             for bin in bins.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "rs")) {
                 let name = bin.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                add(format!("cargo run --bin {name}"), format!("cargo run --bin {}", sh_quote(&name)), root);
+                let debug = cargo(&["build", "--bin", &name]);
+                add(format!("cargo run --bin {name}"), format!("cargo run --bin {}", sh_quote(&name)), root, debug);
             }
         }
     }
@@ -314,13 +405,14 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
             "npm"
         };
         for name in scripts.keys() {
-            add(format!("{manager} run {name}"), format!("{manager} run {}", sh_quote(name)), root);
+            add(format!("{manager} run {name}"), format!("{manager} run {}", sh_quote(name)), root, None);
         }
     }
     if root.join("go.mod").is_file() {
-        add("go run .".into(), "go run .".into(), root);
-        add("go test ./...".into(), "go test ./...".into(), root);
-        add("go build ./...".into(), "go build ./...".into(), root);
+        let debug = Some(DebugSpec::Go { mode: "debug", program: root.to_path_buf(), args: Vec::new() });
+        add("go run .".into(), "go run .".into(), root, debug);
+        add("go test ./...".into(), "go test ./...".into(), root, None);
+        add("go build ./...".into(), "go build ./...".into(), root, None);
     }
     if let Ok(makefile) = std::fs::read_to_string(root.join("Makefile")) {
         for line in makefile.lines() {
@@ -330,28 +422,35 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
                 continue;
             }
             for t in target.split_whitespace() {
-                add(format!("make {t}"), format!("make {}", sh_quote(t)), root);
+                add(format!("make {t}"), format!("make {}", sh_quote(t)), root, None);
             }
         }
     }
     if root.join("pyproject.toml").is_file() || root.join("pytest.ini").is_file() {
-        add("pytest".into(), "python3 -m pytest".into(), root);
+        let debug = Some(DebugSpec::Python { program: None, module: Some("pytest".into()), args: Vec::new() });
+        add("pytest".into(), "python3 -m pytest".into(), root, debug);
     }
     if let Some((path, language)) = current {
         let file = sh_quote(&path.to_string_lossy());
         let dir = path.parent().unwrap_or(root);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let command = match language {
-            Language::Python => Some(format!("python3 {file}")),
-            Language::JavaScript => Some(format!("node {file}")),
-            Language::TypeScript | Language::Tsx => Some(format!("npx tsx {file}")),
-            Language::Shell => Some(format!("bash {file}")),
-            Language::Go => Some(format!("go run {file}")),
-            Language::Php => Some(format!("php {file}")),
-            _ => None,
+        let (command, debug) = match language {
+            Language::Python => {
+                let debug = DebugSpec::Python { program: Some(path.to_path_buf()), module: None, args: Vec::new() };
+                (Some(format!("python3 {file}")), Some(debug))
+            }
+            Language::JavaScript => (Some(format!("node {file}")), None),
+            Language::TypeScript | Language::Tsx => (Some(format!("npx tsx {file}")), None),
+            Language::Shell => (Some(format!("bash {file}")), None),
+            Language::Go => {
+                let debug = DebugSpec::Go { mode: "debug", program: path.to_path_buf(), args: Vec::new() };
+                (Some(format!("go run {file}")), Some(debug))
+            }
+            Language::Php => (Some(format!("php {file}")), None),
+            _ => (None, None),
         };
         if let Some(command) = command {
-            add(format!("Run '{name}'"), command, dir);
+            add(format!("Run '{name}'"), command, dir, debug);
         }
     }
     out

@@ -10,7 +10,7 @@ mod snippet;
 mod sticky;
 
 pub use lsp::EditorLspEvent;
-pub use run::EditorRunEvent;
+pub use run::{EditorBreakpointsChanged, EditorRunEvent};
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -129,6 +129,8 @@ actions!(
         CollapseAllRegions,
         ExpandAllRegions,
         RunAtCaret,
+        DebugAtCaret,
+        ToggleBreakpoint,
         /// ⌘↩ / Ctrl+Enter: "new line below" in code, "submit" in text fields.
         Submit,
     ]
@@ -277,6 +279,8 @@ pub struct Editor {
     gutter_hovered: bool,
     /// Runnable targets for a version (gutter ▶).
     run_cache: Option<(u64, Arc<Vec<crate::run::RunTarget>>)>,
+    /// The row a debug session is paused on (highlighted).
+    debug_line: Option<usize>,
     /// Format, dimensions and size of an image document (read on first show).
     image_info: Option<crate::preview::ImageInfo>,
     /// Merge conflicts for a version.
@@ -344,6 +348,7 @@ impl Editor {
             sticky_rows: Vec::new(),
             gutter_hovered: false,
             run_cache: None,
+            debug_line: None,
             conflict_cache: None,
             conflict_hits: Vec::new(),
             image_info: None,
@@ -1994,7 +1999,20 @@ impl Editor {
                 if seg == 0
                     && let Some(target) = self.run_target_at(row)
                 {
-                    cx.emit(EditorRunEvent(target));
+                    cx.emit(EditorRunEvent { target, debug: false, menu_at: Some(event.position) });
+                    return;
+                }
+            }
+            // A line number sets or clears a breakpoint (in files that can be debugged).
+            let number_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT + 18.);
+            if self.can_break()
+                && event.position.x >= layout.bounds.left() + px(5. + RUN_ICON + 4.)
+                && event.position.x <= number_right + px(4.)
+            {
+                let y = event.position.y - layout.bounds.top() + self.scroll.y;
+                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
+                if seg == 0 && row < self.doc.line_count() {
+                    self.toggle_breakpoint_at(row, cx);
                     return;
                 }
             }
@@ -2333,6 +2351,7 @@ impl Editor {
             .filter(|d| d.range.start <= range_end && d.range.end >= range_start)
             .collect();
 
+        let breakpoints: Vec<usize> = if single { Vec::new() } else { self.doc.breakpoint_rows() };
         let head_rows: Vec<usize> = self
             .selections
             .iter()
@@ -2490,6 +2509,14 @@ impl Editor {
                     let continues = if last_seg { past_line_end } else { de >= seg_range.end };
                     (s < e || continues).then_some((s, e, continues))
                 };
+
+                // The line a debug session is paused on.
+                if self.debug_line == Some(row) && !single {
+                    frame.backgrounds.push(fill(
+                        Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
+                        Hsla::from(theme.warning).alpha(0.16),
+                    ));
+                }
 
                 // Current line highlight.
                 if is_cursor_row && self.selections.len() == 1 && !single {
@@ -2659,7 +2686,13 @@ impl Editor {
                 // Gutter: line number and diagnostic dot, on the line's first row.
                 if first_seg {
                     let number = SharedString::from((row + 1).to_string());
-                    let number_color = if is_cursor_row { theme.line_number_active } else { theme.line_number };
+                    let number_color = if self.debug_line == Some(row) {
+                        theme.warning
+                    } else if is_cursor_row {
+                        theme.line_number_active
+                    } else {
+                        theme.line_number
+                    };
                     let number_line = text_system.shape_line(
                         number.clone(),
                         font_size,
@@ -2674,7 +2707,16 @@ impl Editor {
                         None,
                     );
                     let nx = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.) - number_line.width;
-                    frame.numbers.push((point(nx, y), number_line));
+                    if breakpoints.contains(&row) {
+                        // A breakpoint covers its line number, as in JetBrains.
+                        let d = (line_height * 0.62).min(px(13.));
+                        let right = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.);
+                        frame.gutter_marks.push(
+                            fill(Bounds::new(point(right - d, y + (line_height - d) / 2.), size(d, d)), theme.error).corner_radii(d / 2.),
+                        );
+                    } else {
+                        frame.numbers.push((point(nx, y), number_line));
+                    }
 
                     let folded = self.fold_under(row).is_some();
                     let foldable = !folded
@@ -3805,6 +3847,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::collapse_all))
             .on_action(cx.listener(Self::expand_all))
             .on_action(cx.listener(Self::run_at_caret))
+            .on_action(cx.listener(Self::debug_at_caret))
+            .on_action(cx.listener(Self::toggle_breakpoint))
             .on_action(cx.listener(Self::submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))

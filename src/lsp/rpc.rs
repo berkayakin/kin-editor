@@ -191,7 +191,7 @@ fn read_loop(
 }
 
 /// Reads one `Content-Length`-framed message; None at end of stream.
-fn read_message(reader: &mut impl BufRead) -> Option<Value> {
+pub(crate) fn read_message(reader: &mut impl BufRead) -> Option<Value> {
     loop {
         let mut length = None;
         let mut line = String::new();

@@ -94,6 +94,9 @@ pub struct Document {
     /// Folded (hidden) text: from the start of the first hidden line to the
     /// end of the last. Edits that touch a fold open it.
     folds: Vec<Range<usize>>,
+    /// Line breakpoints, as the offsets their lines start at (sorted), so
+    /// they stay on their lines as text is edited above them.
+    breakpoints: Vec<usize>,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// Modification time of the file when it was last read or written, to
@@ -167,6 +170,7 @@ impl Document {
             large: false,
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
+            breakpoints: Vec::new(),
             snippet: None,
             disk_mtime: None,
             image: None,
@@ -267,7 +271,10 @@ impl Document {
         if text == self.rope.to_string() {
             return false;
         }
+        // Breakpoints keep their line numbers across a reload.
+        let breakpoints = self.breakpoint_rows();
         self.rope = Rope::from_str(&text);
+        self.set_breakpoint_rows(&breakpoints);
         self.syntax = Syntax::new(self.language, &self.rope);
         self.lsp_changes.mark_full();
         self.folds.clear();
@@ -502,6 +509,7 @@ impl Document {
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
         self.shift_folds(&range, text.len());
+        self.shift_breakpoints(&range, text.len());
         if let Some(snippet) = &mut self.snippet
             && !snippet.shift(&range, text.len())
         {
@@ -546,6 +554,56 @@ impl Document {
         let before = self.folds.len();
         self.folds.retain(|f| !unfold(f));
         self.folds.len() != before
+    }
+
+    /// Rows (0-based) with a breakpoint.
+    pub fn breakpoint_rows(&self) -> Vec<usize> {
+        self.breakpoints.iter().map(|&o| self.row_of(o)).collect()
+    }
+
+    pub fn set_breakpoint_rows(&mut self, rows: &[usize]) {
+        let lines = self.line_count();
+        self.breakpoints = rows.iter().filter(|&&r| r < lines).map(|&r| self.line_start(r)).collect();
+        self.breakpoints.sort_unstable();
+        self.breakpoints.dedup();
+    }
+
+    /// Adds or removes the breakpoint on `row`; true when one is there now.
+    pub fn toggle_breakpoint(&mut self, row: usize) -> bool {
+        let start = self.line_start(row);
+        match self.breakpoints.binary_search(&start) {
+            Ok(ix) => {
+                self.breakpoints.remove(ix);
+                false
+            }
+            Err(ix) => {
+                self.breakpoints.insert(ix, start);
+                true
+            }
+        }
+    }
+
+    /// Breakpoints follow their line's text: an edit before a line moves
+    /// it, one that removes the line's start removes it. (Runs after the
+    /// rope changed, so lines can be looked up again.)
+    fn shift_breakpoints(&mut self, range: &Range<usize>, new_len: usize) {
+        if self.breakpoints.is_empty() {
+            return;
+        }
+        let delta = new_len as isize - range.len() as isize;
+        let mut moved: Vec<usize> = Vec::with_capacity(self.breakpoints.len());
+        for &offset in &self.breakpoints {
+            if range.start < offset && offset <= range.end {
+                continue;
+            }
+            let offset = if offset >= range.end { (offset as isize + delta) as usize } else { offset };
+            // Typing at the start of a line leaves it where it is; a new
+            // line inserted there pushes it down.
+            let offset = offset.min(self.rope.len_bytes());
+            moved.push(self.line_start(self.row_of(offset)));
+        }
+        moved.dedup();
+        self.breakpoints = moved;
     }
 
     /// Folds move with edits before them; an edit touching one opens it.
@@ -680,6 +738,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn breakpoints_follow_their_lines() {
+        let mut doc = Document::from_text("a\nb\nc\nd\n".into(), None);
+        assert!(doc.toggle_breakpoint(2));
+        assert_eq!(doc.breakpoint_rows(), [2]);
+        // A line added above moves it down; typing at its start doesn't.
+        doc.edit(vec![(0..0, "new\n".into())], &[], EditKind::Other);
+        assert_eq!(doc.breakpoint_rows(), [3]);
+        let c = doc.line_start(3);
+        doc.edit(vec![(c..c, "x".into())], &[], EditKind::Other);
+        assert_eq!(doc.breakpoint_rows(), [3]);
+        // Joining it with the line above removes it.
+        doc.edit(vec![(c - 1..c, String::new())], &[], EditKind::Other);
+        assert!(doc.breakpoint_rows().is_empty());
+        doc.set_breakpoint_rows(&[0, 9]);
+        assert_eq!(doc.breakpoint_rows(), [0]);
+        assert!(!doc.toggle_breakpoint(0));
+    }
 
     #[test]
     fn folds_follow_edits() {
