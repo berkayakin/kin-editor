@@ -47,11 +47,12 @@ pub enum Page {
     Extensions,
     Keymap,
     Terminal,
+    Trust,
     Updates,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::Appearance,
         Page::Editor,
         Page::Saving,
@@ -59,6 +60,7 @@ impl Page {
         Page::Extensions,
         Page::Keymap,
         Page::Terminal,
+        Page::Trust,
         Page::Updates,
     ];
 
@@ -71,6 +73,7 @@ impl Page {
             Page::Extensions => "Extensions",
             Page::Keymap => "Keymap",
             Page::Terminal => "Terminal & Run",
+            Page::Trust => "Trust",
             Page::Updates => "Updates",
         }
     }
@@ -84,6 +87,7 @@ impl Page {
             Page::Extensions => "More languages, themes and snippets; Zed's extensions work too",
             Page::Keymap => "A base keymap to start from, and shortcuts for every action on top",
             Page::Terminal => "The terminal's shell and your own Run configurations",
+            Page::Trust => "Folders whose language servers, formatters and tools Kin may run",
             Page::Updates => "Getting new versions of Kin",
         }
     }
@@ -97,6 +101,7 @@ impl Page {
             Page::Extensions => Icon::Puzzle,
             Page::Keymap => Icon::Keyboard,
             Page::Terminal => Icon::Terminal,
+            Page::Trust => Icon::ShieldCheck,
             Page::Updates => Icon::Download,
         }
     }
@@ -121,11 +126,12 @@ enum Setting {
     FinalNewline,
     Shell,
     RunConfigurations,
+    TrustAll,
     AutoUpdate,
 }
 
 impl Setting {
-    const ALL: [Setting; 16] = [
+    const ALL: [Setting; 17] = [
         Setting::Theme,
         Setting::BaseKeymap,
         Setting::FontFamily,
@@ -141,6 +147,7 @@ impl Setting {
         Setting::FinalNewline,
         Setting::Shell,
         Setting::RunConfigurations,
+        Setting::TrustAll,
         Setting::AutoUpdate,
     ];
 
@@ -156,6 +163,7 @@ impl Setting {
             | Setting::TrimWhitespace
             | Setting::FinalNewline => Page::Saving,
             Setting::Shell | Setting::RunConfigurations => Page::Terminal,
+            Setting::TrustAll => Page::Trust,
             Setting::AutoUpdate => Page::Updates,
         }
     }
@@ -171,6 +179,7 @@ impl Setting {
             Setting::FormatOnSave | Setting::TrimWhitespace | Setting::FinalNewline => "On save",
             Setting::Shell => "Terminal",
             Setting::RunConfigurations => "Run configurations",
+            Setting::TrustAll => "Restricted Mode",
             Setting::AutoUpdate => "Updates",
         }
     }
@@ -192,6 +201,7 @@ impl Setting {
             Setting::FinalNewline => "Insert final newline",
             Setting::Shell => "Shell",
             Setting::RunConfigurations => "Run configurations",
+            Setting::TrustAll => "Trust all folders",
             Setting::AutoUpdate => "Update automatically",
         }
     }
@@ -213,6 +223,7 @@ impl Setting {
             Setting::FinalNewline => "End every file with a line break.",
             Setting::Shell => "Program and arguments for new terminals. Empty uses your login shell.",
             Setting::RunConfigurations => "Commands for Run… next to the detected ones (cargo, npm scripts, go, make, pytest).",
+            Setting::TrustAll => "Run language servers, formatters and project tools in every folder without asking. Not recommended.",
             Setting::AutoUpdate => "Download new versions from GitHub in the background. Restart to Update in the status bar installs them.",
         }
     }
@@ -235,6 +246,7 @@ impl Setting {
             Setting::FinalNewline => "newline end of file eof",
             Setting::Shell => "terminal bash zsh fish powershell",
             Setting::RunConfigurations => "run tasks commands scripts",
+            Setting::TrustAll => "trust security restricted mode workspace untrusted safe",
             Setting::AutoUpdate => "update upgrade version release download",
         }
     }
@@ -444,6 +456,7 @@ impl Preferences {
         let mut subscriptions = vec![
             // A grammar finished building, an extension came or went.
             cx.observe_global::<ExtensionsChanged>(|_, cx| cx.notify()),
+            cx.observe_global::<crate::trust::TrustChanged>(|_, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &EditorEvent, cx| {
                 this.menu = None;
                 this.scroll.set_offset(point(px(0.), px(0.)));
@@ -1034,6 +1047,7 @@ impl Preferences {
         match self.page {
             Page::Languages => return self.render_languages(window, cx).into_any_element(),
             Page::Extensions => return self.render_extensions(window, cx).into_any_element(),
+            Page::Trust => return self.render_trust(window, cx).into_any_element(),
             Page::Keymap => {
                 let theme = Theme::get(cx).clone();
                 let row = self.render_setting(Setting::BaseKeymap, window, cx);
@@ -1183,6 +1197,7 @@ impl Preferences {
             Setting::HardTabs => self.bool_switch("pref-hard-tabs", "hard_tabs", settings.editor.hard_tabs, cx),
             Setting::SoftWrap => self.bool_switch("pref-soft-wrap", "soft_wrap", settings.editor.soft_wrap, cx),
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
+            Setting::TrustAll => self.switch_with_default("pref-trust-all", "trust_all_projects", settings.trust_all_projects, false, cx),
             Setting::AutoUpdate => self.switch_with_default("pref-auto-update", "auto_update", settings.auto_update, true, cx),
             Setting::TrimWhitespace => {
                 self.bool_switch("pref-trim", "trim_trailing_whitespace", settings.editor.trim_trailing_whitespace, cx)
@@ -1772,6 +1787,47 @@ impl Preferences {
             )
     }
 
+    /// Restricted Mode's switch and the trusted folders, each removable.
+    fn render_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let switch_row = self.render_setting(Setting::TrustAll, window, cx);
+        let folders = crate::trust::folders();
+        let rows: Vec<AnyElement> = if folders.is_empty() {
+            vec![
+                div()
+                    .px_3()
+                    .py_2p5()
+                    .text_color(theme.text_dim)
+                    .child("No trusted folders yet. Opening a folder asks whether to trust it.")
+                    .into_any_element(),
+            ]
+        } else {
+            folders
+                .into_iter()
+                .enumerate()
+                .map(|(ix, folder)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2p5()
+                        .px_3()
+                        .py_2()
+                        .child(icon_el(Icon::Folder, px(15.), theme.text_muted.into()))
+                        .child(div().flex_1().min_w_0().truncate().text_color(theme.text).child(folder.display().to_string()))
+                        .child(
+                            icon_button(("trust-remove", ix), Icon::Trash, theme.text_muted.into(), cx)
+                                .tooltip(|_, cx| tooltip_view("Don't trust", cx))
+                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| crate::trust::untrust(&folder, cx))),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        };
+        self.body()
+            .child(section(Setting::TrustAll.section(), vec![switch_row], &theme))
+            .child(section("Trusted folders", rows, &theme))
+    }
+
     fn render_extension(&self, ix: usize, extension: ExtensionInfo, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut provides: Vec<String> = Vec::new();
         if !extension.languages.is_empty() {
@@ -2067,6 +2123,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::TrimWhitespace => "trim_trailing_whitespace",
         Setting::FinalNewline => "insert_final_newline",
         Setting::Shell => "terminal_shell",
+        Setting::TrustAll => "trust_all_projects",
         Setting::AutoUpdate => "auto_update",
     }
 }

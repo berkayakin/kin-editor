@@ -189,6 +189,10 @@ impl LspStore {
         if self.documents.get(&path).is_some_and(|d| d.editor.upgrade().as_ref() == Some(editor)) {
             return;
         }
+        // Servers run the project's code (build scripts, plugins, its own binaries).
+        if !crate::trust::is_trusted(&path) {
+            return;
+        }
         let Some((key, custom)) = self.server_key(language, &path, cx) else { return };
         let store = cx.weak_entity();
         editor.update(cx, |e, _| e.set_lsp(store));
@@ -405,6 +409,10 @@ impl LspStore {
                 }
             }
             Incoming::Closed { stderr_tail } => {
+                // Stopped on purpose (Restricted Mode, closing): nothing to report.
+                if !self.servers.contains_key(key) {
+                    return;
+                }
                 // rustup's proxy runs, but exits when the component is missing.
                 if let Some(ServerState::Starting(_, install)) = self.servers.get(key)
                     && (stderr_tail.contains("Unknown binary") || stderr_tail.contains("is not installed"))

@@ -145,8 +145,9 @@ impl TerminalView {
         };
         // A new shell activates the project's venv, typed in like a user would:
         // a login profile can reorder PATH set beforehand.
+        // The activate script is the project's own shell script.
         let activate = match (&run, &venv) {
-            (None, Some(venv)) => {
+            (None, Some(venv)) if crate::trust::is_trusted(&cwd) => {
                 let program = configured.as_ref().and_then(|c| c.first().cloned()).or_else(|| std::env::var("SHELL").ok());
                 let program = program.unwrap_or_else(|| if cfg!(windows) { "powershell".into() } else { "sh".into() });
                 crate::python::activate_command(venv, &program)

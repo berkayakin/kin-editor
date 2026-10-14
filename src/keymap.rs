@@ -27,7 +27,7 @@ use crate::{
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
-        AddLogpoint, OpenExtensions, ReloadExtensions,
+        AddLogpoint, OpenExtensions, ReloadExtensions, ProjectTrust,
         ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, SelectOpenedFile, InstallShellCommand,
     },
 };
@@ -95,6 +95,7 @@ fn common(mac: bool) -> Vec<KeyBinding> {
         // Dialogs and panels.
         KeyBinding::new("escape", Cancel, Some("DiffView")),
         KeyBinding::new("escape", Cancel, Some("PushDialog")),
+        KeyBinding::new("escape", Cancel, Some("TrustDialog")),
         KeyBinding::new("escape", Cancel, Some("About")),
         KeyBinding::new("enter", ConfirmPush, Some("PushDialog")),
         KeyBinding::new("secondary-enter", ConfirmPush, Some("PushDialog")),
@@ -754,6 +755,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Soft-Wrap", ToggleSoftWrap),
         a("Settings…", OpenSettings),
         a("Extensions…", OpenExtensions),
+        a("Project Trust…", ProjectTrust),
         a("Reload Extensions", ReloadExtensions),
         a("Preferences…", OpenSettings),
         a("Check for Updates…", CheckForUpdates),

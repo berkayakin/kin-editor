@@ -432,8 +432,11 @@ impl Editor {
         }
     }
 
-    fn detect_external_linter(&mut self) {
+    /// The project's ESLint, which runs its JavaScript config: only in a
+    /// trusted project.
+    pub fn detect_external_linter(&mut self) {
         self.external = match (&self.doc.path, self.doc.language) {
+            (Some(path), _) if !crate::trust::is_trusted(path) => None,
             (
                 Some(path),
                 crate::syntax::Language::JavaScript | crate::syntax::Language::TypeScript | crate::syntax::Language::Tsx,
@@ -693,6 +696,13 @@ impl Editor {
         self.schedule_lint(Duration::ZERO, cx);
         cx.notify();
         true
+    }
+
+    /// The project's trust changed: ESLint may run now, or must stop.
+    pub fn trust_changed(&mut self, cx: &mut Context<Self>) {
+        self.detect_external_linter();
+        self.linted_version = None;
+        self.schedule_lint(Duration::ZERO, cx);
     }
 
     pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {

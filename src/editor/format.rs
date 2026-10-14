@@ -29,8 +29,10 @@ impl Editor {
         .detach();
     }
 
+    /// Not in Restricted Mode, where formatters don't run (saving shouldn't
+    /// complain about it every time).
     pub fn format_on_save(&self) -> bool {
-        self.file_settings.format_on_save
+        self.file_settings.format_on_save && self.doc.path.as_deref().is_some_and(crate::trust::is_trusted)
     }
 
     /// Formats the document, or just the selection when `use_selection` and
@@ -41,6 +43,10 @@ impl Editor {
         let Some(path) = self.doc.path.clone() else {
             return Task::ready(Err("Save the file to format it".into()));
         };
+        // Formatters and servers may run the project's code (Prettier plugins, say).
+        if !crate::trust::is_trusted(&path) {
+            return Task::ready(Err("Formatting is off in Restricted Mode. Trust the project to use it.".into()));
+        }
         let language = self.doc.language;
         let configured = Settings::get(cx).formatters.get(language.name()).cloned();
         let command: Option<Vec<String>> = match &configured {

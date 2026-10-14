@@ -126,6 +126,10 @@ pub struct Branch {
 
 fn command(root: &Path) -> Command {
     let mut cmd = crate::process::command("git");
+    // A repository's config can name a program for `git status` to run.
+    if !crate::trust::is_trusted(root) {
+        cmd.args(["-c", "core.fsmonitor=false"]);
+    }
     cmd.current_dir(root)
         // Never block on an interactive prompt: fail fast instead.
         .env("GIT_TERMINAL_PROMPT", "0")

@@ -76,6 +76,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Debugger for Rust, Go, Python and JavaScript/TypeScript (lldb-dap, Delve, debugpy, js-debug):
   breakpoints with conditions and logpoints, attaching to running processes, stepping, frames,
   variables, watches and an evaluating console; see [Debugging](#debugging)
+- Restricted Mode for folders you haven't trusted (like VS Code and Zed): no language servers,
+  formatters or project tools until you do; see [Project trust](#project-trust)
 - Python virtual environments detected per project and used by terminals, Run, the debugger,
   language servers and formatters; see [Python environments](#python-environments)
 - Run and test: ▶ in the gutter next to tests and `main` functions (Rust, Go, Python, JS/TS),
@@ -353,6 +355,21 @@ current one; press it again to unsplit (both stay as tabs).
 the scrollback and on screen and jumps to the newest; ↵ or ↑ goes to older ones, ⇧↵ or ↓ to newer,
 Esc closes it. Matching ignores case unless the query has capitals.
 
+## Project trust
+
+A cloned repository can make an editor run its code without asking: a language server builds it,
+ESLint and Prettier load its JavaScript config, `node_modules/.bin` and venv tools are its own
+programs, and Git runs a `core.fsmonitor` command from its config. So the first time you open a
+folder, Kin asks whether you trust it. Until you do, it stays in **Restricted Mode** (shown in the
+title bar): language servers don't start, formatters and ESLint don't run, the folder's own tools
+aren't used, terminals don't activate its venv, and Git ignores its fsmonitor. Editing, Git, Run
+and Debug work as usual.
+
+**Trust Folder** remembers the folder; tick **Trust every project in …** to trust its parent
+folder instead (for example the folder you keep your repositories in). Click **Restricted Mode**
+in the title bar or use **Project Trust…** to decide later or to stop trusting a folder.
+**Settings → Trust** lists trusted folders, and `trust_all_projects` turns the checks off.
+
 ## Python environments
 
 Kin finds the project's virtual environment: a `.venv`, `venv`, `env` or `.env` folder holding
@@ -562,6 +579,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
+| `trust_all_projects` | `false` | run language servers, formatters and project tools in every folder without asking; see [Project trust](#project-trust) |
 | `auto_update` | `true` | download new releases in the background; see [Releases and updates](#releases-and-updates) |
 
 ```jsonc

@@ -95,6 +95,7 @@ actions!(
         AddConditionalBreakpoint,
         AddLogpoint,
         OpenExtensions,
+        ProjectTrust,
         ReloadExtensions,
         Resume,
         PauseProgram,
@@ -372,6 +373,7 @@ enum Modal {
     Clone(Entity<CloneDialog>),
     Preferences(Entity<Preferences>),
     Push(Entity<PushDialog>),
+    Trust(Entity<crate::trust_dialog::TrustDialog>),
 }
 
 /// How long two Shift taps may be apart to count as a double Shift.
@@ -593,6 +595,8 @@ impl Workspace {
         let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
         // Extensions reloaded, or a grammar finished building.
         let extensions_observer = cx.observe_global::<extensions::ExtensionsChanged>(|ws, cx| ws.extensions_changed(cx));
+        // A folder was trusted or stopped being trusted (here or in another window).
+        let trust_observer = cx.observe_global::<crate::trust::TrustChanged>(|ws, cx| ws.trust_changed(cx));
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -699,6 +703,7 @@ impl Workspace {
                 settings_observer,
                 updater_observer,
                 extensions_observer,
+                trust_observer,
                 lsp_subscription,
                 lsp_observer,
                 cx.observe_window_bounds(window, |ws, window, cx| ws.remember_placement(window, cx)),
@@ -902,6 +907,9 @@ impl Workspace {
         self.lsp.update(cx, |s, _| s.set_root(root));
         if self.tabs.is_empty() {
             self.restore_session(window, cx);
+        }
+        if self.restricted(cx) && self.modal.is_none() {
+            self.open_trust_dialog(window, cx);
         }
         cx.notify();
     }
@@ -1111,6 +1119,7 @@ impl Workspace {
             font_zoom: saved.font_zoom,
             diff_side_by_side: saved.diff_side_by_side,
             recent_projects: saved.recent_projects,
+            trusted_folders: saved.trusted_folders,
             window: saved.window,
             onboarded: saved.onboarded,
         };
@@ -2912,6 +2921,58 @@ impl Workspace {
     }
 
     /// Open files may have a language now, or one with a grammar.
+    /// The folder trust decides about: the project, else the active file's.
+    fn trust_folder(&self, cx: &App) -> Option<PathBuf> {
+        self.root.clone().or_else(|| self.active_editor()?.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf))
+    }
+
+    fn restricted(&self, cx: &App) -> bool {
+        self.trust_folder(cx).is_some_and(|f| !crate::trust::is_trusted(&f))
+    }
+
+    fn project_trust(&mut self, _: &ProjectTrust, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_trust_dialog(window, cx);
+    }
+
+    fn open_trust_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.trust_folder(cx) else {
+            self.toast(ToastKind::Info, "Open a folder to trust it", None, cx);
+            return;
+        };
+        self.close_modal(window, cx);
+        let dialog = cx.new(|cx| crate::trust_dialog::TrustDialog::new(folder, window, cx));
+        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, _, event: &crate::trust_dialog::TrustDialogEvent, window, cx| {
+            use crate::trust_dialog::TrustDialogEvent;
+            match event {
+                TrustDialogEvent::Trust(folder) => {
+                    ws.close_modal(window, cx);
+                    crate::trust::trust(folder, cx);
+                }
+                TrustDialogEvent::Untrust(folder) => {
+                    ws.close_modal(window, cx);
+                    crate::trust::untrust(folder, cx);
+                }
+                TrustDialogEvent::Dismissed => ws.close_modal(window, cx),
+            }
+        }));
+        self.modal = Some(Modal::Trust(dialog));
+        cx.notify();
+    }
+
+    /// Starts what trust allows, or stops it.
+    fn trust_changed(&mut self, cx: &mut Context<Self>) {
+        if self.restricted(cx) {
+            self.lsp.update(cx, |s, _| s.shutdown_all());
+        }
+        for editor in self.tabs.clone() {
+            editor.update(cx, |e, cx| e.trust_changed(cx));
+            // Starts its server when trusted now.
+            self.lsp.update(cx, |s, cx| s.register(&editor, cx));
+        }
+        self.refresh_git(cx);
+        cx.notify();
+    }
+
     fn extensions_changed(&mut self, cx: &mut Context<Self>) {
         for editor in self.tabs.clone() {
             if editor.update(cx, |e, cx| e.refresh_language(cx)) {
@@ -4864,6 +4925,7 @@ impl Workspace {
             Modal::Clone(c) => c.clone().into_any_element(),
             Modal::Preferences(p) => p.clone().into_any_element(),
             Modal::Push(p) => p.clone().into_any_element(),
+            Modal::Trust(t) => t.clone().into_any_element(),
         };
         let top = modal_top(window);
         // Deferred above the other deferred layers (resize handles), so they
@@ -4955,7 +5017,8 @@ impl Workspace {
                     .items_center()
                     .gap_1()
                     .when(self.root.is_some(), |el| el.child(self.render_project_chip(cx)))
-                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(cx))),
+                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(cx)))
+                    .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
             )
             .child(
                 div()
@@ -5018,6 +5081,30 @@ impl Workspace {
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
             .child(icon_el(Icon::GitBranch, px(13.), theme.text_dim.into()))
             .child(div().truncate().child(self.branch_label()))
+    }
+
+    /// Shown while the project isn't trusted; opens the trust dialog.
+    fn render_restricted_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        div()
+            .id("restricted-chip")
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .h(px(22.))
+            .px_1p5()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(12.))
+            .text_color(theme.warning)
+            .bg(Hsla::from(theme.warning).alpha(0.12))
+            .hover(|st| st.bg(Hsla::from(theme.warning).alpha(0.2)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|ws, _, window, cx| ws.open_trust_dialog(window, cx)))
+            .tooltip(|_, cx| tooltip_view("Language servers, formatters and project tools are off until you trust this folder", cx))
+            .child(icon_el(Icon::ShieldAlert, px(13.), theme.warning.into()))
+            .child("Restricted Mode")
     }
 
     /// The checked-out branch, or what HEAD is when it isn't one.
@@ -6969,6 +7056,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_conditional_breakpoint))
             .on_action(cx.listener(Self::add_logpoint))
             .on_action(cx.listener(Self::open_extensions))
+            .on_action(cx.listener(Self::project_trust))
             .on_action(cx.listener(Self::reload_extensions))
             .on_action(cx.listener(Self::resume))
             .on_action(cx.listener(Self::pause_program))

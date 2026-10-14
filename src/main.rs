@@ -33,6 +33,8 @@ mod onboarding;
 mod picker;
 mod preview;
 mod process;
+mod trust;
+mod trust_dialog;
 mod preferences;
 mod run;
 mod project_search;
@@ -58,7 +60,7 @@ use gpui::{App, Application, Menu, MenuItem};
 use crate::{
     editor::*,
     workspace::{
-        CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings, OpenExtensions,
+        CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings, OpenExtensions, ProjectTrust,
         ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, MinimizeWindow, ZoomWindow, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
@@ -78,6 +80,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Extensions…", OpenExtensions),
+                MenuItem::action("Project Trust…", ProjectTrust),
                 MenuItem::action("Welcome Setup…", WelcomeSetup),
                 MenuItem::action("Install 'kin' Shell Command", InstallShellCommand),
                 MenuItem::separator(),

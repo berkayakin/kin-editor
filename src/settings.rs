@@ -54,6 +54,8 @@ pub struct Settings {
     pub run_configurations: Vec<RunConfiguration>,
     /// Download new versions from GitHub in the background (on by default).
     pub auto_update: Option<bool>,
+    /// Treat every folder as trusted (no Restricted Mode).
+    pub trust_all_projects: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -194,6 +196,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "terminal_shell",
     "run_configurations",
     "auto_update",
+    "trust_all_projects",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -326,6 +329,7 @@ impl Settings {
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
+            "trust_all_projects" => self.trust_all_projects.is_some(),
             _ => false,
         }
     }
@@ -425,6 +429,7 @@ pub fn init(cx: &mut App) -> Vec<String> {
         Settings::default()
     });
     problems.extend(unknown_key_problems());
+    crate::trust::set_trust_all(settings.trust_all_projects == Some(true));
     cx.set_global(settings);
     problems.extend(keymap::install(cx));
     cx.set_global(ConfigStamps { settings: modified(Settings::path()), keymap: modified(keymap::keymap_path()) });
@@ -449,6 +454,11 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
             Ok(settings) => {
                 problems.extend(unknown_key_problems());
                 let theme_changed = settings.theme != Settings::get(cx).theme;
+                let trust_all = settings.trust_all_projects == Some(true);
+                if trust_all != (Settings::get(cx).trust_all_projects == Some(true)) {
+                    crate::trust::set_trust_all(trust_all);
+                    crate::trust::changed(cx);
+                }
                 cx.set_global(settings.clone());
                 // No theme set (any more) means the default one.
                 if theme_changed {
@@ -554,7 +564,11 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // ],
 
   // Download new versions in the background; Restart to Update installs them.
-  // "auto_update": true
+  // "auto_update": true,
+
+  // Run language servers, formatters and project tools in every folder
+  // without asking (no Restricted Mode). Not recommended.
+  // "trust_all_projects": false
 }
 "#;
 

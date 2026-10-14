@@ -37,6 +37,9 @@ pub struct SessionState {
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,
+    /// Folders trusted to run what they configure (see `trust.rs`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_folders: Vec<PathBuf>,
     /// Welcome Setup was finished (`false`: shown but not finished yet).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarded: Option<bool>,
