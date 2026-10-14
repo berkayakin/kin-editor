@@ -205,7 +205,7 @@ fn set_dock_icon() {
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
 
-    static ICON: &[u8] = include_bytes!("../assets/app-icon/macos/icon_1024.png");
+    static ICON: &[u8] = include_bytes!("../assets/app-icon/macos/icon_512.png");
 
     let Some(mtm) = MainThreadMarker::new() else { return };
     let data = NSData::with_bytes(ICON);

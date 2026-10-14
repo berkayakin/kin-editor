@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/app-icon/logo-macos.svg" alt="Kin logo" width="128">
+  <img src="assets/app-icon/macos/icon_1024.png" alt="Kin logo" width="128">
 </p>
 
 # Kin
@@ -96,7 +96,7 @@ GPUI's `runtime_shaders` feature is enabled, so no separate Metal toolchain is n
 
 ### App icon
 
-The icon (a black ‹K› on a lavender, rose and orange gradient) lives in [`assets/app-icon/`](assets/app-icon):
+The icon (a purple serif K with a pastel painted peacock) lives in [`assets/app-icon/`](assets/app-icon):
 
 - **macOS:** the Dock icon is set at startup, so it shows even with `cargo run`. To build a
   `Kin.app` that uses `macos/Kin.icns`, run `cargo install cargo-bundle` and then
@@ -589,7 +589,7 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 - `src/ui.rs`, `src/context_menu.rs`, `src/input_dialog.rs` — shared widgets, menus and prompts
 - `src/assets.rs`, `assets/icons/` — rounded, Lucide-style SVG icons and the title font embedded into the binary
 - `assets/file-icons/`, `src/file_icons.rs` — file-type icons ([Charmed Icons](https://github.com/jmesrje/zed-charmed-icons)) and their file-name associations
-- `assets/app-icon/` — the app logo (`logo.svg`) and its per-platform icons
+- `assets/app-icon/` — the app logo (`logo.png`) and its per-platform icons
 
 ## License
 
