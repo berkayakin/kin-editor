@@ -368,6 +368,8 @@ pub struct Symbol {
     pub offset: usize,
     /// Nesting level among the other symbols.
     pub depth: usize,
+    /// The whole definition (header and body).
+    pub range: Range<usize>,
 }
 
 /// Outline queries capture `@name` inside a `@definition.<kind>` node, the
@@ -698,7 +700,7 @@ impl Syntax {
                 name_text.push('…');
             }
             if !name_text.is_empty() {
-                symbols.push(Symbol { name: name_text, kind, offset: name.start, depth: open.len() });
+                symbols.push(Symbol { name: name_text, kind, offset: name.start, depth: open.len(), range: range.clone() });
             }
             open.push(range.end);
         }

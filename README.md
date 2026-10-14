@@ -49,6 +49,9 @@ platform-native text rendering (CoreText / DirectWrite).
 - Search Everywhere (double Shift), fuzzy Go to File (git-ignored files included, ignored folders
   skipped), Recent Files, Find Action, Go to Line, and File Structure: the current file's functions,
   classes, headings, selectors or keys
+- Breadcrumbs under the tabs (folders, file, then the definitions around the caret; click one to go
+  there) and sticky scroll: the header lines of the functions and classes you've scrolled into stay
+  pinned at the top of the editor (up to four; click one to jump to it)
 - Git: clone, init, gutter change markers with rollback, inline blame, file status colors, a Commit panel
   (stage, discard, commit, amend, push), staging single changes, side-by-side diffs with changed words
   highlighted, a log with a branch graph and file history, merge/rebase with conflict resolution in

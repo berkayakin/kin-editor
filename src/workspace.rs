@@ -4699,6 +4699,7 @@ impl Workspace {
                 PaneAxis::Column => el.border_t_1().border_color(theme.border),
             })
             .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, cx)))
+            .when_some(pane.tabs.get(pane.active).cloned(), |el, editor| el.children(self.render_breadcrumbs(&editor, cx)))
             .when(self.show_find && pane_ix == self.active_pane && !pane.tabs.is_empty(), |el| {
                 el.child(self.find_bar.clone())
             })
@@ -4722,6 +4723,64 @@ impl Workspace {
             )
             .when(pane_ix + 1 < self.panes.len(), |el| el.child(self.resize_handle(Edge::Pane(pane_ix), cx)))
             .into_any_element()
+    }
+
+    /// Under the tabs: the file's folders and name, then the definitions
+    /// around the caret; clicking one goes to it.
+    fn render_breadcrumbs(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (path, symbols) = editor.update(cx, |e, _| (e.doc.path.clone(), e.doc.image.is_none().then(|| e.breadcrumbs())));
+        let path = path?;
+        let theme = Theme::get(cx).clone();
+        let rel = self.display_rel(&path);
+        let mut parts: Vec<String> = rel.split(['/', '\\']).map(str::to_string).collect();
+        let file = parts.pop().unwrap_or_default();
+        let chevron = || icon_el(Icon::ChevronRight, px(11.), theme.text_dim.into());
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .h(px(24.))
+            .px_3()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .bg(theme.background)
+            .text_size(px(12.))
+            .text_color(theme.text_dim);
+        for part in parts {
+            row = row.child(div().flex_shrink_0().child(part)).child(chevron());
+        }
+        row = row.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .flex_shrink_0()
+                .text_color(theme.text_muted)
+                .child(file_icon(&path, px(13.), &theme))
+                .child(file),
+        );
+        let symbols = symbols.unwrap_or_default();
+        let last = symbols.len().saturating_sub(1);
+        for (ix, (name, offset)) in symbols.into_iter().enumerate() {
+            let editor = editor.clone();
+            row = row.child(chevron()).child(
+                div()
+                    .id(("breadcrumb", ix))
+                    .flex_shrink_0()
+                    .px_1()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_color(if ix == last { theme.text } else { theme.text_muted })
+                    .hover(|s| s.bg(theme.hover))
+                    .on_click(move |_, window, cx| {
+                        editor.update(cx, |e, cx| e.go_to(offset, window, cx));
+                        window.focus(&editor.focus_handle(cx));
+                    })
+                    .child(name),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     fn render_welcome(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {

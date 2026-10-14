@@ -7,6 +7,7 @@ mod conflict;
 mod lsp;
 mod run;
 mod snippet;
+mod sticky;
 
 pub use lsp::EditorLspEvent;
 pub use run::EditorRunEvent;
@@ -259,6 +260,10 @@ pub struct Editor {
     fold_cache: Option<((u64, usize), Arc<Vec<crate::fold::FoldRegion>>)>,
     /// `⋯` placeholders on screen last frame, for clicks: (bounds, fold start).
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
+    /// File Structure's symbols for a document version (breadcrumbs, sticky scroll).
+    outline_cache: Option<(u64, Arc<Vec<crate::syntax::Symbol>>)>,
+    /// Pinned lines of sticky scroll, as last painted: bounds and where to go.
+    sticky_rows: Vec<(Bounds<Pixels>, usize)>,
     /// The pointer is over the gutter, so fold arrows show.
     gutter_hovered: bool,
     /// Runnable targets for a version (gutter ▶).
@@ -321,6 +326,8 @@ impl Editor {
             lsp: lsp::EditorLsp::default(),
             fold_cache: None,
             fold_pills: Vec::new(),
+            outline_cache: None,
+            sticky_rows: Vec::new(),
             gutter_hovered: false,
             run_cache: None,
             conflict_cache: None,
@@ -1855,6 +1862,14 @@ impl Editor {
             return;
         }
 
+        // A pinned line jumps to its definition.
+        if let Some(offset) = self.sticky_at(event.position) {
+            self.set_selections(vec![Selection::cursor(offset)], 0, cx);
+            self.center_on_next_frame = true;
+            cx.notify();
+            return;
+        }
+
         if !self.is_chromeless() {
             // A ▶ runs its target.
             if event.position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) {
@@ -2019,7 +2034,12 @@ impl Editor {
                 self.gutter_hovered = over_gutter;
                 cx.notify();
             }
-            self.hover_at(event.position, window, cx);
+            // The pinned lines aren't the code under them.
+            if self.sticky_at(event.position).is_some() {
+                self.pointer_left(window, cx);
+            } else {
+                self.hover_at(event.position, window, cx);
+            }
             return;
         }
         if self.scrollbar_drag.is_some() {
@@ -2152,8 +2172,10 @@ impl Editor {
             let margin = line_height * 3.;
             let top = line_height * drow as f32;
             let viewport = bounds.size.height;
-            if top - margin < self.scroll.y {
-                self.scroll.y = (top - margin).max(px(0.));
+            // Pinned lines cover the top; keep the caret below them.
+            let top_margin = margin + line_height * self.sticky_rows.len() as f32;
+            if top - top_margin < self.scroll.y {
+                self.scroll.y = (top - top_margin).max(px(0.));
             } else if top + line_height + margin > self.scroll.y + viewport {
                 self.scroll.y = top + line_height + margin - viewport;
             }
@@ -2744,6 +2766,8 @@ impl Editor {
 
         if !single {
             self.request_blame(window, cx);
+            let number_right = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.);
+            self.layout_sticky(&mut frame, bounds, first_row, text_left, number_right, window, cx);
         }
 
         // Scrollbar with diagnostic and search markers.
@@ -3714,6 +3738,9 @@ pub struct FrameLayout {
     inline_bgs: Vec<PaintQuad>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
+    sticky_bgs: Vec<PaintQuad>,
+    sticky_lines: Vec<(Point<Pixels>, ShapedLine)>,
+    sticky_numbers: Vec<(Point<Pixels>, ShapedLine)>,
     hitbox: Option<Hitbox>,
 }
 
@@ -3821,6 +3848,18 @@ impl Element for EditorElement {
         }
         for (bounds, icon, color) in frame.fold_icons.drain(..) {
             window.paint_svg(bounds, icon.into(), gpui::TransformationMatrix::unit(), color, cx).ok();
+        }
+        // Sticky scroll's pinned lines, over everything but the scrollbar.
+        for q in frame.sticky_bgs.drain(..) {
+            window.paint_quad(q);
+        }
+        window.with_content_mask(Some(ContentMask { bounds: frame.text_bounds }), |window| {
+            for (origin, line) in &frame.sticky_lines {
+                line.paint(*origin, line_height, window, cx).ok();
+            }
+        });
+        for (origin, line) in &frame.sticky_numbers {
+            line.paint(*origin, line_height, window, cx).ok();
         }
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);
