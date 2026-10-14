@@ -2,6 +2,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod about;
+mod python;
 mod assets;
 mod branch_picker;
 mod cli;

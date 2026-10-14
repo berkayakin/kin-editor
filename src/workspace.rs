@@ -321,6 +321,10 @@ enum MenuAction {
     Launch(RunTarget, bool),
     /// A line number's breakpoint menu.
     Breakpoint(BreakpointEdit, Entity<Editor>, usize),
+    /// Status bar: the project's Python venv (None: detect).
+    Venv(Option<crate::python::Choice>),
+    /// Status bar: pick a venv folder.
+    ChooseVenv,
 }
 
 /// What the breakpoint menu does with a row's breakpoint.
@@ -342,6 +346,8 @@ impl Clone for MenuAction {
             MenuAction::Encoding(encoding, editor) => MenuAction::Encoding(*encoding, editor.clone()),
             MenuAction::Launch(target, debug) => MenuAction::Launch(target.clone(), *debug),
             MenuAction::Breakpoint(edit, editor, row) => MenuAction::Breakpoint(*edit, editor.clone(), *row),
+            MenuAction::Venv(choice) => MenuAction::Venv(choice.clone()),
+            MenuAction::ChooseVenv => MenuAction::ChooseVenv,
         }
     }
 }
@@ -427,6 +433,8 @@ pub struct Workspace {
     breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
     /// Errors and warnings the last Run printed: its name and what was found.
     run_problems: Option<(String, Vec<run::OutputProblem>)>,
+    /// The status bar's venv for a folder (looked up once, not every frame).
+    venv_shown: std::cell::RefCell<Option<(PathBuf, Option<PathBuf>)>>,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -634,6 +642,7 @@ impl Workspace {
             debug_location: None,
             breakpoints: HashMap::new(),
             run_problems: None,
+            venv_shown: Default::default(),
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
             resizing: None,
@@ -871,10 +880,15 @@ impl Workspace {
         // The folders that were open last time, if they still exist.
         self.breakpoints.clear();
         self.run_problems = None;
-        if let Some(session) = ProjectSession::load(&root) {
+        let session = ProjectSession::load(&root);
+        if let Some(session) = &session {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
             self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
         }
+        // Before any tab's language server starts.
+        let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
+        crate::python::set_choice(&root, venv);
+        self.venv_shown.take();
         self.root = Some(root);
         self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
         self.rebuild_tree();
@@ -951,7 +965,8 @@ impl Workspace {
             .filter_map(|(path, breakpoints)| Some(FileBreakpoints { path: path.strip_prefix(&root).ok()?.to_path_buf(), breakpoints }))
             .collect();
         breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
-        ProjectSession { root, tabs, active, layout, expanded, breakpoints }.save()
+        let python_venv = crate::python::choice(&root).map(|c| c.to_saved());
+        ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv }.save()
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -1194,6 +1209,8 @@ impl Workspace {
     /// folders it shows), Go to File, Git status and open files.
     fn disk_changed(&mut self, changes: Vec<FsChange>, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else { return };
+        // A venv may have been created or removed.
+        self.venv_shown.take();
         let (mut tree, mut index, mut git) = (false, false, false);
         let mut paths = HashSet::new();
         for change in changes {
@@ -4110,6 +4127,8 @@ impl Workspace {
                     Some(MenuAction::Launch(target, false)) => ws.run_target(target, window, cx),
                     Some(MenuAction::Breakpoint(BreakpointEdit::Toggle, editor, row)) => editor.update(cx, |e, cx| e.toggle_breakpoint_at(row, cx)),
                     Some(MenuAction::Breakpoint(edit, editor, row)) => ws.edit_breakpoint(edit, editor, row, window, cx),
+                    Some(MenuAction::Venv(choice)) => ws.set_venv(choice, cx),
+                    Some(MenuAction::ChooseVenv) => ws.choose_venv_folder(window, cx),
                     None => {}
                 }
             }
@@ -4145,6 +4164,82 @@ impl Workspace {
             actions.push(Some(MenuAction::Encoding(encoding, editor.clone())));
         }
         self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    /// The status bar's venv for the active file's folder.
+    fn shown_venv(&self, dir: &Path) -> Option<PathBuf> {
+        if let Some((cached_dir, venv)) = self.venv_shown.borrow().as_ref()
+            && cached_dir == dir
+        {
+            return venv.clone();
+        }
+        let venv = crate::python::venv(dir);
+        self.venv_shown.replace(Some((dir.to_path_buf(), venv.clone())));
+        venv
+    }
+
+    fn open_venv_menu(&mut self, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::python::{self, Choice};
+        let Some(root) = self.root.clone() else { return };
+        let current = python::choice(&root);
+        let check = |on: bool, label: String| if on { MenuEntry::item(label, Icon::Check) } else { MenuEntry::text(label) };
+        let detected = self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().and_then(python::detect));
+        let auto = match &detected {
+            Some(venv) => format!("Auto-detect ({})", python::label(venv, Some(&root))),
+            None => "Auto-detect (none found)".into(),
+        };
+        let mut entries = vec![MenuEntry::Header("Python Environment".into()), check(current.is_none(), auto)];
+        let mut actions = vec![None, Some(MenuAction::Venv(None))];
+        let mut venvs = python::candidates(&root);
+        // A folder picked outside the project stays listed.
+        if let Some(Choice::Venv(path)) = &current
+            && !venvs.contains(path)
+        {
+            venvs.push(path.clone());
+        }
+        for venv in venvs {
+            let on = current.as_ref() == Some(&Choice::Venv(venv.clone()));
+            entries.push(check(on, python::label(&venv, Some(&root))));
+            actions.push(Some(MenuAction::Venv(Some(Choice::Venv(venv)))));
+        }
+        entries.push(check(current == Some(Choice::Off), "None".into()));
+        actions.push(Some(MenuAction::Venv(Some(Choice::Off))));
+        entries.push(MenuEntry::Separator);
+        actions.push(None);
+        entries.push(MenuEntry::text("Choose Folder…"));
+        actions.push(Some(MenuAction::ChooseVenv));
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    /// Saves the project's venv choice. New terminals and Run tabs use it;
+    /// the active file's language server restarts with it.
+    fn set_venv(&mut self, choice: Option<crate::python::Choice>, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        crate::python::set_choice(&root, choice);
+        self.venv_shown.take();
+        self.schedule_session_save(cx);
+        if let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) {
+            self.lsp.update(cx, |s, cx| s.restart(&path, cx));
+        }
+        cx.notify();
+    }
+
+    fn choose_venv_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions { files: false, directories: true, multiple: false, prompt: Some("Use Venv".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = rx.await else { return };
+            let Some(path) = paths.pop() else { return };
+            this.update(cx, |ws, cx| {
+                if path.join("pyvenv.cfg").is_file() {
+                    ws.set_venv(Some(crate::python::Choice::Venv(path)), cx);
+                } else {
+                    let detail = format!("{} has no pyvenv.cfg. Pick the folder python -m venv created.", path.display());
+                    ws.toast(ToastKind::Error, "Not a virtual environment", Some(detail), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Like JetBrains: reload the file as the new encoding (its text was read
@@ -6598,6 +6693,20 @@ impl Workspace {
                     }))
                     .into_any_element(),
             );
+            if e.doc.language == Language::Python
+                && self.root.is_some()
+                && let Some(dir) = e.doc.path.as_deref().and_then(Path::parent)
+            {
+                let label = match self.shown_venv(dir) {
+                    Some(venv) => crate::python::label(&venv, self.root.as_deref()),
+                    None => "No venv".into(),
+                };
+                right.push(
+                    menu_item("python-venv", label, "Python Environment")
+                        .on_click(cx.listener(|ws, event: &ClickEvent, window, cx| ws.open_venv_menu(event.position(), window, cx)))
+                        .into_any_element(),
+                );
+            }
             let (icon, color) = match e.doc.language {
                 Language::Html => (Icon::CodeXml, Hsla::from(theme.text_muted)),
                 Language::Markdown => (Icon::FileText, Hsla::from(theme.text_muted)),

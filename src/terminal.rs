@@ -128,6 +128,7 @@ impl TerminalView {
     /// that stays on screen with its exit code when done.
     pub fn create(cwd: PathBuf, run: Option<RunTarget>, cx: &mut App) -> std::io::Result<Entity<Self>> {
         let configured = Settings::get(cx).terminal_shell.clone();
+        let venv = crate::python::venv(&cwd);
         let shell = match &run {
             Some(target) => {
                 // A login, interactive shell so PATH matches the user's terminal.
@@ -136,9 +137,21 @@ impl TerminalView {
                     .and_then(|c| c.first().cloned())
                     .or_else(|| std::env::var("SHELL").ok())
                     .unwrap_or_else(|| "/bin/sh".into());
-                Some(vec![program, "-l".into(), "-i".into(), "-c".into(), run_script(&target.command)])
+                // After the profile, which may reorder PATH.
+                let setup = venv.as_deref().map(crate::python::exports).unwrap_or_default();
+                Some(vec![program, "-l".into(), "-i".into(), "-c".into(), setup + &run_script(&target.command)])
             }
-            None => configured,
+            None => configured.clone(),
+        };
+        // A new shell activates the project's venv, typed in like a user would:
+        // a login profile can reorder PATH set beforehand.
+        let activate = match (&run, &venv) {
+            (None, Some(venv)) => {
+                let program = configured.as_ref().and_then(|c| c.first().cloned()).or_else(|| std::env::var("SHELL").ok());
+                let program = program.unwrap_or_else(|| if cfg!(windows) { "powershell".into() } else { "sh".into() });
+                crate::python::activate_command(venv, &program)
+            }
+            _ => None,
         };
         let (tx, rx) = mpsc::unbounded();
         let listener = Listener(tx);
@@ -160,6 +173,10 @@ impl TerminalView {
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let notifier = Notifier(event_loop.channel());
         event_loop.spawn();
+        if let Some(line) = activate {
+            // The shell reads it once it's ready.
+            notifier.notify((line + "\r").into_bytes());
+        }
         Ok(cx.new(|cx| {
             let mut view = Self::new(term, notifier, rx, cwd, cx);
             if let Some(target) = run {

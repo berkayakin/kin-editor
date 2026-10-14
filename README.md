@@ -76,6 +76,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Debugger for Rust, Go, Python and JavaScript/TypeScript (lldb-dap, Delve, debugpy, js-debug):
   breakpoints with conditions and logpoints, attaching to running processes, stepping, frames,
   variables, watches and an evaluating console; see [Debugging](#debugging)
+- Python virtual environments detected per project and used by terminals, Run, the debugger,
+  language servers and formatters; see [Python environments](#python-environments)
 - Run and test: ▶ in the gutter next to tests and `main` functions (Rust, Go, Python, JS/TS),
   project commands (cargo, npm scripts, go, make, pytest) and your own run configurations, each
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
@@ -351,6 +353,15 @@ current one; press it again to unsplit (both stay as tabs).
 the scrollback and on screen and jumps to the newest; ↵ or ↑ goes to older ones, ⇧↵ or ↓ to newer,
 Esc closes it. Matching ignores case unless the query has capitals.
 
+## Python environments
+
+Kin finds the project's virtual environment: a `.venv`, `venv`, `env` or `.env` folder holding
+`pyvenv.cfg`, next to the file or in a folder above it. New terminals activate it (its activate
+script, typed in like you would), Run tabs and the debugger use its Python, and language servers
+and formatters start with it first on PATH, so they see its packages and are found when installed
+in it. The status bar shows it for Python files; click it to pick another venv in the project, a
+folder elsewhere (**Choose Folder…**) or **None**. The choice is remembered per project.
+
 ## Run and test
 
 A ▶ in the gutter marks what can run in the file; click it to run that one thing:
@@ -423,7 +434,7 @@ Nothing is downloaded; the adapters come from your system:
 | --- | --- | --- |
 | Rust | `lldb-dap` (with Rust's own formatters, so `String`, `Vec` and `Option` read naturally) | Xcode's command line tools (`xcode-select --install`) or LLVM |
 | Go | Delve (`dlv dap`) | `go install github.com/go-delve/delve/cmd/dlv@latest` |
-| Python | debugpy, in the project's `.venv` / `venv` or `python3` | `python3 -m pip install debugpy` |
+| Python | debugpy, in the project's venv or `python3` | `python3 -m pip install debugpy` |
 | JavaScript, TypeScript | Microsoft's js-debug (the one in VS Code), run with `node` | Unpack `js-debug-dap-v*.tar.gz` from [its releases](https://github.com/microsoft/vscode-js-debug/releases) into `~/.config/kin/debug-adapters` (so `debug-adapters/js-debug/src/dapDebugServer.js` exists), or put `js-debug-adapter` on PATH |
 
 One session runs at a time. Attaching to Python injects debugpy into the process, which macOS can

@@ -20,7 +20,7 @@ pub struct Formatter {
     pub name: String,
     pub program: PathBuf,
     pub args: Vec<String>,
-    /// Installed in the project (node_modules), so it wins over a language server.
+    /// Installed in the project (node_modules, a venv), so it wins over a language server.
     pub project_local: bool,
 }
 
@@ -51,7 +51,8 @@ pub fn candidates(language: Language) -> &'static [(&'static str, &'static [&'st
 }
 
 /// The formatter for `file`: a configured command, or the first installed
-/// candidate (in the project's `node_modules/.bin`, then on the search path).
+/// candidate (in the project's `node_modules/.bin` or Python venv, then on the
+/// search path).
 pub fn find(language: Language, file: &Path, configured: Option<&[String]>) -> Option<Formatter> {
     // Settings, else the extension that adds the language.
     let configured = configured.or_else(|| language.extension()?.formatter.as_deref());
@@ -61,11 +62,13 @@ pub fn find(language: Language, file: &Path, configured: Option<&[String]>) -> O
         let args = custom.args.iter().map(|a| expand(a, file)).collect();
         return Some(Formatter { name, program: custom.program, args, project_local: true });
     }
+    let venv = (language == Language::Python).then(|| crate::python::venv(file.parent()?)).flatten();
     for (name, args) in candidates(language) {
         let local = file
             .ancestors()
             .skip(1)
             .map(|d| d.join("node_modules").join(".bin").join(name))
+            .chain(venv.as_deref().map(|v| crate::python::bin_dir(v).join(name)))
             .find(|p| p.is_file());
         let project_local = local.is_some();
         let Some(program) = local.or_else(|| servers::which(name)) else { continue };

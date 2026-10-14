@@ -118,17 +118,9 @@ fn xcrun_lldb_dap() -> Option<PathBuf> {
     (output.status.success() && path.is_file()).then_some(path)
 }
 
-/// The project's virtualenv Python, else python3 on PATH.
+/// The project's venv Python, else python3 on PATH.
 fn python_for(cwd: &Path) -> Option<PathBuf> {
-    for dir in cwd.ancestors() {
-        for venv in [".venv", "venv"] {
-            let python = dir.join(venv).join("bin/python");
-            if python.is_file() {
-                return Some(python);
-            }
-        }
-    }
-    servers::which("python3")
+    crate::python::venv(cwd).map(|v| crate::python::interpreter(&v)).filter(|p| p.is_file()).or_else(|| servers::which("python3"))
 }
 
 /// `initialize` arguments (what Kin supports as a client).

@@ -238,11 +238,14 @@ impl LspStore {
             let spawned = cx
                 .background_executor()
                 .spawn(async move {
+                    // Python servers find the project's packages through `python` on PATH.
+                    let venv = (language == Language::Python).then(|| crate::python::venv(file.parent()?)).flatten();
                     let command = match &custom {
                         Some(command) => servers::custom(command),
-                        None => servers::find(spec, &file),
+                        None => servers::find(spec, &file, venv.as_deref()),
                     };
-                    command.map(|c| (Client::spawn(&c.program, &c.args, &root, servers::search_path()), c))
+                    let path = crate::python::path_with(venv.as_deref(), servers::search_path());
+                    command.map(|c| (Client::spawn(&c.program, &c.args, &root, &path), c))
                 })
                 .await;
             let (client, incoming, command) = match spawned {

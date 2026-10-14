@@ -173,11 +173,15 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
-/// Finds an installed server: the project's `node_modules/.bin` first (a
-/// pinned version), then the search path.
-pub fn find(spec: &ServerSpec, file: &Path) -> Option<Command> {
+/// Finds an installed server: the project's `node_modules/.bin` or Python
+/// venv first (a pinned version), then the search path.
+pub fn find(spec: &ServerSpec, file: &Path, venv: Option<&Path>) -> Option<Command> {
     for (name, args) in spec.candidates {
-        let local = file.ancestors().skip(1).find_map(|d| executable(&d.join("node_modules").join(".bin").join(name)));
+        let local = file
+            .ancestors()
+            .skip(1)
+            .find_map(|d| executable(&d.join("node_modules").join(".bin").join(name)))
+            .or_else(|| executable(&crate::python::bin_dir(venv?).join(name)));
         if let Some(program) = local.or_else(|| which(name)) {
             return Some(Command { program, args: args.iter().map(|a| a.to_string()).collect() });
         }

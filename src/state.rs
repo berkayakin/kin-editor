@@ -124,6 +124,10 @@ pub struct ProjectSession {
     /// Line breakpoints per file, open or not.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub breakpoints: Vec<FileBreakpoints>,
+    /// The Python venv picked for the project (a path, or "off"); detected
+    /// when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_venv: Option<String>,
 }
 
 /// A file's line breakpoints.
@@ -244,6 +248,7 @@ mod tests {
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
             expanded: vec!["src".into(), "src/lsp".into()],
+            python_venv: Some("off".into()),
             breakpoints: vec![FileBreakpoints {
                 path: "src/a.rs".into(),
                 breakpoints: vec![Breakpoint::at(3), Breakpoint { condition: Some("i > 2".into()), ..Breakpoint::at(9) }],
