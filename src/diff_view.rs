@@ -22,7 +22,7 @@ use crate::{
     git_panel::{GitOp, change_color},
     syntax::{Highlight, Language, Syntax},
     theme::Theme,
-    ui::{icon_el, modal_panel, text_button, tooltip_view},
+    ui::{icon_el, text_button, tooltip_view},
 };
 
 const ROW_HEIGHT: f32 = 20.;
@@ -193,19 +193,6 @@ impl DiffView {
         })
     }
 
-    /// Header, borders and padding plus the rows (or the one-line message
-    /// shown while loading or when there's nothing to show).
-    fn content_height(&self) -> gpui::Pixels {
-        const CHROME: f32 = 46. + 1. + 2. + 4. + 10.;
-        let rows = match &self.loaded {
-            // Room for the pictures.
-            Some(l) if l.images.is_some() => 24,
-            Some(l) if !l.doc.changes.is_empty() => self.rows_len(),
-            _ => 2,
-        };
-        px(CHROME + rows as f32 * ROW_HEIGHT)
-    }
-
     fn rows_len(&self) -> usize {
         self.loaded.as_ref().map_or(0, |l| if self.side_by_side { l.doc.split.len() } else { l.doc.unified.len() })
     }
@@ -359,7 +346,7 @@ impl Focusable for DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let (path, rel, change) = self.file_label();
         let file_icon = crate::ui::file_icon(&path, px(16.), &theme);
@@ -500,16 +487,17 @@ impl Render for DiffView {
             }
         };
 
-        modal_panel(cx)
+        div()
+            .flex()
+            .flex_col()
+            .bg(theme.elevated)
             .key_context("DiffView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_escape))
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_previous))
-            .w(px(1180.))
-            .max_w(window.viewport_size().width - px(48.))
-            // As tall as the diff, up to what fits in the window.
-            .h(self.content_height().min(px(760.)).min(crate::workspace::modal_max_height(window)))
+            // Fills the editor area (the workspace places it there).
+            .size_full()
             .child(header)
             .child(body)
     }

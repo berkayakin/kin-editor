@@ -830,6 +830,12 @@ impl Workspace {
             {
                 self.auto_save(&previous, cx);
             }
+            // A diff over the editor area would hide the file being shown.
+            if matches!(self.modal, Some(Modal::Diff(_))) {
+                self.modal = None;
+                self.modal_subscription = None;
+                self.diff_return = None;
+            }
             self.active_pane = pane;
             self.panes[pane].active = ix;
             window.focus(&editor.focus_handle(cx));
@@ -4746,7 +4752,8 @@ impl Workspace {
             Modal::GoToLine(g) => g.clone().into_any_element(),
             Modal::ProjectSearch(s) => s.clone().into_any_element(),
             Modal::Theme(t) => t.clone().into_any_element(),
-            Modal::Diff(d) => d.clone().into_any_element(),
+            // Drawn over the editor area by `render_panes`.
+            Modal::Diff(_) => return None,
             Modal::Branches(b) => b.clone().into_any_element(),
             Modal::Input(i) => i.clone().into_any_element(),
             Modal::Clone(c) => c.clone().into_any_element(),
@@ -5426,6 +5433,28 @@ impl Workspace {
                     .size_full(),
             )
             .children((0..self.panes.len()).map(|ix| self.render_pane(ix, window, cx)))
+            .when_some(self.diff_view(), |el, view| el.child(self.render_diff_overlay(view)))
+    }
+
+    fn diff_view(&self) -> Option<Entity<DiffView>> {
+        match &self.modal {
+            Some(Modal::Diff(view)) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// The Git diff covers only the editor area, so the sidebar (Commit view)
+    /// and the bottom panels (Git log) stay usable beside it.
+    fn render_diff_overlay(&self, view: Entity<DiffView>) -> impl IntoElement {
+        gpui::deferred(
+            div()
+                .id("diff-layer")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .child(view),
+        )
+        .with_priority(1)
     }
 
     fn render_pane(&self, pane_ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
