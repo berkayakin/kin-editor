@@ -1,3 +1,6 @@
+// A GUI app on Windows: no console window opens with it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod about;
 mod assets;
 mod branch_picker;

@@ -4821,7 +4821,11 @@ impl Workspace {
             .bg(theme.panel)
             .border_b_1()
             .border_color(theme.border)
-            .window_control_area(WindowControlArea::Drag)
+            // On Windows a title bar click must reach no listener, or GPUI reports
+            // it handled and the system's drag, double-click and window buttons
+            // don't happen. Blocking the mouse keeps the workspace root from
+            // taking focus on it.
+            .when(cfg!(windows), |el| el.occlude())
             .when(mac, |el| {
                 el.on_click(|event: &ClickEvent, window, _| {
                     if event.click_count() == 2 {
@@ -4829,8 +4833,17 @@ impl Workspace {
                     }
                 })
             })
+            // Drag areas (Windows) are the bar's empty parts, not the bar itself:
+            // GPUI picks the first control area under the pointer, and a parent's
+            // comes before its children's (the window buttons).
             // Room for the traffic lights, which macOS moves out of the window in full screen.
-            .child(div().w(px(if mac && !window.is_fullscreen() { 84. } else { 12. })).flex_shrink_0())
+            .child(
+                div()
+                    .h_full()
+                    .w(px(if mac && !window.is_fullscreen() { 84. } else { 12. }))
+                    .flex_shrink_0()
+                    .window_control_area(WindowControlArea::Drag),
+            )
             .child(
                 div()
                     .flex()
@@ -4842,15 +4855,18 @@ impl Workspace {
             .child(
                 div()
                     .flex_1()
+                    .h_full()
                     .flex()
+                    .items_center()
                     .justify_center()
+                    .window_control_area(WindowControlArea::Drag)
                     .text_color(theme.text_muted)
                     .text_size(px(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .truncate()
                     .child(title),
             )
-            .child(div().w(px(if mac { 84. } else { 0. })).flex_shrink_0())
+            .child(div().h_full().w(px(if mac { 84. } else { 0. })).flex_shrink_0().window_control_area(WindowControlArea::Drag))
             .when(!mac, |el| el.child(self.render_window_controls(cx)))
     }
 
