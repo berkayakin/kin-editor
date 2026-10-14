@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/app-icon/logo-macos.svg" alt="Kin logo" width="128">
+</p>
+
 # Kin
 
 A small, fast code editor written in Rust, rendered entirely on the GPU with
