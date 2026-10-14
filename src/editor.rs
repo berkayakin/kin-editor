@@ -1569,7 +1569,9 @@ impl Editor {
             };
             // `def f():`, `if x:`, `steps:`
             let opens_colon_block = colon_opens && prev == Some(':') && !before.trim_start().starts_with('#');
-            let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_colon_block;
+            // An extension's indents.scm: an @indent node opens on this line.
+            let opens_by_query = doc.syntax().indent_after(doc.rope(), r.start, row) == Some(true);
+            let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_colon_block || opens_by_query;
             let closes_next = match prev {
                 Some('{') => next == Some('}'),
                 Some('[') => next == Some(']'),
@@ -2506,14 +2508,14 @@ impl Editor {
             .map(|s| self.doc.row_of(s.head))
             .collect();
         // Bracket pairs around carets (a few, so many cursors stay cheap).
-        let brackets: Vec<usize> = if focused && !single {
+        let brackets: Vec<Range<usize>> = if focused && !single {
             self.selections
                 .iter()
                 .filter(|s| s.is_empty())
                 .take(8)
-                .filter_map(|s| self.doc.syntax().matching_bracket(s.head))
+                .filter_map(|s| self.doc.syntax().bracket_pair(self.doc.rope(), s.head))
                 .flat_map(|(a, b)| [a, b])
-                .filter(|o| (range_start..=range_end).contains(o))
+                .filter(|r| (range_start..=range_end).contains(&r.start))
                 .collect()
         } else {
             Vec::new()
@@ -2800,12 +2802,12 @@ impl Editor {
                 }
 
                 // Matching brackets (painted with search highlights, under the text).
-                for &b in brackets.iter().filter(|&&b| b >= line_start && b < line_end) {
-                    let col = dl.to_display(b - line_start);
+                for b in brackets.iter().filter(|b| b.start >= line_start && b.start < line_end) {
+                    let col = dl.to_display(b.start - line_start);
                     if wrap::segment_of(&breaks, col) != seg {
                         continue;
                     }
-                    let (x0, x1) = (x_of(col), x_of(dl.to_display(b + 1 - line_start)));
+                    let (x0, x1) = (x_of(col), x_of(dl.to_display(b.end.min(line_end) - line_start)));
                     frame.search.push(
                         fill(
                             Bounds::from_corners(point(origin.x + x0, y + px(1.)), point(origin.x + x1, y + line_height - px(1.))),

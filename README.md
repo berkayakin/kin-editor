@@ -115,6 +115,8 @@ cargo run --release -- path/to/folder path/to/file.js
 Each folder on the command line opens in its own window; files open in the first one.
 
 GPUI's `runtime_shaders` feature is enabled, so no separate Metal toolchain is needed on macOS.
+Building needs `cmake` (for wasmtime, which runs extensions' WebAssembly grammars):
+`brew install cmake` on macOS.
 
 ### App icon
 
@@ -487,14 +489,16 @@ block; attaching to Node turns on its inspector (port 9229 unless it was started
 
 ## Extensions
 
-Extensions add languages, themes and snippets without rebuilding Kin. They use
+Extensions add languages, themes, icon themes and snippets without rebuilding Kin. They use
 [Zed's extension format](https://zed.dev/docs/extensions/developing-extensions), so Zed's language
 and theme extensions work as they are, and VS Code snippet files too.
 
 **Install** from **Settings → Extensions** (or **Extensions…** in the Kin menu and Find Action):
 paste the URL of an extension's Git repository and press **Install**, or **Install from Folder…**
 for one on disk, which is used in place (for making your own: edit it, then **Reload**). Each
-extension is listed with what it adds and any problems; the trash button removes it. Extensions live
+extension is listed with what it adds and any problems; the trash button removes it. If Zed is
+installed, **Installed in Zed** lists its extensions with an **Add** button: those come with their
+grammars prebuilt, so nothing needs compiling. Extensions live
 in `~/.config/kin/extensions/<id>/`; copying a folder there and choosing **Reload Extensions** works
 too.
 
@@ -506,7 +510,15 @@ my-extension/
   languages/mylang/config.toml
   languages/mylang/highlights.scm     tree-sitter highlight query
   languages/mylang/outline.scm        File Structure, breadcrumbs, sticky scroll
+  languages/mylang/injections.scm     embedded languages (CSS in <style>, SQL in strings…)
+  languages/mylang/brackets.scm       bracket pairs, words too (do … end)
+  languages/mylang/indents.scm        what Enter indents after
+  languages/mylang/textobjects.scm    functions and classes for Vim's af / if / ac / ic
+  languages/mylang/runnables.scm      gutter ▶ for tests and mains, with tasks.json
+  languages/mylang/tasks.json         commands for runnables' tags ($ZED_FILE, $ZED_ROW…)
+  grammars/mylang.wasm                a prebuilt grammar (as in Zed's packaged extensions)
   themes/*.json                       Kin themes, or Zed theme families
+  icon_themes/*.json                  file icon themes (Zed's format)
   snippets/<language id>.json         VS Code / Zed snippets
 ```
 
@@ -560,10 +572,15 @@ their file extensions, except that a language naming an exact file (`docker-comp
 Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
 Catppuccin themes, installed from their repositories.
 
-Grammars are compiled the first time with your C compiler (`cc`; on macOS the Xcode command line
-tools: `xcode-select --install`), in the background; files of that language are highlighted when
-it's done. Fetching uses `git`. Zed extensions' WebAssembly code (slash commands, downloading
-servers) isn't run.
+A grammar that comes prebuilt as WebAssembly (`grammars/<name>.wasm`, as in the extensions Zed
+installs) runs as is in Kin's WebAssembly runtime. Otherwise it's compiled the first time with your
+C compiler (`cc`; on macOS the Xcode command line tools: `xcode-select --install`), in the
+background; files of that language are highlighted when it's done. Fetching uses `git`. Zed
+extensions' own WebAssembly code (downloading language servers, slash commands) isn't run yet, so
+a language server has to be installed (see `[language_servers]` above).
+
+Icon themes are chosen with `icon_theme` (Settings → Appearance → Icon theme); without one, Kin uses
+its built-in Charmed Icons.
 
 Kin reads Zed's extension format for compatibility; it isn't affiliated with or endorsed by Zed
 Industries. Extensions come from their authors' repositories, under their own licenses.
@@ -607,6 +624,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `inlay_hints` | `true` | types and parameter names from the language server |
 | `languages` | | per-language overrides of the nine above, by the name in the status bar |
 | `vim_mode` | `false` | Vim's modes and keys; see [Vim mode](#vim-mode) |
+| `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |

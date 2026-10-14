@@ -9,11 +9,11 @@ use crate::{assets::Icon, editor::Editor, file_icons, theme::Theme};
 
 /// The file-type icon for `path`, in the pack's own colors (see `file_icons`).
 pub fn file_icon(path: &std::path::Path, size: Pixels, theme: &Theme) -> Img {
-    img(file_icons::file(path, theme.appearance)).size(size).flex_shrink_0()
+    img(file_icons::file_source(path, theme.appearance)).size(size).flex_shrink_0()
 }
 
 pub fn folder_icon(open: bool, size: Pixels, theme: &Theme) -> Img {
-    img(file_icons::folder(open, theme.appearance)).size(size).flex_shrink_0()
+    img(file_icons::folder_source(open, theme.appearance)).size(size).flex_shrink_0()
 }
 
 pub fn icon_el(icon: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
@@ -91,7 +91,7 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: 
         .child(icon_el(icon, px(15.), color))
 }
 
-pub fn text_button(id: &'static str, label: &'static str, primary: bool, cx: &App) -> Stateful<Div> {
+pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary: bool, cx: &App) -> Stateful<Div> {
     let theme = Theme::get(cx);
     div()
         .id(id)

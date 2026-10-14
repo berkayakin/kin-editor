@@ -112,6 +112,7 @@ impl Page {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Setting {
     Theme,
+    IconTheme,
     BaseKeymap,
     FontFamily,
     FontSize,
@@ -135,8 +136,9 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 21] = [
+    const ALL: [Setting; 22] = [
         Setting::Theme,
+        Setting::IconTheme,
         Setting::BaseKeymap,
         Setting::FontFamily,
         Setting::FontSize,
@@ -161,7 +163,7 @@ impl Setting {
 
     fn page(self) -> Page {
         match self {
-            Setting::Theme => Page::Appearance,
+            Setting::Theme | Setting::IconTheme => Page::Appearance,
             Setting::BaseKeymap => Page::Keymap,
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
@@ -180,6 +182,7 @@ impl Setting {
     fn section(self) -> &'static str {
         match self {
             Setting::Theme => "Theme",
+            Setting::IconTheme => "File icons",
             Setting::BaseKeymap => "Keymap",
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => "Font",
             Setting::TabSize | Setting::HardTabs => "Indentation",
@@ -199,6 +202,7 @@ impl Setting {
     fn label(self) -> &'static str {
         match self {
             Setting::Theme => "Theme",
+            Setting::IconTheme => "Icon theme",
             Setting::BaseKeymap => "Base keymap",
             Setting::FontFamily => "Family",
             Setting::FontSize => "Size",
@@ -225,6 +229,7 @@ impl Setting {
     fn description(self) -> &'static str {
         match self {
             Setting::Theme => "Add your own themes as .json files in the themes folder.",
+            Setting::IconTheme => "File and folder icons. Extensions can add icon themes (Zed's work too).",
             Setting::BaseKeymap => "The shortcuts Kin starts from. Your own changes below stay on top of any of them.",
             Setting::FontFamily => "Monospaced fonts installed on this computer.",
             Setting::FontSize => "Zoom (Increase / Decrease Font Size) adds to this until you reset it.",
@@ -252,6 +257,7 @@ impl Setting {
     fn keywords(self) -> &'static str {
         match self {
             Setting::Theme => "color scheme dark light appearance",
+            Setting::IconTheme => "icons file icons folder icon theme",
             Setting::BaseKeymap => "keymap shortcuts key bindings vscode vs code jetbrains intellij webstorm sublime zed",
             Setting::FontFamily => "typeface family monospace",
             Setting::FontSize => "font zoom text",
@@ -293,6 +299,7 @@ impl Setting {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     AutoSave,
+    IconTheme,
     ShowWhitespace,
     BaseKeymap,
     FontFamily,
@@ -1247,6 +1254,23 @@ impl Preferences {
                     this.set_or_default("show_whitespace", choice.key().into(), ShowWhitespace::default().key().into(), cx);
                 })
             }
+            Setting::IconTheme => {
+                const BUILT_IN: &str = "Charmed Icons (built-in)";
+                let current = settings.icon_theme.clone();
+                let mut names: Vec<String> = vec![BUILT_IN.to_string()];
+                names.extend(extensions::icon_themes().into_iter().map(|t| t.name));
+                let label = current.clone().unwrap_or_else(|| BUILT_IN.to_string());
+                let options = names.iter().enumerate().map(|(ix, n)| (n.clone().into(), if ix == 0 { current.is_none() } else { current.as_deref() == Some(n.as_str()) })).collect();
+                self.dropdown(Menu::IconTheme, label.into(), px(260.), options, cx, move |this, ix, _, cx| {
+                    this.menu = None;
+                    if ix == 0 {
+                        this.reset("icon_theme", cx);
+                    } else {
+                        let result = Settings::set("icon_theme", json!(names[ix]));
+                        this.write(result, cx);
+                    }
+                })
+            }
             Setting::InlayHints => self.switch_with_default("pref-inlay-hints", "inlay_hints", settings.editor.inlay_hints, true, cx),
             Setting::VimMode => self.bool_switch("pref-vim", "vim_mode", settings.vim_mode, cx),
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
@@ -1815,10 +1839,32 @@ impl Preferences {
                 .collect()
         };
 
+        // Zed's installed extensions come with prebuilt grammars.
+        let zed: Vec<AnyElement> = extensions::zed_extensions()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (name, path))| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2p5()
+                    .px_3()
+                    .py_2()
+                    .child(icon_el(Icon::Puzzle, px(15.), theme.text_muted.into()))
+                    .child(div().flex_1().min_w_0().truncate().text_color(theme.text).child(name))
+                    .child(
+                        text_button(("ext-zed", ix), "Add", false, cx)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.installed(extensions::install_folder(&path), cx))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
         let folder = extensions::extensions_dir().map(|d| theme::display_path(&d)).unwrap_or_default();
         self.body()
             .child(section("Install", vec![install.into_any_element()], &theme))
             .child(section("Installed", rows, &theme))
+            .when(!zed.is_empty(), |el| el.child(section("Installed in Zed", zed, &theme)))
             .child(
                 div()
                     .flex()
@@ -2169,6 +2215,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::LineHeight => "editor_line_height",
         Setting::TabSize => "tab_size",
         Setting::HardTabs => "hard_tabs",
+        Setting::IconTheme => "icon_theme",
         Setting::SoftWrap => "soft_wrap",
         Setting::Rulers => "rulers",
         Setting::ShowWhitespace => "show_whitespace",

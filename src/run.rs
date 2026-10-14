@@ -100,10 +100,64 @@ pub fn file_targets(language: Language, path: &Path, text: &str, tree: &Tree) ->
         Language::Go => go_targets(path, text, root, &mut out),
         Language::Python => python_targets(path, text, root, &mut out),
         Language::JavaScript | Language::TypeScript | Language::Tsx => js_targets(path, text, root, &mut out),
+        Language::Extension(_) => extension_targets(language, path, text, tree, &mut out),
         _ => {}
     }
     out.sort_by_key(|t| t.row);
     out
+}
+
+// ---- Extensions --------------------------------------------------------------------
+
+/// Zed's runnables: `runnables.scm` captures `@run` with `(#set! tag …)`, and
+/// the language's `tasks.json` says what runs for each tag, with `$ZED_…`
+/// variables (`$ZED_FILE`, `$ZED_ROW`, `$ZED_SYMBOL`, `$ZED_CUSTOM_<capture>` …).
+fn extension_targets(language: Language, path: &Path, text: &str, tree: &Tree, out: &mut Vec<RunTarget>) {
+    use tree_sitter::{QueryCursor, StreamingIterator};
+    let Some(def) = language.extension() else { return };
+    let Some(query) = crate::syntax::queries(language).and_then(|q| q.runnables.as_ref()) else { return };
+    let Some(run) = query.capture_index_for_name("run") else { return };
+    let dir = path.parent().unwrap_or(path);
+    let root = path.ancestors().find(|d| d.join(".git").exists()).unwrap_or(dir);
+    let display = |p: &Path| p.to_string_lossy().into_owned();
+    let base = [
+        ("ZED_FILE", display(path)),
+        ("ZED_FILENAME", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+        ("ZED_STEM", path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+        ("ZED_DIRNAME", display(dir)),
+        ("ZED_WORKTREE_ROOT", display(root)),
+        ("ZED_RELATIVE_FILE", display(path.strip_prefix(root).unwrap_or(path))),
+    ];
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
+    while let Some(m) = matches.next() {
+        let Some(node) = m.captures.iter().find(|c| c.index == run).map(|c| c.node) else { continue };
+        let tags: Vec<&str> = query.property_settings(m.pattern_index).iter().filter(|p| p.key.as_ref() == "tag").filter_map(|p| p.value.as_deref()).collect();
+        let mut vars: Vec<(String, String)> = base.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+        vars.push(("ZED_ROW".into(), (node.start_position().row + 1).to_string()));
+        vars.push(("ZED_COLUMN".into(), (node.start_position().column + 1).to_string()));
+        vars.push(("ZED_SYMBOL".into(), text[node.byte_range()].to_string()));
+        for c in m.captures {
+            let name = query.capture_names()[c.index as usize];
+            if c.index != run && !name.starts_with('_') {
+                vars.push((format!("ZED_CUSTOM_{name}"), text[c.node.byte_range()].to_string()));
+            }
+        }
+        // Longer names first, so $ZED_FILE doesn't eat $ZED_FILENAME.
+        vars.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+        let expand = |s: &str| vars.iter().fold(s.to_string(), |s, (k, v)| s.replace(&format!("${{{k}}}"), v).replace(&format!("${k}"), v));
+        for task in def.tasks.iter().filter(|t| t.tags.iter().any(|tag| tags.contains(&tag.as_str()))) {
+            let command = std::iter::once(&task.command).chain(&task.args).map(|a| expand(a)).collect::<Vec<_>>().join(" ");
+            out.push(RunTarget {
+                name: expand(&task.label),
+                command,
+                cwd: task.cwd.as_deref().map(|c| PathBuf::from(expand(c))).unwrap_or_else(|| root.to_path_buf()),
+                row: Some(node.start_position().row),
+                rows: node.start_position().row..node.end_position().row + 1,
+                debug: None,
+            });
+        }
+    }
 }
 
 // ---- Rust ------------------------------------------------------------------------

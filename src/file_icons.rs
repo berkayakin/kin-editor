@@ -4,9 +4,13 @@
 //! icon theme, vendored unchanged; updating the pack means copying its SVGs and that file
 //! (the test below catches a missing or unused SVG).
 
-use std::{collections::HashMap, path::Path, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock, RwLock},
+};
 
-use gpui::SharedString;
+use gpui::{ImageSource, SharedString};
 
 use crate::theme::Appearance;
 
@@ -224,6 +228,78 @@ pub fn file(path: &Path, appearance: Appearance) -> SharedString {
 pub fn folder(open: bool, appearance: Appearance) -> SharedString {
     let a = associations();
     if open { a.folder_open.get(appearance) } else { a.folder.get(appearance) }
+}
+
+// ---- Icon themes from extensions -----------------------------------------------
+
+/// An extension's icon theme (Zed's format), with its SVGs on disk.
+struct IconTheme {
+    by_name: HashMap<String, PathBuf>,
+    file: Option<PathBuf>,
+    folder: Option<PathBuf>,
+    folder_open: Option<PathBuf>,
+}
+
+/// The `icon_theme` in use, when it isn't the built-in one.
+static SELECTED: RwLock<Option<Arc<IconTheme>>> = RwLock::new(None);
+
+/// Uses theme `index` of the icon theme file `json` (paths in it are relative
+/// to the extension's folder), or the built-in icons for None.
+pub fn select(theme: Option<(&Path, usize)>) {
+    let loaded = theme.and_then(|(json, index)| load_theme(json, index)).map(Arc::new);
+    *SELECTED.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+}
+
+fn load_theme(json: &Path, index: usize) -> Option<IconTheme> {
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(json).ok()?).ok()?;
+    let theme = &value["themes"][index];
+    let root = json.parent()?.parent()?;
+    let path = |p: &serde_json::Value| p.as_str().map(|p| root.join(p.trim_start_matches("./")));
+    let svg_of = |kind: &str| path(&theme["file_icons"][kind]["path"]);
+    let mut by_name = HashMap::new();
+    for table in ["file_suffixes", "file_stems"] {
+        for (key, kind) in theme[table].as_object().into_iter().flatten() {
+            if let Some(svg) = kind.as_str().and_then(svg_of) {
+                by_name.insert(key.to_lowercase(), svg);
+            }
+        }
+    }
+    Some(IconTheme {
+        by_name,
+        file: svg_of("default"),
+        folder: path(&theme["directory_icons"]["collapsed"]),
+        folder_open: path(&theme["directory_icons"]["expanded"]),
+    })
+}
+
+/// A file's icon: the selected icon theme's, else the built-in one.
+pub fn file_source(path: &Path, appearance: Appearance) -> ImageSource {
+    if let Some(theme) = SELECTED.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_lowercase();
+        let mut rest = name.as_str();
+        let found = loop {
+            if let Some(svg) = theme.by_name.get(rest) {
+                break Some(svg.clone());
+            }
+            match rest.split_once('.') {
+                Some((_, suffix)) => rest = suffix,
+                None => break theme.file.clone(),
+            }
+        };
+        if let Some(svg) = found {
+            return svg.into();
+        }
+    }
+    file(path, appearance).into()
+}
+
+pub fn folder_source(open: bool, appearance: Appearance) -> ImageSource {
+    if let Some(theme) = SELECTED.read().unwrap_or_else(|e| e.into_inner()).clone()
+        && let Some(svg) = if open { theme.folder_open.clone() } else { theme.folder.clone() }
+    {
+        return svg.into();
+    }
+    folder(open, appearance).into()
 }
 
 #[cfg(test)]

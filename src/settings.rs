@@ -58,6 +58,8 @@ pub struct Settings {
     pub trust_all_projects: Option<bool>,
     /// Vim keys: Normal, Insert and Visual modes.
     pub vim_mode: Option<bool>,
+    /// File icons from an extension's icon theme, by name (built-in when unset).
+    pub icon_theme: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -247,6 +249,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "auto_update",
     "trust_all_projects",
     "vim_mode",
+    "icon_theme",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -386,6 +389,7 @@ impl Settings {
             "show_whitespace" => self.editor.show_whitespace.is_some(),
             "inlay_hints" => self.editor.inlay_hints.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
+            "icon_theme" => self.icon_theme.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
@@ -521,12 +525,16 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
             Ok(settings) => {
                 problems.extend(unknown_key_problems());
                 let theme_changed = settings.theme != Settings::get(cx).theme;
+                let icons_changed = settings.icon_theme != Settings::get(cx).icon_theme;
                 let trust_all = settings.trust_all_projects == Some(true);
                 if trust_all != (Settings::get(cx).trust_all_projects == Some(true)) {
                     crate::trust::set_trust_all(trust_all);
                     crate::trust::changed(cx);
                 }
                 cx.set_global(settings.clone());
+                if icons_changed {
+                    crate::extensions::apply_icon_theme(cx);
+                }
                 // No theme set (any more) means the default one.
                 if theme_changed {
                     let name = settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
@@ -608,6 +616,9 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "inlay_hints": true,
   // Vim keys (Normal, Insert and Visual modes).
   // "vim_mode": false,
+
+  // File icons from an extension's icon theme (Zed's format), by name.
+  // "icon_theme": "Soft Charmed Icons",
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {

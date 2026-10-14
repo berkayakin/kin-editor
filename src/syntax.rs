@@ -650,36 +650,113 @@ fn injection(language: Language) -> Option<(&'static LangConfig, fn(Node) -> Vec
     }
 }
 
+/// Queries an extension's language brings besides highlights and outline,
+/// in Zed's format: `injections.scm`, `brackets.scm`, `indents.scm`,
+/// `textobjects.scm` and `runnables.scm`.
+pub(crate) struct LanguageQueries {
+    injections: Option<InjectionQuery>,
+    brackets: Option<Query>,
+    indents: Option<Query>,
+    textobjects: Option<Query>,
+    pub(crate) runnables: Option<Query>,
+}
+
+struct InjectionQuery {
+    query: Query,
+    /// `@injection.content` (or the older `@content`).
+    content: Option<u32>,
+    /// `@injection.language` (or `@language`): the node naming the language.
+    language: Option<u32>,
+}
+
+impl LanguageQueries {
+    /// Compiles the queries that are there; one that doesn't fit the grammar
+    /// is reported and left out.
+    pub(crate) fn build(language: &TsLanguage, source: impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
+        let mut compile = |file: &str| {
+            let text = source(file)?;
+            Query::new(language, &text).map_err(|e| problems.push(format!("{file}, line {}: {}", e.row + 1, e.message))).ok()
+        };
+        let injections = compile("injections.scm").map(|query| {
+            let index = |names: [&str; 2]| names.iter().find_map(|n| query.capture_index_for_name(n));
+            let content = index(["injection.content", "content"]);
+            let language = index(["injection.language", "language"]);
+            InjectionQuery { query, content, language }
+        });
+        Self {
+            injections,
+            brackets: compile("brackets.scm"),
+            indents: compile("indents.scm"),
+            textobjects: compile("textobjects.scm"),
+            runnables: compile("runnables.scm"),
+        }
+    }
+}
+
+pub(crate) fn queries(language: Language) -> Option<&'static LanguageQueries> {
+    language.extension()?.queries()
+}
+
+/// The highlighting for an embedded language named in an injection query:
+/// a built-in language, an extension's, or one known by its file extension.
+fn injected_config(name: &str) -> Option<&'static LangConfig> {
+    let name = name.trim().to_lowercase();
+    let builtin = match name.as_str() {
+        "javascript" | "js" | "jsx" => Language::JavaScript,
+        "typescript" | "ts" => Language::TypeScript,
+        "tsx" => Language::Tsx,
+        "html" => Language::Html,
+        "css" => Language::Css,
+        "rust" | "rs" => Language::Rust,
+        "go" => Language::Go,
+        "python" | "py" => Language::Python,
+        "php" => Language::Php,
+        "bash" | "sh" | "shell" | "zsh" => Language::Shell,
+        "json" => Language::Json,
+        "yaml" | "yml" => Language::Yaml,
+        "toml" => Language::Toml,
+        "markdown" | "md" => Language::Markdown,
+        "markdown_inline" | "markdown-inline" => return Some(&MARKDOWN_INLINE),
+        _ => {
+            let extension = crate::extensions::languages().into_iter().map(Language::Extension).find(|l| {
+                l.extension().is_some_and(|d| d.name.to_lowercase() == name || d.id == name)
+            });
+            extension.unwrap_or_else(|| Language::from_path(Path::new(&format!("file.{name}"))))
+        }
+    };
+    config(builtin)
+}
+
+/// An embedded language's tree: every range of that language, parsed as one.
+struct Injection {
+    config: &'static LangConfig,
+    parser: Parser,
+    tree: Option<Tree>,
+}
+
 pub struct Syntax {
     language: Language,
     parser: Parser,
     tree: Option<Tree>,
-    /// See [`injection`]: one tree spanning every embedded range.
-    injection_parser: Option<Parser>,
-    injection_tree: Option<Tree>,
+    /// Embedded languages (see [`injection`] and extensions' injection queries).
+    injections: Vec<Injection>,
 }
 
 impl Syntax {
     pub fn new(language: Language, rope: &Rope) -> Self {
         let mut parser = Parser::new();
-        let mut injection_parser = None;
         if let Some(config) = config(language) {
+            crate::extensions::prepare_parser(&mut parser, &config.language);
             parser.set_language(&config.language).ok();
         }
-        if let Some((inner, _)) = injection(language) {
-            let mut p = Parser::new();
-            p.set_language(&inner.language).ok();
-            injection_parser = Some(p);
-        }
-        let mut this = Self {
-            language,
-            parser,
-            tree: None,
-            injection_parser,
-            injection_tree: None,
-        };
+        let mut this = Self { language, parser, tree: None, injections: Vec::new() };
         this.reparse(rope);
         this
+    }
+
+    /// The trees of embedded languages, then the file's own.
+    fn trees(&self) -> impl Iterator<Item = &Tree> {
+        self.injections.iter().filter_map(|i| i.tree.as_ref()).chain(self.tree.as_ref())
     }
 
     pub fn tree(&self) -> Option<&Tree> {
@@ -704,16 +781,68 @@ impl Syntax {
         );
         self.tree = tree;
 
-        if let (Some(tree), Some(parser), Some((_, ranges_of))) =
-            (self.tree.as_ref(), self.injection_parser.as_mut(), injection(self.language))
-        {
-            let ranges = ranges_of(tree.root_node());
-            self.injection_tree = None;
-            if !ranges.is_empty() && parser.set_included_ranges(&ranges).is_ok() {
-                self.injection_tree =
-                    parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), None, None);
+        let wanted = self.tree.as_ref().map(|tree| injected_ranges(self.language, tree, rope)).unwrap_or_default();
+        let mut old = std::mem::take(&mut self.injections);
+        for (config, ranges) in wanted {
+            let mut injection = match old.iter().position(|i| std::ptr::eq(i.config, config)) {
+                Some(ix) => old.swap_remove(ix),
+                None => {
+                    let mut parser = Parser::new();
+                    crate::extensions::prepare_parser(&mut parser, &config.language);
+                    if parser.set_language(&config.language).is_err() {
+                        continue;
+                    }
+                    Injection { config, parser, tree: None }
+                }
+            };
+            injection.tree = None;
+            if injection.parser.set_included_ranges(&ranges).is_ok() {
+                injection.tree = injection.parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), None, None);
+            }
+            self.injections.push(injection);
+        }
+    }
+
+    /// Whether a line break at `offset` (on `row`) should indent the next
+    /// line, by the language's `indents.scm`: an `@indent` node starts on
+    /// this row and goes on past the caret. None without such a query.
+    pub fn indent_after(&self, rope: &Rope, offset: usize, row: usize) -> Option<bool> {
+        let query = queries(self.language)?.indents.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        let indent = query.capture_index_for_name("indent")?;
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(offset.saturating_sub(1)..offset + 1);
+        let mut captures = cursor.captures(query, tree.root_node(), RopeProvider(rope));
+        while let Some((m, ix)) = captures.next() {
+            let c = m.captures[*ix];
+            if c.index == indent && c.node.start_position().row == row && c.node.start_byte() < offset && c.node.end_byte() > offset {
+                return Some(true);
             }
         }
+        Some(false)
+    }
+
+    /// A function, class or comment around `offset` from `textobjects.scm`
+    /// (`@function.around`, `@class.inside` …), the smallest one.
+    pub fn text_object(&self, rope: &Rope, offset: usize, object: &str, around: bool) -> Option<Range<usize>> {
+        let query = queries(self.language)?.textobjects.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        let find = |kind: &str| -> Option<Range<usize>> {
+            let index = query.capture_index_for_name(&format!("{object}.{kind}"))?;
+            let mut cursor = QueryCursor::new();
+            cursor.set_byte_range(offset..offset + 1);
+            let mut best: Option<Range<usize>> = None;
+            let mut captures = cursor.captures(query, tree.root_node(), RopeProvider(rope));
+            while let Some((m, ix)) = captures.next() {
+                let c = m.captures[*ix];
+                let r = c.node.byte_range();
+                if c.index == index && r.start <= offset && offset < r.end.max(r.start + 1) && best.as_ref().is_none_or(|b| r.len() < b.len()) {
+                    best = Some(r);
+                }
+            }
+            best
+        };
+        if around { find("around") } else { find("inside").or_else(|| find("around")) }
     }
 
     /// The smallest syntax node that strictly contains `range`, for
@@ -729,22 +858,52 @@ impl Syntax {
                 node = node.parent()?;
             }
         };
-        [self.tree.as_ref(), self.injection_tree.as_ref()]
-            .into_iter()
-            .flatten()
-            .filter_map(grow)
-            .min_by_key(|r| r.len())
+        self.trees().filter_map(grow).min_by_key(|r| r.len())
     }
 
     /// The bracket at `offset` (or just before it) and its partner. Brackets
     /// in strings and comments aren't grammar tokens, so they never match.
-    pub fn matching_bracket(&self, offset: usize) -> Option<(usize, usize)> {
+    pub fn matching_bracket(&self, rope: &Rope, offset: usize) -> Option<(usize, usize)> {
+        self.bracket_pair(rope, offset).map(|(a, b)| (a.start, b.start))
+    }
+
+    /// Like `matching_bracket`, with both brackets' extents: `brackets.scm`
+    /// pairs can be words (`do` … `end`).
+    pub fn bracket_pair(&self, rope: &Rope, offset: usize) -> Option<(Range<usize>, Range<usize>)> {
         // The bracket after the cursor wins, as in JetBrains.
         for at in [Some(offset), offset.checked_sub(1)].into_iter().flatten() {
-            for tree in [self.injection_tree.as_ref(), self.tree.as_ref()].into_iter().flatten() {
+            if let Some(pair) = self.query_bracket(rope, at) {
+                return Some(pair);
+            }
+            for tree in self.trees() {
                 if let Some(partner) = bracket_partner(tree.root_node(), at) {
-                    return Some((at, partner));
+                    return Some((at..at + 1, partner..partner + 1));
                 }
+            }
+        }
+        None
+    }
+
+    /// The pair from `brackets.scm` (`@open`, `@close`) one end of which starts at `at`.
+    fn query_bracket(&self, rope: &Rope, at: usize) -> Option<(Range<usize>, Range<usize>)> {
+        let query = queries(self.language)?.brackets.as_ref()?;
+        let tree = self.tree.as_ref()?;
+        let (open, close) = (query.capture_index_for_name("open")?, query.capture_index_for_name("close")?);
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(at..at + 1);
+        let mut matches = cursor.matches(query, tree.root_node(), RopeProvider(rope));
+        while let Some(m) = matches.next() {
+            let node = |index| m.captures.iter().find(|c| c.index == index).map(|c| c.node.byte_range());
+            let (Some(o), Some(c)) = (node(open), node(close)) else { continue };
+            // Quotes pair a string's ends; skip pairs that are the same token.
+            if o == c {
+                continue;
+            }
+            if o.start == at {
+                return Some((o, c));
+            }
+            if c.start == at {
+                return Some((c, o));
             }
         }
         None
@@ -763,12 +922,12 @@ impl Syntax {
             let mut def = None;
             let mut name = None;
             let context: Vec<String> = m
-                .captures()
+                .captures
                 .iter()
                 .filter(|c| Some(c.index) == config.context && c.node.byte_range().len() < 40)
                 .map(|c| rope.byte_slice(c.node.byte_range()).to_string())
                 .collect();
-            for c in m.captures() {
+            for c in m.captures {
                 if c.index == config.name {
                     name = Some(c.node.byte_range());
                 } else if let Some(kind) = config.kinds[c.index as usize] {
@@ -827,8 +986,10 @@ impl Syntax {
             return Vec::new();
         };
         apply_query(config, tree.root_node(), rope, range.clone(), &mut map);
-        if let (Some(tree), Some((inner, _))) = (self.injection_tree.as_ref(), injection(self.language)) {
-            apply_query(inner, tree.root_node(), rope, range.clone(), &mut map);
+        for injection in &self.injections {
+            if let Some(tree) = injection.tree.as_ref() {
+                apply_query(injection.config, tree.root_node(), rope, range.clone(), &mut map);
+            }
         }
 
         let mut spans = Vec::new();
@@ -881,7 +1042,7 @@ fn apply_query(
     cursor.set_byte_range(range.clone());
     let mut captures = cursor.captures(&config.query, root, RopeProvider(rope));
     while let Some((m, ix)) = captures.next() {
-        let capture = m.captures()[*ix];
+        let capture = m.captures[*ix];
         let h = config.captures[capture.index as usize];
         let node = capture.node;
         let s = node.start_byte().max(range.start) - range.start;
@@ -890,6 +1051,51 @@ fn apply_query(
             map[s..e].fill(h);
         }
     }
+}
+
+/// Embedded ranges per language: the built-in ones, or what the language's
+/// `injections.scm` finds (by `injection.language`, captured or `#set!`).
+fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> {
+    if let Some((config, ranges_of)) = injection(language) {
+        let ranges = ranges_of(tree.root_node());
+        return if ranges.is_empty() { Vec::new() } else { vec![(config, ranges)] };
+    }
+    let Some(injections) = queries(language).and_then(|q| q.injections.as_ref()) else { return Vec::new() };
+    let own = config(language);
+    let mut out: Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&injections.query, tree.root_node(), RopeProvider(rope));
+    while let Some(m) = matches.next() {
+        let named = m.captures.iter().find(|c| Some(c.index) == injections.language).map(|c| rope.byte_slice(c.node.byte_range()).to_string());
+        let set = || {
+            injections.query.property_settings(m.pattern_index).iter().find_map(|p| {
+                matches!(p.key.as_ref(), "injection.language" | "language").then(|| p.value.as_deref().map(str::to_string)).flatten()
+            })
+        };
+        let Some(config) = named.or_else(set).and_then(|name| injected_config(&name)) else { continue };
+        if own.is_some_and(|own| std::ptr::eq(own, config)) {
+            continue;
+        }
+        let ranges = m.captures.iter().filter(|c| Some(c.index) == injections.content).map(|c| c.node.range());
+        match out.iter_mut().find(|(c, _)| std::ptr::eq(*c, config)) {
+            Some((_, list)) => list.extend(ranges),
+            None => out.push((config, ranges.collect())),
+        }
+    }
+    // A parser takes ranges in order and without overlaps.
+    for (_, ranges) in &mut out {
+        ranges.sort_by_key(|r| r.start_byte);
+        let mut end = 0;
+        ranges.retain(|r| {
+            let keep = r.start_byte >= end && r.end_byte > r.start_byte;
+            if keep {
+                end = r.end_byte;
+            }
+            keep
+        });
+    }
+    out.retain(|(_, ranges)| !ranges.is_empty());
+    out
 }
 
 fn script_ranges(root: Node) -> Vec<tree_sitter::Range> {
@@ -1081,14 +1287,14 @@ mod tests {
         let rope = Rope::from_str(src);
         let syntax = Syntax::new(Language::Rust, &rope);
         let at = |c: char, nth: usize| src.match_indices(c).nth(nth).unwrap().0;
-        assert_eq!(syntax.matching_bracket(at('(', 0)), Some((at('(', 0), at(')', 0))));
+        assert_eq!(syntax.matching_bracket(&rope, at('(', 0)), Some((at('(', 0), at(')', 0))));
         // After a closing bracket, the cursor's left neighbor matches.
-        assert_eq!(syntax.matching_bracket(at(')', 0) + 1), Some((at(')', 0), at('(', 0))));
-        assert_eq!(syntax.matching_bracket(at('[', 0)), Some((at('[', 0), at(']', 0))));
-        assert_eq!(syntax.matching_bracket(at('{', 0)), Some((at('{', 0), at('}', 0))));
+        assert_eq!(syntax.matching_bracket(&rope, at(')', 0) + 1), Some((at(')', 0), at('(', 0))));
+        assert_eq!(syntax.matching_bracket(&rope, at('[', 0)), Some((at('[', 0), at(']', 0))));
+        assert_eq!(syntax.matching_bracket(&rope, at('{', 0)), Some((at('{', 0), at('}', 0))));
         // The "(" inside the string literal isn't a bracket.
-        assert_eq!(syntax.matching_bracket(at('(', 1)), None);
-        assert_eq!(syntax.matching_bracket(at('l', 0)), None);
+        assert_eq!(syntax.matching_bracket(&rope, at('(', 1)), None);
+        assert_eq!(syntax.matching_bracket(&rope, at('l', 0)), None);
     }
 
     #[test]

@@ -34,7 +34,7 @@ use tree_sitter::Language as TsLanguage;
 
 use crate::{
     lsp::servers::{self, ServerSpec},
-    syntax::{LangConfig, OutlineConfig},
+    syntax::{LangConfig, LanguageQueries, OutlineConfig},
     theme::config_dir,
 };
 
@@ -122,6 +122,10 @@ pub struct LanguageDef {
     grammar: Option<Grammar>,
     highlights: String,
     outline: Option<String>,
+    /// The language folder, for its other queries (`injections.scm` …).
+    dir: PathBuf,
+    /// `tasks.json`: commands for `runnables.scm` tags (and untagged ones).
+    pub tasks: Vec<Task>,
     /// Set once the grammar's library is loaded (None: it failed to).
     loaded: OnceLock<Option<Loaded>>,
 }
@@ -130,6 +134,21 @@ struct Loaded {
     language: TsLanguage,
     highlights: &'static LangConfig,
     outline: Option<&'static OutlineConfig>,
+    queries: &'static LanguageQueries,
+}
+
+/// A task from a language's `tasks.json`, as in Zed.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Task {
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The `runnables.scm` tags it runs for.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Where a grammar's sources and compiled library are.
@@ -140,6 +159,9 @@ pub struct Grammar {
     /// The folder with `parser.c`.
     src: PathBuf,
     library: PathBuf,
+    /// A prebuilt WebAssembly grammar (`grammars/<name>.wasm`, as in the
+    /// extensions Zed installs): used as is, so no C compiler is needed.
+    wasm: PathBuf,
     /// Fetched into `checkout` at `rev`, when the extension doesn't bundle it.
     repository: Option<String>,
     rev: Option<String>,
@@ -159,6 +181,10 @@ impl LanguageDef {
         self.load().and_then(|l| l.outline)
     }
 
+    pub(crate) fn queries(&self) -> Option<&'static LanguageQueries> {
+        self.load().map(|l| l.queries)
+    }
+
     /// Loads the grammar the first time it's needed and built.
     fn load(&self) -> Option<&Loaded> {
         if let Some(loaded) = self.loaded.get() {
@@ -166,7 +192,7 @@ impl LanguageDef {
         }
         let grammar = self.grammar.as_ref()?;
         // Not built yet: try again when it is.
-        if !grammar.library.is_file() || BUILDING.lock().unwrap().contains(&grammar.library) {
+        if !grammar.wasm.is_file() && (!grammar.library.is_file() || BUILDING.lock().unwrap().contains(&grammar.library)) {
             return None;
         }
         let loaded = match self.load_now(grammar) {
@@ -180,7 +206,11 @@ impl LanguageDef {
     }
 
     fn load_now(&self, grammar: &Grammar) -> Result<Loaded, String> {
-        let language = load_library(&grammar.library, &grammar.name)?;
+        let language = if grammar.wasm.is_file() {
+            load_wasm(&grammar.wasm, &grammar.name)?
+        } else {
+            load_library(&grammar.library, &grammar.name)?
+        };
         // A query that doesn't fit the grammar leaves the language unhighlighted
         // (it still parses, for outlines and syntax errors).
         let highlights = LangConfig::build(language.clone(), &self.highlights).or_else(|err| {
@@ -194,7 +224,12 @@ impl LanguageDef {
                 None
             }
         });
-        Ok(Loaded { language, highlights: Box::leak(Box::new(highlights)), outline })
+        let mut problems = Vec::new();
+        let queries = LanguageQueries::build(&language, |file| std::fs::read_to_string(self.dir.join(file)).ok(), &mut problems);
+        for problem in problems {
+            add_problem(&self.extension, format!("{}: {problem}", self.name));
+        }
+        Ok(Loaded { language, highlights: Box::leak(Box::new(highlights)), outline, queries: Box::leak(Box::new(queries)) })
     }
 
     fn matches(&self, path: &Path) -> bool {
@@ -250,6 +285,40 @@ pub fn installed() -> Vec<ExtensionInfo> {
     REGISTRY.read().unwrap().extensions.clone()
 }
 
+/// An icon theme an extension brings (`icon_themes/*.json`, Zed's format).
+pub struct IconThemeInfo {
+    pub name: String,
+    file: PathBuf,
+    index: usize,
+}
+
+pub fn icon_themes() -> Vec<IconThemeInfo> {
+    let mut out = Vec::new();
+    for extension in installed() {
+        let Ok(entries) = std::fs::read_dir(extension.path.join("icon_themes")) else { continue };
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        files.sort();
+        for file in files {
+            let Some(value) = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { continue };
+            for (index, theme) in value["themes"].as_array().into_iter().flatten().enumerate() {
+                if let Some(name) = theme["name"].as_str() {
+                    out.push(IconThemeInfo { name: name.to_string(), file: file.clone(), index });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Applies the `icon_theme` setting: an extension's icon theme by name, or
+/// the built-in icons.
+pub fn apply_icon_theme(cx: &App) {
+    let name = crate::settings::Settings::get(cx).icon_theme.clone();
+    let themes = icon_themes();
+    let chosen = name.and_then(|n| themes.into_iter().find(|t| t.name == n));
+    crate::file_icons::select(chosen.as_ref().map(|t| (t.file.as_path(), t.index)));
+}
+
 pub fn theme_dirs() -> Vec<PathBuf> {
     REGISTRY.read().unwrap().theme_dirs.clone()
 }
@@ -280,6 +349,7 @@ impl Global for ExtensionsChanged {}
 /// it in the background.
 pub fn reload(cx: &mut App) {
     let jobs = load();
+    apply_icon_theme(cx);
     changed(None, cx);
     // At startup the themes load after this.
     if cx.has_global::<crate::theme::Theme>() {
@@ -419,6 +489,7 @@ fn read_extension(dir: &Path) -> Read {
             name: name.clone(),
             src,
             library,
+            wasm: dir.join("grammars").join(format!("{name}.wasm")),
             repository: field("repository"),
             rev: field("rev").or_else(|| field("commit")),
             checkout,
@@ -529,6 +600,11 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
         extension: extension.to_string(),
         highlights: query("highlights.scm", "highlights.scm").unwrap_or_default(),
         outline: query("outline.scm", "tags.scm"),
+        dir: dir.to_path_buf(),
+        tasks: std::fs::read_to_string(dir.join("tasks.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&crate::settings::strip_jsonc(&text)).ok())
+            .unwrap_or_default(),
         grammar,
         loaded: OnceLock::new(),
     })
@@ -556,6 +632,43 @@ fn leak(s: impl Into<String>) -> &'static str {
 
 /// Links a folder in (like Zed's dev extensions): it's used in place, so its
 /// author's edits apply on Reload. Returns the extension's name.
+/// Where Zed keeps the extensions it installed: packaged, so their grammars
+/// are prebuilt WASM and need no compiler here.
+fn zed_installed_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let dir = if cfg!(target_os = "macos") {
+        home?.join("Library/Application Support/Zed")
+    } else if cfg!(windows) {
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Zed")
+    } else {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| Some(home?.join(".local/share")))?.join("zed")
+    };
+    Some(dir.join("extensions").join("installed"))
+}
+
+/// Zed's installed extensions that Kin doesn't have yet: (name, folder).
+pub fn zed_extensions() -> Vec<(String, PathBuf)> {
+    let have: Vec<String> = installed().into_iter().map(|e| e.id).collect();
+    let mut found: Vec<(String, PathBuf)> = zed_installed_dir()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|path| {
+            let manifest = read_toml(&path.join("extension.toml")).ok()?;
+            let id = manifest.get("id").and_then(Value::as_str).map(str::to_string).or_else(|| Some(path.file_name()?.to_string_lossy().into_owned()))?;
+            if have.contains(&id) {
+                return None;
+            }
+            let name = manifest.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or(id);
+            Some((name, path))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 pub fn install_folder(source: &Path) -> Result<String, String> {
     let manifest = read_toml(&source.join("extension.toml")).map_err(|_| "That folder has no extension.toml".to_string())?;
     let id = manifest.get("id").and_then(Value::as_str).map(str::to_string).or_else(|| Some(source.file_name()?.to_string_lossy().into_owned()));
@@ -622,8 +735,12 @@ pub fn uninstall(path: &Path) -> Result<(), String> {
 
 // ---- Grammars ----------------------------------------------------------------------
 
-/// Not compiled yet, or its sources changed since.
+/// Not compiled yet, or its sources changed since. A prebuilt WASM grammar
+/// never needs building.
 fn needs_build(grammar: &Grammar) -> bool {
+    if grammar.wasm.is_file() {
+        return false;
+    }
     let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     match (modified(&grammar.library), modified(&grammar.src.join("parser.c"))) {
         (None, _) => true,
@@ -697,6 +814,46 @@ fn compile(grammar: &Grammar) -> Result<(), String> {
     std::fs::rename(&temp, &grammar.library).map_err(|e| e.to_string())
 }
 
+/// One engine for every WASM grammar: a language loaded with it works in any
+/// parser holding a store made from the same engine.
+static WASM_ENGINE: LazyLock<tree_sitter::wasmtime::Engine> = LazyLock::new(Default::default);
+/// The store grammars are loaded into; it lives as long as they do.
+static WASM_LOADER: Mutex<Option<tree_sitter::WasmStore>> = Mutex::new(None);
+
+/// A WebAssembly grammar, run by wasmtime.
+fn load_wasm(path: &Path, name: &str) -> Result<TsLanguage, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let mut loader = WASM_LOADER.lock().unwrap_or_else(|e| e.into_inner());
+    if loader.is_none() {
+        *loader = Some(tree_sitter::WasmStore::new(&WASM_ENGINE).map_err(|e| e.message)?);
+    }
+    let store = loader.as_mut().expect("just set");
+    let language = store.load_language(&name.replace('-', "_"), &bytes).map_err(|e| format!("couldn't load {}: {}", path.display(), e.message))?;
+    check_abi(&language)?;
+    Ok(language)
+}
+
+/// Readies `parser` for `language`: a WASM grammar runs in a store of its own.
+pub fn prepare_parser(parser: &mut tree_sitter::Parser, language: &TsLanguage) {
+    if language.is_wasm()
+        && let Ok(store) = tree_sitter::WasmStore::new(&WASM_ENGINE)
+    {
+        parser.set_wasm_store(store).ok();
+    }
+}
+
+fn check_abi(language: &TsLanguage) -> Result<(), String> {
+    let abi = language.abi_version();
+    if !(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION..=tree_sitter::LANGUAGE_VERSION).contains(&abi) {
+        return Err(format!(
+            "generated for tree-sitter ABI {abi}; Kin reads {}–{}",
+            tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
+            tree_sitter::LANGUAGE_VERSION
+        ));
+    }
+    Ok(())
+}
+
 /// The grammar from its library: `tree_sitter_<name>` returns it.
 fn load_library(path: &Path, name: &str) -> Result<TsLanguage, String> {
     let symbol = format!("tree_sitter_{}", name.replace('-', "_"));
@@ -711,14 +868,7 @@ fn load_library(path: &Path, name: &str) -> Result<TsLanguage, String> {
         std::mem::forget(library);
         language
     };
-    let abi = language.abi_version();
-    if !(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION..=tree_sitter::LANGUAGE_VERSION).contains(&abi) {
-        return Err(format!(
-            "generated for tree-sitter ABI {abi}; Kin reads {}–{}",
-            tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
-            tree_sitter::LANGUAGE_VERSION
-        ));
-    }
+    check_abi(&language)?;
     Ok(language)
 }
 

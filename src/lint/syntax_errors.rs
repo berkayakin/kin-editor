@@ -11,6 +11,7 @@ const MAX_ERRORS: usize = 100;
 
 pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
     let mut parser = Parser::new();
+    crate::extensions::prepare_parser(&mut parser, language);
     if parser.set_language(language).is_err() {
         return Vec::new();
     }
@@ -25,7 +26,7 @@ pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
         // regions (even the whole file) in an error node; when it holds more
         // specific errors, report those instead of the wrapper.
         let descend = if node.is_error() {
-            let nested = (0..node.child_count()).any(|i| node.child(i).is_some_and(|c| c.has_error()));
+            let nested = (0..node.child_count()).any(|i| node.child(i as u32).is_some_and(|c| c.has_error()));
             if !nested {
                 out.push(unexpected(node, text));
             }

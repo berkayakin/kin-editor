@@ -74,7 +74,7 @@ enum Parse {
 }
 
 const MOTIONS: &str = "hjklwbeWBE0^$G{}%;, +-_";
-const OBJECTS: &str = "wW\"'`()b[]{}B<>";
+const OBJECTS: &str = "wW\"'`()b[]{}B<>fc";
 
 /// Splits a leading count off `s`.
 fn take_count(s: &str) -> (Option<usize>, &str) {
@@ -1042,7 +1042,7 @@ impl Editor {
             '%' => {
                 let text = self.doc.slice(from..line_end);
                 let offset = text.char_indices().find(|(_, c)| "()[]{}".contains(*c)).map(|(i, _)| from + i)?;
-                let (_, partner) = self.doc.syntax().matching_bracket(offset).filter(|(at, _)| *at == offset).or_else(|| self.bracket_partner(offset).map(|p| (offset, p)))?;
+                let (_, partner) = self.doc.syntax().matching_bracket(self.doc.rope(), offset).filter(|(at, _)| *at == offset).or_else(|| self.bracket_partner(offset).map(|p| (offset, p)))?;
                 (partner, Kind::Inclusive)
             }
             'f' | 'F' | 't' | 'T' | ';' | ',' => {
@@ -1195,6 +1195,20 @@ impl Editor {
     /// block, inner (`i`) or with its delimiters (`a`).
     fn vim_object(&self, at: usize, around: bool, object: char) -> Option<Range<usize>> {
         match object {
+            // A function or class: the language's textobjects.scm, else
+            // the outline's definitions.
+            'f' | 'c' => {
+                let name = if object == 'f' { "function" } else { "class" };
+                if let Some(range) = self.doc.syntax().text_object(self.doc.rope(), at, name, around) {
+                    return Some(range);
+                }
+                let kinds: &[&str] = if object == 'f' { &["function", "method"] } else { &["class", "struct", "enum", "interface", "trait", "impl", "module", "type"] };
+                let symbol = self.doc.syntax().symbols(self.doc.rope()).into_iter().filter(|s| kinds.contains(&s.kind) && s.range.start <= at && at < s.range.end).min_by_key(|s| s.range.len())?;
+                let range = symbol.range;
+                let (first, last) = (self.doc.row_of(range.start), self.doc.row_of(range.end.saturating_sub(1)));
+                // Inside: the lines between its first and last.
+                Some(if around || last <= first + 1 { range } else { self.doc.line_start(first + 1)..self.doc.line_start(last) })
+            }
             'w' | 'W' => {
                 let big = object == 'W';
                 let cls = class(self.doc.char_at(at)?, big);
