@@ -1894,13 +1894,18 @@ impl Workspace {
         self.show_context_menu(entries, actions, position, None, window, cx);
     }
 
-    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, window: &mut Window, cx: &mut Context<Self>) {
         // Like JetBrains tool windows: show Files, or hide if Files is showing.
         if self.show_sidebar && self.sidebar_mode == SidebarMode::Files {
             self.show_sidebar = false;
         } else {
             self.show_sidebar = true;
             self.sidebar_mode = SidebarMode::Files;
+        }
+        // Leaving the Commit view: its message box must not keep focus while hidden, or
+        // key presses (⌘0 included) go nowhere.
+        if self.git_panel.focus_handle(cx).contains_focused(window, cx) {
+            self.focus_active(window, cx);
         }
         self.save_state();
         cx.notify();
