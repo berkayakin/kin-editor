@@ -96,6 +96,8 @@ actions!(
         AddLogpoint,
         OpenExtensions,
         ProjectTrust,
+        UndoFileChange,
+        RedoFileChange,
         ReloadExtensions,
         Resume,
         PauseProgram,
@@ -229,6 +231,8 @@ enum TreeAction {
     Git(GitOp),
     ShowDiff(FileStatus, bool),
     AddToGitignore(String),
+    UndoFileChange,
+    RedoFileChange,
 }
 
 /// What an open input dialog will do with the name it collects.
@@ -394,6 +398,9 @@ struct TreeEntry {
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    /// The file tree's, so ⌘Z there undoes file operations.
+    tree_focus: FocusHandle,
+    file_history: crate::file_history::FileHistory,
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     entries: Vec<TreeEntry>,
@@ -615,6 +622,8 @@ impl Workspace {
         .detach();
         let mut this = Self {
             focus_handle,
+            tree_focus: cx.focus_handle(),
+            file_history: Default::default(),
             root: None,
             expanded: HashSet::new(),
             entries: Vec::new(),
@@ -4081,6 +4090,18 @@ impl Workspace {
         let dir = if is_dir { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone()) };
         let is_root = self.root.as_deref() == Some(path.as_path());
 
+        let undo = self.file_history.undo_label().map(|l| format!("Undo {l}"));
+        let redo = self.file_history.redo_label().map(|l| format!("Redo {l}"));
+        let binding = |action: &dyn gpui::Action| crate::ui::binding_label(action, window);
+        if let Some(label) = undo {
+            add(MenuEntry::item(label, Icon::Undo).shortcut(binding(&UndoFileChange)), Some(TreeAction::UndoFileChange));
+        }
+        if let Some(label) = redo {
+            add(MenuEntry::item(label, Icon::Redo).shortcut(binding(&RedoFileChange)), Some(TreeAction::RedoFileChange));
+        }
+        if self.file_history.undo_label().is_some() || self.file_history.redo_label().is_some() {
+            add(MenuEntry::Separator, None);
+        }
         add(MenuEntry::item("New File…", Icon::FilePlus), Some(TreeAction::NewFile(dir.clone())));
         add(MenuEntry::item("New Folder…", Icon::FolderPlus), Some(TreeAction::NewFolder(dir.clone())));
         add(MenuEntry::Separator, None);
@@ -4517,6 +4538,8 @@ impl Workspace {
             TreeAction::Git(op) => self.run_git(op, window, cx),
             TreeAction::ShowDiff(file, staged) => self.open_diff(file, staged, window, cx),
             TreeAction::AddToGitignore(rel) => self.add_to_gitignore(rel, cx),
+            TreeAction::UndoFileChange => self.step_file_history(false, window, cx),
+            TreeAction::RedoFileChange => self.step_file_history(true, window, cx),
         }
     }
 
@@ -4545,8 +4568,13 @@ impl Workspace {
         self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, dialog, event: &InputDialogEvent, window, cx| match event {
             InputDialogEvent::Confirm(name) => match ws.apply_name(name, window, cx) {
                 Ok(()) => {
+                    let in_tree = matches!(ws.pending_input, Some(PendingInput::Rename(_) | PendingInput::NewFolder(_)));
                     ws.pending_input = None;
                     ws.close_modal(window, cx);
+                    // So ⌘Z undoes it.
+                    if in_tree {
+                        window.focus(&ws.tree_focus);
+                    }
                 }
                 Err(err) => dialog.update(cx, |d, cx| d.set_error(err, cx)),
             },
@@ -4601,10 +4629,12 @@ impl Workspace {
                 if path.exists() {
                     return Err(format!("{name} already exists"));
                 }
+                let created = crate::file_history::topmost_new(&path);
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+                self.file_history.record(format!("New File “{name}”"), crate::file_history::Change::Created(created));
                 self.reveal_in_tree(&path);
                 self.after_fs_change(cx);
                 self.open_path(path, window, cx);
@@ -4614,7 +4644,9 @@ impl Workspace {
                 if path.exists() {
                     return Err(format!("{name} already exists"));
                 }
+                let created = crate::file_history::topmost_new(&path);
                 std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+                self.file_history.record(format!("New Folder “{name}”"), crate::file_history::Change::Created(created));
                 self.reveal_in_tree(&path);
                 self.expanded.insert(path);
                 self.after_fs_change(cx);
@@ -4628,10 +4660,19 @@ impl Workspace {
                 if new.exists() {
                     return Err(format!("{name} already exists"));
                 }
+                // Folders the new name adds go away again on undo.
+                let new_dirs = new.parent().map(crate::file_history::topmost_new).filter(|d| !d.exists());
                 if let Some(parent) = new.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 std::fs::rename(&old, &new).map_err(|e| e.to_string())?;
+                let old_name = old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let renamed = crate::file_history::Change::Renamed { from: old.clone(), to: new.clone() };
+                let change = match new_dirs {
+                    Some(dirs) => crate::file_history::Change::Batch(vec![crate::file_history::Change::Created(dirs), renamed]),
+                    None => renamed,
+                };
+                self.file_history.record(format!("Rename “{old_name}”"), change);
                 self.moved(&old, &new, cx);
                 self.reveal_in_tree(&new);
                 self.after_fs_change(cx);
@@ -4640,6 +4681,71 @@ impl Workspace {
             PendingInput::RenameSymbol { .. } => {}
         }
         Ok(())
+    }
+
+    /// Undoes (or redoes) the last file operation. Moving files with unsaved
+    /// edits to the Trash asks first.
+    fn step_file_history(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let label = if redo { self.file_history.redo_label() } else { self.file_history.undo_label() };
+        let Some(label) = label.map(str::to_string) else { return };
+        let mut trashes = Vec::new();
+        if let Some(change) = self.file_history.next(redo) {
+            change.visit(&mut |c| {
+                if let crate::file_history::Change::Created(p) | crate::file_history::Change::Restored(p) = c {
+                    trashes.push(p.clone());
+                }
+            });
+        }
+        let dirty = self.tabs.iter().any(|t| {
+            let doc = &t.read(cx).doc;
+            doc.is_dirty() && doc.path.as_deref().is_some_and(|p| trashes.iter().any(|t| p.starts_with(t)))
+        });
+        if !dirty {
+            self.apply_file_history(redo, window, cx);
+            return;
+        }
+        let verb = if redo { "Redo" } else { "Undo" };
+        let trash_name = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+        let detail = format!("This moves files with unsaved changes to the {trash_name}; the changes will be lost.");
+        let rx = window.prompt(PromptLevel::Warning, &format!("{verb} {label}?"), Some(&detail), &[verb, "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if rx.await == Ok(0) {
+                this.update_in(cx, |ws, window, cx| ws.apply_file_history(redo, window, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn apply_file_history(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::file_history::Change;
+        let Some((label, result)) = self.file_history.step(redo) else { return };
+        match result {
+            Ok(done) => done.visit(&mut |change| match change {
+                Change::Renamed { from, to } => {
+                    self.moved(from, to, cx);
+                    self.reveal_in_tree(to);
+                }
+                Change::Trashed(trashed) => {
+                    let path = &trashed.original;
+                    for editor in self.tabs.clone() {
+                        if editor.read(cx).doc.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                            self.remove_tab(&editor, window, cx);
+                        }
+                    }
+                    self.expanded.retain(|p| !p.starts_with(path));
+                    self.recent.retain(|p| !p.starts_with(path));
+                }
+                Change::Created(path) | Change::Restored(path) => self.reveal_in_tree(path),
+                Change::Batch(_) => {}
+            }),
+            Err(err) => {
+                let verb = if redo { "redo" } else { "undo" };
+                self.toast(ToastKind::Error, format!("Couldn't {verb} {label}"), Some(err.to_string()), cx);
+            }
+        }
+        window.focus(&self.tree_focus);
+        self.after_fs_change(cx);
+        self.schedule_session_save(cx);
     }
 
     /// Keeps open tabs, expanded folders and recents pointing at moved files.
@@ -4678,6 +4784,8 @@ impl Workspace {
             self.toast(ToastKind::Error, "Couldn't move", Some(problem), cx);
             return;
         }
+        let label = format!("Move “{}”", name.to_string_lossy());
+        self.file_history.record(label, crate::file_history::Change::Renamed { from: from.clone(), to: to.clone() });
         self.moved(&from, &to, cx);
         self.expanded.insert(dir);
         self.reveal_in_tree(&to);
@@ -4714,6 +4822,13 @@ impl Workspace {
             self.toast(ToastKind::Error, "Couldn't copy everything", Some(problems.join("\n")), cx);
         }
         let Some(first) = added.first().cloned() else { return };
+        let label = match added.as_slice() {
+            [one] => format!("Copy “{}”", one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            many => format!("Copy {} Items", many.len()),
+        };
+        let created = added.iter().cloned().map(crate::file_history::Change::Created).collect();
+        self.file_history.record(label, crate::file_history::Change::Batch(created));
+        window.focus(&self.tree_focus);
         self.expanded.insert(dir.clone());
         self.reveal_in_tree(&first);
         self.after_fs_change(cx);
@@ -4834,6 +4949,7 @@ impl Workspace {
         let Some(target) = target else { return };
         match std::fs::copy(&path, &target) {
             Ok(_) => {
+                self.file_history.record(format!("Duplicate “{stem}{ext}”"), crate::file_history::Change::Created(target.clone()));
                 self.after_fs_change(cx);
                 // Offer to name the copy right away.
                 self.ask_for_name(PendingInput::Rename(target), window, cx);
@@ -4869,8 +4985,11 @@ impl Workspace {
             if rx.await != Ok(0) {
                 return;
             }
-            this.update_in(cx, |ws, window, cx| match trash::delete(&path) {
-                Ok(()) => {
+            this.update_in(cx, |ws, window, cx| match crate::file_history::move_to_trash(&path) {
+                Ok(trashed) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    ws.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
+                    window.focus(&ws.tree_focus);
                     for editor in ws.tabs.clone() {
                         if editor.read(cx).doc.path.as_deref().is_some_and(|p| p.starts_with(&path)) {
                             ws.remove_tab(&editor, window, cx);
@@ -5429,6 +5548,10 @@ impl Workspace {
             .flex_1()
             .pt_1p5()
             .pb_2()
+            .track_focus(&self.tree_focus)
+            .key_context("FileTree")
+            .on_action(cx.listener(|ws, _: &UndoFileChange, window, cx| ws.step_file_history(false, window, cx)))
+            .on_action(cx.listener(|ws, _: &RedoFileChange, window, cx| ws.step_file_history(true, window, cx)))
             // Right-clicking empty space targets the project root.
             .on_mouse_down(
                 MouseButton::Right,

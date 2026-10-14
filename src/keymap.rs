@@ -27,7 +27,7 @@ use crate::{
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
-        AddLogpoint, OpenExtensions, ReloadExtensions, ProjectTrust,
+        AddLogpoint, OpenExtensions, ReloadExtensions, ProjectTrust, UndoFileChange, RedoFileChange,
         ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, SelectOpenedFile, InstallShellCommand,
     },
 };
@@ -142,6 +142,8 @@ fn common(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-x", Cut, e),
         KeyBinding::new("secondary-v", Paste, e),
         KeyBinding::new("secondary-z", Undo, e),
+        KeyBinding::new("secondary-z", UndoFileChange, Some("FileTree")),
+        KeyBinding::new("secondary-shift-z", RedoFileChange, Some("FileTree")),
         KeyBinding::new("secondary-shift-z", Redo, e),
         KeyBinding::new("secondary-/", ToggleComment, e),
     ];
@@ -756,6 +758,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Settings…", OpenSettings),
         a("Extensions…", OpenExtensions),
         a("Project Trust…", ProjectTrust),
+        a("Undo File Change", UndoFileChange),
+        a("Redo File Change", RedoFileChange),
         a("Reload Extensions", ReloadExtensions),
         a("Preferences…", OpenSettings),
         a("Check for Updates…", CheckForUpdates),

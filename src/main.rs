@@ -17,6 +17,7 @@ mod editor;
 mod extensions;
 mod editorconfig;
 mod encoding;
+mod file_history;
 mod file_icons;
 mod find_bar;
 mod fold;

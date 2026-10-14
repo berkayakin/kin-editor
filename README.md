@@ -95,7 +95,9 @@ platform-native text rendering (CoreText / DirectWrite).
   follow changes made outside Kin (a checkout, a generator, another editor) as they happen
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
   Reveal in Finder; drag entries onto a folder to move them (open tabs follow); **Select Opened File**
-  (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; tabs, custom title bar, IME support
+  (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z)
+  in the tree, or its right-click menu, undo and redo file operations, deletes included (they come
+  back from the Trash); tabs, custom title bar, IME support
 - A Settings dialog for every option, with search across its pages; see [Settings](#settings)
 - Automatic updates from GitHub Releases (signed), installed with **Restart to Update**; see
   [Releases and updates](#releases-and-updates)
