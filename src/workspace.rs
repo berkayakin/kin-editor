@@ -3731,7 +3731,7 @@ impl Workspace {
 
     // ---- Rendering --------------------------------------------------------------
 
-    fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         // The project is shown in its own chip, so the center only names the file.
         let title = match (self.active_editor(), self.root.as_deref()) {
@@ -3759,7 +3759,8 @@ impl Workspace {
                     }
                 })
             })
-            .child(div().w(px(if mac { 84. } else { 12. })).flex_shrink_0())
+            // Room for the traffic lights, which macOS moves out of the window in full screen.
+            .child(div().w(px(if mac && !window.is_fullscreen() { 84. } else { 12. })).flex_shrink_0())
             .child(
                 div()
                     .flex()
@@ -5476,7 +5477,7 @@ impl Render for Workspace {
             .text_color(theme.text)
             .font_family(theme.ui_font.clone())
             .text_size(px(theme.ui_font_size))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(window, cx))
             .child(
                 div()
                     .flex()
