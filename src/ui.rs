@@ -80,9 +80,10 @@ pub fn popover(theme: &Theme) -> Div {
 }
 
 /// The lit edge that marks the selected row in a list (the row must be
-/// `relative`), like the open file in the file tree.
+/// `relative`), like the open file in the file tree: a short pill set just
+/// inside the row, wide enough that its rounded ends show.
 pub fn selected_edge(theme: &Theme) -> Div {
-    div().absolute().left_0().top(px(6.)).bottom(px(6.)).w(px(2.)).rounded_full().bg(theme.accent)
+    div().absolute().left(px(3.)).top(px(7.)).bottom(px(7.)).w(px(3.)).rounded_full().bg(theme.accent)
 }
 
 /// A container for related toggles, drawn like a segmented control; its

@@ -2322,6 +2322,33 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Shows or hides the sidebar, keeping the view it has.
+    fn set_sidebar_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_sidebar = visible;
+        // A hidden Commit view's message box must not keep focus (see `toggle_sidebar`).
+        if !visible && self.git_panel.focus_handle(cx).contains_focused(window, cx) {
+            self.focus_active(window, cx);
+        }
+        if visible && self.sidebar_mode == SidebarMode::Commit {
+            self.refresh_git(cx);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The sidebar switch's Files segment.
+    fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_mode == SidebarMode::Files {
+            return;
+        }
+        self.sidebar_mode = SidebarMode::Files;
+        if self.git_panel.focus_handle(cx).contains_focused(window, cx) {
+            self.focus_active(window, cx);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
     fn show_commit(&mut self, _: &ShowCommit, window: &mut Window, cx: &mut Context<Self>) {
         self.show_sidebar = true;
         self.sidebar_mode = SidebarMode::Commit;
@@ -5515,14 +5542,15 @@ impl Workspace {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        // Files and Commit are switched from the status bar; only Commit has a header (its branch).
+        // Under the Files / Commit switch, the Commit view has a toolbar (its branch).
         let header = (self.sidebar_mode == SidebarMode::Commit && self.repo.is_some()).then(|| {
             div()
                 .flex()
                 .items_center()
                 .gap_0p5()
-                .h(px(TAB_HEIGHT - ISLAND_INSET))
+                .h(px(30.))
                 .px_1()
+                .mb_1()
                 .flex_shrink_0()
                 .border_b_1()
                 .border_color(theme.border_subtle)
@@ -5710,10 +5738,89 @@ impl Workspace {
             .w(self.sidebar_width)
             .flex_shrink_0()
             .h_full()
+            .child(self.render_sidebar_switch(cx))
             .children(header)
             .child(body)
             // Deferred so the grab area sits above the editor it overlaps.
             .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx)))
+    }
+
+    /// The sidebar's two views as a segmented switch across its top: a recessed
+    /// track (the chrome's color) with the current view raised like the current
+    /// tab beside it, and as tall as the tab bar so the two line up.
+    fn render_sidebar_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let files_on = self.sidebar_mode == SidebarMode::Files;
+        let changes = self.git_status.files.len();
+        let segment = |id: &'static str, icon: Icon, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .px_2p5()
+                .rounded(px(7.))
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if on { theme.text } else { theme.text_muted })
+                .when(on, |el| {
+                    el.bg(theme.elevated)
+                        .border_color(theme.border_subtle)
+                        .shadow(soft_shadow(&theme, 1))
+                        .child(tab_glow(&theme))
+                })
+                .when(!on, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
+                .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
+                .child(div().truncate().child(label))
+        };
+        div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .h(px(TAB_HEIGHT - ISLAND_INSET))
+            .pb(px(ISLAND_INSET))
+            // A little room before the list starts.
+            .mb(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .gap(px(2.))
+                    .p(px(2.))
+                    .rounded(px(10.))
+                    .bg(theme.panel)
+                    .border_1()
+                    .border_color(Hsla::from(theme.border).alpha(0.6))
+                    .child(
+                        segment("sidebar-files", Icon::Folder, "Files", files_on)
+                            .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
+                            .on_click(cx.listener(|ws, _, window, cx| ws.show_files(window, cx))),
+                    )
+                    .child(
+                        segment("sidebar-commit", Icon::GitBranch, "Commit", !files_on)
+                            // Uncommitted changes, so they show from the Files view too.
+                            .when(changes > 0, |el| {
+                                el.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.5))
+                                        .text_color(if files_on { theme.text_dim } else { theme.accent })
+                                        .child(changes.to_string()),
+                                )
+                            })
+                            .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx))
+                            .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
+                    ),
+            )
     }
 
     /// An invisible grab area filling the gap after an island; only the
@@ -6945,9 +7052,6 @@ impl Workspace {
                 + run_problems.iter().filter(|p| p.severity == sev).count()
         };
         let (errors, warnings, infos) = (count(Severity::Error), count(Severity::Warning), count(Severity::Info));
-        let files_on = self.show_sidebar && self.sidebar_mode == SidebarMode::Files;
-        let commit_on = self.show_sidebar && self.sidebar_mode == SidebarMode::Commit;
-        let changes = self.git_status.files.len();
 
         let item = |child: AnyElement| {
             div()
@@ -7102,32 +7206,17 @@ impl Workspace {
             .px(px(GAP))
             .text_size(px(11.5))
             .text_color(theme.text_dim)
-            // The sidebar's views, like JetBrains tool window buttons: a click shows that view,
-            // or hides the sidebar when it's the one showing.
+            // Shows or hides the sidebar; its Files / Commit switch is inside it.
             .child(
-                dock()
-                    .child(toggle(
-                        self.icon_button("toggle-sidebar", Icon::FolderTree, files_on, cx, |ws, _, window, cx| {
-                            ws.toggle_sidebar(&ToggleSidebar, window, cx)
+                dock().child(
+                    toggle(
+                        self.icon_button("toggle-sidebar", Icon::PanelLeft, self.show_sidebar, cx, |ws, _, window, cx| {
+                            ws.set_sidebar_visible(!ws.show_sidebar, window, cx)
                         }),
-                        files_on,
+                        self.show_sidebar,
                     )
-                    .tooltip(|window, cx| status_tooltip("Project", &ToggleSidebar, window, cx)))
-                    .child(
-                        toggle(
-                            self.icon_button("toggle-commit", Icon::GitBranch, commit_on, cx, |ws, _, window, cx| {
-                                ws.toggle_commit(&ToggleCommit, window, cx)
-                            }),
-                            commit_on,
-                        )
-                        .w_auto()
-                        .min_w(px(20.))
-                        .px_1()
-                        .gap_1()
-                        .when(commit_on, |el| el.text_color(theme.text))
-                        .when(changes > 0, |el| el.child(changes.to_string()))
-                        .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx)),
-                    ),
+                    .tooltip(|_, cx| tooltip_view("Toggle Sidebar", cx)),
+                ),
             )
             .child(
                 div()
