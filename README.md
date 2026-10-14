@@ -4,6 +4,10 @@ A small, fast code editor written in Rust, rendered entirely on the GPU with
 [GPUI](https://www.gpui.rs) (Metal on macOS, DirectX on Windows), with
 platform-native text rendering (CoreText / DirectWrite).
 
+<p align="center">
+  <img src="docs/screenshots/default.png" alt="Kin with the file tree and a Rust file open, in the default Clay Black theme">
+</p>
+
 ## Features
 
 - Rope-backed buffer (`ropey`) with undo/redo; only visible lines are shaped and painted
