@@ -26,6 +26,8 @@ use crate::{
 #[serde(default)]
 pub struct Settings {
     pub theme: Option<String>,
+    /// The shortcuts Kin starts from; `keymap.json` goes on top.
+    pub base_keymap: Option<BaseKeymap>,
     /// When edited files are written to disk without an explicit save.
     pub auto_save: Option<AutoSave>,
     /// Idle time in milliseconds before `after_delay` saves.
@@ -63,6 +65,41 @@ pub struct RunConfiguration {
 }
 
 impl Global for Settings {}
+
+/// Built-in keymaps, named as in Zed's `base_keymap` setting.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BaseKeymap {
+    #[default]
+    JetBrains,
+    #[serde(alias = "VS Code", alias = "vscode")]
+    VSCode,
+    #[serde(alias = "Sublime Text", alias = "sublime")]
+    SublimeText,
+    Zed,
+}
+
+impl BaseKeymap {
+    pub const ALL: [BaseKeymap; 4] = [BaseKeymap::JetBrains, BaseKeymap::VSCode, BaseKeymap::SublimeText, BaseKeymap::Zed];
+
+    /// The value in `settings.json`.
+    pub fn key(self) -> &'static str {
+        match self {
+            BaseKeymap::JetBrains => "JetBrains",
+            BaseKeymap::VSCode => "VSCode",
+            BaseKeymap::SublimeText => "SublimeText",
+            BaseKeymap::Zed => "Zed",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BaseKeymap::JetBrains => "JetBrains",
+            BaseKeymap::VSCode => "VS Code",
+            BaseKeymap::SublimeText => "Sublime Text",
+            BaseKeymap::Zed => "Zed",
+        }
+    }
+}
 
 /// Auto-save modes, named like VS Code's `files.autoSave`. Every mode but
 /// `off` also saves when the window loses focus, a tab is closed and on quit.
@@ -138,6 +175,7 @@ impl EditorSettings {
 
 const TOP_LEVEL_KEYS: &[&str] = &[
     "theme",
+    "base_keymap",
     "auto_save",
     "auto_save_delay",
     "editor_font_family",
@@ -266,6 +304,7 @@ impl Settings {
     pub fn is_set(&self, key: &str) -> bool {
         match key {
             "theme" => self.theme.is_some(),
+            "base_keymap" => self.base_keymap.is_some(),
             "auto_save" => self.auto_save.is_some(),
             "auto_save_delay" => self.auto_save_delay.is_some(),
             "editor_font_family" => self.editor_font_family.is_some(),
@@ -414,7 +453,9 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
             Err(p) => problems.extend(p),
         }
     }
-    if keymap_time != old_keymap {
+    // A different base keymap needs the bindings rebuilt too.
+    let installed = cx.try_global::<keymap::Installed>().map(|i| i.0);
+    if keymap_time != old_keymap || installed != Some(Settings::get(cx).base_keymap.unwrap_or_default()) {
         problems.extend(keymap::install(cx));
     }
     cx.set_global(ConfigStamps { settings: settings_time, keymap: keymap_time });
@@ -448,6 +489,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
 // Comments and trailing commas are allowed.
 {
   // "theme": "Clay Black",
+
+  // The shortcuts to start from: "JetBrains", "VSCode", "SublimeText" or "Zed".
+  // keymap.json goes on top.
+  // "base_keymap": "JetBrains",
 
   // "off", "after_delay", "on_focus_change" or "on_window_change"
   // "auto_save": "after_delay",

@@ -19,7 +19,7 @@ use crate::{
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp},
     format,
     lsp::servers,
-    settings::{self, AutoSave, RunConfiguration, Settings},
+    settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings},
     syntax::Language,
     theme::{self, Appearance, Theme, ThemeRegistry},
     workspace::Find,
@@ -70,7 +70,7 @@ impl Page {
             Page::Editor => "Font, indentation and line wrapping",
             Page::Saving => "When files are saved and what saving does",
             Page::Languages => "Per-language options, language servers and formatters",
-            Page::Keymap => "Shortcuts for every action, on top of the JetBrains keymap",
+            Page::Keymap => "A base keymap to start from, and shortcuts for every action on top",
             Page::Terminal => "The terminal's shell and your own Run configurations",
             Page::Updates => "Getting new versions of Kin",
         }
@@ -94,6 +94,7 @@ impl Page {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Setting {
     Theme,
+    BaseKeymap,
     FontFamily,
     FontSize,
     LineHeight,
@@ -111,8 +112,9 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 15] = [
+    const ALL: [Setting; 16] = [
         Setting::Theme,
+        Setting::BaseKeymap,
         Setting::FontFamily,
         Setting::FontSize,
         Setting::LineHeight,
@@ -132,6 +134,7 @@ impl Setting {
     fn page(self) -> Page {
         match self {
             Setting::Theme => Page::Appearance,
+            Setting::BaseKeymap => Page::Keymap,
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
             Setting::AutoSave
@@ -147,6 +150,7 @@ impl Setting {
     fn section(self) -> &'static str {
         match self {
             Setting::Theme => "Theme",
+            Setting::BaseKeymap => "Keymap",
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => "Font",
             Setting::TabSize | Setting::HardTabs => "Indentation",
             Setting::SoftWrap => "Wrapping",
@@ -161,6 +165,7 @@ impl Setting {
     fn label(self) -> &'static str {
         match self {
             Setting::Theme => "Theme",
+            Setting::BaseKeymap => "Base keymap",
             Setting::FontFamily => "Family",
             Setting::FontSize => "Size",
             Setting::LineHeight => "Line height",
@@ -181,6 +186,7 @@ impl Setting {
     fn description(self) -> &'static str {
         match self {
             Setting::Theme => "Add your own themes as .json files in the themes folder.",
+            Setting::BaseKeymap => "The shortcuts Kin starts from. Your own changes below stay on top of any of them.",
             Setting::FontFamily => "Monospaced fonts installed on this computer.",
             Setting::FontSize => "Zoom (Increase / Decrease Font Size) adds to this until you reset it.",
             Setting::LineHeight => "A multiple of the font size.",
@@ -202,6 +208,7 @@ impl Setting {
     fn keywords(self) -> &'static str {
         match self {
             Setting::Theme => "color scheme dark light appearance",
+            Setting::BaseKeymap => "keymap shortcuts key bindings vscode vs code jetbrains intellij webstorm sublime zed",
             Setting::FontFamily => "typeface family monospace",
             Setting::FontSize => "font zoom text",
             Setting::LineHeight => "spacing leading font",
@@ -237,6 +244,7 @@ impl Setting {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     AutoSave,
+    BaseKeymap,
     FontFamily,
     LanguageServer,
     Formatter,
@@ -398,7 +406,7 @@ pub struct Preferences {
     commit_task: Option<Task<()>>,
     /// Where each dropdown's button was last drawn (by `Menu`), and the open
     /// one's list for this frame.
-    menu_anchors: [Rc<Cell<Bounds<Pixels>>>; 4],
+    menu_anchors: [Rc<Cell<Bounds<Pixels>>>; 5],
     overlay: Option<AnyElement>,
     _subscriptions: Vec<Subscription>,
 }
@@ -1002,7 +1010,19 @@ impl Preferences {
     fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.page {
             Page::Languages => return self.render_languages(window, cx).into_any_element(),
-            Page::Keymap => return self.keymap.clone().into_any_element(),
+            Page::Keymap => {
+                let theme = Theme::get(cx).clone();
+                let row = self.render_setting(Setting::BaseKeymap, window, cx);
+                return div()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().px(px(28.)).child(section(Setting::BaseKeymap.section(), vec![row], &theme)))
+                    .child(self.keymap.clone())
+                    .into_any_element();
+            }
             _ => {}
         }
         let mut sections: Vec<(&'static str, Vec<Setting>)> = Vec::new();
@@ -1144,6 +1164,15 @@ impl Preferences {
             }
             Setting::FinalNewline => {
                 self.bool_switch("pref-newline", "insert_final_newline", settings.editor.insert_final_newline, cx)
+            }
+            Setting::BaseKeymap => {
+                let current = settings.base_keymap.unwrap_or_default();
+                let options = BaseKeymap::ALL.iter().map(|k| (k.label().into(), *k == current)).collect();
+                self.dropdown(Menu::BaseKeymap, current.label().into(), px(260.), options, cx, move |this, ix, _, cx| {
+                    this.menu = None;
+                    let keymap = BaseKeymap::ALL[ix];
+                    this.set_or_default("base_keymap", keymap.key().into(), BaseKeymap::default().key().into(), cx);
+                })
             }
             Setting::AutoSave => {
                 let current = settings.auto_save.unwrap_or_default();
@@ -1797,6 +1826,7 @@ fn page_sections(page: Page) -> Vec<&'static str> {
 fn setting_key(setting: Setting) -> &'static str {
     match setting {
         Setting::Theme | Setting::RunConfigurations => "",
+        Setting::BaseKeymap => "base_keymap",
         Setting::FontFamily => "editor_font_family",
         Setting::FontSize => "editor_font_size",
         Setting::LineHeight => "editor_line_height",

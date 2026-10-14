@@ -1,6 +1,8 @@
-//! Key bindings modeled on the JetBrains IDE keymaps: the macOS keymap on
-//! macOS and the Windows/Linux keymap elsewhere. Double Shift (Search
-//! Everywhere) isn't a regular binding; the workspace detects it.
+//! Key bindings. A base keymap chosen in settings (`base_keymap`: JetBrains by
+//! default, VS Code, Sublime Text or Zed, like Zed's own setting) goes on top
+//! of the shortcuts they all share, each in its macOS or Windows/Linux variant.
+//! Double Shift (Search Everywhere) isn't a regular binding; the workspace
+//! detects it.
 //!
 //! The user's `keymap.json` is added on top; see [`install`].
 
@@ -16,7 +18,7 @@ use crate::{
     picker::ActionEntry,
     push_dialog::ConfirmPush,
     terminal::{TerminalClear, TerminalCopy, TerminalPaste},
-    settings::strip_jsonc,
+    settings::{BaseKeymap, strip_jsonc},
     theme::{self, config_dir},
     workspace::{
         CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine, OpenSettingsFile,
@@ -28,9 +30,35 @@ use crate::{
     },
 };
 
-pub fn bindings() -> Vec<KeyBinding> {
+/// Which base keymap the installed bindings came from.
+pub struct Installed(pub crate::settings::BaseKeymap);
+
+impl gpui::Global for Installed {}
+
+/// The built-in bindings for a base keymap: what every keymap shares, then
+/// its own layer (later bindings win), like Zed's base keymaps. On macOS the
+/// macOS variant of each keymap, the Windows/Linux one elsewhere.
+pub fn bindings(base: BaseKeymap) -> Vec<KeyBinding> {
+    let mac = cfg!(target_os = "macos");
+    let mut b = common(mac);
+    b.extend(match base {
+        BaseKeymap::JetBrains => jetbrains(mac),
+        BaseKeymap::VSCode => vscode(mac),
+        BaseKeymap::SublimeText => sublime_text(mac),
+        BaseKeymap::Zed => zed(mac),
+    });
+    b
+}
+
+/// The keymap chosen in settings (JetBrains unless set).
+pub fn current(cx: &App) -> BaseKeymap {
+    cx.try_global::<crate::settings::Settings>().and_then(|s| s.base_keymap).unwrap_or_default()
+}
+
+/// Shortcuts every editor (and the platform) agrees on, and Kin's own
+/// dialogs. `secondary` is ⌘ on macOS and Ctrl elsewhere.
+fn common(mac: bool) -> Vec<KeyBinding> {
     let e = Some("Editor");
-    // Shared by both keymaps (`secondary` is ⌘ on macOS, Ctrl elsewhere).
     let mut b = vec![
         KeyBinding::new("secondary-n", NewFile, None),
         KeyBinding::new("secondary-o", OpenFile, None),
@@ -38,50 +66,14 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-s", SaveAs, None),
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-f", Find, None),
-        KeyBinding::new("secondary-r", Replace, None),
         KeyBinding::new("secondary-shift-f", FindInFiles, None),
-        KeyBinding::new("secondary-shift-r", ReplaceInFiles, None),
-        KeyBinding::new("secondary-e", RecentFiles, None),
-        KeyBinding::new("secondary-f12", FileStructure, None),
-        KeyBinding::new("alt-f12", ToggleTerminal, None),
-        KeyBinding::new("secondary-\\", SplitRight, None),
-        KeyBinding::new("secondary-shift-\\", SplitDown, None),
-        KeyBinding::new("ctrl-space", ShowCompletions, e),
-        KeyBinding::new("secondary-b", GoToDeclaration, e),
-        KeyBinding::new("alt-f7", FindUsages, e),
-        KeyBinding::new("shift-f6", RenameSymbol, e),
-        KeyBinding::new("alt-enter", ShowContextActions, e),
-        KeyBinding::new("secondary-alt-l", ReformatCode, e),
-        // ⌘-/⌘= fold in the editor (JetBrains), so zoom takes ⌥⌘-/⌥⌘=.
-        KeyBinding::new("secondary-alt-=", IncreaseFontSize, None),
-        KeyBinding::new("secondary-alt-+", IncreaseFontSize, None),
-        KeyBinding::new("secondary-alt--", DecreaseFontSize, None),
-        KeyBinding::new("secondary--", CollapseRegion, e),
-        KeyBinding::new("secondary-=", ExpandRegion, e),
-        KeyBinding::new("secondary-+", ExpandRegion, e),
-        KeyBinding::new("secondary-shift--", CollapseAllRegions, e),
-        // Shift+minus arrives as underscore on some layouts.
-        KeyBinding::new("secondary-shift-_", CollapseAllRegions, e),
-        KeyBinding::new("secondary-_", CollapseAllRegions, e),
-        KeyBinding::new("secondary-shift-=", ExpandAllRegions, e),
-        KeyBinding::new("secondary-shift-+", ExpandAllRegions, e),
-        KeyBinding::new("secondary-shift-a", FindAction, None),
-        KeyBinding::new("secondary-p", GoToFile, None),
         KeyBinding::new("f3", FindNext, None),
         KeyBinding::new("shift-f3", FindPrevious, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("secondary-shift-]", NextTab, None),
-        KeyBinding::new("secondary-shift-[", PrevTab, None),
-        KeyBinding::new("secondary-shift-m", ToggleProblems, None),
-        // JetBrains "Quick Switch Scheme".
-        KeyBinding::new("ctrl-`", SelectTheme, None),
-        // Git (JetBrains: Commit, Push, Update Project).
-        KeyBinding::new("secondary-k", ShowCommit, None),
-        KeyBinding::new("secondary-shift-k", GitPush, None),
-        KeyBinding::new("secondary-t", GitPull, None),
-        KeyBinding::new("ctrl-alt-shift-down", NextChange, e),
-        KeyBinding::new("ctrl-alt-shift-up", PreviousChange, e),
+        KeyBinding::new("secondary-\\", SplitRight, None),
+        KeyBinding::new("ctrl-space", ShowCompletions, e),
+        // Dialogs and panels.
         KeyBinding::new("escape", Cancel, Some("DiffView")),
         KeyBinding::new("escape", Cancel, Some("PushDialog")),
         KeyBinding::new("escape", Cancel, Some("About")),
@@ -89,7 +81,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-enter", ConfirmPush, Some("PushDialog")),
         KeyBinding::new("up", MoveUp, Some("PushDialog")),
         KeyBinding::new("down", MoveDown, Some("PushDialog")),
-        // JetBrains' diff viewer: F7 / ⇧F7 step through changes.
+        // The diff viewer: F7 / ⇧F7 step through changes (JetBrains and VS Code).
         KeyBinding::new("f7", NextChange, Some("DiffView")),
         KeyBinding::new("shift-f7", PreviousChange, Some("DiffView")),
         KeyBinding::new("ctrl-alt-shift-down", NextChange, Some("DiffView")),
@@ -120,7 +112,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-backspace", Backspace, e),
         KeyBinding::new("delete", Delete, e),
         KeyBinding::new("enter", Newline, e),
-        KeyBinding::new("shift-enter", NewlineBelow, e),
+        // New line below in code, "submit" in text fields.
         KeyBinding::new("secondary-enter", Submit, e),
         KeyBinding::new("tab", Indent, e),
         KeyBinding::new("shift-tab", Outdent, e),
@@ -132,47 +124,23 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("secondary-z", Undo, e),
         KeyBinding::new("secondary-shift-z", Redo, e),
         KeyBinding::new("secondary-/", ToggleComment, e),
-        KeyBinding::new("secondary-d", DuplicateLine, e),
-        KeyBinding::new("secondary-shift-u", ToggleCase, e),
-        KeyBinding::new("ctrl-shift-j", JoinLines, e),
-        KeyBinding::new("alt-shift-up", MoveLineUp, e),
-        KeyBinding::new("alt-shift-down", MoveLineDown, e),
     ];
-
-    if cfg!(target_os = "macos") {
+    if mac {
         b.extend([
-            // The Windows-style Ctrl variants also work on macOS.
-            KeyBinding::new("ctrl-f", Find, None),
-            // JetBrains: ⌃R runs, ⌃⌥R picks what to run, ⌃⇧R runs at the caret.
-            KeyBinding::new("ctrl-r", Rerun, None),
-            KeyBinding::new("ctrl-alt-r", RunConfiguration, None),
-            KeyBinding::new("ctrl-shift-r", RunAtCaret, e),
-            KeyBinding::new("cmd-f2", StopRun, None),
-            KeyBinding::new("ctrl-shift-f", FindInFiles, None),
             KeyBinding::new("cmd-g", FindNext, None),
             KeyBinding::new("cmd-shift-g", FindPrevious, None),
-            KeyBinding::new("cmd-shift-o", GoToFile, None),
-            KeyBinding::new("cmd-l", GoToLine, None),
+            KeyBinding::new("cmd-shift-]", NextTab, None),
+            KeyBinding::new("cmd-shift-[", PrevTab, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
-            KeyBinding::new("f1", QuickDocumentation, e),
+            KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-shift-n", NewWindow, None),
+            KeyBinding::new("cmd-shift-w", CloseWindow, None),
             KeyBinding::new("cmd-t", NewTerminal, Some("Terminal")),
-            KeyBinding::new("alt-tab", NextPane, None),
             KeyBinding::new("cmd-w", CloseTerminal, Some("Terminal")),
             KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
             KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
             KeyBinding::new("cmd-k", TerminalClear, Some("Terminal")),
-            KeyBinding::new("cmd-w", CloseTab, None),
-            KeyBinding::new("ctrl-right", NextTab, None),
-            KeyBinding::new("ctrl-left", PrevTab, None),
-            KeyBinding::new("cmd-1", ToggleSidebar, None),
-            KeyBinding::new("cmd-6", ToggleProblems, None),
-            KeyBinding::new("cmd-0", ToggleCommit, None),
-            KeyBinding::new("cmd-9", ToggleGitLog, None),
-            KeyBinding::new("cmd-alt-z", RollbackHunk, e),
-            KeyBinding::new("cmd-alt-o", OpenFolder, None),
-            // Zed's window shortcuts (JetBrains has none by default).
-            KeyBinding::new("cmd-shift-n", NewWindow, None),
-            KeyBinding::new("cmd-shift-w", CloseWindow, None),
+            // macOS text navigation.
             KeyBinding::new("cmd-left", MoveLineStart, e),
             KeyBinding::new("cmd-right", MoveLineEnd, e),
             KeyBinding::new("cmd-shift-left", SelectLineStart, e),
@@ -189,43 +157,17 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("alt-shift-right", SelectWordRight, e),
             KeyBinding::new("alt-backspace", DeleteWordLeft, e),
             KeyBinding::new("alt-delete", DeleteWordRight, e),
-            KeyBinding::new("cmd-backspace", DeleteLine, e),
-            KeyBinding::new("alt-up", ExtendSelection, e),
-            KeyBinding::new("alt-down", ShrinkSelection, e),
-            KeyBinding::new("ctrl-g", SelectNextOccurrence, e),
-            KeyBinding::new("ctrl-shift-g", UnselectOccurrence, e),
-            KeyBinding::new("ctrl-cmd-g", SelectAllOccurrences, e),
-            KeyBinding::new("cmd-alt-/", ToggleBlockComment, e),
-            KeyBinding::new("cmd-alt-enter", NewlineAbove, e),
-            KeyBinding::new("cmd-alt-up", AddCursorAbove, e),
-            KeyBinding::new("cmd-alt-down", AddCursorBelow, e),
             KeyBinding::new("ctrl-a", MoveLineStart, e),
             KeyBinding::new("ctrl-e", MoveLineEnd, e),
             KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, e),
         ]);
     } else {
         b.extend([
-            KeyBinding::new("ctrl-shift-n", GoToFile, None),
-            KeyBinding::new("ctrl-g", GoToLine, None),
-            KeyBinding::new("ctrl-alt-s", OpenSettings, None),
-            KeyBinding::new("ctrl-q", QuickDocumentation, e),
+            KeyBinding::new("ctrl-f4", CloseTab, None),
             KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Terminal")),
             KeyBinding::new("ctrl-shift-w", CloseTerminal, Some("Terminal")),
-            KeyBinding::new("shift-f10", Rerun, None),
-            KeyBinding::new("alt-shift-f10", RunConfiguration, None),
-            KeyBinding::new("ctrl-shift-f10", RunAtCaret, e),
-            KeyBinding::new("ctrl-f2", StopRun, None),
             KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
             KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
-            KeyBinding::new("ctrl-f4", CloseTab, None),
-            KeyBinding::new("alt-right", NextTab, None),
-            KeyBinding::new("alt-left", PrevTab, None),
-            KeyBinding::new("alt-1", ToggleSidebar, None),
-            KeyBinding::new("alt-6", ToggleProblems, None),
-            KeyBinding::new("alt-0", ToggleCommit, None),
-            KeyBinding::new("alt-9", ToggleGitLog, None),
-            KeyBinding::new("ctrl-alt-z", RollbackHunk, e),
-            KeyBinding::new("ctrl-alt-o", OpenFolder, None),
             KeyBinding::new("ctrl-home", MoveDocStart, e),
             KeyBinding::new("ctrl-end", MoveDocEnd, e),
             KeyBinding::new("ctrl-shift-home", SelectDocStart, e),
@@ -236,6 +178,110 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-shift-right", SelectWordRight, e),
             KeyBinding::new("ctrl-backspace", DeleteWordLeft, e),
             KeyBinding::new("ctrl-delete", DeleteWordRight, e),
+        ]);
+    }
+    b
+}
+
+/// The JetBrains IDE keymaps ("macOS" and "Windows/Linux" in IntelliJ).
+fn jetbrains(mac: bool) -> Vec<KeyBinding> {
+    let e = Some("Editor");
+    let mut b = vec![
+        KeyBinding::new("secondary-r", Replace, None),
+        KeyBinding::new("secondary-shift-r", ReplaceInFiles, None),
+        KeyBinding::new("secondary-e", RecentFiles, None),
+        KeyBinding::new("secondary-f12", FileStructure, None),
+        KeyBinding::new("alt-f12", ToggleTerminal, None),
+        KeyBinding::new("secondary-shift-\\", SplitDown, None),
+        KeyBinding::new("secondary-b", GoToDeclaration, e),
+        KeyBinding::new("alt-f7", FindUsages, e),
+        KeyBinding::new("shift-f6", RenameSymbol, e),
+        KeyBinding::new("alt-enter", ShowContextActions, e),
+        KeyBinding::new("secondary-alt-l", ReformatCode, e),
+        // ⌘-/⌘= fold in the editor, so zoom takes ⌥⌘-/⌥⌘=.
+        KeyBinding::new("secondary-alt-=", IncreaseFontSize, None),
+        KeyBinding::new("secondary-alt-+", IncreaseFontSize, None),
+        KeyBinding::new("secondary-alt--", DecreaseFontSize, None),
+        KeyBinding::new("secondary--", CollapseRegion, e),
+        KeyBinding::new("secondary-=", ExpandRegion, e),
+        KeyBinding::new("secondary-+", ExpandRegion, e),
+        KeyBinding::new("secondary-shift--", CollapseAllRegions, e),
+        // Shift+minus arrives as underscore on some layouts.
+        KeyBinding::new("secondary-shift-_", CollapseAllRegions, e),
+        KeyBinding::new("secondary-_", CollapseAllRegions, e),
+        KeyBinding::new("secondary-shift-=", ExpandAllRegions, e),
+        KeyBinding::new("secondary-shift-+", ExpandAllRegions, e),
+        KeyBinding::new("secondary-shift-a", FindAction, None),
+        KeyBinding::new("secondary-p", GoToFile, None),
+        KeyBinding::new("secondary-shift-m", ToggleProblems, None),
+        // "Quick Switch Scheme".
+        KeyBinding::new("ctrl-`", SelectTheme, None),
+        // Commit, Push, Update Project.
+        KeyBinding::new("secondary-k", ShowCommit, None),
+        KeyBinding::new("secondary-shift-k", GitPush, None),
+        KeyBinding::new("secondary-t", GitPull, None),
+        KeyBinding::new("ctrl-alt-shift-down", NextChange, e),
+        KeyBinding::new("ctrl-alt-shift-up", PreviousChange, e),
+        KeyBinding::new("shift-enter", NewlineBelow, e),
+        KeyBinding::new("secondary-d", DuplicateLine, e),
+        KeyBinding::new("secondary-shift-u", ToggleCase, e),
+        KeyBinding::new("ctrl-shift-j", JoinLines, e),
+        KeyBinding::new("alt-shift-up", MoveLineUp, e),
+        KeyBinding::new("alt-shift-down", MoveLineDown, e),
+    ];
+    if mac {
+        b.extend([
+            // The Windows-style Ctrl variants also work on macOS.
+            KeyBinding::new("ctrl-f", Find, None),
+            KeyBinding::new("ctrl-shift-f", FindInFiles, None),
+            // ⌃R runs, ⌃⌥R picks what to run, ⌃⇧R runs at the caret.
+            KeyBinding::new("ctrl-r", Rerun, None),
+            KeyBinding::new("ctrl-alt-r", RunConfiguration, None),
+            KeyBinding::new("ctrl-shift-r", RunAtCaret, e),
+            KeyBinding::new("cmd-f2", StopRun, None),
+            KeyBinding::new("cmd-shift-o", GoToFile, None),
+            KeyBinding::new("cmd-l", GoToLine, None),
+            KeyBinding::new("f1", QuickDocumentation, e),
+            KeyBinding::new("alt-tab", NextPane, None),
+            KeyBinding::new("ctrl-right", NextTab, None),
+            KeyBinding::new("ctrl-left", PrevTab, None),
+            KeyBinding::new("cmd-1", ToggleSidebar, None),
+            KeyBinding::new("cmd-6", ToggleProblems, None),
+            KeyBinding::new("cmd-0", ToggleCommit, None),
+            KeyBinding::new("cmd-9", ToggleGitLog, None),
+            KeyBinding::new("cmd-alt-z", RollbackHunk, e),
+            KeyBinding::new("cmd-alt-o", OpenFolder, None),
+            KeyBinding::new("cmd-backspace", DeleteLine, e),
+            KeyBinding::new("alt-up", ExtendSelection, e),
+            KeyBinding::new("alt-down", ShrinkSelection, e),
+            KeyBinding::new("ctrl-g", SelectNextOccurrence, e),
+            KeyBinding::new("ctrl-shift-g", UnselectOccurrence, e),
+            KeyBinding::new("ctrl-cmd-g", SelectAllOccurrences, e),
+            KeyBinding::new("cmd-alt-/", ToggleBlockComment, e),
+            KeyBinding::new("cmd-alt-enter", NewlineAbove, e),
+            KeyBinding::new("cmd-alt-up", AddCursorAbove, e),
+            KeyBinding::new("cmd-alt-down", AddCursorBelow, e),
+        ]);
+    } else {
+        b.extend([
+            KeyBinding::new("ctrl-shift-]", NextTab, None),
+            KeyBinding::new("ctrl-shift-[", PrevTab, None),
+            KeyBinding::new("ctrl-shift-n", GoToFile, None),
+            KeyBinding::new("ctrl-g", GoToLine, None),
+            KeyBinding::new("ctrl-alt-s", OpenSettings, None),
+            KeyBinding::new("ctrl-q", QuickDocumentation, e),
+            KeyBinding::new("shift-f10", Rerun, None),
+            KeyBinding::new("alt-shift-f10", RunConfiguration, None),
+            KeyBinding::new("ctrl-shift-f10", RunAtCaret, e),
+            KeyBinding::new("ctrl-f2", StopRun, None),
+            KeyBinding::new("alt-right", NextTab, None),
+            KeyBinding::new("alt-left", PrevTab, None),
+            KeyBinding::new("alt-1", ToggleSidebar, None),
+            KeyBinding::new("alt-6", ToggleProblems, None),
+            KeyBinding::new("alt-0", ToggleCommit, None),
+            KeyBinding::new("alt-9", ToggleGitLog, None),
+            KeyBinding::new("ctrl-alt-z", RollbackHunk, e),
+            KeyBinding::new("ctrl-alt-o", OpenFolder, None),
             KeyBinding::new("ctrl-y", DeleteLine, e),
             KeyBinding::new("ctrl-w", ExtendSelection, e),
             KeyBinding::new("ctrl-shift-w", ShrinkSelection, e),
@@ -246,6 +292,276 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-alt-enter", NewlineAbove, e),
             KeyBinding::new("ctrl-alt-up", AddCursorAbove, e),
             KeyBinding::new("ctrl-alt-down", AddCursorBelow, e),
+        ]);
+    }
+    b
+}
+
+/// VS Code's default keyboard shortcuts.
+fn vscode(mac: bool) -> Vec<KeyBinding> {
+    let e = Some("Editor");
+    let mut b = vec![
+        KeyBinding::new("secondary-shift-p", FindAction, None),
+        KeyBinding::new("f1", FindAction, None),
+        KeyBinding::new("secondary-p", GoToFile, None),
+        KeyBinding::new("ctrl-g", GoToLine, None),
+        KeyBinding::new("secondary-shift-o", FileStructure, None),
+        KeyBinding::new("secondary-shift-h", ReplaceInFiles, None),
+        KeyBinding::new("secondary-b", ToggleSidebar, None),
+        KeyBinding::new("secondary-shift-e", ToggleSidebar, None),
+        KeyBinding::new("ctrl-shift-g", ShowCommit, None),
+        KeyBinding::new("secondary-shift-m", ToggleProblems, None),
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        KeyBinding::new("ctrl-shift-`", NewTerminal, None),
+        KeyBinding::new("secondary-k secondary-s", OpenKeymap, None),
+        KeyBinding::new("secondary-k secondary-t", SelectTheme, None),
+        KeyBinding::new("secondary-k secondary-o", OpenFolder, None),
+        KeyBinding::new("ctrl-r", RecentProjects, None),
+        KeyBinding::new("secondary-k secondary-\\", SplitDown, None),
+        KeyBinding::new("secondary-=", IncreaseFontSize, None),
+        KeyBinding::new("secondary-+", IncreaseFontSize, None),
+        KeyBinding::new("secondary--", DecreaseFontSize, None),
+        KeyBinding::new("secondary-0", ResetFontSize, None),
+        // F5 runs (VS Code debugs; Kin runs without the debugger), ⇧F5 stops.
+        KeyBinding::new("f5", Rerun, None),
+        KeyBinding::new("ctrl-f5", Rerun, None),
+        KeyBinding::new("shift-f5", StopRun, None),
+        KeyBinding::new("f12", GoToDeclaration, e),
+        KeyBinding::new("shift-f12", FindUsages, e),
+        KeyBinding::new("alt-shift-f12", FindUsages, e),
+        KeyBinding::new("f2", RenameSymbol, e),
+        KeyBinding::new("secondary-.", ShowContextActions, e),
+        KeyBinding::new("shift-alt-f", ReformatCode, e),
+        KeyBinding::new("secondary-k secondary-i", QuickDocumentation, e),
+        KeyBinding::new("secondary-k secondary-0", CollapseAllRegions, e),
+        KeyBinding::new("secondary-k secondary-j", ExpandAllRegions, e),
+        KeyBinding::new("shift-alt-a", ToggleBlockComment, e),
+        KeyBinding::new("shift-alt-down", DuplicateLine, e),
+        KeyBinding::new("shift-alt-up", DuplicateLine, e),
+        KeyBinding::new("alt-up", MoveLineUp, e),
+        KeyBinding::new("alt-down", MoveLineDown, e),
+        KeyBinding::new("secondary-shift-k", DeleteLine, e),
+        KeyBinding::new("secondary-shift-enter", NewlineAbove, e),
+        KeyBinding::new("shift-enter", Newline, e),
+        KeyBinding::new("secondary-d", SelectNextOccurrence, e),
+        KeyBinding::new("secondary-shift-l", SelectAllOccurrences, e),
+        KeyBinding::new("secondary-u", UnselectOccurrence, e),
+        KeyBinding::new("alt-z", ToggleSoftWrap, e),
+        KeyBinding::new("alt-f5", NextChange, e),
+        KeyBinding::new("shift-alt-f5", PreviousChange, e),
+    ];
+    if mac {
+        b.extend([
+            KeyBinding::new("cmd-alt-f", Replace, None),
+            KeyBinding::new("cmd-alt-right", NextTab, None),
+            KeyBinding::new("cmd-alt-left", PrevTab, None),
+            KeyBinding::new("cmd-alt-[", CollapseRegion, e),
+            KeyBinding::new("cmd-alt-]", ExpandRegion, e),
+            KeyBinding::new("cmd-alt-up", AddCursorAbove, e),
+            KeyBinding::new("cmd-alt-down", AddCursorBelow, e),
+            KeyBinding::new("ctrl-shift-cmd-right", ExtendSelection, e),
+            KeyBinding::new("ctrl-shift-cmd-left", ShrinkSelection, e),
+            KeyBinding::new("ctrl-j", JoinLines, e),
+        ]);
+    } else {
+        b.extend([
+            KeyBinding::new("ctrl-h", Replace, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PrevTab, None),
+            KeyBinding::new("ctrl-shift-n", NewWindow, None),
+            KeyBinding::new("ctrl-shift-w", CloseWindow, None),
+            KeyBinding::new("ctrl-shift-[", CollapseRegion, e),
+            KeyBinding::new("ctrl-shift-]", ExpandRegion, e),
+            KeyBinding::new("ctrl-alt-up", AddCursorAbove, e),
+            KeyBinding::new("ctrl-alt-down", AddCursorBelow, e),
+            KeyBinding::new("shift-alt-right", ExtendSelection, e),
+            KeyBinding::new("shift-alt-left", ShrinkSelection, e),
+            // Linux's Format Document.
+            KeyBinding::new("ctrl-shift-i", ReformatCode, e),
+            KeyBinding::new("ctrl-y", Redo, e),
+        ]);
+    }
+    b
+}
+
+/// Sublime Text's default key bindings.
+fn sublime_text(mac: bool) -> Vec<KeyBinding> {
+    let e = Some("Editor");
+    let mut b = vec![
+        KeyBinding::new("secondary-shift-p", FindAction, None),
+        KeyBinding::new("secondary-p", GoToFile, None),
+        KeyBinding::new("ctrl-g", GoToLine, None),
+        KeyBinding::new("secondary-r", FileStructure, None),
+        KeyBinding::new("secondary-k secondary-b", ToggleSidebar, None),
+        // The console.
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        // Build and Build With….
+        KeyBinding::new("secondary-b", Rerun, None),
+        KeyBinding::new("secondary-shift-b", RunConfiguration, None),
+        KeyBinding::new("secondary-=", IncreaseFontSize, None),
+        KeyBinding::new("secondary-+", IncreaseFontSize, None),
+        KeyBinding::new("secondary--", DecreaseFontSize, None),
+        KeyBinding::new("f12", GoToDeclaration, e),
+        KeyBinding::new("shift-f12", FindUsages, e),
+        KeyBinding::new("secondary-d", SelectNextOccurrence, e),
+        KeyBinding::new("secondary-u", UnselectOccurrence, e),
+        // Expand Selection to Tag / to Brackets.
+        KeyBinding::new("secondary-shift-a", ExtendSelection, e),
+        KeyBinding::new("ctrl-shift-m", ExtendSelection, e),
+        KeyBinding::new("secondary-shift-d", DuplicateLine, e),
+        KeyBinding::new("ctrl-shift-k", DeleteLine, e),
+        KeyBinding::new("secondary-j", JoinLines, e),
+        KeyBinding::new("secondary-shift-enter", NewlineAbove, e),
+        KeyBinding::new("shift-enter", Newline, e),
+        KeyBinding::new("secondary-k secondary-u", ToggleCase, e),
+        KeyBinding::new("secondary-k secondary-1", CollapseAllRegions, e),
+        KeyBinding::new("secondary-k secondary-0", ExpandAllRegions, e),
+        KeyBinding::new("secondary-k secondary-j", ExpandAllRegions, e),
+        // Next / previous modification.
+        KeyBinding::new("ctrl-.", NextChange, e),
+        KeyBinding::new("ctrl-,", PreviousChange, e),
+    ];
+    if mac {
+        b.extend([
+            KeyBinding::new("cmd-t", GoToFile, None),
+            KeyBinding::new("cmd-alt-f", Replace, None),
+            KeyBinding::new("cmd-alt-right", NextTab, None),
+            KeyBinding::new("cmd-alt-left", PrevTab, None),
+            KeyBinding::new("cmd-alt-2", SplitRight, None),
+            KeyBinding::new("cmd-alt-shift-2", SplitDown, None),
+            KeyBinding::new("ctrl-cmd-p", RecentProjects, None),
+            KeyBinding::new("alt-cmd-down", GoToDeclaration, e),
+            KeyBinding::new("alt-shift-cmd-down", FindUsages, e),
+            KeyBinding::new("ctrl-cmd-g", SelectAllOccurrences, e),
+            KeyBinding::new("ctrl-shift-up", AddCursorAbove, e),
+            KeyBinding::new("ctrl-shift-down", AddCursorBelow, e),
+            KeyBinding::new("ctrl-cmd-up", MoveLineUp, e),
+            KeyBinding::new("ctrl-cmd-down", MoveLineDown, e),
+            KeyBinding::new("cmd-alt-/", ToggleBlockComment, e),
+            KeyBinding::new("cmd-alt-[", CollapseRegion, e),
+            KeyBinding::new("cmd-alt-]", ExpandRegion, e),
+        ]);
+    } else {
+        b.extend([
+            KeyBinding::new("ctrl-h", Replace, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PrevTab, None),
+            KeyBinding::new("ctrl-shift-n", NewWindow, None),
+            KeyBinding::new("ctrl-shift-w", CloseWindow, None),
+            KeyBinding::new("alt-shift-2", SplitRight, None),
+            KeyBinding::new("alt-shift-8", SplitDown, None),
+            KeyBinding::new("ctrl-alt-p", RecentProjects, None),
+            KeyBinding::new("alt-f3", SelectAllOccurrences, e),
+            KeyBinding::new("ctrl-alt-up", AddCursorAbove, e),
+            KeyBinding::new("ctrl-alt-down", AddCursorBelow, e),
+            KeyBinding::new("ctrl-shift-up", MoveLineUp, e),
+            KeyBinding::new("ctrl-shift-down", MoveLineDown, e),
+            KeyBinding::new("ctrl-shift-/", ToggleBlockComment, e),
+            KeyBinding::new("ctrl-shift-[", CollapseRegion, e),
+            KeyBinding::new("ctrl-shift-]", ExpandRegion, e),
+            KeyBinding::new("ctrl-y", Redo, e),
+        ]);
+    }
+    b
+}
+
+/// Zed's default keymap.
+fn zed(mac: bool) -> Vec<KeyBinding> {
+    let e = Some("Editor");
+    let mut b = vec![
+        KeyBinding::new("secondary-shift-p", FindAction, None),
+        KeyBinding::new("secondary-p", GoToFile, None),
+        KeyBinding::new("ctrl-g", GoToLine, None),
+        KeyBinding::new("secondary-shift-o", FileStructure, None),
+        KeyBinding::new("secondary-shift-h", ReplaceInFiles, None),
+        KeyBinding::new("secondary-b", ToggleSidebar, None),
+        KeyBinding::new("secondary-shift-e", ToggleSidebar, None),
+        KeyBinding::new("ctrl-shift-g", ShowCommit, None),
+        KeyBinding::new("secondary-shift-m", ToggleProblems, None),
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        KeyBinding::new("ctrl-~", NewTerminal, None),
+        KeyBinding::new("secondary-alt-,", OpenSettingsFile, None),
+        KeyBinding::new("secondary-k secondary-s", OpenKeymap, None),
+        KeyBinding::new("secondary-k secondary-t", SelectTheme, None),
+        KeyBinding::new("ctrl-r", RecentProjects, None),
+        KeyBinding::new("secondary-k right", SplitRight, None),
+        KeyBinding::new("secondary-k down", SplitDown, None),
+        KeyBinding::new("secondary-=", IncreaseFontSize, None),
+        KeyBinding::new("secondary-+", IncreaseFontSize, None),
+        KeyBinding::new("secondary--", DecreaseFontSize, None),
+        KeyBinding::new("secondary-0", ResetFontSize, None),
+        KeyBinding::new("ctrl-g up", GitPush, None),
+        KeyBinding::new("ctrl-g down", GitPull, None),
+        KeyBinding::new("f12", GoToDeclaration, e),
+        KeyBinding::new("alt-shift-f12", FindUsages, e),
+        KeyBinding::new("f2", RenameSymbol, e),
+        KeyBinding::new("secondary-.", ShowContextActions, e),
+        KeyBinding::new("secondary-shift-i", ReformatCode, e),
+        KeyBinding::new("secondary-k secondary-i", QuickDocumentation, e),
+        KeyBinding::new("secondary-k secondary-0", CollapseAllRegions, e),
+        KeyBinding::new("secondary-k secondary-j", ExpandAllRegions, e),
+        KeyBinding::new("secondary-k secondary-/", ToggleBlockComment, e),
+        KeyBinding::new("alt-up", MoveLineUp, e),
+        KeyBinding::new("alt-down", MoveLineDown, e),
+        KeyBinding::new("secondary-shift-k", DeleteLine, e),
+        KeyBinding::new("secondary-shift-enter", NewlineAbove, e),
+        KeyBinding::new("shift-enter", Newline, e),
+        KeyBinding::new("secondary-d", SelectNextOccurrence, e),
+        KeyBinding::new("secondary-shift-l", SelectAllOccurrences, e),
+        KeyBinding::new("secondary-u", UnselectOccurrence, e),
+        KeyBinding::new("secondary-k z", ToggleSoftWrap, e),
+    ];
+    if mac {
+        b.extend([
+            KeyBinding::new("cmd-alt-f", Replace, None),
+            KeyBinding::new("alt-cmd-o", RecentProjects, None),
+            KeyBinding::new("alt-cmd-right", NextTab, None),
+            KeyBinding::new("alt-cmd-left", PrevTab, None),
+            // Tasks: Rerun and Spawn.
+            KeyBinding::new("cmd-alt-r", Rerun, None),
+            KeyBinding::new("cmd-shift-r", RunConfiguration, None),
+            KeyBinding::new("cmd-alt-[", CollapseRegion, e),
+            KeyBinding::new("cmd-alt-]", ExpandRegion, e),
+            KeyBinding::new("alt-shift-down", DuplicateLine, e),
+            KeyBinding::new("alt-shift-up", DuplicateLine, e),
+            KeyBinding::new("cmd-alt-up", AddCursorAbove, e),
+            KeyBinding::new("cmd-alt-down", AddCursorBelow, e),
+            KeyBinding::new("ctrl-cmd-right", ExtendSelection, e),
+            KeyBinding::new("ctrl-cmd-left", ShrinkSelection, e),
+            KeyBinding::new("ctrl-j", JoinLines, e),
+            KeyBinding::new("cmd-f8", NextChange, e),
+            KeyBinding::new("cmd-shift-f8", PreviousChange, e),
+            KeyBinding::new("cmd-alt-z", RollbackHunk, e),
+        ]);
+    } else {
+        b.extend([
+            KeyBinding::new("ctrl-h", Replace, None),
+            KeyBinding::new("ctrl-,", OpenSettings, None),
+            KeyBinding::new("ctrl-w", CloseTab, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PrevTab, None),
+            KeyBinding::new("ctrl-shift-n", NewWindow, None),
+            KeyBinding::new("ctrl-shift-w", CloseWindow, None),
+            KeyBinding::new("ctrl-alt-o", RecentProjects, None),
+            KeyBinding::new("ctrl-k ctrl-o", OpenFolder, None),
+            KeyBinding::new("ctrl-alt-r", Rerun, None),
+            KeyBinding::new("alt-shift-t", RunConfiguration, None),
+            KeyBinding::new("ctrl-shift-[", CollapseRegion, e),
+            KeyBinding::new("ctrl-shift-]", ExpandRegion, e),
+            KeyBinding::new("ctrl-alt-shift-down", DuplicateLine, e),
+            KeyBinding::new("ctrl-alt-shift-up", DuplicateLine, e),
+            KeyBinding::new("shift-alt-up", AddCursorAbove, e),
+            KeyBinding::new("shift-alt-down", AddCursorBelow, e),
+            KeyBinding::new("alt-shift-right", ExtendSelection, e),
+            KeyBinding::new("alt-shift-left", ShrinkSelection, e),
+            KeyBinding::new("ctrl-shift-j", JoinLines, e),
+            KeyBinding::new("ctrl-f8", NextChange, e),
+            KeyBinding::new("ctrl-shift-f8", PreviousChange, e),
+            KeyBinding::new("ctrl-k ctrl-r", RollbackHunk, e),
+            KeyBinding::new("ctrl-y", Redo, e),
         ]);
     }
     b
@@ -388,13 +704,16 @@ struct Section {
 /// `keymap.json`. User bindings come later, so they win. Returns problems
 /// with the user file; the bindings that are fine still apply.
 pub fn install(cx: &mut App) -> Vec<String> {
+    let base = current(cx);
     let (user, problems) = user_bindings(cx);
-    let defaults = bindings();
+    let defaults = bindings(base);
     let passthrough = terminal_passthrough(&defaults);
     cx.clear_key_bindings();
     cx.bind_keys(defaults);
     cx.bind_keys(passthrough);
     cx.bind_keys(user);
+    // Menus show shortcuts and observe this to pick up new ones.
+    cx.set_global(Installed(base));
     problems
 }
 
@@ -404,6 +723,7 @@ pub fn install(cx: &mut App) -> Vec<String> {
 fn terminal_passthrough(defaults: &[KeyBinding]) -> Vec<KeyBinding> {
     const KEEP: &[&str] = &[
         "workspace::ToggleTerminal",
+        "workspace::NewTerminal",
         "workspace::ToggleGitLog",
         "workspace::NextTab",
         "workspace::PrevTab",
@@ -483,7 +803,8 @@ fn user_bindings(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
 }
 
 /// The comment at the top of `keymap.json`.
-const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in JetBrains keymap.
+const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in keymap
+// ("base_keymap" in settings.json: JetBrains, VSCode, SublimeText or Zed).
 // Changes apply when you save this file.
 //
 // Keys: "cmd-shift-d", "ctrl-alt-l", "f5", or two strokes like "cmd-k cmd-s".
@@ -495,7 +816,8 @@ const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in
 "#;
 
 /// Written by Open Keymap when there's no file yet.
-pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the built-in JetBrains keymap.
+pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the built-in keymap
+// ("base_keymap" in settings.json: JetBrains, VSCode, SublimeText or Zed).
 // Changes apply when you save this file.
 //
 // Keys: "cmd-shift-d", "ctrl-alt-l", "f5", or two strokes like "cmd-k cmd-s".
@@ -550,7 +872,7 @@ pub fn change_shortcut(name: &str, action: &dyn Action, change: ShortcutChange, 
         Some(a) => a.partial_eq(action),
         None => cx.build_action(value, None).is_ok_and(|a| a.partial_eq(action)),
     };
-    let defaults: Vec<(String, Option<String>)> = bindings()
+    let defaults: Vec<(String, Option<String>)> = bindings(current(cx))
         .iter()
         .filter(|b| b.action().partial_eq(action))
         .map(|b| (binding_keys(b), b.predicate().map(|p| p.to_string())))
@@ -632,6 +954,50 @@ fn apply_shortcut_change(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn layers(base: BaseKeymap, mac: bool) -> Vec<KeyBinding> {
+        let mut b = common(mac);
+        b.extend(match base {
+            BaseKeymap::JetBrains => jetbrains(mac),
+            BaseKeymap::VSCode => vscode(mac),
+            BaseKeymap::SublimeText => sublime_text(mac),
+            BaseKeymap::Zed => zed(mac),
+        });
+        b
+    }
+
+    #[test]
+    fn keymaps_have_no_conflicts_and_cover_the_essentials() {
+        let essentials: [(&str, Box<dyn Action>); 8] = [
+            ("Find Action", Box::new(FindAction)),
+            ("Go to File", Box::new(GoToFile)),
+            ("Go to Line", Box::new(GoToLine)),
+            ("Terminal", Box::new(ToggleTerminal)),
+            ("Go to Declaration", Box::new(GoToDeclaration)),
+            ("Duplicate Line", Box::new(DuplicateLine)),
+            ("Delete Line", Box::new(DeleteLine)),
+            ("Select Next Occurrence", Box::new(SelectNextOccurrence)),
+        ];
+        for base in BaseKeymap::ALL {
+            for mac in [true, false] {
+                let bindings = layers(base, mac);
+                // The same keys in the same context must mean one thing.
+                let mut seen: HashMap<(String, String), &'static str> = HashMap::new();
+                for b in &bindings {
+                    let place = (binding_keys(b), b.predicate().map(|p| p.to_string()).unwrap_or_default());
+                    if let Some(other) = seen.insert(place.clone(), b.action().name()) {
+                        assert_eq!(other, b.action().name(), "{base:?} (mac: {mac}): {place:?} is bound twice");
+                    }
+                }
+                for (name, action) in &essentials {
+                    assert!(
+                        bindings.iter().any(|b| b.action().partial_eq(action.as_ref())),
+                        "{base:?} (mac: {mac}) has no shortcut for {name}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn edits_shortcuts() {

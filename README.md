@@ -123,10 +123,16 @@ run `xattr -dr com.apple.quarantine /Applications/Kin.app`. Updates don't need t
 
 ## Key bindings
 
-Kin follows the JetBrains IDE keymaps: the macOS keymap on macOS and the
+Kin starts from the JetBrains IDE keymaps: the macOS keymap on macOS and the
 Windows/Linux keymap elsewhere. On macOS the Ctrl variants of Find/Replace
 (Ctrl+F, Ctrl+R, Ctrl+Shift+F, Ctrl+Shift+R) work too. Every action is also
 reachable through Find Action, which shows its shortcut.
+
+To use other shortcuts, pick a **Base keymap** in Settings → Keymap (or set `"base_keymap"` in
+`settings.json`): **JetBrains** (the default), **VS Code**, **Sublime Text** or **Zed**, each in its
+macOS or Windows/Linux variant, like Zed's setting of the same name. Shortcuts you change yourself
+(`keymap.json`) stay on top of whichever you pick, and menus and Find Action show the current keys.
+The table below is the JetBrains keymap.
 
 | Action | macOS | Windows / Linux |
 | --- | --- | --- |
@@ -313,6 +319,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | Setting | Default | |
 | --- | --- | --- |
 | `theme` | `"Clay Black"` | see [Themes](#themes) |
+| `base_keymap` | `"JetBrains"` | `"JetBrains"`, `"VSCode"`, `"SublimeText"` or `"Zed"`; see [Key bindings](#key-bindings) |
 | `auto_save` | `"after_delay"` | `"off"`, `"after_delay"`, `"on_focus_change"`, `"on_window_change"` |
 | `auto_save_delay` | `1000` | milliseconds |
 | `editor_font_family` | built-in choice | any installed font |

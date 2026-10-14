@@ -233,6 +233,8 @@ fn main() {
                 workspace::open_window(None, cx, |_, _, _| {});
             });
             cx.set_menus(menus());
+            // Menu items show their shortcuts; another keymap changes them.
+            cx.observe_global::<keymap::Installed>(|cx| cx.set_menus(menus())).detach();
 
             // Each folder on the command line gets its own window, like Zed;
             // files open in the first one. Without paths, reopen the last project.

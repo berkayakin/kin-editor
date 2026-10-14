@@ -12,7 +12,7 @@ use crate::{
     editor::{Editor, EditorEvent},
     keymap::{self, ShortcutChange},
     picker::ActionEntry,
-    settings,
+    settings::{self, BaseKeymap},
     theme::Theme,
     ui::{icon_button, icon_el, input_box, kbd, shortcut_label, text_button, tooltip_view},
     workspace::SearchEverywhere,
@@ -20,13 +20,16 @@ use crate::{
 
 struct Row {
     entry: ActionEntry,
-    /// The built-in keys that apply in the editor, for telling changed rows apart.
+    /// The built-in keys that apply in the editor, for telling changed rows
+    /// apart (in the keymap `defaults_for`).
     default_keys: Vec<String>,
 }
 
 pub struct KeymapPage {
     filter: Entity<Editor>,
     rows: Vec<Row>,
+    /// The base keymap `default_keys` came from.
+    defaults_for: BaseKeymap,
     recording: Option<usize>,
     /// Shown under a row after recording, e.g. other actions using the keys.
     notice: Option<(usize, String)>,
@@ -47,20 +50,8 @@ fn applies_in_editor(binding: &KeyBinding) -> bool {
 impl KeymapPage {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| Editor::single_line("Filter by action or shortcut", cx));
-        let defaults = keymap::bindings();
-        let rows = keymap::action_entries()
-            .into_iter()
-            .map(|entry| {
-                let mut default_keys: Vec<String> = defaults
-                    .iter()
-                    .filter(|b| b.action().partial_eq(entry.action.as_ref()) && applies_in_editor(b))
-                    .map(keymap::binding_keys)
-                    .collect();
-                default_keys.sort();
-                default_keys.dedup();
-                Row { entry, default_keys }
-            })
-            .collect();
+        let base = keymap::current(cx);
+        let rows = keymap::action_entries().into_iter().map(|entry| Row { entry, default_keys: Vec::new() }).collect();
         let page: WeakEntity<Self> = cx.entity().downgrade();
         let handle: AnyWindowHandle = window.window_handle();
         let subscriptions = vec![
@@ -85,7 +76,25 @@ impl KeymapPage {
                 page.update(cx, |page, cx| page.record(keystroke, window, cx));
             }),
         ];
-        Self { filter, rows, recording: None, notice: None, _subscriptions: subscriptions }
+        let mut page = Self { filter, rows, defaults_for: base, recording: None, notice: None, _subscriptions: subscriptions };
+        page.load_defaults(base);
+        page
+    }
+
+    /// Each action's built-in keys in `base`.
+    fn load_defaults(&mut self, base: BaseKeymap) {
+        let defaults = keymap::bindings(base);
+        for row in &mut self.rows {
+            let mut keys: Vec<String> = defaults
+                .iter()
+                .filter(|b| b.action().partial_eq(row.entry.action.as_ref()) && applies_in_editor(b))
+                .map(keymap::binding_keys)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            row.default_keys = keys;
+        }
+        self.defaults_for = base;
     }
 
     pub fn focus_filter(&self, window: &mut Window, cx: &App) {
@@ -174,6 +183,11 @@ fn matches_name(entry: &ActionEntry, words: &[String]) -> bool {
 
 impl Render for KeymapPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Another base keymap was picked: "Changed" compares against its keys.
+        let base = keymap::current(cx);
+        if base != self.defaults_for {
+            self.load_defaults(base);
+        }
         let theme = Theme::get(cx).clone();
         let query = self.filter.read(cx).text();
         let filter_words = words(&query);
