@@ -402,7 +402,8 @@ panel sizes, whether the sidebar, Problems panel, terminal and Git log are open 
 closed the first time), which sidebar view (Files or Commit) shows, the font zoom and the diff layout. This lives in
 `state.json` next to `settings.json` in the config folder.
 
-Each project also reopens with the tabs it had, the active tab and each caret. Unsaved edits
+Each project also reopens with the tabs it had, the active tab, each caret and the folders
+expanded in the file tree. Unsaved edits
 are kept as well (like VS Code's hot exit) and undo goes back to the file's saved text. These
 live in `sessions/` in the config folder, one file per project.
 

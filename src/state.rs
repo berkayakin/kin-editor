@@ -72,6 +72,9 @@ pub struct ProjectSession {
     /// Split panes; absent for a single pane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layout: Option<PaneLayout>,
+    /// Expanded folders in the file tree, relative to `root`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expanded: Vec<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
@@ -179,6 +182,7 @@ mod tests {
             ],
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
+            expanded: vec!["src".into(), "src/lsp".into()],
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);

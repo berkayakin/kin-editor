@@ -701,6 +701,10 @@ impl Workspace {
         });
         self.expanded.clear();
         self.expanded.insert(root.clone());
+        // The folders that were open last time, if they still exist.
+        if let Some(session) = ProjectSession::load(&root) {
+            self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
+        }
         self.root = Some(root);
         self.show_sidebar = true;
         self.rebuild_tree();
@@ -769,7 +773,10 @@ impl Workspace {
             sizes: self.pane_sizes.clone(),
             active: pane_active,
         });
-        ProjectSession { root, tabs, active, layout }.save()
+        let mut expanded: Vec<PathBuf> =
+            self.expanded.iter().filter_map(|p| p.strip_prefix(&root).ok()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect();
+        expanded.sort();
+        ProjectSession { root, tabs, active, layout, expanded }.save()
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -970,6 +977,7 @@ impl Workspace {
                 self.expanded.insert(entry.path);
             }
             self.rebuild_tree();
+            self.schedule_session_save(cx);
             cx.notify();
         } else {
             self.open_path(entry.path, window, cx);
@@ -3384,6 +3392,7 @@ impl Workspace {
             TreeAction::CollapseAll => {
                 self.expanded.retain(|p| Some(p) == self.root.as_ref());
                 self.rebuild_tree();
+                self.schedule_session_save(cx);
                 cx.notify();
             }
             TreeAction::Git(op) => self.run_git(op, window, cx),
