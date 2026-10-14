@@ -3196,6 +3196,7 @@ name = "kin"
 version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
+ "encoding_rs",
  "futures",
  "gpui",
  "ignore",

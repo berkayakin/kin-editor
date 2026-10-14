@@ -24,6 +24,7 @@ use crate::{
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
+    encoding::TextEncoding,
     watcher::{self, FsChange, GitPath, Watcher},
     onboarding::{Onboarding, OnboardingEvent},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
@@ -283,6 +284,9 @@ enum MenuAction {
     /// A language server's fix or refactoring.
     CodeAction(Arc<Server>, CodeAction),
     Tab(TabAction, Entity<Editor>),
+    /// Status bar: save with these line endings (true: CRLF).
+    LineEndings(bool, Entity<Editor>),
+    Encoding(TextEncoding, Entity<Editor>),
 }
 
 impl Clone for MenuAction {
@@ -292,6 +296,8 @@ impl Clone for MenuAction {
             MenuAction::Run(action) => MenuAction::Run(action.boxed_clone()),
             MenuAction::CodeAction(server, action) => MenuAction::CodeAction(server.clone(), action.clone()),
             MenuAction::Tab(action, editor) => MenuAction::Tab(*action, editor.clone()),
+            MenuAction::LineEndings(crlf, editor) => MenuAction::LineEndings(*crlf, editor.clone()),
+            MenuAction::Encoding(encoding, editor) => MenuAction::Encoding(*encoding, editor.clone()),
         }
     }
 }
@@ -644,6 +650,10 @@ impl Workspace {
         }
         match Document::open(&path) {
             Ok(doc) => {
+                if doc.large {
+                    let detail = "Highlighting, linting and language servers are off for files this big.";
+                    self.toast(ToastKind::Info, "Opened as plain text", Some(detail.into()), cx);
+                }
                 let editor = cx.new(|cx| Editor::new(doc, cx));
                 self.add_tab(editor, window, cx);
             }
@@ -805,6 +815,7 @@ impl Workspace {
                     pane: pane_ix,
                     pinned: self.pinned.contains(&tab.entity_id()),
                     folds: e.folded_rows(),
+                    encoding: (e.doc.encoding != TextEncoding::UTF8).then(|| e.doc.encoding.key()),
                 });
             }
             pane_active.push(active_in_pane);
@@ -842,7 +853,15 @@ impl Workspace {
         };
         for tab in session.tabs {
             let doc = match tab.path.as_deref().map(Document::open) {
-                Some(Ok(doc)) => doc,
+                Some(Ok(mut doc)) => {
+                    // An encoding picked last time, rather than the guess.
+                    if let Some(encoding) = tab.encoding.as_deref().and_then(TextEncoding::from_key)
+                        && encoding != doc.encoding
+                    {
+                        let _ = doc.reload_with_encoding(encoding);
+                    }
+                    doc
+                }
                 // The file is gone and there's nothing unsaved to keep.
                 Some(Err(_)) if tab.unsaved.is_none() => continue,
                 // Untitled, or a deleted file with edits: keep the text.
@@ -3475,6 +3494,12 @@ impl Workspace {
                     Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
                     Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
                     Some(MenuAction::Tab(action, editor)) => ws.run_tab_action(action, &editor, window, cx),
+                    Some(MenuAction::LineEndings(crlf, editor)) => editor.update(cx, |e, cx| {
+                        e.doc.set_crlf(crlf);
+                        cx.emit(EditorEvent::Edited);
+                        cx.notify();
+                    }),
+                    Some(MenuAction::Encoding(encoding, editor)) => ws.choose_encoding(encoding, editor, window, cx),
                     None => {}
                 }
             }
@@ -3482,6 +3507,82 @@ impl Workspace {
         });
         self.context_menu = Some(OpenContextMenu { menu, position, actions, target, _subscription: subscription });
         cx.notify();
+    }
+
+    // ---- Line endings and encoding (status bar) ------------------------------------
+
+    fn open_line_endings_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let crlf = editor.read(cx).doc.uses_crlf;
+        let choice = |label: &'static str, on: bool| if on { MenuEntry::item(label, Icon::Check) } else { MenuEntry::text(label) };
+        let entries = vec![
+            MenuEntry::Header("Line endings".into()),
+            choice("LF (macOS, Linux)", !crlf),
+            choice("CRLF (Windows)", crlf),
+        ];
+        let actions = vec![None, Some(MenuAction::LineEndings(false, editor.clone())), Some(MenuAction::LineEndings(true, editor))];
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    fn open_encoding_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = editor.read(cx).doc.encoding;
+        let mut entries = vec![MenuEntry::Header("Encoding".into())];
+        let mut actions = vec![None];
+        for encoding in crate::encoding::choices() {
+            entries.push(match encoding == current {
+                true => MenuEntry::item(encoding.menu_label(), Icon::Check),
+                false => MenuEntry::text(encoding.menu_label()),
+            });
+            actions.push(Some(MenuAction::Encoding(encoding, editor.clone())));
+        }
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    /// Like JetBrains: reload the file as the new encoding (its text was read
+    /// wrong) or convert it (the next save writes the new encoding).
+    fn choose_encoding(&mut self, encoding: TextEncoding, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let (current, dirty, saved) = {
+            let doc = &editor.read(cx).doc;
+            (doc.encoding, doc.is_dirty(), doc.path.is_some())
+        };
+        if encoding == current {
+            return;
+        }
+        let convert = move |editor: &Entity<Editor>, cx: &mut Context<Self>| {
+            editor.update(cx, |e, cx| {
+                e.doc.convert_to(encoding);
+                cx.emit(EditorEvent::Edited);
+                cx.notify();
+            })
+        };
+        if !saved {
+            convert(&editor, cx);
+            return;
+        }
+        let label = encoding.label();
+        let message = format!("Reload or convert to {label}?");
+        let detail = if dirty {
+            format!("Convert saves the text as {label}. Reloading isn't possible with unsaved changes.")
+        } else {
+            format!("Reload reads the file again as {label}, for text that looks wrong. Convert keeps the text and saves it as {label}.")
+        };
+        let buttons: &[&str] = if dirty { &["Convert", "Cancel"] } else { &["Reload", "Convert", "Cancel"] };
+        let answer = window.prompt(PromptLevel::Info, &message, Some(&detail), buttons, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(choice) = answer.await else { return };
+            let reload = !dirty && choice == 0;
+            let convert_choice = if dirty { 0 } else { 1 };
+            this.update(cx, |ws, cx| {
+                if reload {
+                    if let Err(err) = editor.update(cx, |e, cx| e.reload_with_encoding(encoding, cx)) {
+                        ws.toast(ToastKind::Error, "Couldn't reload the file", Some(err.to_string()), cx);
+                    }
+                } else if choice == convert_choice {
+                    convert(&editor, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- Editor context menu -----------------------------------------------------
@@ -5368,6 +5469,7 @@ impl Workspace {
     fn render_statusbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let lsp_item = self.render_lsp_status(&theme, cx);
+        let active_editor = self.active_editor().cloned();
         let editor = self.active_editor().map(|e| e.read(cx));
         let count = |sev: Severity| {
             editor.map_or(0, |e| e.doc.diagnostics.iter().filter(|d| d.severity == sev).count())
@@ -5435,7 +5537,39 @@ impl Workspace {
                 right.push(item(lsp_item).into_any_element());
             }
             right.push(item(e.indent_label().into_any_element()).into_any_element());
-            right.push(item(if e.doc.uses_crlf { "CRLF" } else { "LF" }.into_any_element()).into_any_element());
+            let menu_item = |id: &'static str, label: String, tip: &'static str| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .h(px(22.))
+                    .px_1p5()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                    .tooltip(move |_, cx| tooltip_view(tip, cx))
+                    .child(label)
+            };
+            let tab = active_editor.clone();
+            right.push(
+                menu_item("line-endings", if e.doc.uses_crlf { "CRLF".into() } else { "LF".into() }, "Line Endings")
+                    .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
+                        if let Some(editor) = tab.clone() {
+                            ws.open_line_endings_menu(editor, event.position(), window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            );
+            let tab = active_editor.clone();
+            right.push(
+                menu_item("encoding", e.doc.encoding.label(), "File Encoding")
+                    .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
+                        if let Some(editor) = tab.clone() {
+                            ws.open_encoding_menu(editor, event.position(), window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            );
             let (icon, color) = match e.doc.language {
                 Language::Html => (Icon::CodeXml, Hsla::from(theme.text_muted)),
                 Language::Markdown => (Icon::FileText, Hsla::from(theme.text_muted)),

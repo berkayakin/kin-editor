@@ -10,6 +10,7 @@ use std::{
 use ropey::Rope;
 
 use crate::{
+    encoding::{self, TextEncoding},
     lint::Diagnostic,
     syntax::{Language, Syntax, input_edit},
 };
@@ -64,6 +65,11 @@ pub enum EditKind {
     Other,
 }
 
+/// Above this, a file opens as plain text without language features.
+const LARGE_FILE_SIZE: u64 = 20_000_000;
+/// Above this, it doesn't open at all (it would take that much memory twice over).
+const MAX_FILE_SIZE: u64 = 500_000_000;
+
 pub struct Document {
     rope: Rope,
     pub path: Option<PathBuf>,
@@ -79,6 +85,10 @@ pub struct Document {
     external_diagnostics: Vec<Diagnostic>,
     lsp_diagnostics: Vec<Diagnostic>,
     pub uses_crlf: bool,
+    /// The file's encoding, used again when saving.
+    pub encoding: TextEncoding,
+    /// Big enough that highlighting, linting and language servers are off.
+    pub large: bool,
     /// Edits since the language server last heard about this document.
     lsp_changes: LspChanges,
     /// Folded (hidden) text: from the start of the first hidden line to the
@@ -107,9 +117,20 @@ impl Document {
             doc.image = Some(path.to_path_buf());
             return Ok(doc);
         }
+        let size = std::fs::metadata(path)?.len();
+        if size > MAX_FILE_SIZE {
+            return Err(std::io::Error::other(format!("{} MB is too large to open", size / 1_000_000)));
+        }
         let bytes = std::fs::read(path)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let (text, encoding) = encoding::decode(&bytes, None);
         let mut doc = Self::from_text(text, Some(path.to_path_buf()));
+        doc.encoding = encoding;
+        if size > LARGE_FILE_SIZE {
+            // Shown as plain text: no parsing, linting or language server.
+            doc.large = true;
+            doc.language = Language::PlainText;
+            doc.syntax = Syntax::new(Language::PlainText, &doc.rope);
+        }
         doc.disk_mtime = mtime(path);
         Ok(doc)
     }
@@ -142,6 +163,8 @@ impl Document {
             external_diagnostics: Vec::new(),
             lsp_diagnostics: Vec::new(),
             uses_crlf,
+            encoding: TextEncoding::UTF8,
+            large: false,
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
             snippet: None,
@@ -199,10 +222,50 @@ impl Document {
             return Ok(changed);
         }
         let bytes = std::fs::read(&path)?;
-        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        let (text, encoding) = encoding::decode(&bytes, Some(self.encoding));
+        self.encoding = encoding;
         self.disk_mtime = mtime(&path);
+        Ok(self.replace_all(text.replace("\r\n", "\n")))
+    }
+
+    /// Reads the file again as `encoding` (when it was guessed wrong).
+    /// Unsaved edits are lost; callers ask first.
+    pub fn reload_with_encoding(&mut self, encoding: TextEncoding) -> std::io::Result<()> {
+        let path = self.path.clone().ok_or_else(|| std::io::Error::other("document has no path"))?;
+        let bytes = std::fs::read(&path)?;
+        self.encoding = encoding;
+        self.disk_mtime = mtime(&path);
+        self.replace_all(encoding::decode_as(&bytes, encoding).replace("\r\n", "\n"));
+        self.saved_version = self.version;
+        Ok(())
+    }
+
+    /// Saves in another encoding from now on (the next save converts).
+    pub fn convert_to(&mut self, encoding: TextEncoding) {
+        if self.encoding != encoding {
+            self.encoding = encoding;
+            self.mark_unsaved();
+        }
+    }
+
+    /// Saves with Windows (CRLF) or Unix (LF) line endings from now on.
+    pub fn set_crlf(&mut self, crlf: bool) {
+        if self.uses_crlf != crlf {
+            self.uses_crlf = crlf;
+            self.mark_unsaved();
+        }
+    }
+
+    /// A change that isn't an edit (encoding, line endings) still needs a save.
+    fn mark_unsaved(&mut self) {
+        self.saved_version = u64::MAX;
+    }
+
+    /// Replaces all text, as when the file changed on disk. Returns whether
+    /// anything changed; undo history goes since it no longer applies.
+    fn replace_all(&mut self, text: String) -> bool {
         if text == self.rope.to_string() {
-            return Ok(false);
+            return false;
         }
         self.rope = Rope::from_str(&text);
         self.syntax = Syntax::new(self.language, &self.rope);
@@ -213,7 +276,7 @@ impl Document {
         self.saved_version = self.version;
         self.undo_stack.clear();
         self.redo_stack.clear();
-        Ok(true)
+        true
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -234,7 +297,8 @@ impl Document {
         if self.uses_crlf {
             text = text.replace('\n', "\r\n");
         }
-        std::fs::write(&path, text)?;
+        let bytes = encoding::encode(&text, self.encoding).map_err(std::io::Error::other)?;
+        std::fs::write(&path, bytes)?;
         self.disk_mtime = mtime(&path);
         self.saved_version = self.version;
         Ok(())

@@ -566,20 +566,27 @@ impl Editor {
         if self.doc.is_dirty() {
             return;
         }
-        match self.doc.reload_from_disk() {
-            Ok(true) => {
-                let selections = self.clamp_selections(self.selections.clone());
-                self.set_selections(selections, 0, cx);
-                self.autoscroll = false;
-                self.linted_version = None;
-                self.schedule_lint(Duration::ZERO, cx);
-                self.schedule_diff(Duration::ZERO, cx);
-                self.edited(cx);
-                cx.notify();
-            }
-            Ok(false) => {}
-            Err(_) => {}
+        if let Ok(true) = self.doc.reload_from_disk() {
+            self.after_reload(cx);
         }
+    }
+
+    /// Reads the file again as `encoding`; unsaved edits are dropped.
+    pub fn reload_with_encoding(&mut self, encoding: crate::encoding::TextEncoding, cx: &mut Context<Self>) -> std::io::Result<()> {
+        self.doc.reload_with_encoding(encoding)?;
+        self.after_reload(cx);
+        Ok(())
+    }
+
+    fn after_reload(&mut self, cx: &mut Context<Self>) {
+        let selections = self.clamp_selections(self.selections.clone());
+        self.set_selections(selections, 0, cx);
+        self.autoscroll = false;
+        self.linted_version = None;
+        self.schedule_lint(Duration::ZERO, cx);
+        self.schedule_diff(Duration::ZERO, cx);
+        self.edited(cx);
+        cx.notify();
     }
 
     /// Re-reads the settings and `.editorconfig` for this file: tab size,
@@ -592,7 +599,8 @@ impl Editor {
         // A file's own indentation wins over settings, but not over .editorconfig.
         self.indent_unit = if fs.indent_is_explicit { configured } else { detect_indent(&self.doc).unwrap_or(configured) };
         if self.mode == EditorMode::Full {
-            self.soft_wrap = fs.soft_wrap;
+            // Wrapping a huge file means measuring every line.
+            self.soft_wrap = fs.soft_wrap && !self.doc.large;
         }
         self.wrap = None;
         cx.notify();

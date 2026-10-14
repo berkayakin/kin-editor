@@ -67,6 +67,12 @@ platform-native text rendering (CoreText / DirectWrite).
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
 - Image preview: PNG, JPEG, GIF (animated), WebP, BMP, TIFF, ICO, TGA and QOI files open as a
   picture with their dimensions and size (SVG stays text); Git diffs show an image's before and after
+- Encodings and line endings: files keep their encoding (UTF-8 with or without BOM, UTF-16,
+  Windows-125x, ISO-8859-2, Shift JIS, EUC-KR, GBK, Big5) and line endings when saved; the status
+  bar shows both, and clicking them reloads the file in another encoding or converts it (as in
+  JetBrains). Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
+  encoding can't hold is never saved in it. Files over 20 MB open as plain text without language
+  features; over 500 MB they don't open
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
   follow changes made outside Kin (a checkout, a generator, another editor) as they happen
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
