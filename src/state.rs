@@ -37,6 +37,9 @@ pub struct SessionState {
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,
+    /// Welcome Setup was finished (`false`: shown but not finished yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboarded: Option<bool>,
     /// Where the last moved or resized window was, for the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
@@ -61,6 +64,30 @@ pub struct WindowPlacement {
 impl SessionState {
     fn path() -> Option<PathBuf> {
         config_dir().map(|d| d.join("state.json"))
+    }
+
+    /// Whether Welcome Setup should show: on a fresh install, until it's
+    /// finished. An install that already has settings or state counts as set up.
+    pub fn needs_onboarding() -> bool {
+        let mut state = Self::load();
+        if let Some(done) = state.onboarded {
+            return !done;
+        }
+        let exists = |path: Option<PathBuf>| path.is_some_and(|p| p.exists());
+        let fresh = !exists(Self::path()) && !exists(crate::settings::Settings::path());
+        state.onboarded = Some(!fresh);
+        if let Err(err) = state.save() {
+            eprintln!("couldn't save window state: {err}");
+        }
+        fresh
+    }
+
+    pub fn set_onboarded() {
+        let mut state = Self::load();
+        state.onboarded = Some(true);
+        if let Err(err) = state.save() {
+            eprintln!("couldn't save window state: {err}");
+        }
     }
 
     pub fn load() -> Self {

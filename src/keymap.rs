@@ -26,7 +26,7 @@ use crate::{
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
-        ToggleAutoSave, ToggleSidebar, CheckForUpdates,
+        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup,
     },
 };
 
@@ -48,6 +48,23 @@ pub fn bindings(base: BaseKeymap) -> Vec<KeyBinding> {
         BaseKeymap::Zed => zed(mac),
     });
     b
+}
+
+/// How `base` binds `action` out of the box (its first binding that works in
+/// the editor), formatted for display; for showing keymaps side by side.
+pub fn shortcut_in(base: BaseKeymap, action: &dyn Action) -> Option<String> {
+    let matching: Vec<KeyBinding> = bindings(base)
+        .into_iter()
+        .filter(|b| {
+            b.action().partial_eq(action) && b.predicate().is_none_or(|p| matches!(p.to_string().as_str(), "Editor" | "Workspace"))
+        })
+        .collect();
+    // The platform's own binding comes last (JetBrains' ⌘⇧O after the shared ⌘P);
+    // a bare key like F1 is only an alternative.
+    let modified = |b: &&KeyBinding| b.keystrokes().first().is_some_and(|k| k.modifiers().modified());
+    let binding = matching.iter().rev().find(modified).or(matching.first())?;
+    let keys: Vec<String> = binding.keystrokes().iter().map(|k| crate::ui::shortcut_label(&k.to_string())).collect();
+    Some(keys.join(" "))
 }
 
 /// The keymap chosen in settings (JetBrains unless set).
@@ -581,6 +598,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Find Next Occurrence", FindNext),
         a("Find Previous Occurrence", FindPrevious),
         a("Go to File", GoToFile),
+        a("Welcome Setup", WelcomeSetup),
         a("Go to Line:Column", GoToLine),
         a("File Structure", FileStructure),
         a("Go to Declaration", GoToDeclaration),

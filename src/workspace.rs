@@ -24,6 +24,7 @@ use crate::{
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
+    onboarding::{Onboarding, OnboardingEvent},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     push_dialog::{PushDialog, PushDialogEvent},
     git_log::{GitLog, GitLogEvent},
@@ -117,6 +118,7 @@ actions!(
         OpenRemote,
         ToggleAutoSave,
         CheckForUpdates,
+        WelcomeSetup,
     ]
 );
 
@@ -410,6 +412,8 @@ pub struct Workspace {
     session_task: Option<Task<()>>,
     /// Debounced write of the window's place on screen.
     placement_task: Option<Task<()>>,
+    /// Welcome Setup, shown in place of everything below the title bar.
+    onboarding: Option<(Entity<Onboarding>, Subscription)>,
     /// Language servers for this window's files.
     lsp: Entity<LspStore>,
     /// The Preferences page shown last, to reopen there.
@@ -576,6 +580,7 @@ impl Workspace {
             close_confirmed: false,
             session_task: None,
             placement_task: None,
+            onboarding: None,
             lsp,
             preferences_page: preferences::Page::Appearance,
             _subscriptions: vec![
@@ -600,6 +605,10 @@ impl Workspace {
     }
 
     fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((onboarding, _)) = &self.onboarding {
+            window.focus(&onboarding.focus_handle(cx));
+            return;
+        }
         match self.active_editor() {
             Some(editor) => window.focus(&editor.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
@@ -926,6 +935,7 @@ impl Workspace {
             diff_side_by_side: saved.diff_side_by_side,
             recent_projects: saved.recent_projects,
             window: saved.window,
+            onboarded: saved.onboarded,
         };
         if let Err(err) = state.save() {
             eprintln!("couldn't save window state: {err}");
@@ -955,6 +965,36 @@ impl Workspace {
                 eprintln!("couldn't save window state: {err}");
             }
         }));
+    }
+
+    /// Shows Welcome Setup (theme, keymap, editor basics) over the window.
+    pub fn show_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        let onboarding = cx.new(Onboarding::new);
+        let subscription = cx.subscribe_in(&onboarding, window, |ws, _, event: &OnboardingEvent, window, cx| match event {
+            OnboardingEvent::Done => ws.finish_onboarding(window, cx),
+            OnboardingEvent::OpenSettings => {
+                ws.finish_onboarding(window, cx);
+                ws.open_settings(&OpenSettings, window, cx);
+            }
+            OnboardingEvent::BrowseThemes => ws.select_theme(&SelectTheme, window, cx),
+            OnboardingEvent::Problems(problems) => ws.report_config_problems(problems.clone(), cx),
+        });
+        window.focus(&onboarding.focus_handle(cx));
+        self.onboarding = Some((onboarding, subscription));
+        cx.notify();
+    }
+
+    fn welcome_setup(&mut self, _: &WelcomeSetup, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_onboarding(window, cx);
+    }
+
+    fn finish_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        self.onboarding = None;
+        SessionState::set_onboarded();
+        self.focus_active(window, cx);
+        cx.notify();
     }
 
     /// Rescans project files in the background (for Go to File).
@@ -5451,6 +5491,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_remote))
             .on_action(cx.listener(Self::toggle_auto_save))
             .on_action(cx.listener(Self::check_for_updates))
+            .on_action(cx.listener(Self::welcome_setup))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))
@@ -5478,7 +5519,10 @@ impl Render for Workspace {
             .font_family(theme.ui_font.clone())
             .text_size(px(theme.ui_font_size))
             .child(self.render_titlebar(window, cx))
-            .child(
+            .when_some(self.onboarding.as_ref().map(|(o, _)| o.clone()), |el, onboarding| {
+                el.child(div().flex_1().min_h_0().child(onboarding))
+            })
+            .when(self.onboarding.is_none(), |el| el.child(
                 div()
                     .flex()
                     .flex_row()
@@ -5497,7 +5541,7 @@ impl Render for Workspace {
                             .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx))),
                     ),
             )
-            .child(self.render_statusbar(cx))
+            .child(self.render_statusbar(cx)))
             .children(toasts)
             .children(self.render_context_menu(cx))
             .children(modal)

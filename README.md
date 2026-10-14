@@ -328,6 +328,11 @@ PATH work as in the terminal.
 
 ## Settings
 
+The first time Kin starts, **Welcome Setup** asks for the basics: a theme (applied as you click),
+the keymap to start from (each shown with a few of its shortcuts) and editor basics such as font
+size, auto-save, reformat on save and soft wrap. Its choices go to `settings.json` like any other.
+Open it again any time from the Kin menu or Find Action (**Welcome Setup**).
+
 **Settings…** (⌘, / Ctrl+Alt+S, or the gear at the right of the status bar) opens the Settings
 dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
 wrapping), Saving, Languages (per-language options, language server and formatter), Keymap and

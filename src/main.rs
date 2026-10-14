@@ -19,6 +19,7 @@ mod input_dialog;
 mod keymap;
 mod lint;
 mod lsp;
+mod onboarding;
 mod picker;
 mod preview;
 mod preferences;
@@ -49,7 +50,7 @@ use crate::{
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
-        ToggleProblems, ToggleSidebar,
+        ToggleProblems, ToggleSidebar, WelcomeSetup,
     },
 };
 
@@ -62,6 +63,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Welcome Setup…", WelcomeSetup),
                 MenuItem::separator(),
                 MenuItem::action("Quit Kin", Quit),
             ],
@@ -245,6 +247,7 @@ fn main() {
             let mut dirs = dirs.into_iter();
             let first_dir = dirs.next();
             let restore = first_dir.is_none() && files.is_empty();
+            let onboarding = state::SessionState::needs_onboarding();
             let mut last = workspace::open_window(None, cx, move |workspace, window, cx| {
                 if restore {
                     workspace.restore_last_project(window, cx);
@@ -254,6 +257,9 @@ fn main() {
                 }
                 for path in files {
                     workspace.open_path(path, window, cx);
+                }
+                if onboarding {
+                    workspace.show_onboarding(window, cx);
                 }
             });
             for dir in dirs {
