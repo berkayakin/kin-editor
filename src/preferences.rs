@@ -558,7 +558,7 @@ impl Preferences {
 
     fn choose_theme(&mut self, name: SharedString, cx: &mut Context<Self>) {
         theme::apply_theme(&name, cx);
-        let result = if name.as_ref() == theme::DEFAULT_DARK && Settings::get(cx).theme.is_none() {
+        let result = if name.as_ref() == theme::DEFAULT_THEME && Settings::get(cx).theme.is_none() {
             Ok(())
         } else {
             Settings::set("theme", name.as_ref().into())

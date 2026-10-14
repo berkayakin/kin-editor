@@ -394,6 +394,9 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/one-light.json"),
 ];
 
+/// The theme used when settings name none.
+pub const DEFAULT_THEME: &str = "Monokai Pro";
+/// What themes without `extends` fill missing colors from, per appearance.
 pub const DEFAULT_DARK: &str = "Clay Black";
 pub const DEFAULT_LIGHT: &str = "Clay Light";
 
@@ -606,7 +609,7 @@ pub fn reload_themes(cx: &mut App) {
     let current = Theme::get(cx).name.to_string();
     cx.set_global(ThemeRegistry::load());
     if !apply_theme(&current, cx) {
-        apply_theme(DEFAULT_DARK, cx);
+        apply_theme(DEFAULT_THEME, cx);
     }
 }
 
@@ -675,10 +678,10 @@ pub fn pick_fonts(cx: &App) -> (SharedString, SharedString) {
 /// Installs the theme registry and the saved (or default) theme.
 pub fn init(cx: &mut App) {
     let registry = ThemeRegistry::load();
-    let wanted = Settings::get(cx).theme.clone().unwrap_or_else(|| DEFAULT_DARK.to_string());
+    let wanted = Settings::get(cx).theme.clone().unwrap_or_else(|| DEFAULT_THEME.to_string());
     let entry = registry
         .find(&wanted)
-        .or_else(|| registry.find(DEFAULT_DARK))
+        .or_else(|| registry.find(DEFAULT_THEME))
         .expect("default theme is built in");
     let theme = (*entry.theme).clone();
     cx.set_global(registry);

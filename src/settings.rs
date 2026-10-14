@@ -443,7 +443,9 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
                 problems.extend(unknown_key_problems());
                 let theme_changed = settings.theme != Settings::get(cx).theme;
                 cx.set_global(settings.clone());
-                if theme_changed && let Some(name) = settings.theme.as_deref() {
+                // No theme set (any more) means the default one.
+                if theme_changed {
+                    let name = settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
                     if !theme::apply_theme(name, cx) {
                         problems.push(format!("settings.json: there's no theme named \"{name}\""));
                     }
@@ -488,7 +490,7 @@ impl Global for StartupProblems {}
 pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you save this file.
 // Comments and trailing commas are allowed.
 {
-  // "theme": "Clay Black",
+  // "theme": "Monokai Pro",
 
   // The shortcuts to start from: "JetBrains", "VSCode", "SublimeText" or "Zed".
   // keymap.json goes on top.

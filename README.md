@@ -9,7 +9,7 @@ A small, fast code editor written in Rust, rendered entirely on the GPU with
 platform-native text rendering (CoreText / DirectWrite).
 
 <p align="center">
-  <img src="docs/screenshots/default.png" alt="Kin with the file tree and a Rust file open, in the default Clay Black theme">
+  <img src="docs/screenshots/default.png" alt="Kin with the file tree and a Rust file open, in the Clay Black theme">
 </p>
 
 ## Features
@@ -342,7 +342,7 @@ are fine, and Kin keeps them when it changes a value itself.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `theme` | `"Clay Black"` | see [Themes](#themes) |
+| `theme` | `"Monokai Pro"` | see [Themes](#themes) |
 | `base_keymap` | `"JetBrains"` | `"JetBrains"`, `"VSCode"`, `"SublimeText"` or `"Zed"`; see [Key bindings](#key-bindings) |
 | `auto_save` | `"after_delay"` | `"off"`, `"after_delay"`, `"on_focus_change"`, `"on_window_change"` |
 | `auto_save_delay` | `1000` | milliseconds |
@@ -474,8 +474,8 @@ Pick a theme with **Select Theme** (Ctrl+\` like JetBrains' Quick Switch Scheme,
 Action). Moving through the list previews each theme live; Enter keeps it
 (saved to `settings.json`), Escape restores the previous one.
 
-Built in: Clay Black (default; near-black with neutral grays), Clay Dark, One Dark, Dracula, Nord, Tokyo Night, Gruvbox Dark,
-Catppuccin Mocha, Rosé Pine, Solarized Dark, Monokai Pro, Everforest Dark, Kanagawa, Ayu Dark, Night Owl,
+Built in: Monokai Pro (default), Clay Black (near-black with neutral grays), Clay Dark, One Dark, Dracula, Nord, Tokyo Night,
+Gruvbox Dark, Catppuccin Mocha, Rosé Pine, Solarized Dark, Everforest Dark, Kanagawa, Ayu Dark, Night Owl,
 Material Palenight, GitHub Dark, Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2,
 and the light themes Clay Light, GitHub Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light
 and One Light. Their sources in [`assets/themes/`](assets/themes) use the same format as user themes.
