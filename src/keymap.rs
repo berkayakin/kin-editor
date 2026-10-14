@@ -26,7 +26,7 @@ use crate::{
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
-        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol,
+        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal,
     },
 };
 
@@ -614,6 +614,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Go to Implementation", GoToImplementation),
         a("Go to Type Definition", GoToTypeDefinition),
         a("Go to Symbol", GoToSymbol),
+        a("Split Terminal", SplitTerminal),
         a("Find Usages", FindUsages),
         a("Rename…", RenameSymbol),
         a("Show Context Actions", ShowContextActions),

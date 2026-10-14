@@ -323,6 +323,12 @@ On macOS, Option types characters as usual (`@` on many layouts). Full-screen pr
 htop, less) get mouse and wheel events; hold Shift to select text in them instead. Colors come
 from the theme's `terminal_*` keys.
 
+Hold ⌘ (Ctrl on Windows/Linux) over a URL or a file path in the output, such as a compiler's
+`src/main.rs:12:5`, to underline it, and click to open it: URLs in the browser, files in the editor
+at that line and column. Paths are relative to the terminal's folder and must exist. The split
+button in the panel header (or **Split Terminal** in Find Action) shows a second shell beside the
+current one; press it again to unsplit (both stay as tabs).
+
 ## Run and test
 
 A ▶ in the gutter marks what can run in the file; click it to run that one thing:

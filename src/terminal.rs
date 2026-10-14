@@ -4,7 +4,13 @@
 //! context); text arrives through the input handler, so dead keys and IMEs
 //! work.
 
-use std::{borrow::Cow, collections::HashMap, ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize},
@@ -21,7 +27,7 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
-    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Modifiers,
+    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
     ScrollWheelEvent, ShapedLine, SharedString, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
     actions, div, fill, font, point, prelude::*, px, relative, size,
@@ -45,6 +51,15 @@ pub enum TerminalEvent {
     TitleChanged,
     /// The shell exited; the tab should close.
     Exited,
+    /// ⌘/Ctrl-click on a `path:line:col` in the output (1-based line and column).
+    OpenFile { path: PathBuf, line: Option<u32>, column: Option<u32> },
+}
+
+/// Something clickable in the output.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Link {
+    Url(String),
+    File { path: PathBuf, line: Option<u32>, column: Option<u32> },
 }
 
 pub struct TerminalView {
@@ -62,6 +77,11 @@ pub struct TerminalView {
     scroll_rest: f32,
     /// Set for a Run tab: what runs, and its exit code once it's done.
     run: Option<(RunTarget, RunState)>,
+    /// Where the shell started, for relative paths in its output.
+    cwd: PathBuf,
+    /// The link under the pointer while ⌘/Ctrl is held: screen row, columns.
+    link: Option<(usize, Range<usize>, Link)>,
+    last_mouse: Option<Point<Pixels>>,
     _events: Task<()>,
 }
 
@@ -103,7 +123,7 @@ impl TerminalView {
         });
         // A Run tab must show everything the program printed before it exited.
         let drain_on_exit = run.is_some();
-        let options = tty::Options { shell, working_directory: Some(cwd), drain_on_exit, env, ..Default::default() };
+        let options = tty::Options { shell, working_directory: Some(cwd.clone()), drain_on_exit, env, ..Default::default() };
         let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, window_size, 0)?;
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener.clone());
@@ -112,7 +132,7 @@ impl TerminalView {
         let notifier = Notifier(event_loop.channel());
         event_loop.spawn();
         Ok(cx.new(|cx| {
-            let mut view = Self::new(term, notifier, rx, cx);
+            let mut view = Self::new(term, notifier, rx, cwd, cx);
             if let Some(target) = run {
                 view.title = target.name.clone().into();
                 view.run = Some((target, RunState::Running));
@@ -135,6 +155,7 @@ impl TerminalView {
         term: Arc<FairMutex<Term<Listener>>>,
         notifier: Notifier,
         mut rx: mpsc::UnboundedReceiver<TermEvent>,
+        cwd: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
         let events = cx.spawn(async move |this, cx| {
@@ -172,6 +193,9 @@ impl TerminalView {
             selecting: false,
             scroll_rest: 0.,
             run: None,
+            cwd,
+            link: None,
+            last_mouse: None,
             _events: events,
         }
     }
@@ -309,8 +333,47 @@ impl TerminalView {
         self.write(format!("\x1b[<{code};{};{}{action}", point.column.0 + 1, row + 1).into_bytes());
     }
 
+    /// The URL or existing file at `position` (in screen coordinates).
+    fn link_at(&self, position: Point<Pixels>) -> Option<(usize, Range<usize>, Link)> {
+        let (point, _) = self.grid_point(position);
+        let term = self.term.lock();
+        let screen_row = (point.line.0 + term.grid().display_offset() as i32).max(0) as usize;
+        let row = &term.grid()[point.line];
+        let chars: Vec<char> = (0..term.columns()).map(|c| row[Column(c)].c).collect();
+        drop(term);
+        let (range, text) = word_at(&chars, point.column.0)?;
+        Some((screen_row, range, parse_link(&text, &self.cwd)?))
+    }
+
+    fn update_link(&mut self, position: Point<Pixels>, modifiers: &Modifiers, cx: &mut Context<Self>) {
+        let link = if modifiers.secondary() { self.link_at(position) } else { None };
+        if link != self.link {
+            self.link = link;
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(position) = self.last_mouse {
+            self.update_link(position, &event.modifiers, cx);
+        }
+    }
+
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
+        // ⌘/Ctrl-click opens a link, even in programs that take the mouse.
+        if event.modifiers.secondary()
+            && let Some((_, _, link)) = self.link_at(event.position)
+        {
+            // Focus moves away, so this view won't see ⌘ go up: drop the underline now.
+            self.link = None;
+            cx.notify();
+            match link {
+                Link::Url(url) => cx.open_url(&url),
+                Link::File { path, line, column } => cx.emit(TerminalEvent::OpenFile { path, line, column }),
+            }
+            return;
+        }
         if self.mouse_reporting(&event.modifiers) {
             self.report_mouse(0, event.position, true, &event.modifiers);
             return;
@@ -327,6 +390,10 @@ impl TerminalView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.last_mouse = Some(event.position);
+        if event.pressed_button.is_none() {
+            self.update_link(event.position, &event.modifiers, cx);
+        }
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
@@ -526,8 +593,46 @@ impl TerminalView {
                 i = j;
             }
         }
+        if let Some((row, cols, _)) = &self.link {
+            let y = inner.origin.y + cell_h * (*row + 1) as f32 - px(1.);
+            let x = inner.origin.x + cell_w * cols.start as f32;
+            frame.link = Some(fill(Bounds::new(point(x, y), size(cell_w * cols.len() as f32, px(1.))), theme.accent));
+        }
         frame
     }
+}
+
+/// The run of non-space characters around `col`, without the brackets,
+/// quotes and punctuation that usually surround a path or URL in output.
+fn word_at(chars: &[char], col: usize) -> Option<(Range<usize>, String)> {
+    let stop = |c: char| c.is_whitespace() || "\"'`<>()[]{},|".contains(c);
+    if chars.get(col).is_none_or(|c| stop(*c)) {
+        return None;
+    }
+    let start = chars[..col].iter().rposition(|c| stop(*c)).map_or(0, |i| i + 1);
+    let mut end = chars[col..].iter().position(|c| stop(*c)).map_or(chars.len(), |i| col + i);
+    // A sentence's full stop or a trailing colon isn't part of it.
+    while end > start + 1 && ".:;!?".contains(chars[end - 1]) {
+        end -= 1;
+    }
+    (col < end).then(|| (start..end, chars[start..end].iter().collect()))
+}
+
+/// A URL, or a file that exists (relative to `cwd`) with an optional
+/// `:line` and `:column`, as compilers and test runners print them.
+fn parse_link(text: &str, cwd: &Path) -> Option<Link> {
+    if text.starts_with("https://") || text.starts_with("http://") {
+        return Some(Link::Url(text.to_string()));
+    }
+    let mut parts = text.splitn(3, ':');
+    let path = parts.next()?;
+    let line = parts.next().and_then(|n| n.parse().ok());
+    let column = parts.next().and_then(|n| n.parse().ok());
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(PathBuf::from)?.join(rest),
+        None => cwd.join(path),
+    };
+    path.is_file().then_some(Link::File { path, line, column })
 }
 
 impl Drop for TerminalView {
@@ -545,6 +650,8 @@ pub struct TerminalFrame {
     backgrounds: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Under the link the pointer is on (⌘/Ctrl held).
+    link: Option<PaintQuad>,
     hitbox: Option<Hitbox>,
 }
 
@@ -744,6 +851,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::clear))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -859,9 +967,13 @@ impl Element for TerminalElement {
         let focus_handle = self.view.read(cx).focus_handle.clone();
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.view.clone()), cx);
         if let Some(hitbox) = frame.hitbox.as_ref() {
-            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+            let style = if frame.link.is_some() { CursorStyle::PointingHand } else { CursorStyle::IBeam };
+            window.set_cursor_style(style, hitbox);
         }
         window.with_content_mask(Some(ContentMask { bounds: frame.bounds }), |window| {
+            if let Some(underline) = frame.link.take() {
+                window.paint_quad(underline);
+            }
             for quad in frame.backgrounds.drain(..) {
                 window.paint_quad(quad);
             }
@@ -881,6 +993,29 @@ mod tests {
 
     fn keys(source: &str, mode: TermMode) -> Option<Vec<u8>> {
         escape_for(&gpui::Keystroke::parse(source).unwrap(), mode).map(|c| c.into_owned())
+    }
+
+    #[test]
+    fn finds_links_in_output() {
+        let dir = std::env::temp_dir().join(format!("kin-term-links-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "").unwrap();
+        let row: Vec<char> = "  --> src/main.rs:12:5 (see https://example.com/a?b=1).".chars().collect();
+        let at = |needle: &str| row.iter().collect::<String>().find(needle).unwrap() + 1;
+        let (range, text) = word_at(&row, at("src")).unwrap();
+        assert_eq!((range, text.as_str()), (6..22, "src/main.rs:12:5"));
+        assert_eq!(
+            parse_link(&text, &dir),
+            Some(Link::File { path: dir.join("src/main.rs"), line: Some(12), column: Some(5) })
+        );
+        let (_, url) = word_at(&row, at("https")).unwrap();
+        assert_eq!(parse_link(&url, &dir), Some(Link::Url("https://example.com/a?b=1".into())));
+        // Plain words and missing files aren't links.
+        let (_, word) = word_at(&row, at("see")).unwrap();
+        assert_eq!(parse_link(&word, &dir), None);
+        assert_eq!(parse_link("src/missing.rs:3", &dir), None);
+        assert!(word_at(&row, 0).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

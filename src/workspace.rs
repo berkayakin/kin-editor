@@ -123,6 +123,7 @@ actions!(
         CheckForUpdates,
         WelcomeSetup,
         GoToSymbol,
+        SplitTerminal,
     ]
 );
 
@@ -366,6 +367,8 @@ pub struct Workspace {
     show_terminal: bool,
     terminals: Vec<Entity<TerminalView>>,
     active_terminal: usize,
+    /// A second terminal shown beside the active one.
+    split_terminal: Option<Entity<TerminalView>>,
     /// For Rerun.
     last_run: Option<RunTarget>,
     sidebar_width: Pixels,
@@ -560,6 +563,7 @@ impl Workspace {
             show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminals: Vec::new(),
             active_terminal: 0,
+            split_terminal: None,
             last_run: None,
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
@@ -664,6 +668,24 @@ impl Workspace {
                 let detail = err.to_string();
                 let _ = window.prompt(PromptLevel::Critical, &message, Some(&detail), &["OK"], cx);
             }
+        }
+    }
+
+    /// Opens a file at a 1-based line and column (from terminal output).
+    fn open_at(&mut self, path: PathBuf, line: Option<u32>, column: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
+        let path = path.canonicalize().unwrap_or(path);
+        self.open_path(path.clone(), window, cx);
+        let (Some(line), Some(editor)) = (line, self.tab_for(&path, cx)) else { return };
+        editor.update(cx, |e, cx| {
+            let row = (line as usize).saturating_sub(1).min(e.doc.line_count().saturating_sub(1));
+            let start = e.doc.line_start(row);
+            let text = e.doc.line_text(row);
+            let col = column.map_or(0, |c| c as usize).saturating_sub(1);
+            let offset = start + text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
+            e.go_to(offset, window, cx);
+        });
+        if let Some(editor) = self.tab_for(&path, cx) {
+            window.focus(&editor.focus_handle(cx));
         }
     }
 
@@ -1294,6 +1316,7 @@ impl Workspace {
         self.pinned.clear();
         self.session_task = None;
         self.terminals.clear();
+        self.split_terminal = None;
         self.show_terminal = false;
         self.lsp.update(cx, |s, _| {
             s.shutdown_all();
@@ -2724,6 +2747,7 @@ impl Workspace {
                     TerminalEvent::TitleChanged => cx.notify(),
                     TerminalEvent::Exited if terminal.read(cx).run().is_some() => cx.notify(),
                     TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
+                    TerminalEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
                 }));
                 let ix = at.unwrap_or(self.terminals.len()).min(self.terminals.len());
                 self.terminals.insert(ix, terminal);
@@ -2837,10 +2861,39 @@ impl Workspace {
         }
     }
 
+    /// Shows a new terminal beside the active one, or ends the split (both stay as tabs).
+    fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if self.split_terminal.take().is_some() {
+            self.focus_terminal(window, cx);
+            cx.notify();
+            return;
+        }
+        let left = self.terminals.get(self.active_terminal).cloned();
+        self.new_terminal(&NewTerminal, window, cx);
+        if let Some(left) = left {
+            self.split_terminal = self.terminals.get(self.active_terminal).cloned();
+            self.active_terminal = self.terminals.iter().position(|t| *t == left).unwrap_or(0);
+        }
+        cx.notify();
+    }
+
     fn remove_terminal(&mut self, terminal: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.terminals.iter().position(|t| t == terminal) else { return };
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
+        // Closing one side of a split leaves the other.
+        if self.split_terminal.as_ref() == Some(terminal) {
+            self.split_terminal = None;
+        } else if ix == self.active_terminal
+            && let Some(split) = self.split_terminal.take()
+        {
+            self.active_terminal = self.terminals.iter().position(|t| *t == split).unwrap_or(0);
+        }
+        // The active tab stays active when another one closes.
+        let keep = self.terminals.get(self.active_terminal).filter(|t| *t != terminal).cloned();
         self.terminals.remove(ix);
+        if let Some(keep) = keep {
+            self.active_terminal = self.terminals.iter().position(|t| *t == keep).unwrap_or(0);
+        }
         if self.terminals.is_empty() {
             self.show_terminal = false;
             self.active_terminal = 0;
@@ -2863,9 +2916,11 @@ impl Workspace {
             .iter()
             .enumerate()
             .map(|(ix, terminal)| {
-                let active = ix == self.active_terminal;
+                let split = self.split_terminal.as_ref() == Some(terminal);
+                let active = ix == self.active_terminal || split;
                 let title = terminal.read(cx).title();
                 let entity = terminal.clone();
+                let tab = terminal.clone();
                 div()
                     .id(("terminal-tab", ix))
                     .group("terminal-tab")
@@ -2882,6 +2937,11 @@ impl Workspace {
                     .when(active, |el| el.bg(theme.active))
                     .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
                     .on_click(cx.listener(move |ws, _, window, cx| {
+                        // The split side keeps its place; it just gets focus.
+                        if split {
+                            window.focus(&tab.focus_handle(cx));
+                            return;
+                        }
                         ws.active_terminal = ix;
                         ws.focus_terminal(window, cx);
                         cx.notify();
@@ -2938,6 +2998,15 @@ impl Workspace {
                     .tooltip(|window, cx| status_tooltip("New Terminal", &NewTerminal, window, cx)),
             )
             .child(div().flex_1())
+            .child(
+                self.icon_button("split-terminal", Icon::SplitRight, self.split_terminal.is_some(), cx, |ws, _, window, cx| {
+                    ws.split_terminal(&SplitTerminal, window, cx)
+                })
+                .tooltip({
+                    let label = if self.split_terminal.is_some() { "Unsplit Terminal" } else { "Split Terminal" };
+                    move |window, cx| status_tooltip(label, &SplitTerminal, window, cx)
+                }),
+            )
             .child(self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
                 ws.show_terminal = false;
                 ws.focus_active(window, cx);
@@ -2954,7 +3023,19 @@ impl Workspace {
             .border_t_1()
             .border_color(theme.border)
             .child(header)
-            .child(div().flex_1().min_h_0().children(self.terminals.get(self.active_terminal).cloned()))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .children(self.terminals.get(self.active_terminal).cloned().map(|t| div().flex_1().min_w_0().child(t)))
+                    .children(
+                        self.split_terminal
+                            .clone()
+                            .filter(|s| self.terminals.get(self.active_terminal) != Some(s))
+                            .map(|t| div().flex_1().min_w_0().border_l_1().border_color(theme.border).child(t)),
+                    ),
+            )
             .child(self.resize_handle(Edge::Problems, cx))
     }
 
@@ -5872,6 +5953,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::welcome_setup))
             .on_action(cx.listener(Self::go_to_symbol))
+            .on_action(cx.listener(Self::split_terminal))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))
