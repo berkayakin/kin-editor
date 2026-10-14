@@ -98,6 +98,8 @@ actions!(
         ProjectTrust,
         UndoFileChange,
         RedoFileChange,
+        /// Vim's `:` command line.
+        VimCommandLine,
         ReloadExtensions,
         Resume,
         PauseProgram,
@@ -242,6 +244,8 @@ enum PendingInput {
     Rename(PathBuf),
     /// Rename a symbol through its language server.
     RenameSymbol { server: Arc<Server>, path: PathBuf, position: Position, current: String },
+    /// A Vim `:` command.
+    VimCommand,
 }
 
 /// A group of tabs with its own tab bar; panes sit side by side or stacked.
@@ -4562,6 +4566,7 @@ impl Workspace {
             PendingInput::RenameSymbol { current, .. } => {
                 ("Rename", Icon::Pencil, format!("Rename {current} and its usages"), current.clone(), Some(0..current.len()))
             }
+            PendingInput::VimCommand => (":", Icon::Terminal, "w, q, wq, x, or a line number".to_string(), String::new(), None),
         };
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| InputDialog::new(title, icon, hint, &initial, select, window, cx));
@@ -4607,8 +4612,55 @@ impl Workspace {
         format!("…/{}", parts.join("/"))
     }
 
+    fn vim_command_line(&mut self, _: &VimCommandLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_for_name(PendingInput::VimCommand, window, cx);
+    }
+
+    /// Runs a Vim `:` command: write, quit, both, or go to a line.
+    fn run_vim_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        let command = command.trim().trim_start_matches(':');
+        if let Ok(line) = command.parse::<usize>() {
+            let editor = self.active_editor().cloned().ok_or("No file is open")?;
+            editor.update(cx, |e, cx| {
+                let row = line.saturating_sub(1).min(e.doc.line_count().saturating_sub(1));
+                let text = e.doc.line_text(row);
+                let offset = e.doc.line_start(row) + (text.len() - text.trim_start().len());
+                e.go_to(offset, window, cx);
+            });
+            return Ok(());
+        }
+        match command {
+            "w" | "write" => self.save(&Save, window, cx),
+            "q" | "q!" | "quit" | "close" => self.close_tab(&CloseTab, window, cx),
+            "wq" | "x" | "wq!" | "x!" => {
+                self.save(&Save, window, cx);
+                self.close_tab(&CloseTab, window, cx);
+            }
+            "wa" | "wall" => {
+                for editor in self.tabs.clone() {
+                    if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+                        editor.update(cx, |e, cx| e.save(cx)).ok();
+                    }
+                }
+            }
+            "qa" | "qa!" | "qall" => cx.defer(quit),
+            "" => {}
+            other => return Err(format!("Not a command Kin knows: {other}")),
+        }
+        Ok(())
+    }
+
     /// Creates or renames according to the open input dialog.
     fn apply_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+        if matches!(self.pending_input, Some(PendingInput::VimCommand)) {
+            let command = name.to_string();
+            self.pending_input = None;
+            self.close_modal(window, cx);
+            if let Err(err) = self.run_vim_command(&command, window, cx) {
+                self.toast(ToastKind::Error, err, None, cx);
+            }
+            return Ok(());
+        }
         if let Some(PendingInput::RenameSymbol { server, path, position, current }) = self.pending_input.as_ref() {
             let new_name = name.trim();
             if new_name.is_empty() {
@@ -4678,7 +4730,7 @@ impl Workspace {
                 self.after_fs_change(cx);
             }
             // Handled before the name checks above.
-            PendingInput::RenameSymbol { .. } => {}
+            PendingInput::RenameSymbol { .. } | PendingInput::VimCommand => {}
         }
         Ok(())
     }
@@ -6833,6 +6885,12 @@ impl Workspace {
         let mut right: Vec<AnyElement> = Vec::new();
         // An image tab has no caret, indentation or line endings.
         if let Some(e) = editor.filter(|e| e.doc.image.is_none()) {
+            if let Some(mode) = e.vim_status() {
+                right.push(
+                    item(div().font_family(theme.mono_font.clone()).text_size(px(11.)).text_color(theme.text).child(mode).into_any_element())
+                        .into_any_element(),
+                );
+            }
             let (line, col) = e.cursor_position();
             let selected = e.selected_chars();
             let cursors = e.selections().len();
@@ -7180,6 +7238,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_logpoint))
             .on_action(cx.listener(Self::open_extensions))
             .on_action(cx.listener(Self::project_trust))
+            .on_action(cx.listener(Self::vim_command_line))
             .on_action(cx.listener(Self::reload_extensions))
             .on_action(cx.listener(Self::resume))
             .on_action(cx.listener(Self::pause_program))

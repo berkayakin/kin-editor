@@ -119,6 +119,9 @@ pub struct Document {
     breakpoints: Vec<(usize, Breakpoint)>,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
+    /// The language server's inlay hints (sorted); they follow edits until
+    /// the next answer replaces them.
+    inlay_hints: Vec<InlayHint>,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -192,6 +195,7 @@ impl Document {
             folds: Vec::new(),
             breakpoints: Vec::new(),
             snippet: None,
+            inlay_hints: Vec::new(),
             disk_mtime: None,
             image: None,
         }
@@ -487,6 +491,28 @@ impl Document {
         result
     }
 
+    /// Where the undo history is now, for `merge_undo_since`.
+    pub fn undo_mark(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    /// Makes everything done since `mark` one undo step (a Vim change: the
+    /// operator and the text typed after it).
+    pub fn merge_undo_since(&mut self, mark: usize) {
+        if self.undo_stack.len() <= mark + 1 {
+            return;
+        }
+        let mut merged = self.undo_stack.split_off(mark);
+        let mut first = merged.remove(0);
+        for t in merged {
+            first.edits.extend(t.edits);
+            first.after = t.after;
+            first.at = t.at;
+        }
+        first.kind = EditKind::Other;
+        self.undo_stack.push(first);
+    }
+
     /// Records the selections after the most recent transaction, for redo.
     pub fn set_selections_after(&mut self, selections: &[Selection]) {
         if let Some(t) = self.undo_stack.last_mut() {
@@ -540,7 +566,36 @@ impl Document {
         {
             self.snippet = None;
         }
+        self.shift_inlay_hints(&range, text.len());
         self.shift_diagnostics(range, text.len());
+    }
+
+    pub fn inlay_hints(&self) -> &[InlayHint] {
+        &self.inlay_hints
+    }
+
+    pub fn set_inlay_hints(&mut self, mut hints: Vec<InlayHint>) {
+        hints.sort_by_key(|h| h.offset);
+        self.inlay_hints = hints;
+    }
+
+    /// Hints after an edit move with the text; ones inside replaced text go.
+    /// A hint where text is inserted stays after it (a type after a name
+    /// being typed).
+    fn shift_inlay_hints(&mut self, range: &Range<usize>, new_len: usize) {
+        if self.inlay_hints.is_empty() {
+            return;
+        }
+        let delta = new_len as isize - range.len() as isize;
+        self.inlay_hints.retain_mut(|h| {
+            if h.offset > range.start && h.offset < range.end {
+                return false;
+            }
+            if h.offset >= range.end {
+                h.offset = (h.offset as isize + delta) as usize;
+            }
+            true
+        });
     }
 
     pub fn set_builtin_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
@@ -688,6 +743,16 @@ impl Document {
         }
         self.merge_diagnostics();
     }
+}
+
+/// A type or parameter name from the language server, shown in the text
+/// before `offset`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlayHint {
+    pub offset: usize,
+    pub label: String,
+    pub pad_left: bool,
+    pub pad_right: bool,
 }
 
 /// One replacement in LSP terms: where it was (as line plus UTF-8 and

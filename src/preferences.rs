@@ -20,7 +20,7 @@ use crate::{
     extensions::{self, ExtensionInfo, ExtensionsChanged},
     format,
     lsp::servers,
-    settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings},
+    settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings, ShowWhitespace},
     syntax::Language,
     theme::{self, Appearance, Theme, ThemeRegistry},
     workspace::Find,
@@ -119,6 +119,10 @@ enum Setting {
     TabSize,
     HardTabs,
     SoftWrap,
+    Rulers,
+    ShowWhitespace,
+    InlayHints,
+    VimMode,
     AutoSave,
     AutoSaveDelay,
     FormatOnSave,
@@ -131,7 +135,7 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 17] = [
+    const ALL: [Setting; 21] = [
         Setting::Theme,
         Setting::BaseKeymap,
         Setting::FontFamily,
@@ -140,6 +144,10 @@ impl Setting {
         Setting::TabSize,
         Setting::HardTabs,
         Setting::SoftWrap,
+        Setting::Rulers,
+        Setting::ShowWhitespace,
+        Setting::InlayHints,
+        Setting::VimMode,
         Setting::AutoSave,
         Setting::AutoSaveDelay,
         Setting::FormatOnSave,
@@ -157,6 +165,7 @@ impl Setting {
             Setting::BaseKeymap => Page::Keymap,
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
+            Setting::Rulers | Setting::ShowWhitespace | Setting::InlayHints | Setting::VimMode => Page::Editor,
             Setting::AutoSave
             | Setting::AutoSaveDelay
             | Setting::FormatOnSave
@@ -175,6 +184,9 @@ impl Setting {
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => "Font",
             Setting::TabSize | Setting::HardTabs => "Indentation",
             Setting::SoftWrap => "Wrapping",
+            Setting::Rulers | Setting::ShowWhitespace => "Guides",
+            Setting::InlayHints => "Hints",
+            Setting::VimMode => "Vim",
             Setting::AutoSave | Setting::AutoSaveDelay => "Auto-save",
             Setting::FormatOnSave | Setting::TrimWhitespace | Setting::FinalNewline => "On save",
             Setting::Shell => "Terminal",
@@ -194,6 +206,10 @@ impl Setting {
             Setting::TabSize => "Tab size",
             Setting::HardTabs => "Indent with tabs",
             Setting::SoftWrap => "Soft wrap",
+            Setting::Rulers => "Rulers",
+            Setting::ShowWhitespace => "Show whitespace",
+            Setting::InlayHints => "Inlay hints",
+            Setting::VimMode => "Vim mode",
             Setting::AutoSave => "Auto-save",
             Setting::AutoSaveDelay => "Delay",
             Setting::FormatOnSave => "Reformat on save",
@@ -216,6 +232,10 @@ impl Setting {
             Setting::TabSize => "Columns per indent level and per tab. A file's own indentation and .editorconfig come first.",
             Setting::HardTabs => "Use tab characters when a file doesn't show a style of its own.",
             Setting::SoftWrap => "Wrap long lines at the edge of the editor. Markdown and plain text wrap either way.",
+            Setting::Rulers => "Columns for vertical guides, e.g. 80, 120. Empty uses .editorconfig's max_line_length.",
+            Setting::ShowWhitespace => "Mark spaces with dots and tabs with lines.",
+            Setting::InlayHints => "Types and parameter names from the language server, shown in the code.",
+            Setting::VimMode => "Vim's Normal, Insert and Visual modes. The status bar shows the mode.",
             Setting::AutoSave => "Every mode but Off also saves when Kin quits or a tab closes.",
             Setting::AutoSaveDelay => "How long after you stop typing.",
             Setting::FormatOnSave => "Reformat Code when you Save; auto-save never reformats while you type.",
@@ -239,6 +259,10 @@ impl Setting {
             Setting::TabSize => "indent width spaces",
             Setting::HardTabs => "indentation spaces hard tabs",
             Setting::SoftWrap => "word wrap lines",
+            Setting::Rulers => "ruler guide column line length margin 80",
+            Setting::ShowWhitespace => "whitespace spaces tabs invisible characters dots render",
+            Setting::InlayHints => "inlay hints types parameters names language server",
+            Setting::VimMode => "vim vi modal normal insert visual keys",
             Setting::AutoSave => "autosave save automatically",
             Setting::AutoSaveDelay => "autosave milliseconds idle",
             Setting::FormatOnSave => "format prettier formatter",
@@ -269,6 +293,7 @@ impl Setting {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     AutoSave,
+    ShowWhitespace,
     BaseKeymap,
     FontFamily,
     LanguageServer,
@@ -419,6 +444,7 @@ pub struct Preferences {
     fonts_task: Option<Task<()>>,
     language: Language,
     shell: Entity<Editor>,
+    rulers: Entity<Editor>,
     server_command: Entity<Editor>,
     formatter_command: Entity<Editor>,
     /// "Custom command" was picked for this tool but there's no command yet.
@@ -450,6 +476,7 @@ impl Preferences {
         let login_shell = std::env::var("SHELL").unwrap_or_else(|_| "login shell".into());
         let shell = cx.new(|cx| Editor::single_line(format!("{login_shell} (login shell)"), cx));
         let server_command = cx.new(|cx| Editor::single_line("Command and arguments", cx));
+        let rulers = cx.new(|cx| Editor::single_line("None", cx));
         let formatter_command = cx.new(|cx| Editor::single_line("Command and arguments ({file} is the file's path)", cx));
         let keymap = cx.new(|cx| KeymapPage::new(window, cx));
         let extension_url = cx.new(|cx| Editor::single_line("Git URL of an extension (Zed extensions work too)", cx));
@@ -465,11 +492,12 @@ impl Preferences {
             cx.subscribe(&font_filter, |_, _, _: &EditorEvent, cx| cx.notify()),
             cx.subscribe(&keymap, |_, _, event: &PreferencesEvent, cx| cx.emit(clone_event(event))),
         ];
-        for field in [&shell, &server_command, &formatter_command] {
+        for field in [&shell, &rulers, &server_command, &formatter_command] {
             subscriptions.push(cx.subscribe(field, |this, _, _: &EditorEvent, cx| this.schedule_commit(cx)));
         }
         let settings = Settings::get(cx).clone();
         set_field(&shell, &settings.terminal_shell.as_deref().map(join_command).unwrap_or_default(), cx);
+        set_field(&rulers, &rulers_text(settings.editor.rulers.as_deref()), cx);
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             page,
@@ -481,6 +509,7 @@ impl Preferences {
             fonts_task: None,
             language: Language::JavaScript,
             shell,
+            rulers,
             server_command,
             formatter_command,
             pending_custom: None,
@@ -587,6 +616,9 @@ impl Preferences {
 
     fn reset(&mut self, key: &str, cx: &mut Context<Self>) {
         self.write(Settings::remove(key), cx);
+        if key == "rulers" {
+            set_field(&self.rulers, "", cx);
+        }
         if key == "editor_font_size" {
             theme::zoom(None, cx);
         }
@@ -622,6 +654,15 @@ impl Preferences {
         self.commit_task = None;
         let settings = Settings::get(cx).clone();
         let mut results = Vec::new();
+
+        let rulers: Vec<usize> = self.rulers.read(cx).text().split([',', ' ']).filter_map(|c| c.trim().parse().ok()).collect();
+        let rulers = (!rulers.is_empty()).then_some(rulers);
+        if rulers != settings.editor.rulers {
+            results.push(match &rulers {
+                Some(rulers) => Settings::set("rulers", json!(rulers)),
+                None => Settings::remove("rulers"),
+            });
+        }
 
         let shell = split_command(&self.shell.read(cx).text());
         let shell = (!shell.is_empty()).then_some(shell);
@@ -1196,6 +1237,18 @@ impl Preferences {
             }
             Setting::HardTabs => self.bool_switch("pref-hard-tabs", "hard_tabs", settings.editor.hard_tabs, cx),
             Setting::SoftWrap => self.bool_switch("pref-soft-wrap", "soft_wrap", settings.editor.soft_wrap, cx),
+            Setting::Rulers => div().w(px(160.)).flex().child(input_box(&self.rulers, None, window, cx)).into_any_element(),
+            Setting::ShowWhitespace => {
+                let current = settings.editor.show_whitespace.unwrap_or_default();
+                let options = ShowWhitespace::ALL.iter().map(|w| (w.label().into(), *w == current)).collect();
+                self.dropdown(Menu::ShowWhitespace, current.label().into(), px(220.), options, cx, move |this, ix, _, cx| {
+                    this.menu = None;
+                    let choice = ShowWhitespace::ALL[ix];
+                    this.set_or_default("show_whitespace", choice.key().into(), ShowWhitespace::default().key().into(), cx);
+                })
+            }
+            Setting::InlayHints => self.switch_with_default("pref-inlay-hints", "inlay_hints", settings.editor.inlay_hints, true, cx),
+            Setting::VimMode => self.bool_switch("pref-vim", "vim_mode", settings.vim_mode, cx),
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
             Setting::TrustAll => self.switch_with_default("pref-trust-all", "trust_all_projects", settings.trust_all_projects, false, cx),
             Setting::AutoUpdate => self.switch_with_default("pref-auto-update", "auto_update", settings.auto_update, true, cx),
@@ -1976,7 +2029,7 @@ impl Preferences {
         }).collect();
 
         let language = self.language;
-        let overrides = settings.languages.get(language.name()).copied().unwrap_or_default();
+        let overrides = settings.languages.get(language.name()).cloned().unwrap_or_default();
         let effective = settings.for_file(language, None);
         let mut editor_rows: Vec<AnyElement> = Vec::new();
         for option in LanguageOption::ALL {
@@ -2117,6 +2170,10 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::TabSize => "tab_size",
         Setting::HardTabs => "hard_tabs",
         Setting::SoftWrap => "soft_wrap",
+        Setting::Rulers => "rulers",
+        Setting::ShowWhitespace => "show_whitespace",
+        Setting::InlayHints => "inlay_hints",
+        Setting::VimMode => "vim_mode",
         Setting::AutoSave => "auto_save",
         Setting::AutoSaveDelay => "auto_save_delay",
         Setting::FormatOnSave => "format_on_save",
@@ -2181,6 +2238,10 @@ fn tool_description(tool: Tool, language: Language, mode: ToolMode) -> (&'static
 
 fn strings(items: &[Value]) -> Vec<String> {
     items.iter().filter_map(Value::as_str).map(str::to_string).collect()
+}
+
+fn rulers_text(rulers: Option<&[usize]>) -> String {
+    rulers.unwrap_or_default().iter().map(usize::to_string).collect::<Vec<_>>().join(", ")
 }
 
 fn set_field(field: &Entity<Editor>, text: &str, cx: &mut App) {

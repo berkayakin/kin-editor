@@ -56,6 +56,8 @@ pub struct Settings {
     pub auto_update: Option<bool>,
     /// Treat every folder as trusted (no Restricted Mode).
     pub trust_all_projects: Option<bool>,
+    /// Vim keys: Normal, Insert and Visual modes.
+    pub vim_mode: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -129,8 +131,47 @@ impl AutoSave {
     }
 }
 
+/// Which whitespace characters the editor marks (spaces as dots, tabs as lines).
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowWhitespace {
+    /// Inside selections.
+    #[default]
+    Selection,
+    /// Indentation and trailing whitespace.
+    Boundary,
+    Trailing,
+    All,
+    None,
+}
+
+impl ShowWhitespace {
+    pub const ALL: [ShowWhitespace; 5] =
+        [ShowWhitespace::Selection, ShowWhitespace::Boundary, ShowWhitespace::Trailing, ShowWhitespace::All, ShowWhitespace::None];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            ShowWhitespace::Selection => "selection",
+            ShowWhitespace::Boundary => "boundary",
+            ShowWhitespace::Trailing => "trailing",
+            ShowWhitespace::All => "all",
+            ShowWhitespace::None => "none",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShowWhitespace::Selection => "In selections",
+            ShowWhitespace::Boundary => "Indentation and line ends",
+            ShowWhitespace::Trailing => "At line ends",
+            ShowWhitespace::All => "Everywhere",
+            ShowWhitespace::None => "Never",
+        }
+    }
+}
+
 /// Options that can differ per language and per `.editorconfig` section.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Debug)]
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct EditorSettings {
     /// Columns per indent level and per tab character.
@@ -144,6 +185,11 @@ pub struct EditorSettings {
     pub insert_final_newline: Option<bool>,
     /// Reformat when saving with Save (not auto-save).
     pub format_on_save: Option<bool>,
+    /// Columns to draw a vertical guide at.
+    pub rulers: Option<Vec<usize>>,
+    pub show_whitespace: Option<ShowWhitespace>,
+    /// Types and parameter names from the language server, shown in the text.
+    pub inlay_hints: Option<bool>,
 }
 
 impl EditorSettings {
@@ -156,6 +202,9 @@ impl EditorSettings {
             trim_trailing_whitespace: self.trim_trailing_whitespace.or(base.trim_trailing_whitespace),
             insert_final_newline: self.insert_final_newline.or(base.insert_final_newline),
             format_on_save: self.format_on_save.or(base.format_on_save),
+            rulers: self.rulers.or(base.rulers),
+            show_whitespace: self.show_whitespace.or(base.show_whitespace),
+            inlay_hints: self.inlay_hints.or(base.inlay_hints),
         }
     }
 
@@ -197,6 +246,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "run_configurations",
     "auto_update",
     "trust_all_projects",
+    "vim_mode",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -206,10 +256,13 @@ const EDITOR_KEYS: &[&str] = &[
     "trim_trailing_whitespace",
     "insert_final_newline",
     "format_on_save",
+    "rulers",
+    "show_whitespace",
+    "inlay_hints",
 ];
 
 /// Editor options resolved for one file.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct FileSettings {
     pub tab_size: usize,
     pub hard_tabs: bool,
@@ -219,6 +272,9 @@ pub struct FileSettings {
     pub trim_trailing_whitespace: bool,
     pub insert_final_newline: bool,
     pub format_on_save: bool,
+    pub rulers: Vec<usize>,
+    pub show_whitespace: ShowWhitespace,
+    pub inlay_hints: bool,
 }
 
 impl Settings {
@@ -326,6 +382,10 @@ impl Settings {
             "trim_trailing_whitespace" => self.editor.trim_trailing_whitespace.is_some(),
             "insert_final_newline" => self.editor.insert_final_newline.is_some(),
             "format_on_save" => self.editor.format_on_save.is_some(),
+            "rulers" => self.editor.rulers.is_some(),
+            "show_whitespace" => self.editor.show_whitespace.is_some(),
+            "inlay_hints" => self.editor.inlay_hints.is_some(),
+            "vim_mode" => self.vim_mode.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
@@ -371,7 +431,7 @@ impl Settings {
 
     /// Editor options for a file of `language` at `path`.
     pub fn for_file(&self, language: Language, path: Option<&Path>) -> FileSettings {
-        let language_overrides = self.languages.get(language.name()).copied().unwrap_or_default();
+        let language_overrides = self.languages.get(language.name()).cloned().unwrap_or_default();
         let config = path.map(EditorConfig::for_file).unwrap_or_default();
         let from_config = EditorSettings {
             tab_size: config.indent_size.or(config.tab_width),
@@ -380,10 +440,13 @@ impl Settings {
             trim_trailing_whitespace: config.trim_trailing_whitespace,
             insert_final_newline: config.insert_final_newline,
             format_on_save: None,
+            rulers: None,
+            show_whitespace: None,
+            inlay_hints: None,
         };
         let s = from_config
             .or(language_overrides)
-            .or(self.editor)
+            .or(self.editor.clone())
             .or(EditorSettings::language_default(language));
         FileSettings {
             tab_size: s.tab_size.unwrap_or(4).clamp(1, 16),
@@ -393,6 +456,10 @@ impl Settings {
             trim_trailing_whitespace: s.trim_trailing_whitespace.unwrap_or(false),
             insert_final_newline: s.insert_final_newline.unwrap_or(false),
             format_on_save: s.format_on_save.unwrap_or(false),
+            // .editorconfig's max_line_length when no ruler is set.
+            rulers: s.rulers.or(config.max_line_length.map(|n| vec![n])).unwrap_or_default(),
+            show_whitespace: s.show_whitespace.unwrap_or_default(),
+            inlay_hints: s.inlay_hints.unwrap_or(true),
         }
     }
 }
@@ -531,6 +598,16 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "insert_final_newline": false,
   // Reformat on Save (auto-save doesn't reformat while you type).
   // "format_on_save": false,
+  // Vertical guides at these columns (.editorconfig's max_line_length
+  // when unset).
+  // "rulers": [80, 120],
+  // Mark spaces and tabs: "selection", "boundary" (indentation and line
+  // ends), "trailing", "all" or "none".
+  // "show_whitespace": "selection",
+  // Types and parameter names from the language server, in the text.
+  // "inlay_hints": true,
+  // Vim keys (Normal, Insert and Visual modes).
+  // "vim_mode": false,
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {

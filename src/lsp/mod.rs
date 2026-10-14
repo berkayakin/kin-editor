@@ -645,6 +645,7 @@ fn initialize_params(root: &Path) -> Value {
                     "isPreferredSupport": true,
                 },
                 "publishDiagnostics": {},
+                "inlayHint": {},
             },
         },
     })

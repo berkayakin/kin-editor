@@ -8,6 +8,8 @@ mod lsp;
 mod run;
 mod snippet;
 mod sticky;
+mod transform;
+mod vim;
 
 pub use lsp::EditorLspEvent;
 pub use run::{EditorBreakpointMenu, EditorBreakpointsChanged, EditorRunEvent};
@@ -30,7 +32,7 @@ use crate::{
     document::{Document, EditKind, Selection},
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
-    settings::{FileSettings, Settings},
+    settings::{FileSettings, Settings, ShowWhitespace},
     theme::Theme,
     wrap::{self, Break, WrapKey, WrapMap},
 };
@@ -101,6 +103,17 @@ actions!(
         UnselectOccurrence,
         SelectAllOccurrences,
         ToggleCase,
+        ConvertToUpperCase,
+        ConvertToLowerCase,
+        ConvertToTitleCase,
+        ConvertToSnakeCase,
+        ConvertToKebabCase,
+        ConvertToCamelCase,
+        ConvertToPascalCase,
+        SortLinesAscending,
+        SortLinesDescending,
+        ReverseLines,
+        RemoveDuplicateLines,
         JoinLines,
         NewlineAbove,
         ToggleBlockComment,
@@ -114,6 +127,7 @@ actions!(
         PreviousChange,
         ToggleInlineBlame,
         ToggleSoftWrap,
+        ToggleInlayHints,
         ToggleMarkdownPreview,
         ShowCompletions,
         QuickDocumentation,
@@ -188,6 +202,9 @@ struct Drag {
     mode: DragMode,
     /// The unit (char/word/line range) where the drag started.
     origin: Range<usize>,
+    /// With Alt: the row and display column it started at. Moving the
+    /// pointer then selects a box (a selection per line) instead.
+    column_from: Option<(usize, usize)>,
 }
 
 /// Geometry from the last frame, used for hit-testing and IME positioning.
@@ -223,6 +240,8 @@ pub struct Editor {
     center_on_next_frame: bool,
     /// Like autoscroll, but centers the cursor when it is off screen.
     reveal_primary: bool,
+    /// Vim mode's state while the `vim_mode` setting is on.
+    vim: Option<vim::Vim>,
     layout: Option<LayoutSnapshot>,
     drag: Option<Drag>,
     scrollbar_drag: Option<Pixels>,
@@ -309,6 +328,7 @@ impl Editor {
             autoscroll: false,
             center_on_next_frame: false,
             reveal_primary: false,
+            vim: None,
             layout: None,
             drag: None,
             scrollbar_drag: None,
@@ -622,7 +642,7 @@ impl Editor {
     /// indentation, soft wrap and what saving does.
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let fs = Settings::get(cx).for_file(self.doc.language, self.doc.path.as_deref());
-        self.file_settings = fs;
+        self.file_settings = fs.clone();
         self.tab_size = fs.tab_size;
         let configured = if fs.hard_tabs { "\t".to_string() } else { " ".repeat(fs.tab_size) };
         // A file's own indentation wins over settings, but not over .editorconfig.
@@ -632,6 +652,8 @@ impl Editor {
             self.soft_wrap = fs.soft_wrap && !self.doc.large;
         }
         self.wrap = None;
+        self.schedule_inlay_hints(cx);
+        self.sync_vim(cx);
         cx.notify();
     }
 
@@ -851,6 +873,7 @@ impl Editor {
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.doc.set_selections_after(&self.selections);
+        self.schedule_inlay_hints(cx);
         self.schedule_lint(Duration::from_millis(150), cx);
         self.schedule_diff(Duration::from_millis(120), cx);
         self.edited(cx);
@@ -988,10 +1011,29 @@ impl Editor {
         }
     }
 
+    /// `row` as displayed: tabs expanded, inlay hints in place. Wrapped lines
+    /// get no hints (the wrap map is measured without them).
+    fn display_line(&self, row: usize) -> DisplayLine {
+        let text = self.doc.line_text(row);
+        let hints = self.doc.inlay_hints();
+        if !self.file_settings.inlay_hints || hints.is_empty() || !self.line_breaks(row).is_empty() {
+            return DisplayLine::new(&text, self.tab_size);
+        }
+        let start = self.doc.line_start(row);
+        let end = start + text.len();
+        let first = hints.partition_point(|h| h.offset < start);
+        let inlays: Vec<(usize, &str, bool, bool)> = hints[first..]
+            .iter()
+            .take_while(|h| h.offset <= end)
+            .map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right))
+            .collect();
+        DisplayLine::with_inlays(&text, self.tab_size, &inlays)
+    }
+
     /// Shapes the part of `row` shown on display segment `seg`.
     fn shape_segment(&self, row: usize, seg: usize, window: &mut Window, cx: &App) -> RowShape {
         let theme = Theme::get(cx);
-        let dl = DisplayLine::new(&self.doc.line_text(row), self.tab_size);
+        let dl = self.display_line(row);
         let breaks = self.line_breaks(row);
         let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.text.len());
         let last = seg >= breaks.len();
@@ -1019,7 +1061,7 @@ impl Editor {
     /// The x of `offset` within its display row (wrap indent included).
     fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
         let row = self.doc.row_of(offset);
-        let col = DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - self.doc.line_start(row));
+        let col = self.display_line(row).to_display(offset - self.doc.line_start(row));
         let seg = wrap::segment_of(self.line_breaks(row), col);
         let shape = self.shape_segment(row, seg, window, cx);
         shape.indent + shape.line.x_for_index(col - shape.range.start)
@@ -1164,6 +1206,13 @@ impl Editor {
     fn zoom_preview(&mut self, delta: f32, cx: &mut Context<Self>) {
         let zoom = ((self.md_zoom + delta) * 10.).round() / 10.;
         self.md_zoom = zoom.clamp(0.5, 3.);
+        cx.notify();
+    }
+
+    /// For this editor, until settings change (like Toggle Soft Wrap).
+    fn toggle_inlay_hints(&mut self, _: &ToggleInlayHints, _: &mut Window, cx: &mut Context<Self>) {
+        self.file_settings.inlay_hints = !self.file_settings.inlay_hints;
+        self.schedule_inlay_hints(cx);
         cx.notify();
     }
 
@@ -2087,13 +2136,19 @@ impl Editor {
             (DragMode::Char, offset..offset)
         };
 
-        if event.modifiers.shift {
+        if event.modifiers.shift && event.modifiers.alt && !in_gutter && !self.is_single_line() {
+            // Alt+Shift+click: a box from the caret to here (VS Code).
+            let head = self.primary_selection().head;
+            let from = (self.doc.row_of(head), self.display_column_of(head));
+            self.drag = Some(Drag { mode: DragMode::Char, origin: head..head, column_from: Some(from) });
+            self.select_box(from, event.position, cx);
+        } else if event.modifiers.shift {
             let p = self.primary_selection();
             let head = if offset < p.anchor { unit.start } else { unit.end };
             let mut selections = self.selections.clone();
             selections[self.primary] = Selection { anchor: p.anchor, head };
             self.set_selections(selections, self.primary, cx);
-            self.drag = Some(Drag { mode, origin: p.anchor..p.anchor });
+            self.drag = Some(Drag { mode, origin: p.anchor..p.anchor, column_from: None });
         } else {
             let sel = Selection { anchor: unit.start, head: unit.end };
             if event.modifiers.alt {
@@ -2104,11 +2159,56 @@ impl Editor {
             } else {
                 self.set_selections(vec![sel], 0, cx);
             }
-            self.drag = Some(Drag { mode, origin: unit });
+            // Alt+drag selects a box (JetBrains); Alt+click alone adds a caret.
+            let column_from = (event.modifiers.alt && mode == DragMode::Char && !in_gutter && !self.is_single_line())
+                .then(|| (self.doc.row_of(offset), self.column_at_x(event.position.x)));
+            self.drag = Some(Drag { mode, origin: unit, column_from });
         }
         self.goal_x = None;
         self.autoscroll = false;
         self.restart_blink(window, cx);
+    }
+
+    /// The display column (tabs expanded) nearest to a window x.
+    fn column_at_x(&self, x: Pixels) -> usize {
+        let Some(layout) = self.layout.as_ref() else { return 0 };
+        ((x - layout.text_left + self.scroll.x) / layout.char_width).round().max(0.) as usize
+    }
+
+    fn display_column_of(&self, offset: usize) -> usize {
+        let row = self.doc.row_of(offset);
+        let start = self.doc.line_start(row);
+        DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - start)
+    }
+
+    /// Column (box) selection: on every line from `from`'s row to the one
+    /// under `to`, the same columns. Lines too short for a box that has width
+    /// are skipped; a zero-width box puts a caret on each line.
+    fn select_box(&mut self, from: (usize, usize), to: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(layout) = self.layout.as_ref() else { return };
+        let y = to.y - layout.bounds.top() + self.scroll.y;
+        let drow = ((y / layout.line_height).floor().max(0.) as usize).min(self.display_row_count().saturating_sub(1));
+        let row = self.line_of_display_row(drow).0.min(self.doc.line_count() - 1);
+        let col = self.column_at_x(to.x);
+        let (left, right) = (from.1.min(col), from.1.max(col));
+        let rows: Vec<usize> = if row >= from.0 { (from.0..=row).collect() } else { (row..=from.0).rev().collect() };
+        let mut selections = Vec::new();
+        for r in rows.into_iter().filter(|&r| !self.row_hidden(r)) {
+            let text = self.doc.line_text(r);
+            let dl = DisplayLine::new(&text, self.tab_size);
+            if left > dl.text.len() && right > left {
+                continue;
+            }
+            let start = self.doc.line_start(r);
+            let (a, b) = (start + dl.to_buffer(from.1), start + dl.to_buffer(col));
+            selections.push(Selection { anchor: a, head: b });
+        }
+        if selections.is_empty() {
+            let start = self.doc.line_start(from.0);
+            selections.push(Selection::cursor(start + DisplayLine::new(&self.doc.line_text(from.0), self.tab_size).to_buffer(from.1)));
+        }
+        let primary = selections.len() - 1;
+        self.set_selections(selections, primary, cx);
     }
 
     /// The row whose line number is at `position`, where clicks set breakpoints.
@@ -2217,8 +2317,17 @@ impl Editor {
             return;
         }
         let Some(drag) = self.drag.as_ref() else { return };
-        let (mode, origin) = (drag.mode, drag.origin.clone());
+        let (mode, origin, column_from) = (drag.mode, drag.origin.clone(), drag.column_from);
         self.sync_wrap(window, cx);
+        if let Some(from) = column_from {
+            let row = self.doc.row_of(self.offset_for_position(event.position, window, cx));
+            // Still on the spot it started: an Alt+click, not a box yet.
+            if (row, self.column_at_x(event.position.x)) != from {
+                self.select_box(from, event.position, cx);
+            }
+            self.autoscroll = self.layout.as_ref().is_some_and(|l| !l.bounds.contains(&event.position));
+            return;
+        }
         let offset = self.offset_for_position(event.position, window, cx);
         let unit = match mode {
             DragMode::Char => offset..offset,
@@ -2240,8 +2349,10 @@ impl Editor {
             .is_some_and(|l| !l.bounds.contains(&event.position));
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.drag = None;
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            self.vim_after_mouse(cx);
+        }
         self.scrollbar_drag = None;
     }
 
@@ -2413,6 +2524,17 @@ impl Editor {
             line_height,
             ..Default::default()
         };
+        // Rulers: full-height guides at fixed columns.
+        if !single {
+            for &col in &self.file_settings.rulers {
+                let x = text_left - self.scroll.x + char_width * col as f32;
+                if x >= text_bounds.left() && x <= text_bounds.right() {
+                    frame.guides.push(fill(Bounds::new(point(x, text_bounds.top()), size(px(1.), text_bounds.size.height)), theme.indent_guide));
+                }
+            }
+        }
+        let show_whitespace = if single { ShowWhitespace::None } else { self.file_settings.show_whitespace };
+        let whitespace_color = Hsla::from(theme.text_dim).alpha(0.55);
         let ui_font = font(theme.ui_font.clone());
 
         let tab_size = self.tab_size;
@@ -2438,7 +2560,7 @@ impl Editor {
             let line_start = self.doc.line_start(row);
             let text = self.doc.line_text(row);
             let line_end = line_start + text.len();
-            let dl = DisplayLine::new(&text, tab_size);
+            let dl = self.display_line(row);
 
             // Build styled runs from highlight spans and diagnostics.
             while hl_ix < highlights.len() && highlights[hl_ix].0.end <= line_start {
@@ -2500,6 +2622,9 @@ impl Editor {
                 });
             }
 
+            if !dl.inlays.is_empty() {
+                runs = inlay_runs(runs, &dl, editor_font.clone(), theme.text_dim.into());
+            }
             let is_cursor_row = head_rows.contains(&row);
             let indent = indents[row - first_row].unwrap_or_else(|| {
                 let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
@@ -2592,6 +2717,50 @@ impl Editor {
                     col += guide_step;
                 }
 
+                // Inlay hints sit on a soft chip.
+                for span in dl.inlays.iter().filter(|s| s.label.start >= seg_range.start && s.label.end <= seg_range.end) {
+                    let bounds = Bounds::from_corners(
+                        point(origin.x + x_of(span.label.start) - px(2.), y + px(2.)),
+                        point(origin.x + x_of(span.label.end) + px(2.), y + line_height - px(2.)),
+                    );
+                    frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
+                }
+
+                // Spaces as dots and tabs as lines, where `show_whitespace` asks.
+                if show_whitespace != ShowWhitespace::None {
+                    let body_start = text.len() - text.trim_start().len();
+                    let body_end = text.trim_end().len();
+                    let selected: Vec<Range<usize>> = self
+                        .selections
+                        .iter()
+                        .map(|s| s.range())
+                        .filter(|r| !r.is_empty() && r.start <= line_end && r.end > line_start)
+                        .collect();
+                    for (i, c) in text.char_indices().filter(|(_, c)| *c == ' ' || *c == '\t') {
+                        let shown = match show_whitespace {
+                            ShowWhitespace::All => true,
+                            ShowWhitespace::Boundary => i < body_start || i >= body_end,
+                            ShowWhitespace::Trailing => i >= body_end,
+                            ShowWhitespace::Selection => selected.iter().any(|r| r.contains(&(line_start + i))),
+                            ShowWhitespace::None => false,
+                        };
+                        let (ds, de) = (dl.to_display(i), dl.to_display(i + 1));
+                        if !shown || ds < seg_range.start || ds >= seg_range.end {
+                            continue;
+                        }
+                        let (x0, x1) = (origin.x + x_of(ds), origin.x + x_of(de));
+                        let mid = y + line_height / 2.;
+                        let quad = if c == ' ' {
+                            let d = (char_width * 0.16).max(px(1.5));
+                            Bounds::new(point((x0 + x1) / 2. - d / 2., mid - d / 2.), size(d, d))
+                        } else {
+                            let inset = char_width * 0.3;
+                            Bounds::from_corners(point(x0 + inset, mid), point(x1 - inset, mid + px(1.)))
+                        };
+                        frame.guides.push(fill(quad, whitespace_color));
+                    }
+                }
+
                 // Search matches.
                 let first_match = self.search_matches.partition_point(|m| m.end < line_start);
                 for (ix, m) in self.search_matches.iter().enumerate().skip(first_match) {
@@ -2677,24 +2846,28 @@ impl Editor {
                     }
                 }
 
-                // Cursors.
-                if focused && self.cursor_visible {
+                // Cursors (blocks in Vim's Normal and Visual modes).
+                let block = self.vim_block_cursor();
+                if focused && (self.cursor_visible || block) {
                     for sel in &self.selections {
-                        if self.doc.row_of(sel.head) != row {
+                        let head = self.vim_cursor_of(sel);
+                        if self.doc.row_of(head) != row {
                             continue;
                         }
-                        let col = dl.to_display(sel.head - line_start);
+                        let col = dl.to_display(head - line_start);
                         if wrap::segment_of(&breaks, col) != seg {
                             continue;
                         }
                         let x = x_of(col);
-                        frame.cursors.push(
-                            fill(
-                                Bounds::new(point(origin.x + x - px(1.), y + px(2.)), size(px(2.), line_height - px(4.))),
-                                theme.cursor,
-                            )
-                            .corner_radii(px(1.)),
-                        );
+                        let bounds = if block {
+                            let next = dl.to_display((head - line_start + self.doc.char_at(head).filter(|c| *c != '\n').map_or(0, char::len_utf8)).min(text.len()));
+                            let width = if next > col { x_of(next) - x } else { char_width };
+                            Bounds::new(point(origin.x + x, y + px(1.)), size(width, line_height - px(2.)))
+                        } else {
+                            Bounds::new(point(origin.x + x - px(1.), y + px(2.)), size(px(2.), line_height - px(4.)))
+                        };
+                        let color = if block { Hsla::from(theme.cursor).alpha(0.55) } else { theme.cursor.into() };
+                        frame.cursors.push(fill(bounds, color).corner_radii(px(1.)));
                     }
                 }
 
@@ -3185,24 +3358,87 @@ fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
     out
 }
 
+/// Runs for a line with inlay hints: the hints' text in `color`, plain, and
+/// a run for hints after the last character (the text's runs end there).
+fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> Vec<TextRun> {
+    let mut runs = runs;
+    let total: usize = runs.iter().map(|r| r.len).sum();
+    if total < dl.text.len() {
+        runs.push(TextRun { len: dl.text.len() - total, font, color, background_color: None, underline: None, strikethrough: None });
+    }
+    let in_hint = |at: usize| dl.inlays.iter().any(|s| s.whole.contains(&at));
+    let mut cuts: Vec<usize> = dl.inlays.iter().flat_map(|s| [s.whole.start, s.whole.end]).collect();
+    cuts.sort_unstable();
+    let mut out = Vec::with_capacity(runs.len() + cuts.len());
+    let mut pos = 0;
+    for run in runs {
+        let end = pos + run.len;
+        let mut start = pos;
+        for &cut in cuts.iter().filter(|&&c| c > pos && c < end).chain(std::iter::once(&end)) {
+            let mut piece = TextRun { len: cut - start, ..run.clone() };
+            if in_hint(start) {
+                piece.color = color;
+                piece.underline = None;
+                piece.background_color = None;
+            }
+            out.push(piece);
+            start = cut;
+        }
+        pos = end;
+    }
+    out
+}
+
 /// A buffer line prepared for display: tabs are expanded to spaces, with a
 /// mapping between buffer columns and display columns (both in bytes).
 pub struct DisplayLine {
     pub text: String,
     map: Option<Vec<usize>>,
+    /// Inlay hints shown in `text`: the inserted text (padding included), the
+    /// label within it, and the buffer column they sit before.
+    pub inlays: Vec<InlaySpan>,
+}
+
+pub struct InlaySpan {
+    pub whole: Range<usize>,
+    pub label: Range<usize>,
+    pub column: usize,
 }
 
 impl DisplayLine {
     pub fn new(line: &str, tab_size: usize) -> Self {
-        if !line.contains('\t') {
-            return Self { text: line.to_string(), map: None };
+        Self::with_inlays(line, tab_size, &[])
+    }
+
+    /// With inlay hints (buffer column, label, pad left, pad right), sorted
+    /// by column. A buffer column maps to the display column before its
+    /// hints, so carets sit left of them.
+    pub fn with_inlays(line: &str, tab_size: usize, inlays: &[(usize, &str, bool, bool)]) -> Self {
+        if !line.contains('\t') && inlays.is_empty() {
+            return Self { text: line.to_string(), map: None, inlays: Vec::new() };
         }
         let mut text = String::with_capacity(line.len() + 16);
         let mut map = Vec::with_capacity(line.len() + 1);
+        let mut spans = Vec::new();
+        let mut next = 0;
+        let mut insert = |at: usize, text: &mut String| {
+            while let Some(&(column, label, pad_left, pad_right)) = inlays.get(next).filter(|i| i.0 <= at) {
+                let start = text.len();
+                text.push_str(if pad_left { " " } else { "" });
+                let label_start = text.len();
+                text.push_str(label);
+                let label_end = text.len();
+                text.push_str(if pad_right { " " } else { "" });
+                spans.push(InlaySpan { whole: start..text.len(), label: label_start..label_end, column });
+                next += 1;
+            }
+        };
         let mut col = 0;
-        for ch in line.chars() {
+        for (i, ch) in line.char_indices() {
+            let before = text.len();
+            insert(i, &mut text);
             for _ in 0..ch.len_utf8() {
-                map.push(text.len());
+                map.push(before);
             }
             if ch == '\t' {
                 let n = tab_size - col % tab_size;
@@ -3213,8 +3449,10 @@ impl DisplayLine {
                 col += 1;
             }
         }
-        map.push(text.len());
-        Self { text, map: Some(map) }
+        let before = text.len();
+        insert(line.len(), &mut text);
+        map.push(before);
+        Self { text, map: Some(map), inlays: spans }
     }
 
     pub fn to_display(&self, col: usize) -> usize {
@@ -3225,6 +3463,10 @@ impl DisplayLine {
     }
 
     pub fn to_buffer(&self, display: usize) -> usize {
+        // On a hint: the column it sits before.
+        if let Some(span) = self.inlays.iter().find(|s| s.whole.start < display && display <= s.whole.end) {
+            return span.column;
+        }
         match &self.map {
             None => display.min(self.text.len()),
             Some(m) => m.partition_point(|&d| d < display).min(m.len() - 1),
@@ -3876,6 +4118,18 @@ impl Render for Editor {
             .on_action(cx.listener(Self::unselect_occurrence))
             .on_action(cx.listener(Self::select_all_occurrences))
             .on_action(cx.listener(Self::toggle_case))
+            .on_action(cx.listener(Self::toggle_inlay_hints))
+            .on_action(cx.listener(Self::convert_to_upper_case))
+            .on_action(cx.listener(Self::convert_to_lower_case))
+            .on_action(cx.listener(Self::convert_to_title_case))
+            .on_action(cx.listener(Self::convert_to_snake_case))
+            .on_action(cx.listener(Self::convert_to_kebab_case))
+            .on_action(cx.listener(Self::convert_to_camel_case))
+            .on_action(cx.listener(Self::convert_to_pascal_case))
+            .on_action(cx.listener(Self::sort_lines_ascending))
+            .on_action(cx.listener(Self::sort_lines_descending))
+            .on_action(cx.listener(Self::reverse_lines))
+            .on_action(cx.listener(Self::remove_duplicate_lines))
             .on_action(cx.listener(Self::join_lines))
             .on_action(cx.listener(Self::newline_above))
             .on_action(cx.listener(Self::toggle_block_comment))

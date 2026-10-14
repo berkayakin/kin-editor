@@ -37,6 +37,10 @@ platform-native text rendering (CoreText / DirectWrite).
   signature help, Go to Declaration / Implementation / Type Definition, Find Usages, highlighted
   uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
   (quick fixes and refactorings); see [Language servers](#language-servers)
+- Inlay hints from the language server (types, parameter names), rulers, visible whitespace,
+  column (box) selection with Alt+drag, sort/reverse/de-duplicate lines and case conversions
+  (upper, lower, title, snake, kebab, camel, Pascal) from Find Action
+- Vim mode (`vim_mode`): Normal, Insert, Visual and Visual Line; see [Vim mode](#vim-mode)
 - Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
   (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
@@ -299,6 +303,28 @@ rules and ESLint still run). Hover a symbol for its documentation and any proble
 popover scrolls, and a copy button that appears on hover copies its text); completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
 server or turn one off, see `language_servers` below.
+
+**Inlay hints** show what the server infers inside the code, on a soft chip: variable types,
+parameter names at call sites and the like. rust-analyzer, basedpyright and clangd send them as
+they come; typescript-language-server and gopls need settings Kin doesn't pass yet. Turn them
+off with `inlay_hints` or, for one editor, **Toggle Inlay Hints**.
+
+## Vim mode
+
+With `"vim_mode": true` (Settings → Editor → Vim), editors start in Normal mode with a block caret;
+the status bar shows the mode and a command being typed.
+
+- **Motions** with counts: `h j k l`, `w b e W B E`, `0 ^ $`, `gg G`, `{ }`, `%`, `f t F T` and `; ,`
+- **Operators** `d c y > <` with a motion, a text object or doubled (`dd`, `cc`, `yy`, `>>`); text
+  objects `iw aw iW aW`, `i" a" i' a'` (and backticks), `i( a( ib ab`, `i[ a[`, `i{ a{ iB aB`, `i< a<`
+- `x X s S D C Y`, `r`, `~`, `J`, `p P`, `u` and ⌃R, `.` (repeats the last change, Insert text
+  included), `i a I A o O`, `v V` (Visual: `d c y > < ~ u U J p o`), ⌃D / ⌃U half a page
+- `/ ?` open the find bar, `n N` go to the next and previous match, `* #` search the word at the
+  caret, `gd` goes to the declaration, and `:` takes `w`, `q`, `wq`, `x`, `wa`, `qa` or a line number
+
+Yanks and deletes use the system clipboard. ⌘ shortcuts (Ctrl ones Vim doesn't use, elsewhere)
+keep working in every mode, and an Insert session (with the operator that started it) is one undo
+step.
 
 ## Snippets
 
@@ -576,7 +602,11 @@ are fine, and Kin keeps them when it changes a value itself.
 | `trim_trailing_whitespace` | `false` | on save; lines with a caret are left alone |
 | `insert_final_newline` | `false` | on save |
 | `format_on_save` | `false` | reformat on Save (auto-save never reformats) |
-| `languages` | | per-language overrides of the six above, by the name in the status bar |
+| `rulers` | `[]` (`.editorconfig`'s `max_line_length`) | columns for vertical guides, e.g. `[80, 120]` |
+| `show_whitespace` | `"selection"` | mark spaces and tabs: `"selection"`, `"boundary"` (indentation and line ends), `"trailing"`, `"all"`, `"none"` |
+| `inlay_hints` | `true` | types and parameter names from the language server |
+| `languages` | | per-language overrides of the nine above, by the name in the status bar |
+| `vim_mode` | `false` | Vim's modes and keys; see [Vim mode](#vim-mode) |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |

@@ -100,6 +100,7 @@ pub(super) struct EditorLsp {
     /// for the document version they were computed on.
     pub(super) symbol_highlights: (u64, Vec<std::ops::Range<usize>>),
     symbol_highlight_task: Option<Task<()>>,
+    inlay_task: Option<Task<()>>,
 }
 
 pub(super) fn is_word_char(c: char) -> bool {
@@ -144,6 +145,8 @@ impl Editor {
         let diagnostics = protocol::diagnostics(params, self.doc.rope(), encoding, name);
         self.lsp.raw_diagnostics = params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
         self.doc.set_lsp_diagnostics(diagnostics);
+        // The server has (re)analysed the file: its hints may have changed too.
+        self.schedule_inlay_hints(cx);
         if !self.lsp.active {
             self.lsp.active = true;
             // Re-run the built-in linter without its now-duplicate syntax check.
@@ -524,6 +527,70 @@ impl Editor {
             layout.text_left - layout.bounds.left() + x - self.scroll.x,
             layout.line_height * drow as f32 - self.scroll.y,
         ))
+    }
+
+    // ---- Inlay hints ---------------------------------------------------------------------
+
+    /// Asks for the file's inlay hints once typing pauses (they follow edits
+    /// in the meantime).
+    pub(super) fn schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Full || self.doc.large || !self.file_settings.inlay_hints {
+            self.lsp.inlay_task = None;
+            if !self.doc.inlay_hints().is_empty() {
+                self.doc.set_inlay_hints(Vec::new());
+                cx.notify();
+            }
+            return;
+        }
+        self.lsp.inlay_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
+            let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
+                let server = e.lsp_server(cx).filter(|s| s.capability("inlayHintProvider"))?;
+                let rope = e.doc.rope();
+                let end = offset_to_position(rope, rope.len_bytes(), server.encoding);
+                let params = json!({
+                    "textDocument": e.text_document()?,
+                    "range": { "start": { "line": 0, "character": 0 }, "end": end.to_json() },
+                });
+                Some((server, params, e.doc.version()))
+            }) else {
+                return;
+            };
+            let result = server.request("textDocument/inlayHint", params).await;
+            this.update(cx, |e, cx| {
+                // Edited meanwhile: the next request answers for the new text.
+                if e.doc.version() != version {
+                    return;
+                }
+                let rope = e.doc.rope();
+                let hints = result
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|h| {
+                        let position = protocol::Position::from_json(h.get("position")?)?;
+                        // A string, or parts with a `value` each.
+                        let label = match h.get("label")? {
+                            Value::String(s) => s.clone(),
+                            Value::Array(parts) => parts.iter().filter_map(|p| p.get("value")?.as_str()).collect(),
+                            _ => return None,
+                        };
+                        let flag = |key: &str| h.get(key).and_then(Value::as_bool).unwrap_or(false);
+                        Some(crate::document::InlayHint {
+                            offset: protocol::position_to_offset(rope, position, server.encoding),
+                            label: label.trim().to_string(),
+                            pad_left: flag("paddingLeft"),
+                            pad_right: flag("paddingRight"),
+                        })
+                    })
+                    .filter(|h| !h.label.is_empty())
+                    .collect();
+                e.doc.set_inlay_hints(hints);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     // ---- Symbol highlights ---------------------------------------------------------------

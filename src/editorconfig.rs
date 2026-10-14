@@ -13,6 +13,8 @@ pub struct EditorConfig {
     pub tab_width: Option<usize>,
     pub trim_trailing_whitespace: Option<bool>,
     pub insert_final_newline: Option<bool>,
+    /// Shown as a ruler.
+    pub max_line_length: Option<usize>,
 }
 
 impl EditorConfig {
@@ -84,6 +86,9 @@ impl EditorConfig {
                 }
                 "insert_final_newline" => {
                     self.insert_final_newline = if unset { None } else { flag.or(self.insert_final_newline) }
+                }
+                "max_line_length" => {
+                    self.max_line_length = if unset || value == "off" { None } else { value.parse().ok().or(self.max_line_length) }
                 }
                 _ => {}
             }
