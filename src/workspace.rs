@@ -6031,8 +6031,12 @@ impl Workspace {
                     let (icon, color) = severity_icon(d.severity, &theme);
                     let target = d.range.start;
                     let editor = editor.clone();
+                    // One row per problem: a multi-line message (Pyright's
+                    // details) reads as one line, like the inline hint.
+                    let message = d.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
                     div()
                         .id(("problem", ix))
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap_2()
@@ -6048,7 +6052,7 @@ impl Workspace {
                             }
                         })
                         .child(icon_el(icon, px(14.), color))
-                        .child(div().text_color(theme.text).truncate().child(d.message.clone()))
+                        .child(div().min_w_0().text_color(theme.text).truncate().child(message))
                         .child(div().text_color(theme.text_dim).flex_shrink_0().child(SharedString::from(d.rule.to_string())))
                         .child(div().flex_1())
                         .child(
