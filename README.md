@@ -45,8 +45,9 @@ platform-native text rendering (CoreText / DirectWrite).
   toggles it per file)
 - Find/Replace bar with case, whole-word and regex options; Find/Replace in Files with preview
   (searches unsaved buffers too, honors .gitignore)
-- Search Everywhere (double Shift), fuzzy Go to File, Recent Files, Find Action, Go to Line, and
-  File Structure: the current file's functions, classes, headings, selectors or keys
+- Search Everywhere (double Shift), fuzzy Go to File (git-ignored files included, ignored folders
+  skipped), Recent Files, Find Action, Go to Line, and File Structure: the current file's functions,
+  classes, headings, selectors or keys
 - Git: clone, init, gutter change markers with rollback, inline blame, file status colors, a Commit panel
   (stage, discard, commit, amend, push), staging single changes, side-by-side diffs with changed words
   highlighted, a log with a branch graph and file history, merge/rebase with conflict resolution in

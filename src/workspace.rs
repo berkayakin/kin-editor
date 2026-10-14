@@ -39,7 +39,7 @@ use crate::{
     },
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
-    search::{SearchQuery, project_files},
+    search::{SearchQuery, openable_files},
     state::{PaneLayout, ProjectSession, SessionState, TabSession},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
@@ -923,7 +923,7 @@ impl Workspace {
             return;
         };
         self.index_task = Some(cx.spawn(async move |this, cx| {
-            let files = cx.background_executor().spawn(async move { project_files(&root) }).await;
+            let files = cx.background_executor().spawn(async move { openable_files(&root) }).await;
             this.update(cx, |ws, cx| {
                 ws.file_index = Arc::new(files);
                 if let Some(Modal::Picker(picker)) = &ws.modal {

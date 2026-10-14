@@ -120,6 +120,22 @@ pub fn project_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Files to offer in Go to File / Search Everywhere: like `project_files`,
+/// but git-ignored *files* (`.env`, local configs) are listed too. Ignored
+/// folders (build output, dependencies) still aren't entered.
+pub fn openable_files(root: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = walker(root)
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        .filter_map(|dir| std::fs::read_dir(dir.path()).ok())
+        .flat_map(|entries| entries.filter_map(|e| e.ok()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && e.file_name() != ".DS_Store")
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    files
+}
+
 fn walker(root: &Path) -> ignore::Walk {
     ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -225,6 +241,25 @@ mod tests {
         assert_eq!(q("i\\w+s", re).find_all(text), vec![10..15]);
         assert!(SearchQuery::new("(", re).is_err());
         assert_eq!(q("a.b", SearchOptions::default()).find_all("a.b axb"), vec![0..3]);
+    }
+
+    #[test]
+    fn openable_files_include_ignored_files_but_not_ignored_folders() {
+        let dir = std::env::temp_dir().join(format!("kin-search-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [".git", "config", "build", "node_modules/pkg"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join(".gitignore"), "partners.yml\nbuild/\n").unwrap();
+        for file in ["config/partners.yml", "config/partners.yml.example", "build/out.js", "node_modules/pkg/index.js", ".git/HEAD"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            files.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names(openable_files(&dir)), [".gitignore", "config/partners.yml", "config/partners.yml.example"]);
+        assert_eq!(names(project_files(&dir)), [".gitignore", "config/partners.yml.example"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
