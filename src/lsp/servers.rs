@@ -241,16 +241,25 @@ pub fn search_path() -> &'static OsString {
 /// interactive shell config can't hang Kin.
 #[cfg(unix)]
 fn login_shell_path() -> Option<OsString> {
-    use std::{io::Read, process::Stdio, time::Duration};
+    use std::{io::Read, os::unix::process::CommandExt, process::Stdio, time::Duration};
     const MARK: &str = "__KIN_PATH__";
     let shell = std::env::var("SHELL").ok()?;
-    let mut child = std::process::Command::new(shell)
+    let mut command = std::process::Command::new(shell);
+    command
         .args(["-l", "-i", "-c", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // An interactive shell opens /dev/tty and makes itself the terminal's foreground job,
+    // which stops (or breaks) the shell Kin was started from. Its own session has no terminal.
+    // SAFETY: setsid is async-signal-safe, as pre_exec requires.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
     for _ in 0..60 {
         if child.try_wait().ok()?.is_some() {
             let mut out = String::new();

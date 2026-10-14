@@ -52,6 +52,10 @@ tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 url = "2.5.8"
 
+[target.'cfg(unix)'.dependencies]
+# setsid for the login shell that reports PATH, so it can't take over Kin's terminal.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
