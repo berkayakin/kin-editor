@@ -551,7 +551,9 @@ impl Workspace {
             panes_bounds: Default::default(),
             pane_drag_pair: 0.,
             pinned: HashSet::new(),
-            show_sidebar: state.show_sidebar.unwrap_or(true),
+            // Without a project there's nothing to browse; opening one shows
+            // the sidebar as it was left (see `set_root`).
+            show_sidebar: false,
             show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
             // Closed unless it was open when the window last closed.
             show_terminal: state.show_terminal.unwrap_or(false),
@@ -756,7 +758,7 @@ impl Workspace {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
         }
         self.root = Some(root);
-        self.show_sidebar = true;
+        self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
         self.rebuild_tree();
         self.refresh_file_index(cx);
         self.start_watching(cx);
@@ -777,10 +779,7 @@ impl Workspace {
         let Some(root) = SessionState::load().last_root.filter(|r| r.is_dir()) else {
             return;
         };
-        // Opening a folder normally reveals the sidebar; keep the saved choice instead.
-        let show_sidebar = self.show_sidebar;
         self.set_root(root, window, cx);
-        self.show_sidebar = show_sidebar;
     }
 
     // ---- Project session --------------------------------------------------------
@@ -959,7 +958,9 @@ impl Workspace {
             last_root: self.root.clone().or(saved.last_root),
             sidebar_width: Some(self.sidebar_width.into()),
             problems_height: Some(self.problems_height.into()),
-            show_sidebar: Some(self.show_sidebar),
+            // The sidebar's visibility is remembered for projects only; it's
+            // always closed without one.
+            show_sidebar: if self.root.is_some() { Some(self.show_sidebar) } else { saved.show_sidebar },
             show_problems: Some(self.show_problems),
             show_terminal: Some(self.show_terminal),
             sidebar_mode: Some(match self.sidebar_mode {
@@ -1306,6 +1307,7 @@ impl Workspace {
         self.watcher = None;
         self.watch_task = None;
         self.root = None;
+        self.show_sidebar = false;
         self.repo = None;
         self.git_remote = None;
         self.last_commit = None;
