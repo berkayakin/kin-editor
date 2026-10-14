@@ -267,6 +267,19 @@ popover scrolls, and a copy button that appears on hover copies its text); compl
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
 server or turn one off, see `language_servers` below.
 
+## Snippets
+
+Completions from a language server that contain placeholders (a function's arguments, a `for`
+loop) select the first one; **Tab** and **Shift+Tab** move between them and **Escape** stops.
+A placeholder used in several places is filled in everywhere at once.
+
+Your own snippets use VS Code's format, so existing ones can be copied over. **Open Snippets
+Folder** (Find Action) opens `snippets/` in the config folder, with an example on first use.
+`<language id>.json` (`rust.json`, `typescript.json`, `typescriptreact.json`, `python.json`,
+`shellscript.json`…) holds one language's snippets; `*.code-snippets` files hold any, limited
+with `"scope": "rust,go"`. Type a snippet's prefix and press Tab, or pick it from completion.
+Changes to the files apply right away.
+
 ## Formatting
 
 **Reformat Code** formats the file, or the selection when the language server supports range

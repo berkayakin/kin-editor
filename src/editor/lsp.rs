@@ -15,7 +15,7 @@ use nucleo_matcher::{
 };
 use serde_json::{Value, json};
 
-use super::{Editor, EditorEvent, EditorMode, Selection};
+use super::{Editor, EditorEvent, EditorMode};
 use crate::{
     assets::Icon,
     document::EditKind,
@@ -102,7 +102,7 @@ pub(super) struct EditorLsp {
     symbol_highlight_task: Option<Task<()>>,
 }
 
-fn is_word_char(c: char) -> bool {
+pub(super) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
@@ -212,8 +212,9 @@ impl Editor {
         self.lsp.completion_task = Some(cx.spawn(async move |this, cx| {
             let Ok(value) = server.request("textDocument/completion", params).await else { return };
             let incomplete = value.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false);
-            let items = protocol::completion_items(value);
+            let mut items = protocol::completion_items(value);
             this.update(cx, |e, cx| {
+                items.extend(super::snippet::user_snippet_items(e.doc.language));
                 e.lsp.completion = Some(CompletionMenu {
                     items: Arc::new(items),
                     matches: Vec::new(),
@@ -311,7 +312,8 @@ impl Editor {
         let (server, start) = (menu.server, menu.start);
         cx.notify();
         // Auto-imports often arrive only on resolve.
-        if item.additional_edits.is_empty() && server.resolves("completionProvider") {
+        let own = item.raw.get("kinUserSnippet").is_some();
+        if item.additional_edits.is_empty() && !own && server.resolves("completionProvider") {
             self.lsp.completion_task = Some(cx.spawn(async move |this, cx| {
                 if let Ok(resolved) = server.request("completionItem/resolve", item.raw.clone()).await {
                     item.merge_resolved(&resolved);
@@ -335,7 +337,10 @@ impl Editor {
                 to += c.len_utf8();
             }
         }
-        let (text, selection) = item.text();
+        let (text, stops) = match item.is_snippet {
+            true => protocol::expand_snippet(&self.indented_snippet(item.raw_text(), from)),
+            false => (item.raw_text().to_string(), Vec::new()),
+        };
         let mut edits = vec![(from..to, text.clone())];
         for (range, new_text) in protocol::resolve_edits(&rope, &item.additional_edits, encoding) {
             // An extra edit overlapping the main one is a server bug; skip it.
@@ -351,14 +356,11 @@ impl Editor {
             .sum();
         let new_start = (from as isize + shift) as usize;
         self.edit_and_remap(edits, EditKind::Other, cx);
-        let caret = match &selection {
-            Some(r) => Selection { anchor: new_start + r.start, head: new_start + r.end },
-            None => Selection::cursor(new_start + text.len()),
-        };
-        self.set_selections(vec![caret], 0, cx);
+        let has_stops = stops.len() > 1;
+        self.select_snippet(new_start, text.len(), stops, cx);
         self.autoscroll = true;
         // Accepting a function often opens its argument list.
-        if text.ends_with('(') || selection.is_some() {
+        if text.ends_with('(') || has_stops {
             self.request_signature_help(cx);
         }
     }

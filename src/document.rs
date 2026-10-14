@@ -84,6 +84,8 @@ pub struct Document {
     /// Folded (hidden) text: from the start of the first hidden line to the
     /// end of the last. Edits that touch a fold open it.
     folds: Vec<Range<usize>>,
+    /// The tab stops of a snippet being filled in; they follow edits.
+    pub snippet: Option<crate::snippets::SnippetStops>,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -142,6 +144,7 @@ impl Document {
             uses_crlf,
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
+            snippet: None,
             disk_mtime: None,
             image: None,
         }
@@ -205,6 +208,7 @@ impl Document {
         self.syntax = Syntax::new(self.language, &self.rope);
         self.lsp_changes.mark_full();
         self.folds.clear();
+        self.snippet = None;
         self.version += 1;
         self.saved_version = self.version;
         self.undo_stack.clear();
@@ -434,6 +438,11 @@ impl Document {
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
         self.shift_folds(&range, text.len());
+        if let Some(snippet) = &mut self.snippet
+            && !snippet.shift(&range, text.len())
+        {
+            self.snippet = None;
+        }
         self.shift_diagnostics(range, text.len());
     }
 

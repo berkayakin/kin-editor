@@ -6,6 +6,7 @@ mod format;
 mod conflict;
 mod lsp;
 mod run;
+mod snippet;
 
 pub use lsp::EditorLspEvent;
 pub use run::EditorRunEvent;
@@ -1417,6 +1418,9 @@ impl Editor {
             cx.propagate();
             return;
         }
+        if self.snippet_tab(1, cx) || self.expand_user_snippet(cx) {
+            return;
+        }
         if self.selections.iter().all(|s| s.is_empty()) {
             let unit = self.indent_unit.clone();
             let tab_size = self.tab_size;
@@ -1448,6 +1452,9 @@ impl Editor {
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_chromeless() {
             cx.propagate();
+            return;
+        }
+        if self.snippet_tab(-1, cx) {
             return;
         }
         let mut edits = Vec::new();
@@ -1684,6 +1691,8 @@ impl Editor {
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        // Escape leaves a snippet's stops (and still does the rest below).
+        self.doc.snippet = None;
         if self.open_hunk.take().is_some() {
             cx.notify();
             return;

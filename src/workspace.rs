@@ -107,6 +107,7 @@ actions!(
         ResetFontSize,
         SelectTheme,
         OpenThemesFolder,
+        OpenSnippetsFolder,
         ReloadThemes,
         ShowCommit,
         ToggleCommit,
@@ -3087,6 +3088,15 @@ impl Workspace {
         }
     }
 
+    fn open_snippets_folder(&mut self, _: &OpenSnippetsFolder, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::snippets::ensure_snippets_dir() {
+            Ok(dir) => cx.open_url(&format!("file://{}", dir.display())),
+            Err(err) => {
+                let _ = window.prompt(PromptLevel::Warning, "Couldn't create the snippets folder", Some(&err.to_string()), &["OK"], cx);
+            }
+        }
+    }
+
     fn reload_themes(&mut self, _: &ReloadThemes, _: &mut Window, cx: &mut Context<Self>) {
         theme::reload_themes(cx);
     }
@@ -5650,6 +5660,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_keymap))
             .on_action(cx.listener(Self::select_theme))
             .on_action(cx.listener(Self::open_themes_folder))
+            .on_action(cx.listener(Self::open_snippets_folder))
             .on_action(cx.listener(Self::reload_themes))
             .on_action(cx.listener(Self::show_commit))
             .on_action(cx.listener(Self::toggle_commit))

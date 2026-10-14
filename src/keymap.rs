@@ -24,7 +24,7 @@ use crate::{
         CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine, OpenSettingsFile,
         CloseWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
-        GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, ReloadThemes, ReplaceInFiles,
+        GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol,
     },
@@ -707,6 +707,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Reset Font Size", ResetFontSize),
         a("Select Theme…", SelectTheme),
         a("Open Themes Folder", OpenThemesFolder),
+        a("Open Snippets Folder", OpenSnippetsFolder),
         a("Reload Themes", ReloadThemes),
         a("Quit", Quit),
     ]

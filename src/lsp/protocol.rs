@@ -300,11 +300,9 @@ impl CompletionItem {
         }
     }
 
-    /// The text to insert (snippet syntax expanded) and the selection to
-    /// leave inside it.
-    pub fn text(&self) -> (String, Option<Range<usize>>) {
-        let raw = self.edit.as_ref().map(|e| e.new_text.as_str()).or(self.insert_text.as_deref()).unwrap_or(&self.label);
-        if self.is_snippet { expand_snippet(raw) } else { (raw.to_string(), None) }
+    /// The text to insert, as written (still in snippet syntax when `is_snippet`).
+    pub fn raw_text(&self) -> &str {
+        self.edit.as_ref().map(|e| e.new_text.as_str()).or(self.insert_text.as_deref()).unwrap_or(&self.label)
     }
 }
 
@@ -351,17 +349,32 @@ fn completion_kind(kind: u64) -> &'static str {
     }
 }
 
-/// Expands LSP snippet syntax to plain text. Returns the selection to leave:
-/// the first placeholder (or tab stop), else `$0`, else none (end of text).
-pub fn expand_snippet(snippet: &str) -> (String, Option<Range<usize>>) {
+/// Expands snippet syntax to plain text and its tab stops in Tab order:
+/// `$1`, `$2`… then `$0` (the end of the text when there's none). A stop used
+/// in several places lists each. Plain text has no stops.
+pub fn expand_snippet(snippet: &str) -> (String, Vec<Vec<Range<usize>>>) {
     let chars: Vec<char> = snippet.chars().collect();
     let mut out = String::new();
     // (tab stop number, range in `out`)
-    let mut stops: Vec<(u32, Range<usize>)> = Vec::new();
-    expand_into(&chars, &mut 0, &mut out, &mut stops, false);
-    let first = stops.iter().filter(|(n, _)| *n > 0).min_by_key(|(n, r)| (*n, r.start)).map(|(_, r)| r.clone());
-    let last = stops.iter().find(|(n, _)| *n == 0).map(|(_, r)| r.clone());
-    (out, first.or(last))
+    let mut found: Vec<(u32, Range<usize>)> = Vec::new();
+    expand_into(&chars, &mut 0, &mut out, &mut found, false);
+    if found.is_empty() {
+        return (out, Vec::new());
+    }
+    let mut numbers: Vec<u32> = found.iter().map(|(n, _)| *n).filter(|n| *n > 0).collect();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let mut stops: Vec<Vec<Range<usize>>> = numbers
+        .into_iter()
+        .map(|n| {
+            let mut ranges: Vec<_> = found.iter().filter(|(m, _)| *m == n).map(|(_, r)| r.clone()).collect();
+            ranges.sort_by_key(|r| r.start);
+            ranges
+        })
+        .collect();
+    let end = found.iter().find(|(n, _)| *n == 0).map_or(out.len()..out.len(), |(_, r)| r.clone());
+    stops.push(vec![end]);
+    (out, stops)
 }
 
 fn expand_into(chars: &[char], i: &mut usize, out: &mut String, stops: &mut Vec<(u32, Range<usize>)>, nested: bool) {
@@ -377,7 +390,9 @@ fn expand_into(chars: &[char], i: &mut usize, out: &mut String, stops: &mut Vec<
                 *i += 1;
                 if *i < chars.len() && chars[*i].is_ascii_digit() {
                     let n = read_number(chars, i);
-                    stops.push((n, out.len()..out.len()));
+                    let start = out.len();
+                    mirror(n, out, stops);
+                    stops.push((n, start..out.len()));
                 } else if *i < chars.len() && chars[*i] == '{' {
                     *i += 1;
                     if *i < chars.len() && chars[*i].is_ascii_digit() {
@@ -402,7 +417,7 @@ fn expand_into(chars: &[char], i: &mut usize, out: &mut String, stops: &mut Vec<
                                 }
                                 *i += 1;
                             }
-                            _ => {}
+                            _ => mirror(n, out, stops),
                         }
                         stops.push((n, start..out.len()));
                     } else {
@@ -433,6 +448,14 @@ fn expand_into(chars: &[char], i: &mut usize, out: &mut String, stops: &mut Vec<
                 *i += 1;
             }
         }
+    }
+}
+
+/// A repeated tab stop starts with the text its first place has (`${1:v} = $1`).
+fn mirror(n: u32, out: &mut String, stops: &[(u32, Range<usize>)]) {
+    if let Some((_, r)) = stops.iter().find(|(m, r)| *m == n && !r.is_empty()) {
+        let text = out[r.clone()].to_string();
+        out.push_str(&text);
     }
 }
 
@@ -666,11 +689,13 @@ mod tests {
 
     #[test]
     fn expands_snippets() {
-        assert_eq!(expand_snippet("println!(\"$1\")$0"), ("println!(\"\")".to_string(), Some(10..10)));
-        assert_eq!(expand_snippet("foo(${1:a}, ${2:b})"), ("foo(a, b)".to_string(), Some(4..5)));
-        assert_eq!(expand_snippet("${1|one,two|} \\$x ${TM_FILENAME:file}$0"), ("one $x file".to_string(), Some(0..3)));
-        assert_eq!(expand_snippet("plain"), ("plain".to_string(), None));
-        assert_eq!(expand_snippet("a${1:b${2:c}}d"), ("abcd".to_string(), Some(1..3)));
+        assert_eq!(expand_snippet("println!(\"$1\")$0"), ("println!(\"\")".to_string(), vec![vec![10..10], vec![12..12]]));
+        assert_eq!(expand_snippet("foo(${1:a}, ${2:b})"), ("foo(a, b)".to_string(), vec![vec![4..5], vec![7..8], vec![9..9]]));
+        assert_eq!(expand_snippet("${1|one,two|} \\$x ${TM_FILENAME:file}$0"), ("one $x file".to_string(), vec![vec![0..3], vec![11..11]]));
+        assert_eq!(expand_snippet("plain"), ("plain".to_string(), Vec::new()));
+        assert_eq!(expand_snippet("a${1:b${2:c}}d"), ("abcd".to_string(), vec![vec![1..3], vec![2..3], vec![4..4]]));
+        // Mirrors: both places of $1, in order.
+        assert_eq!(expand_snippet("${1:x} = $1;"), ("x = x;".to_string(), vec![vec![0..1, 4..5], vec![6..6]]));
     }
 
     #[test]
@@ -722,6 +747,7 @@ mod tests {
               "textEdit": { "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 4}}, "newText": "push(${1:value})$0" } }
         ] }));
         assert_eq!(items[0].kind, Some("method"));
-        assert_eq!(items[0].text(), ("push(value)".to_string(), Some(5..10)));
+        assert_eq!(items[0].raw_text(), "push(${1:value})$0");
+        assert_eq!(expand_snippet(items[0].raw_text()), ("push(value)".to_string(), vec![vec![5..10], vec![11..11]]));
     }
 }

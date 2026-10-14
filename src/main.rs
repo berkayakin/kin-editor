@@ -28,6 +28,7 @@ mod project_search;
 mod push_dialog;
 mod search;
 mod settings;
+mod snippets;
 mod state;
 mod syntax;
 mod terminal;
