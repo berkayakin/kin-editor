@@ -277,7 +277,7 @@ impl GitPanel {
                 .pr_1()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(is_selected, |el| el.bg(theme.accent_soft))
+                .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
                 .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                     this.selected = Some((f.rel.clone(), staged));
@@ -475,7 +475,8 @@ impl GitPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(6.))
+                // Pills, like `ui::text_button`.
+                .rounded(px(13.))
                 .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .when(!can_commit, |el| el.opacity(0.45))
@@ -483,6 +484,8 @@ impl GitPanel {
                 .when(primary, |el| {
                     el.bg(theme.accent_soft)
                         .text_color(theme.accent)
+                        .border_1()
+                        .border_color(Hsla::from(theme.accent).alpha(0.3))
                         .when(can_commit, |el| el.hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24))))
                 })
                 .when(!primary, |el| el.bg(theme.hover).text_color(theme.text).when(can_commit, |el| el.hover(|s| s.bg(theme.active))))
@@ -499,12 +502,13 @@ impl GitPanel {
             .child(
                 div()
                     .h(px(96.))
-                    .px_2()
+                    .px_2p5()
                     .py_1p5()
-                    .rounded(px(7.))
+                    .rounded(px(10.))
                     .bg(theme.background)
                     .border_1()
-                    .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { theme.border.into() })
+                    .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
+                    .when(focused, |el| el.shadow(crate::ui::focus_glow(&theme)))
                     .overflow_hidden()
                     .child(self.message.clone()),
             )

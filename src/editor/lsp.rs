@@ -782,9 +782,9 @@ impl Editor {
                 .absolute()
                 .bg(theme.elevated)
                 .border_1()
-                .border_color(theme.border)
-                .rounded(px(6.))
-                .shadow_lg()
+                .border_color(gpui::Hsla::from(theme.border).alpha(0.85))
+                .rounded(px(10.))
+                .shadow(crate::ui::soft_shadow(&theme, 2))
                 .text_size(px(theme.ui_font_size - 0.5))
                 .text_color(theme.text)
         };
@@ -827,14 +827,15 @@ impl Editor {
                         let selected = ix == menu.selected;
                         div()
                             .id(("completion", ix))
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
                             .h(px(MENU_ROW_HEIGHT))
                             .px_2()
-                            .rounded(px(4.))
+                            .rounded(px(6.))
                             .cursor_pointer()
-                            .when(selected, |el| el.bg(theme.accent_soft))
+                            .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(4.)).bottom(px(4.))))
                             .on_mouse_down(MouseButton::Left, cx.listener(move |e, _, _, cx| {
                                 cx.stop_propagation();
                                 e.accept_completion(ix, false, cx);

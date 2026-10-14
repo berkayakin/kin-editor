@@ -24,7 +24,10 @@ use crate::{
     syntax::Language,
     theme::{self, Appearance, Theme, ThemeRegistry},
     workspace::Find,
-    ui::{icon_button, icon_el, input_box, modal_panel, switch, text_button, tooltip_view},
+    ui::{
+        GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, selected_edge, switch, text_button,
+        tooltip_view,
+    },
 };
 
 use keymap_page::KeymapPage;
@@ -307,6 +310,11 @@ enum Menu {
     Formatter,
 }
 
+impl Menu {
+    /// How many menus there are (sizes `menu_anchors`); keep it the last variant + 1.
+    const COUNT: usize = Menu::Formatter as usize + 1;
+}
+
 /// How a language picks its server or formatter (`language_servers` and
 /// `formatters` in settings).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -464,7 +472,7 @@ pub struct Preferences {
     commit_task: Option<Task<()>>,
     /// Where each dropdown's button was last drawn (by `Menu`), and the open
     /// one's list for this frame.
-    menu_anchors: [Rc<Cell<Bounds<Pixels>>>; 5],
+    menu_anchors: [Rc<Cell<Bounds<Pixels>>>; Menu::COUNT],
     overlay: Option<AnyElement>,
     /// Extensions page: the Git URL to install from, and how the last install went.
     extension_url: Entity<Editor>,
@@ -909,20 +917,20 @@ impl Render for Preferences {
                 this.search.update(cx, |e, cx| e.select_all_text(cx));
             }))
             .flex_row()
-            .bg(theme.background)
-            .w(px(920.))
+            .w(px(940.))
             .max_w(viewport.width - px(48.))
             .h(height)
             .text_size(px(13.))
             .font_family(theme.ui_font.clone())
+            // Like the main window: the nav on the chrome, the page on an island.
             .child(self.render_nav(&words, window, cx))
             .child(
-                div()
-                    .flex()
-                    .flex_col()
+                island(&theme)
+                    .p_0()
                     .flex_1()
                     .min_w_0()
-                    .h_full()
+                    .my(px(GAP))
+                    .mr(px(GAP))
                     .child(self.render_header(&words, cx))
                     .when_some(self.file_error.clone(), |el, error| el.child(self.render_file_error(error, cx)))
                     .child(content),
@@ -940,18 +948,19 @@ impl Preferences {
             let selected = !searching && page == self.page;
             items.push(div()
                 .id(("pref-page", page as usize))
+                .relative()
                 .flex()
                 .items_center()
                 .gap_2()
                 .h(px(30.))
-                .px_2()
-                .rounded(px(6.))
+                .px_2p5()
+                .rounded(px(8.))
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
-                .when(selected, |el| el.bg(theme.active).font_weight(FontWeight::MEDIUM))
+                .when(selected, |el| el.bg(theme.accent_soft).font_weight(FontWeight::MEDIUM).child(selected_edge(&theme)))
                 .when(!selected, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show_page(page, window, cx)))
-                .child(icon_el(page.icon(), px(14.), if selected { theme.text.into() } else { theme.text_dim.into() }))
+                .child(icon_el(page.icon(), px(14.), if selected { theme.accent.into() } else { theme.text_dim.into() }))
                 .child(page.title())
                 .into_any_element());
             // The open page's sections, to jump to.
@@ -964,8 +973,8 @@ impl Preferences {
                             .flex()
                             .items_center()
                             .h(px(24.))
-                            .pl(px(32.))
-                            .rounded(px(6.))
+                            .pl(px(34.))
+                            .rounded(px(8.))
                             .cursor_pointer()
                             .text_size(px(12.))
                             .text_color(theme.text_dim)
@@ -986,12 +995,6 @@ impl Preferences {
             .flex_shrink_0()
             .w(px(212.))
             .h_full()
-            // GPUI clips children to a rectangle, so backgrounds next to the
-            // dialog's rounded corners need rounding of their own (12 - border).
-            .rounded_l(px(11.))
-            .bg(theme.panel)
-            .border_r_1()
-            .border_color(theme.border)
             .child(div().p_2().pt_3().child(input_box(&self.search, Some(Icon::Search), window, cx)))
             .child(div().flex().flex_col().gap_0p5().px_2().pt_1().flex_1().children(items))
             .child(
@@ -1000,8 +1003,6 @@ impl Preferences {
                     .flex_col()
                     .gap_0p5()
                     .p_2()
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
                     .child(
                         link_row("pref-open-settings", Icon::FileCode, "Open settings.json", &theme)
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::OpenSettingsFile))),
@@ -1437,13 +1438,13 @@ impl Preferences {
                     .gap_2()
                     .h(px(26.))
                     .px_2()
-                    .rounded(px(5.))
+                    .rounded(px(6.))
                     .cursor_pointer()
                     .text_color(theme.text)
-                    .hover(|s| s.bg(theme.hover))
+                    .hover(|s| s.bg(theme.accent_soft))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_pick(this, ix, window, cx)))
                     .child(div().flex_1().child(text))
-                    .when(selected, |el| el.child(icon_el(Icon::Check, px(13.), theme.text_muted.into())))
+                    .when(selected, |el| el.child(icon_el(Icon::Check, px(13.), theme.accent.into())))
             });
             let anchor = self.menu_anchors[menu as usize].clone();
             let trigger = anchor.get();
@@ -1452,16 +1453,9 @@ impl Preferences {
                 .anchor(Corner::TopRight)
                 .snap_to_window_with_margin(px(8.))
                 .child(
-                    div()
+                    popover(&theme)
                         .w(width)
                         .p_1()
-                        .flex()
-                        .flex_col()
-                        .rounded(px(8.))
-                        .bg(theme.elevated)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
                         .occlude()
                         .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                             // The trigger's own click toggles it closed.
@@ -1550,7 +1544,7 @@ impl Preferences {
                                     .when_some(rows[ix].clone(), |el, f| {
                                         el.child(div().font_family(f).text_color(theme.text_muted).child("Ag 0O il1 {}"))
                                     })
-                                    .when(selected, |el| el.child(icon_el(Icon::Check, px(13.), theme.text_muted.into()))),
+                                    .when(selected, |el| el.child(icon_el(Icon::Check, px(13.), theme.accent.into()))),
                             )
                         })
                         .collect()
@@ -1601,13 +1595,13 @@ impl Preferences {
                 .id(("pref-theme", ix))
                 .flex()
                 .flex_col()
-                .rounded(px(8.))
+                .rounded(px(10.))
                 .overflow_hidden()
                 .border_1()
                 // Only the current theme is outlined; the others keep a clear border so
                 // every card has the same size.
                 .border_color(if selected { Hsla::from(theme.accent) } else { gpui::transparent_black() })
-                .when(selected, |el| el.shadow_sm())
+                .when(selected, |el| el.shadow(focus_glow(&theme)))
                 .cursor_pointer()
                 .hover(|s| s.border_color(Hsla::from(theme.accent).alpha(0.6)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_theme(name.clone(), cx)))
@@ -1620,7 +1614,7 @@ impl Preferences {
                         .h(px(52.))
                         .px_2p5()
                         .py(px(8.))
-                        .rounded_t(px(7.))
+                        .rounded_t(px(9.))
                         .bg(t.background)
                         .child(line(0.).child(bar(16., t.syntax.keyword)).child(bar(30., t.syntax.function)).child(bar(8., t.syntax.punctuation)))
                         .child(line(10.).child(bar(12., t.syntax.keyword)).child(bar(22., t.syntax.variable_builtin)).child(bar(34., t.syntax.string)))
@@ -1634,7 +1628,7 @@ impl Preferences {
                         .gap_1p5()
                         .h(px(28.))
                         .px_2p5()
-                        .rounded_b(px(7.))
+                        .rounded_b(px(9.))
                         .bg(t.panel)
                         .border_t_1()
                         .border_color(t.border)
@@ -2055,15 +2049,16 @@ impl Preferences {
             let selected = language == chosen;
             div()
                 .id(("pref-lang", ix))
+                .relative()
                 .flex()
                 .items_center()
                 .gap_2()
                 .h(px(28.))
-                .px_2()
-                .rounded(px(6.))
+                .px_2p5()
+                .rounded(px(8.))
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
-                .when(selected, |el| el.bg(theme.active))
+                .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(&theme)))
                 .when(!selected, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.select_language(language, cx)))
                 .child(div().flex_1().child(language.name()))
@@ -2415,10 +2410,10 @@ fn card(theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()
-        .rounded(px(10.))
+        .rounded(px(12.))
         .bg(theme.elevated)
         .border_1()
-        .border_color(theme.border_subtle)
+        .border_color(Hsla::from(theme.border).alpha(0.6))
 }
 
 /// Label and description on the left, the control on the right.
@@ -2468,9 +2463,10 @@ fn dropdown_trigger(id: impl Into<gpui::ElementId>, label: SharedString, width: 
         .h(px(30.))
         .pl_2p5()
         .pr_2()
-        .rounded(px(7.))
+        .rounded(px(10.))
         .border_1()
-        .border_color(if open { Hsla::from(theme.accent).alpha(0.7) } else { theme.border.into() })
+        .border_color(if open { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
+        .when(open, |el| el.shadow(focus_glow(theme)))
         .bg(theme.background)
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover))
@@ -2509,8 +2505,8 @@ fn link_row(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) ->
         .items_center()
         .gap_2()
         .h(px(28.))
-        .px_2()
-        .rounded(px(6.))
+        .px_2p5()
+        .rounded(px(8.))
         .cursor_pointer()
         .text_size(px(12.))
         .text_color(theme.text_muted)

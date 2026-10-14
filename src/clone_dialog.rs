@@ -365,9 +365,6 @@ impl Render for CloneDialog {
                     .gap_2()
                     .px_4()
                     .py_3()
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
-                    .bg(theme.panel)
                     .child(
                         text_button("clone-cancel", if busy { "Stop" } else { "Cancel" }, false, cx)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_or_dismiss(cx))),

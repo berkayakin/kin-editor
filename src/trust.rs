@@ -6,7 +6,9 @@
 //! none of that; editing, Git and anything run explicitly (Run, Debug) work.
 //!
 //! Trusting a folder trusts everything inside it, so trusting a parent folder
-//! covers every project in it. Trusted folders live in `state.json`; the
+//! covers every project in it. Trusted folders live in `trust.json`, a file of
+//! their own: Kin versions from before trust existed rewrite `state.json`
+//! without the keys they don't know, which forgot every trusted folder. The
 //! `trust_all_projects` setting turns the checks off without saving anything.
 
 use std::{
@@ -17,9 +19,11 @@ use std::{
     },
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::state::SessionState;
 
-/// Trusted folders, loaded from `state.json` on first use.
+/// Trusted folders, loaded from `trust.json` on first use.
 static TRUSTED: RwLock<Option<Vec<PathBuf>>> = RwLock::new(None);
 static TRUST_ALL: AtomicBool = AtomicBool::new(false);
 
@@ -52,7 +56,64 @@ fn with_trusted<T>(f: impl FnOnce(&Vec<PathBuf>) -> T) -> T {
         }
     }
     let mut trusted = TRUSTED.write().unwrap_or_else(|e| e.into_inner());
-    f(trusted.get_or_insert_with(|| SessionState::load().trusted_folders))
+    f(trusted.get_or_insert_with(load))
+}
+
+/// `trust.json`.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct TrustFile {
+    folders: Vec<PathBuf>,
+}
+
+fn file_path() -> Option<PathBuf> {
+    crate::theme::config_dir().map(|d| d.join("trust.json"))
+}
+
+/// The trusted folders on disk: `trust.json`, plus any still in `state.json`
+/// from before it existed (moved over right away, before an older Kin can
+/// rewrite `state.json` without them).
+fn load() -> Vec<PathBuf> {
+    let file: TrustFile = file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let legacy = SessionState::load().trusted_folders;
+    let moving = !legacy.is_empty();
+    let folders = merged(file.folders, legacy);
+    if moving && let Err(err) = save(&folders) {
+        eprintln!("couldn't move trusted folders to trust.json: {err}");
+    }
+    folders
+}
+
+fn merged(mut folders: Vec<PathBuf>, legacy: Vec<PathBuf>) -> Vec<PathBuf> {
+    for folder in legacy {
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders.sort();
+    folders
+}
+
+/// Writes `trust.json` (through a temporary file, so a reader never sees half
+/// of it) and empties `state.json`'s old list, which `load` would merge back.
+fn save(folders: &[PathBuf]) -> std::io::Result<()> {
+    let path = file_path().ok_or_else(|| std::io::Error::other("no config directory"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(&TrustFile { folders: folders.to_vec() })? + "\n";
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, &path)?;
+    let mut state = SessionState::load();
+    if !state.trusted_folders.is_empty() {
+        state.trusted_folders.clear();
+        state.save()?;
+    }
+    Ok(())
 }
 
 /// Trusts `folder` and everything in it, and remembers it.
@@ -72,16 +133,15 @@ pub fn untrust(folder: &Path, cx: &mut gpui::App) {
 }
 
 fn change(cx: &mut gpui::App, edit: impl FnOnce(&mut Vec<PathBuf>)) {
-    let mut state = SessionState::load();
-    {
+    let folders = {
         let mut trusted = TRUSTED.write().unwrap_or_else(|e| e.into_inner());
         // The file has the latest list (another window may have changed it).
-        let folders = trusted.insert(state.trusted_folders.clone());
+        let folders = trusted.insert(load());
         edit(folders);
         folders.sort();
-        state.trusted_folders = folders.clone();
-    }
-    if let Err(err) = state.save() {
+        folders.clone()
+    };
+    if let Err(err) = save(&folders) {
         eprintln!("couldn't save trusted folders: {err}");
     }
     changed(cx);
@@ -110,5 +170,18 @@ mod tests {
         assert!(!is_trusted(Path::new("/work/clients-old")));
         assert!(!is_trusted(Path::new("/work")));
         assert_eq!(trusted_by(Path::new("/work/clients/acme")), Some(PathBuf::from("/work/clients")));
+    }
+
+    #[test]
+    fn folders_from_state_json_are_kept() {
+        let folders = merged(vec![PathBuf::from("/b")], vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(folders, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn state_keeps_keys_it_does_not_know() {
+        let state: SessionState = serde_json::from_str(r#"{"last_root": "/p", "from_a_newer_kin": [1, 2]}"#).unwrap();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""from_a_newer_kin":[1,2]"#), "{json}");
     }
 }

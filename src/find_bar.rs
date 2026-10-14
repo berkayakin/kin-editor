@@ -323,12 +323,14 @@ impl Render for FindBar {
             .flex_col()
             .flex_shrink_0()
             .gap_1p5()
-            .w_full()
+            .mx_1()
+            .mb_1()
             .px_2()
             .py_1p5()
+            .rounded(px(10.))
             .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
+            .border_1()
+            .border_color(gpui::Hsla::from(theme.border).alpha(0.75))
             .child(search_row)
             .when(self.replace_mode, |el| {
                 el.child(

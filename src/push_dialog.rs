@@ -284,10 +284,11 @@ impl Render for PushDialog {
                                         .items_center()
                                         .gap_2()
                                         .h(px(ROW_HEIGHT))
-                                        .px_2()
-                                        .rounded(px(6.))
+                                        .px_2p5()
+                                        .rounded(px(8.))
                                         .cursor_pointer()
-                                        .when(is_selected, |el| el.bg(theme.accent_soft))
+                                        .relative()
+                                        .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
                                         .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.focus(window);

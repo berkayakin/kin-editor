@@ -288,14 +288,10 @@ struct DraggedTabView(SharedString);
 impl Render for DraggedTabView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
-        div()
+        popover(theme)
             .px_3()
             .py_1()
-            .rounded(px(6.))
-            .bg(theme.elevated)
-            .border_1()
-            .border_color(theme.border)
-            .shadow_lg()
+            .rounded(px(14.))
             .text_size(px(theme.ui_font_size))
             .text_color(theme.text)
             .child(self.0.clone())
@@ -387,10 +383,11 @@ enum Modal {
 /// How long two Shift taps may be apart to count as a double Shift.
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 
-const TITLEBAR_HEIGHT: f32 = 38.0;
+const TITLEBAR_HEIGHT: f32 = 40.0;
 const STATUSBAR_HEIGHT: f32 = 30.0;
-const TAB_HEIGHT: f32 = 36.0;
+const TAB_HEIGHT: f32 = 38.0;
 const TREE_ROW_HEIGHT: f32 = 26.0;
+
 
 #[derive(Clone)]
 struct TreeEntry {
@@ -1135,6 +1132,7 @@ impl Workspace {
             trusted_folders: saved.trusted_folders,
             window: saved.window,
             welcome_done: saved.welcome_done,
+            other: saved.other,
         };
         if let Err(err) = state.save() {
             eprintln!("couldn't save window state: {err}");
@@ -2872,15 +2870,9 @@ impl Workspace {
 
     fn render_git_log_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        div()
-            .relative()
-            .flex()
-            .flex_col()
+        island(&theme)
             .h(self.problems_height)
             .flex_shrink_0()
-            .bg(theme.background)
-            .border_t_1()
-            .border_color(theme.border)
             .child(self.git_log.clone())
             .child(self.resize_handle(Edge::Problems, cx))
     }
@@ -3346,15 +3338,9 @@ impl Workspace {
         let (session, _) = self.debug.as_ref()?;
         let theme = Theme::get(cx).clone();
         Some(
-            div()
-                .relative()
-                .flex()
-                .flex_col()
+            island(&theme)
                 .h(self.problems_height)
                 .flex_shrink_0()
-                .bg(theme.background)
-                .border_t_1()
-                .border_color(theme.border)
                 .child(session.clone())
                 .child(self.resize_handle(Edge::Problems, cx)),
         )
@@ -3623,15 +3609,9 @@ impl Workspace {
                 ws.save_state();
                 cx.notify();
             }));
-        div()
-            .relative()
-            .flex()
-            .flex_col()
+        island(&theme)
             .h(self.problems_height)
             .flex_shrink_0()
-            .bg(theme.background)
-            .border_t_1()
-            .border_color(theme.border)
             .child(header)
             .child(
                 div()
@@ -5140,25 +5120,16 @@ impl Workspace {
     // ---- Rendering --------------------------------------------------------------
 
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx).clone();
-        // The project is shown in its own chip, so the center only names the file.
-        let title = match (self.active_editor(), self.root.as_deref()) {
-            (Some(e), _) => e.read(cx).doc.file_name(),
-            (None, Some(_)) => String::new(),
-            (None, None) => "Kin".into(),
-        };
         let mac = cfg!(target_os = "macos");
         div()
             .id("titlebar")
+            .relative()
             .flex()
             .flex_row()
             .items_center()
             .flex_shrink_0()
             .h(px(TITLEBAR_HEIGHT))
             .w_full()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
             // On Windows a title bar click must reach no listener, or GPUI reports
             // it handled and the system's drag, double-click and window buttons
             // don't happen. Blocking the mouse keeps the workspace root from
@@ -5178,7 +5149,7 @@ impl Workspace {
             .child(
                 div()
                     .h_full()
-                    .w(px(if mac && !window.is_fullscreen() { 84. } else { 12. }))
+                    .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
                     .flex_shrink_0()
                     .window_control_area(WindowControlArea::Drag),
             )
@@ -5191,67 +5162,167 @@ impl Workspace {
                     .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(cx)))
                     .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
             )
+            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
+            .when(!mac, |el| el.child(self.render_window_controls(cx)))
+            // Centered on the window, not on the space the chips leave.
             .child(
                 div()
-                    .flex_1()
-                    .h_full()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(relative(0.3))
+                    .right(relative(0.3))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .window_control_area(WindowControlArea::Drag)
-                    .text_color(theme.text_muted)
-                    .text_size(px(12.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .truncate()
-                    .child(title),
+                    .child(self.render_command_capsule(cx)),
             )
-            .child(div().h_full().w(px(if mac { 84. } else { 0. })).flex_shrink_0().window_control_area(WindowControlArea::Drag))
-            .when(!mac, |el| el.child(self.render_window_controls(cx)))
     }
 
-    /// The open project's folder name. Clicking lists recent projects, like Zed.
+    /// The title bar's center: the current file, and a way into Search
+    /// Everywhere (which it opens), like a command palette's field.
+    fn render_command_capsule(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let file = self.active_editor().map(|e| {
+            let doc = &e.read(cx).doc;
+            (doc.path.clone(), doc.file_name(), doc.is_dirty())
+        });
+        let folder = file.as_ref().and_then(|(path, _, _)| path.as_deref()).and_then(|path| {
+            let rel = self.display_rel(path);
+            let (dir, _) = rel.rsplit_once(['/', '\\'])?;
+            Some(format!("{dir}/"))
+        });
+        div()
+            .id("command-capsule")
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .max_w(px(460.))
+            .h(px(28.))
+            .pl_2p5()
+            .pr_1()
+            .rounded(px(14.))
+            .bg(theme.background)
+            .border_1()
+            .border_color(theme.border_subtle)
+            .cursor_pointer()
+            .text_size(px(12.5))
+            .hover(|s| s.border_color(theme.border))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)))
+            .child(icon_el(Icon::Search, px(13.), theme.text_dim.into()))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .map(|el| match file {
+                        Some((path, name, dirty)) => el
+                            .when_some(path.as_deref().map(|p| file_icon(p, px(13.), &theme)), |el, icon| el.child(icon))
+                            .child(
+                                div()
+                                    .flex()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .when_some(folder, |el, f| el.child(div().flex_shrink().truncate().text_color(theme.text_dim).child(f)))
+                                    .child(div().flex_shrink_0().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(name)),
+                            )
+                            .when(dirty, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.accent))),
+                        None => el.text_color(theme.text_dim).child("Search Everywhere"),
+                    }),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py(px(1.))
+                    .rounded(px(10.))
+                    .bg(theme.hover)
+                    .text_size(px(11.))
+                    .text_color(theme.text_dim)
+                    .child(double_shift_label()),
+            )
+    }
+
+    /// The open project: a tinted monogram and its folder name. Clicking
+    /// lists recent projects.
     fn render_project_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let name = self.root.as_deref().map(folder_name).unwrap_or_default();
+        let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+        let tint = monogram_color(&name, &theme);
         div()
             .id("project-chip")
             .flex()
             .items_center()
-            .h(px(26.))
-            .px_2()
-            .rounded(px(6.))
+            .gap_2()
+            .h(px(28.))
+            .pl_1()
+            .pr_2()
+            .rounded(px(8.))
             .cursor_pointer()
             .text_size(px(12.5))
-            .font_weight(FontWeight::MEDIUM)
+            .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text)
             .hover(|st| st.bg(theme.hover))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
+            .child(
+                div()
+                    .size(px(20.))
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .bg(gpui::linear_gradient(
+                        135.,
+                        gpui::linear_color_stop(tint, 0.),
+                        gpui::linear_color_stop(tint.alpha(0.55), 1.),
+                    ))
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(gpui::hsla(0., 0., 0., 0.78))
+                    .child(initial),
+            )
             .child(name)
     }
 
     /// The current branch beside the project name. Clicking opens Branches….
     fn render_branch_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let s = &self.git_status;
+        let dirty = !s.files.is_empty();
         div()
             .id("branch-chip")
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(26.))
+            .gap_1p5()
+            .h(px(24.))
             .max_w(px(240.))
-            .px_1p5()
-            .rounded(px(6.))
+            .px_2()
+            .rounded(px(12.))
             .cursor_pointer()
-            .text_size(px(12.5))
+            .text_size(px(12.))
             .text_color(theme.text_muted)
-            .hover(|st| st.bg(theme.hover).text_color(theme.text))
+            .bg(theme.hover)
+            .hover(|st| st.bg(theme.active).text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
-            .child(icon_el(Icon::GitBranch, px(13.), theme.text_dim.into()))
+            .child(icon_el(Icon::GitBranch, px(12.), theme.text_dim.into()))
             .child(div().truncate().child(self.branch_label()))
+            // Uncommitted changes, like a shell prompt's marker.
+            .when(dirty, |el| el.child(div().flex_shrink_0().size(px(5.)).rounded_full().bg(theme.git_modified)))
+            .when(s.ahead > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↑{}", s.ahead))))
+            .when(s.behind > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↓{}", s.behind))))
     }
 
     /// Shown while the project isn't trusted; opens the trust dialog.
@@ -5313,11 +5384,11 @@ impl Workspace {
                         .flex()
                         .gap_2()
                         .p_3()
-                        .rounded(px(10.))
+                        .rounded(px(12.))
                         .bg(theme.elevated)
                         .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
+                        .border_color(Hsla::from(theme.border).alpha(0.85))
+                        .shadow(soft_shadow(&theme, 2))
                         .cursor_pointer()
                         .on_click(cx.listener(move |ws, _, _, cx| {
                             ws.toasts.retain(|t| t.id != id);
@@ -5450,11 +5521,11 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap_0p5()
-                .h(px(TAB_HEIGHT))
-                .px_1p5()
+                .h(px(TAB_HEIGHT - ISLAND_INSET))
+                .px_1()
                 .flex_shrink_0()
                 .border_b_1()
-                .border_color(theme.border)
+                .border_color(theme.border_subtle)
                 .children(self.render_git_toolbar(cx))
         });
 
@@ -5489,8 +5560,9 @@ impl Workspace {
                             let drop_dir = if e.is_dir { e.path.clone() } else { e.path.parent().map(Path::to_path_buf).unwrap_or_default() };
                             let dragged = DraggedEntry { path: e.path.clone(), name: e.name.clone() };
                             let is_target = e.is_dir && tree_drop.as_deref() == Some(e.path.as_path());
-                            div().w_full().px_1p5().child(div()
+                            div().w_full().px_1().child(div()
                                 .id(ix)
+                                .relative()
                                 .w_full()
                                 .flex()
                                 .items_center()
@@ -5501,7 +5573,8 @@ impl Workspace {
                                 .rounded(px(6.))
                                 .cursor_pointer()
                                 .text_color(if selected { theme.text } else { theme.text_muted })
-                                .when(selected, |el| el.bg(theme.accent_soft))
+                                // A lit edge marks the open file.
+                                .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(theme)))
                                 .when(!selected, |el| el.hover(|s| s.bg(theme.hover)))
                                 .on_click(cx.listener(move |ws, _, window, cx| ws.click_entry(ix, window, cx)))
                                 .on_drag(dragged, |entry, _, _, cx| cx.new(|_| DraggedTabView(entry.name.clone())))
@@ -5598,7 +5671,9 @@ impl Workspace {
                 }
             }))
             .flex_1()
-            .pt_1p5()
+            // Puts the first row's text level with the tab labels beside it
+            // (GPUI applies a uniform list's own padding twice, so this is 2px).
+            .pt(px(1.))
             .pb_2()
             .track_focus(&self.tree_focus)
             .key_context("FileTree")
@@ -5631,24 +5706,18 @@ impl Workspace {
                 .into_any_element()
         };
 
-        div()
-            .relative()
-            .flex()
-            .flex_col()
+        island(&theme)
             .w(self.sidebar_width)
             .flex_shrink_0()
             .h_full()
-            .bg(theme.panel)
-            .border_r_1()
-            .border_color(theme.border)
             .children(header)
             .child(body)
             // Deferred so the grab area sits above the editor it overlaps.
             .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx)))
     }
 
-    /// A thin, invisible grab area straddling a panel border; only the cursor
-    /// shows it.
+    /// An invisible grab area filling the gap after an island; only the
+    /// cursor shows it.
     fn resize_handle(&self, edge: Edge, cx: &mut Context<Self>) -> impl IntoElement {
         let id: gpui::SharedString = match edge {
             Edge::Problems => "resize-problems".into(),
@@ -5657,12 +5726,12 @@ impl Workspace {
         };
         let handle = div().id(id).absolute();
         let handle = match edge {
-            Edge::Problems => handle.top(px(-3.)).left_0().right_0().h(px(6.)).cursor(CursorStyle::ResizeUpDown),
-            Edge::Sidebar => handle.top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor(CursorStyle::ResizeLeftRight),
+            Edge::Problems => handle.top(px(-GAP - 1.)).left_0().right_0().h(px(GAP)).cursor(CursorStyle::ResizeUpDown),
+            Edge::Sidebar => handle.top_0().bottom_0().right(px(-GAP - 1.)).w(px(GAP)).cursor(CursorStyle::ResizeLeftRight),
             Edge::Pane(_) if self.pane_axis == PaneAxis::Row => {
-                handle.top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor(CursorStyle::ResizeLeftRight)
+                handle.top_0().bottom_0().right(px(-GAP - 1.)).w(px(GAP)).cursor(CursorStyle::ResizeLeftRight)
             }
-            Edge::Pane(_) => handle.left_0().right_0().bottom(px(-3.)).h(px(6.)).cursor(CursorStyle::ResizeUpDown),
+            Edge::Pane(_) => handle.left_0().right_0().bottom(px(-GAP - 1.)).h(px(GAP)).cursor(CursorStyle::ResizeUpDown),
         };
         handle.on_mouse_down(
             MouseButton::Left,
@@ -5703,8 +5772,10 @@ impl Workspace {
             .gap_2()
             .h(px(30.))
             .px_3()
-            .rounded(px(8.))
+            .rounded(px(15.))
             .bg(theme.accent_soft)
+            .border_1()
+            .border_color(Hsla::from(theme.accent).alpha(0.3))
             .text_color(theme.accent)
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
@@ -5723,12 +5794,12 @@ impl Workspace {
             .id(("tabs", pane_ix))
             .flex()
             .flex_row()
+            .items_center()
+            .gap(px(2.))
             .flex_shrink_0()
-            .h(px(TAB_HEIGHT))
+            .h(px(TAB_HEIGHT - ISLAND_INSET))
             .w_full()
-            .bg(theme.panel)
-            .border_b_1()
-            .border_color(theme.border)
+            .pb(px(ISLAND_INSET))
             .overflow_x_scroll()
             // Dropping on the bar's empty part moves the tab to the end.
             .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
@@ -5748,17 +5819,23 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("tab-{pane_ix}-{ix}")))
                     .group(group.clone())
+                    .relative()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .h_full()
-                    .pl_3()
-                    .pr_1p5()
+                    .gap_1p5()
+                    .h(px(28.))
+                    .pl_2p5()
+                    .pr_1()
                     .flex_shrink_0()
-                    .border_r_1()
-                    .border_color(theme.border_subtle)
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
                     .cursor_pointer()
-                    .when(active, |el| el.bg(theme.background))
+                    // The current tab is raised; in the focused pane it's lit underneath.
+                    .when(active && focused_pane, |el| {
+                        el.bg(theme.elevated).border_color(theme.border_subtle).child(tab_glow(&theme))
+                    })
+                    .when(active && !focused_pane, |el| el.bg(theme.hover))
                     .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
                     .on_click(cx.listener(move |ws, _, window, cx| ws.activate_in(pane_ix, ix, window, cx)))
                     .on_mouse_down(
@@ -5782,13 +5859,13 @@ impl Workspace {
                         ws.move_tab(&dragged.editor, pane_ix, Some(ix), window, cx);
                     }))
                     .child(icon)
-                    .child(div().text_color(name_color).child(name))
+                    .child(div().text_color(name_color).when(active, |el| el.font_weight(FontWeight::MEDIUM)).child(name))
                     // Files with errors get a small dot rather than a recolored name.
                     .when(errors > 0, |el| el.child(div().size(px(6.)).rounded_full().bg(theme.error)))
                     .child(
                         div()
                             .id(SharedString::from(format!("close-{pane_ix}-{ix}")))
-                            .size(px(20.))
+                            .size(px(18.))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -5807,9 +5884,9 @@ impl Workspace {
                                     // A dot that turns into a close button on hover.
                                     el.child(
                                         div()
-                                            .size(px(8.))
+                                            .size(px(7.))
                                             .rounded_full()
-                                            .bg(theme.text_muted)
+                                            .bg(theme.accent)
                                             .group_hover(group.clone(), |s| s.invisible()),
                                     )
                                     .child(
@@ -5838,6 +5915,7 @@ impl Workspace {
         div()
             .relative()
             .flex()
+            .gap(px(GAP))
             .size_full()
             .when(self.pane_axis == PaneAxis::Column, |el| el.flex_col())
             .child(
@@ -5846,7 +5924,7 @@ impl Workspace {
                     .size_full(),
             )
             .children((0..self.panes.len()).map(|ix| self.render_pane(ix, window, cx)))
-            .when_some(self.diff_view(), |el, view| el.child(self.render_diff_overlay(view)))
+            .when_some(self.diff_view(), |el, view| el.child(self.render_diff_overlay(view, cx)))
     }
 
     fn diff_view(&self) -> Option<Entity<DiffView>> {
@@ -5858,14 +5936,14 @@ impl Workspace {
 
     /// The Git diff covers only the editor area, so the sidebar (Commit view)
     /// and the bottom panels (Git log) stay usable beside it.
-    fn render_diff_overlay(&self, view: Entity<DiffView>) -> impl IntoElement {
+    fn render_diff_overlay(&self, view: Entity<DiffView>, cx: &App) -> impl IntoElement {
         gpui::deferred(
-            div()
+            island(Theme::get(cx))
                 .id("diff-layer")
                 .absolute()
                 .inset_0()
                 .occlude()
-                .child(view),
+                .child(div().size_full().overflow_hidden().child(view)),
         )
         .with_priority(1)
     }
@@ -5892,20 +5970,15 @@ impl Workspace {
         };
         let multiple = self.panes.len() > 1;
         let drop_group = SharedString::from(format!("pane-drop-{pane_ix}"));
-        div()
-            .relative()
-            .flex()
-            .flex_col()
+        island(&theme)
             .min_w_0()
             .min_h_0()
             .map(|el| match self.pane_axis {
                 PaneAxis::Row => el.h_full().w(share),
                 PaneAxis::Column => el.w_full().h(share),
             })
-            .when(multiple && pane_ix > 0, |el| match self.pane_axis {
-                PaneAxis::Row => el.border_l_1().border_color(theme.border),
-                PaneAxis::Column => el.border_t_1().border_color(theme.border),
-            })
+            // With splits, the pane that has the keyboard is outlined.
+            .when(multiple && pane_ix == self.active_pane, |el| el.border_color(Hsla::from(theme.accent).alpha(0.35)))
             .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, cx)))
             .when_some(pane.tabs.get(pane.active).cloned(), |el, editor| el.children(self.render_breadcrumbs(&editor, cx)))
             .when(self.show_find && pane_ix == self.active_pane && !pane.tabs.is_empty(), |el| {
@@ -6292,7 +6365,7 @@ impl Workspace {
         let git = self.render_welcome_git(window, cx);
 
         // ---- Quick actions ----
-        let double_shift = if cfg!(target_os = "macos") { "⇧⇧" } else { "Shift Shift" };
+        let double_shift = double_shift_label();
         let auto_save_on = self.auto_save != AutoSave::Off;
         let quick = div()
             .flex()
@@ -6732,15 +6805,9 @@ impl Workspace {
                 .into_any_element()
         };
 
-        div()
-            .relative()
-            .flex()
-            .flex_col()
+        island(&theme)
             .h(self.problems_height)
             .flex_shrink_0()
-            .bg(theme.panel)
-            .border_t_1()
-            .border_color(theme.border)
             .child(header)
             .child(list)
             .child(self.resize_handle(Edge::Problems, cx))
@@ -6824,10 +6891,28 @@ impl Workspace {
             }
             LspStatus::Failed(message) => ("Language server stopped".into(), theme.error.into(), Some(format!("{message}. Click to restart."))),
         };
+        // A small light: green when ready, the accent while working.
+        let light: Hsla = match &status {
+            LspStatus::Ready(_) => theme.success.into(),
+            LspStatus::Starting | LspStatus::Busy(_) => theme.accent.into(),
+            LspStatus::Missing(_) => theme.warning.into(),
+            LspStatus::Failed(_) => theme.error.into(),
+        };
         Some(
             div()
                 .id("lsp-status")
+                .flex()
+                .items_center()
+                .gap_1p5()
                 .text_color(color)
+                .child(
+                    div().size(px(6.)).rounded_full().bg(light).shadow(vec![gpui::BoxShadow {
+                        color: light.alpha(0.6),
+                        offset: point(px(0.), px(0.)),
+                        blur_radius: px(4.),
+                        spread_radius: px(0.),
+                    }]),
+                )
                 .when(matches!(status, LspStatus::Missing(_) | LspStatus::Failed(_)), |el| el.cursor_pointer())
                 .child(label)
                 .when_some(tip, |el, tip| el.tooltip(move |_, cx| tooltip_view(tip.clone(), cx)))
@@ -6878,6 +6963,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap_1()
+                .when(n > 0, |el| el.text_color(color))
                 .child(icon_el(icon, px(13.), if n > 0 { color } else { theme.text_dim.into() }))
                 .child(n.to_string())
         };
@@ -6900,7 +6986,10 @@ impl Workspace {
             } else if selected > 0 {
                 pos.push_str(&format!("  ({selected} selected)"));
             }
-            right.push(item(pos.into_any_element()).into_any_element());
+            right.push(
+                item(div().font_family(theme.mono_font.clone()).text_size(px(11.)).text_color(theme.text_muted).child(pos).into_any_element())
+                    .into_any_element(),
+            );
             if let Some((name, error)) = e.external_linter_status() {
                 let (icon, color, label) = match error {
                     None => (Icon::CircleCheck, Hsla::from(theme.success), name.to_string()),
@@ -6933,9 +7022,10 @@ impl Workspace {
                     .id(id)
                     .flex()
                     .items_center()
-                    .h(px(22.))
-                    .px_1p5()
-                    .rounded(px(5.))
+                    // Same size and rounding as the docks and the problem counts.
+                    .h(px(24.))
+                    .px_2()
+                    .rounded(px(9.))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.hover).text_color(theme.text))
                     .tooltip(move |_, cx| tooltip_view(tip, cx))
@@ -6995,43 +7085,49 @@ impl Workspace {
             );
         }
 
+        // Panel toggles sit in two small docks, like segmented controls.
+        let dock = || dock(&theme);
+        let toggle = |button: Stateful<gpui::Div>, on: bool| {
+            button.size(px(20.)).rounded(px(7.)).when(on, |el| segment_on(el, &theme))
+        };
+
         div()
             .flex()
             .flex_row()
             .items_center()
+            .gap_1()
             .flex_shrink_0()
             .h(px(STATUSBAR_HEIGHT))
             .w_full()
-            .px_1p5()
-            .bg(theme.panel)
-            .border_t_1()
-            .border_color(theme.border)
-            .text_size(px(12.))
-            .text_color(theme.text_muted)
+            .px(px(GAP))
+            .text_size(px(11.5))
+            .text_color(theme.text_dim)
             // The sidebar's views, like JetBrains tool window buttons: a click shows that view,
             // or hides the sidebar when it's the one showing.
             .child(
-                self.icon_button("toggle-sidebar", Icon::FolderTree, files_on, cx, |ws, _, window, cx| {
-                    ws.toggle_sidebar(&ToggleSidebar, window, cx)
-                })
-                .size(px(22.))
-                .mx(px(3.))
-                .when(files_on, |el| el.bg(theme.active))
-                .tooltip(|window, cx| status_tooltip("Project", &ToggleSidebar, window, cx)),
-            )
-            .child(
-                self.icon_button("toggle-commit", Icon::GitBranch, commit_on, cx, |ws, _, window, cx| {
-                    ws.toggle_commit(&ToggleCommit, window, cx)
-                })
-                .h(px(22.))
-                .mx(px(3.))
-                .w_auto()
-                .min_w(px(22.))
-                .px_1()
-                .gap_1()
-                .when(commit_on, |el| el.bg(theme.active).text_color(theme.text))
-                .when(changes > 0, |el| el.child(changes.to_string()))
-                .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx)),
+                dock()
+                    .child(toggle(
+                        self.icon_button("toggle-sidebar", Icon::FolderTree, files_on, cx, |ws, _, window, cx| {
+                            ws.toggle_sidebar(&ToggleSidebar, window, cx)
+                        }),
+                        files_on,
+                    )
+                    .tooltip(|window, cx| status_tooltip("Project", &ToggleSidebar, window, cx)))
+                    .child(
+                        toggle(
+                            self.icon_button("toggle-commit", Icon::GitBranch, commit_on, cx, |ws, _, window, cx| {
+                                ws.toggle_commit(&ToggleCommit, window, cx)
+                            }),
+                            commit_on,
+                        )
+                        .w_auto()
+                        .min_w(px(20.))
+                        .px_1()
+                        .gap_1()
+                        .when(commit_on, |el| el.text_color(theme.text))
+                        .when(changes > 0, |el| el.child(changes.to_string()))
+                        .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx)),
+                    ),
             )
             .child(
                 div()
@@ -7039,11 +7135,12 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(22.))
+                    // Same size and rounding as the docks beside it.
+                    .h(px(24.))
                     .px_2()
-                    .rounded(px(4.))
+                    .rounded(px(9.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover))
+                    .hover(|s| s.bg(theme.hover).text_color(theme.text_muted))
                     .on_click(cx.listener(|ws, _, window, cx| ws.toggle_problems(&ToggleProblems, window, cx)))
                     .child(counter(Icon::CircleX, errors, theme.error.into()))
                     .child(counter(Icon::TriangleAlert, warnings, theme.warning.into()))
@@ -7056,6 +7153,7 @@ impl Workspace {
                         .items_center()
                         .gap_1()
                         .px_2()
+                        .text_color(theme.text_muted)
                         .child(icon_el(Icon::Refresh, px(12.), theme.accent.into()))
                         .child(busy),
                 )
@@ -7068,12 +7166,13 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .h(px(22.))
+                        .h(px(24.))
                         .px_2()
-                        .rounded(px(4.))
+                        .rounded(px(9.))
                         .cursor_pointer()
-                        .text_color(theme.text)
-                        .hover(|s| s.bg(theme.hover))
+                        .text_color(theme.accent)
+                        .bg(theme.accent_soft)
+                        .hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24)))
                         .on_click(cx.listener(|ws, _, _, cx| ws.restart_to_update(cx)))
                         .child(icon_el(Icon::Download, px(13.), theme.accent.into()))
                         .child("Restart to Update")
@@ -7081,55 +7180,57 @@ impl Workspace {
                 )
             })
             .children(right)
-            .when(self.repo.is_some(), |el| {
-                el.child(
-                    self.icon_button("toggle-git-log", Icon::GitCommit, self.show_git_log, cx, |ws, _, window, cx| {
-                        ws.toggle_git_log(&ToggleGitLog, window, cx)
-                    })
-                    .size(px(22.))
-                    .mx(px(3.))
-                    .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
-                )
-            })
-            .when(self.debug.is_some(), |el| {
-                el.child(
-                    self.icon_button("toggle-debug", Icon::Bug, self.show_debug, cx, |ws, _, window, cx| {
-                        ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
-                    })
-                    .size(px(22.))
-                    .mx(px(3.))
-                    .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
-                )
-            })
             .child(
-                self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
-                    ws.toggle_terminal(&ToggleTerminal, window, cx)
-                })
-                .size(px(22.))
-                .mx(px(3.))
-                .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
-            )
-            .child(
-                self.icon_button("toggle-problems", Icon::PanelBottom, self.show_problems, cx, |ws, _, window, cx| {
-                    ws.toggle_problems(&ToggleProblems, window, cx)
-                })
-                .size(px(22.))
-                .mx(px(3.))
-                .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
+                dock()
+                    .ml_1()
+                    .when(self.repo.is_some(), |el| {
+                        el.child(
+                            toggle(
+                                self.icon_button("toggle-git-log", Icon::GitCommit, self.show_git_log, cx, |ws, _, window, cx| {
+                                    ws.toggle_git_log(&ToggleGitLog, window, cx)
+                                }),
+                                self.show_git_log,
+                            )
+                            .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
+                        )
+                    })
+                    .when(self.debug.is_some(), |el| {
+                        el.child(
+                            toggle(
+                                self.icon_button("toggle-debug", Icon::Bug, self.show_debug, cx, |ws, _, window, cx| {
+                                    ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
+                                }),
+                                self.show_debug,
+                            )
+                            .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
+                        )
+                    })
+                    .child(
+                        toggle(
+                            self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
+                                ws.toggle_terminal(&ToggleTerminal, window, cx)
+                            }),
+                            self.show_terminal,
+                        )
+                        .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
+                    )
+                    .child(
+                        toggle(
+                            self.icon_button("toggle-problems", Icon::PanelBottom, self.show_problems, cx, |ws, _, window, cx| {
+                                ws.toggle_problems(&ToggleProblems, window, cx)
+                            }),
+                            self.show_problems,
+                        )
+                        .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
+                    ),
             )
             // Windows and Linux have no app menu, so Settings needs a way in.
-            .child(
-                self.icon_button(
-                    "open-settings",
-                    Icon::Settings,
-                    matches!(self.modal, Some(Modal::Preferences(_))),
-                    cx,
-                    |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx),
-                )
-                .size(px(22.))
-                .mx(px(3.))
-                .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx)),
-            )
+            .child({
+                let on = matches!(self.modal, Some(Modal::Preferences(_)));
+                toggle(self.icon_button("open-settings", Icon::Settings, on, cx, |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx)), on)
+                    .size(px(24.))
+                    .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))
+            })
     }
 
     fn update_window_title(&mut self, window: &mut Window, cx: &App) {
@@ -7272,13 +7373,21 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.background)
+            // The base the islands float on, faintly lit with the accent from above.
+            .bg(chrome_bg(&theme, 0.45))
             .text_color(theme.text)
             .font_family(theme.ui_font.clone())
             .text_size(px(theme.ui_font_size))
             .child(self.render_titlebar(window, cx))
             .when_some(self.onboarding.as_ref().map(|(o, _)| o.clone()), |el, onboarding| {
-                el.child(div().flex_1().min_h_0().child(onboarding))
+                el.child(
+                    island(&theme)
+                        .flex_1()
+                        .min_h_0()
+                        .mx(px(GAP))
+                        .mb(px(GAP))
+                        .child(div().size_full().overflow_hidden().child(onboarding)),
+                )
             })
             .when(self.onboarding.is_none(), |el| el.child(
                 div()
@@ -7286,6 +7395,8 @@ impl Render for Workspace {
                     .flex_row()
                     .flex_1()
                     .min_h_0()
+                    .px(px(GAP))
+                    .gap(px(GAP))
                     .when(self.show_sidebar, |el| el.child(self.render_sidebar(cx)))
                     .child(
                         div()
@@ -7293,7 +7404,8 @@ impl Render for Workspace {
                             .flex_col()
                             .flex_1()
                             .min_w_0()
-                            .child(div().flex_1().min_h_0().overflow_hidden().child(panes))
+                            .gap(px(GAP))
+                            .child(div().flex_1().min_h_0().child(panes))
                             .when(self.show_problems, |el| el.child(self.render_problems(cx)))
                             .when(self.show_terminal, |el| el.child(terminal_panel.unwrap()))
                             .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx)))
@@ -7325,7 +7437,9 @@ impl Render for Workspace {
     }
 }
 
-use crate::ui::{file_icon, folder_icon};
+use crate::ui::{
+    GAP, ISLAND_INSET, chrome_bg, dock, soft_shadow, file_icon, folder_icon, island, popover, segment_on, selected_edge,
+};
 
 /// Copies a file or folder into `dir`, as "name copy" when the name is
 /// taken. Returns where it went.
@@ -7430,7 +7544,7 @@ pub fn open_window(
         titlebar: Some(TitlebarOptions {
             title: Some("Kin".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(14.), px(12.))),
+            traffic_light_position: Some(point(px(16.), px(13.))),
         }),
         window_min_size: Some(size(px(480.), px(320.))),
         app_id: Some("dev.kin.editor".into()),
@@ -7540,6 +7654,26 @@ fn card(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border_subtle)
         .overflow_hidden()
+}
+
+/// The line of light under the current tab: the accent, fading out to both ends.
+fn tab_glow(theme: &Theme) -> impl IntoElement {
+    let accent: Hsla = theme.accent.into();
+    let clear = accent.alpha(0.);
+    div()
+        .absolute()
+        .bottom(px(-1.))
+        .left(px(6.))
+        .right(px(6.))
+        .h(px(2.))
+        .flex()
+        .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(clear, 0.), gpui::linear_color_stop(accent, 1.))))
+        .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(accent, 0.), gpui::linear_color_stop(clear, 1.))))
+}
+
+/// Search Everywhere's shortcut (double Shift works in every keymap).
+fn double_shift_label() -> &'static str {
+    if cfg!(target_os = "macos") { "⇧⇧" } else { "Shift Shift" }
 }
 
 /// A compact action row: icon, label and the action's shortcut.

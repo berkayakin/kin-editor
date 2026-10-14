@@ -5,7 +5,105 @@ use gpui::{
     Img, Render, SharedString, Stateful, Styled, Window, div, img, prelude::*, px, svg,
 };
 
-use crate::{assets::Icon, editor::Editor, file_icons, theme::Theme};
+use crate::{
+    assets::Icon,
+    editor::Editor,
+    file_icons,
+    theme::{Appearance, Theme},
+};
+
+// ---- Islands ------------------------------------------------------------------------
+//
+// Kin's look: content sits on rounded "islands" (the editor's background) that
+// float on the chrome (the theme's panel color, faintly lit with the accent from
+// above). The main window, Preferences and the pickers all follow it; menus,
+// popovers and tooltips are `popover`s floating above everything.
+
+/// Space between islands, and around them.
+pub const GAP: f32 = 6.0;
+pub const ISLAND_RADIUS: f32 = 12.0;
+/// Content masks are square, so content that paints its own background
+/// (editor, terminal) is kept this far inside an island's rounded corners.
+pub const ISLAND_INSET: f32 = 4.0;
+
+/// The chrome's background: the panel color, with an accent glow at the top
+/// that has faded out by `fade` (0–1) of the height.
+pub fn chrome_bg(theme: &Theme, fade: f32) -> gpui::Background {
+    let top = Hsla::from(theme.panel).blend(Hsla::from(theme.accent).alpha(0.07));
+    gpui::linear_gradient(180., gpui::linear_color_stop(top, 0.), gpui::linear_color_stop(theme.panel, fade))
+}
+
+/// A soft drop shadow; `depth` 1 for islands, 2 for popovers, 3 for modals.
+pub fn soft_shadow(theme: &Theme, depth: u8) -> Vec<gpui::BoxShadow> {
+    let alpha: f32 = match theme.appearance {
+        Appearance::Dark => 0.32,
+        Appearance::Light => 0.07,
+    };
+    let (alpha, y, blur) = match depth {
+        0 | 1 => (alpha, 2., 12.),
+        2 => (alpha * 1.4, 8., 24.),
+        _ => (alpha * 1.8, 16., 48.),
+    };
+    vec![gpui::BoxShadow {
+        color: gpui::hsla(0., 0., 0., alpha.min(0.6)),
+        offset: gpui::point(px(0.), px(y)),
+        blur_radius: px(blur),
+        spread_radius: px(0.),
+    }]
+}
+
+/// A rounded card on the chrome: the sidebar, each pane, each bottom panel,
+/// Preferences' pages, a picker's list.
+pub fn island(theme: &Theme) -> Div {
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .p(px(ISLAND_INSET))
+        .rounded(px(ISLAND_RADIUS))
+        .bg(theme.background)
+        .border_1()
+        .border_color(Hsla::from(theme.border).alpha(0.75))
+        .shadow(soft_shadow(theme, 1))
+}
+
+/// A card floating above the window: menus, completion, hover, toasts.
+pub fn popover(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(10.))
+        .bg(theme.elevated)
+        .border_1()
+        .border_color(Hsla::from(theme.border).alpha(0.85))
+        .shadow(soft_shadow(theme, 2))
+}
+
+/// The lit edge that marks the selected row in a list (the row must be
+/// `relative`), like the open file in the file tree.
+pub fn selected_edge(theme: &Theme) -> Div {
+    div().absolute().left_0().top(px(6.)).bottom(px(6.)).w(px(2.)).rounded_full().bg(theme.accent)
+}
+
+/// A container for related toggles, drawn like a segmented control; its
+/// buttons use `segment_on` for the one that's active.
+pub fn dock(theme: &Theme) -> Div {
+    div().flex().flex_shrink_0().items_center().gap(px(2.)).p(px(2.)).rounded(px(9.)).bg(theme.hover)
+}
+
+pub fn segment_on<E: Styled>(el: E, theme: &Theme) -> E {
+    el.bg(theme.background).shadow(soft_shadow(theme, 1))
+}
+
+/// A soft accent halo for focused fields and active controls.
+pub fn focus_glow(theme: &Theme) -> Vec<gpui::BoxShadow> {
+    vec![gpui::BoxShadow {
+        color: Hsla::from(theme.accent).alpha(0.22),
+        offset: gpui::point(px(0.), px(0.)),
+        blur_radius: px(6.),
+        spread_radius: px(1.),
+    }]
+}
 
 /// The file-type icon for `path`, in the pack's own colors (see `file_icons`).
 pub fn file_icon(path: &std::path::Path, size: Pixels, theme: &Theme) -> Img {
@@ -30,12 +128,13 @@ pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, c
         .gap_2()
         .flex_1()
         .min_w_0()
-        .h(px(30.))
-        .px_2()
-        .rounded(px(7.))
+        .h(px(32.))
+        .px_2p5()
+        .rounded(px(10.))
         .bg(theme.background)
         .border_1()
-        .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { theme.border.into() })
+        .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
+        .when(focused, |el| el.shadow(focus_glow(theme)))
         .when_some(icon, |el, icon| el.child(icon_el(icon, px(14.), theme.text_dim.into())))
         .child(div().flex_1().min_w_0().overflow_hidden().child(editor.clone()))
 }
@@ -51,7 +150,7 @@ pub fn toggle(id: &'static str, label: &'static str, active: bool, tooltip: &'st
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(6.))
+        .rounded(px(7.))
         .font_family(theme.mono_font.clone())
         .text_size(px(12.))
         .cursor_pointer()
@@ -70,7 +169,7 @@ pub fn switch(on: bool, theme: &Theme) -> impl IntoElement {
         .h(px(16.))
         .p(px(2.))
         .rounded_full()
-        .when(on, |el| el.bg(theme.accent).justify_end())
+        .when(on, |el| el.bg(theme.accent).justify_end().shadow(focus_glow(theme)))
         .when(!on, |el| el.bg(theme.active))
         .child(div().size(px(12.)).rounded_full().bg(if on { theme.background } else { theme.text_dim }))
 }
@@ -84,7 +183,7 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: 
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .rounded(px(6.))
+        .rounded(px(8.))
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.active))
@@ -100,12 +199,14 @@ pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary:
         .flex()
         .flex_shrink_0()
         .items_center()
-        .rounded(px(7.))
+        .rounded(px(14.))
         .cursor_pointer()
         .font_weight(gpui::FontWeight::MEDIUM)
         .when(primary, |el| {
             el.bg(theme.accent_soft)
                 .text_color(theme.accent)
+                .border_1()
+                .border_color(Hsla::from(theme.accent).alpha(0.3))
                 .hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24)))
         })
         .when(!primary, |el| {
@@ -121,8 +222,10 @@ pub fn kbd(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let theme = Theme::get(cx);
     div()
         .px_1p5()
-        .rounded(px(4.))
+        .rounded(px(5.))
         .bg(theme.hover)
+        .border_1()
+        .border_color(theme.border_subtle)
         .text_size(px(11.5))
         .text_color(theme.text_muted)
         .child(text.into())
@@ -219,14 +322,11 @@ pub struct Tooltip(pub SharedString);
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
-        div()
+        popover(theme)
             .max_w(px(420.))
             .px_2()
             .py_1()
-            .rounded(px(6.))
-            .bg(theme.elevated)
-            .border_1()
-            .border_color(theme.border)
+            .rounded(px(8.))
             .text_size(px(12.))
             .text_color(theme.text)
             .font_family(theme.ui_font.clone())
@@ -239,16 +339,17 @@ pub fn tooltip_view(text: impl Into<SharedString>, cx: &mut App) -> AnyView {
     cx.new(|_| Tooltip(text)).into()
 }
 
-/// The floating panel used by all modal popups.
+/// The floating panel used by all modal popups: chrome, like the window
+/// around the islands. Long content goes into an `island` inside it.
 pub fn modal_panel(cx: &App) -> Div {
     let theme = Theme::get(cx);
     div()
         .flex()
         .flex_col()
-        .bg(theme.elevated)
+        .bg(chrome_bg(theme, 0.5))
         .border_1()
-        .border_color(theme.border)
-        .rounded(px(12.))
-        .shadow_lg()
+        .border_color(Hsla::from(theme.border).alpha(0.85))
+        .rounded(px(16.))
+        .shadow(soft_shadow(theme, 3))
         .overflow_hidden()
 }

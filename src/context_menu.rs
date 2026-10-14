@@ -131,9 +131,9 @@ impl Render for ContextMenu {
             .flex_col()
             .bg(theme.elevated)
             .border_1()
-            .border_color(theme.border)
-            .rounded(px(8.))
-            .shadow_lg()
+            .border_color(gpui::Hsla::from(theme.border).alpha(0.85))
+            .rounded(px(10.))
+            .shadow(crate::ui::soft_shadow(&theme, 2))
             .text_size(px(12.5))
             .children(self.entries.iter().enumerate().map(|(ix, entry)| match entry {
                 MenuEntry::Separator => div().my(px(3.)).mx_1().h(px(1.)).bg(theme.border_subtle).into_any_element(),
@@ -159,15 +159,16 @@ impl Render for ContextMenu {
                         .child(
                             div()
                                 .id(ix)
+                                .relative()
                                 .flex()
                                 .items_center()
                                 .gap(px(7.))
                                 .h(px(24.))
                                 .px(px(7.))
-                                .rounded(px(5.))
+                                .rounded(px(6.))
                                 .cursor_pointer()
                                 .text_color(color)
-                                .when(selected, |el| el.bg(theme.accent_soft))
+                                .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
                                 .hover(|s| s.bg(theme.accent_soft))
                                 .on_mouse_move(cx.listener(move |this, _, _, cx| {
                                     if this.selected != Some(ix) {

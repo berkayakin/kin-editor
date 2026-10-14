@@ -14,7 +14,7 @@ use crate::{
     keymap,
     settings::{self, AutoSave, BaseKeymap, Settings},
     theme::{self, Appearance, Theme, ThemeRegistry},
-    ui::{icon_el, kbd, switch},
+    ui::{focus_glow, icon_el, kbd, switch},
     workspace::{FindAction, GoToFile, OpenSettings},
 };
 use crate::editor::{DeleteLine, DuplicateLine};
@@ -98,10 +98,10 @@ impl Onboarding {
                     .id(("welcome-theme", ix))
                     .flex()
                     .flex_col()
-                    .rounded(px(10.))
+                    .rounded(px(12.))
                     .border_2()
                     .border_color(if selected { Hsla::from(current.accent) } else { Hsla::from(current.border_subtle) })
-                    .when(selected, |el| el.shadow_md())
+                    .when(selected, |el| el.shadow(focus_glow(&current)))
                     .cursor_pointer()
                     .hover(|s| s.border_color(Hsla::from(current.accent).alpha(0.6)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.choose_theme(name.clone(), cx)))
@@ -178,10 +178,12 @@ impl Onboarding {
                     .flex_col()
                     .gap_2()
                     .p(px(14.))
-                    .rounded(px(10.))
+                    .rounded(px(12.))
                     .border_2()
                     .border_color(if selected { Hsla::from(theme.accent) } else { Hsla::from(theme.border_subtle) })
-                    .bg(if selected { Hsla::from(theme.accent_soft) } else { Hsla::from(theme.panel) })
+                    // Like the theme cards: the outline and glow mark the choice, not a fill.
+                    .when(selected, |el| el.shadow(focus_glow(&theme)))
+                    .bg(theme.panel)
                     .cursor_pointer()
                     .hover(|s| s.border_color(Hsla::from(theme.accent).alpha(0.6)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {

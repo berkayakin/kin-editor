@@ -13,7 +13,7 @@ use crate::{
     assets,
     editor::Cancel,
     theme::Theme,
-    ui::text_button,
+    ui::{chrome_bg, soft_shadow, text_button},
     workspace::{CloseTab, CloseWindow},
 };
 
@@ -102,11 +102,11 @@ impl Render for AboutWindow {
             .pt(px(44.))
             .pb_5()
             .px_5()
-            .bg(theme.background)
+            .bg(chrome_bg(&theme, 0.6))
             .font_family(theme.ui_font.clone())
             .text_size(px(theme.ui_font_size))
             .text_color(theme.text)
-            .child(img(assets::LOGO).size(px(72.)).rounded(px(18.)))
+            .child(img(assets::LOGO).size(px(72.)).rounded(px(18.)).shadow(soft_shadow(&theme, 2)))
             .child(
                 div()
                     .mt_3()

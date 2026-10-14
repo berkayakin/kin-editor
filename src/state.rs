@@ -37,7 +37,8 @@ pub struct SessionState {
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,
-    /// Folders trusted to run what they configure (see `trust.rs`).
+    /// Where trusted folders were kept before `trust.json`; `trust.rs` moves
+    /// them over and clears this.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_folders: Vec<PathBuf>,
     /// Welcome Setup was finished (Get Started or Escape). Only finishing it
@@ -48,6 +49,10 @@ pub struct SessionState {
     /// Where the last moved or resized window was, for the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
+    /// Keys this version doesn't know (a newer Kin wrote them), kept so that
+    /// saving here doesn't drop them.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A window's place on screen, in points.

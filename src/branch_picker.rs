@@ -141,15 +141,16 @@ impl Render for BranchPicker {
                         let is_selected = ix == selected;
                         let row = div()
                             .id(ix)
+                            .relative()
                             .w_full()
                             .flex()
                             .items_center()
                             .gap_2()
                             .h(px(30.))
-                            .px_2()
-                            .rounded(px(6.))
+                            .px_2p5()
+                            .rounded(px(8.))
                             .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme.accent_soft))
+                            .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
                             .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                             .on_click(cx.listener(move |this, _, _, cx| this.confirm(ix, cx)));
                         let row = match &items[ix] {
@@ -180,7 +181,7 @@ impl Render for BranchPicker {
                                             .h(px(20.))
                                             .flex()
                                             .items_center()
-                                            .rounded(px(4.))
+                                            .rounded(px(10.))
                                             .text_size(px(11.5))
                                             .text_color(theme.text_muted)
                                             .bg(theme.elevated)
@@ -204,7 +205,7 @@ impl Render for BranchPicker {
                                     )
                                 }),
                         };
-                        div().w_full().px_1p5().child(row)
+                        div().w_full().px_1().child(row)
                     })
                     .collect()
             })
@@ -229,17 +230,17 @@ impl Render for BranchPicker {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .px_3()
-                    .pt_2p5()
-                    .pb_1p5()
+                    .px_3p5()
+                    .pt_3()
+                    .pb_2()
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(icon_el(Icon::GitBranch, px(13.), theme.text_muted.into()))
                     .child("Branches"),
             )
-            .child(div().px_3().pb_2().child(input_box(&self.query, None, window, cx)))
-            .child(div().border_t_1().border_color(theme.border).child(match (&self.branches, &self.error) {
+            .child(div().px_2p5().pb_2().child(input_box(&self.query, Some(Icon::Search), window, cx)))
+            .child(crate::ui::island(&theme).p_0().mx(px(crate::ui::GAP)).mb(px(crate::ui::GAP)).child(match (&self.branches, &self.error) {
                 (_, Some(e)) => div().p_3().text_color(theme.error).child(e.clone()).into_any_element(),
                 (None, _) => div().p_3().text_color(theme.text_dim).child("Loading branches…").into_any_element(),
                 _ if count == 0 => div().p_3().text_color(theme.text_dim).child("No branches").into_any_element(),

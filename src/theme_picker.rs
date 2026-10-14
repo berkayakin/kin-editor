@@ -164,18 +164,19 @@ impl Render for ThemePicker {
                         let row = &rows[ix];
                         let t = &row.theme;
                         let is_selected = ix == selected;
-                        div().w_full().px_1p5().child(
+                        div().w_full().px_1().child(
                             div()
                                 .id(ix)
+                                .relative()
                                 .w_full()
                                 .flex()
                                 .items_center()
                                 .gap_2()
                                 .h(px(32.))
-                                .px_2()
-                                .rounded(px(6.))
+                                .px_2p5()
+                                .rounded(px(8.))
                                 .cursor_pointer()
-                                .when(is_selected, |el| el.bg(current.accent_soft))
+                                .when(is_selected, |el| el.bg(current.accent_soft).child(crate::ui::selected_edge(&current)))
                                 .when(!is_selected, |el| el.hover(|s| s.bg(current.hover)))
                                 .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                     this.select(ix, cx);
@@ -191,7 +192,7 @@ impl Render for ThemePicker {
                                         .gap_1()
                                         .px_1p5()
                                         .py_1()
-                                        .rounded(px(6.))
+                                        .rounded_full()
                                         .bg(t.background)
                                         .border_1()
                                         .border_color(current.border)
@@ -241,9 +242,8 @@ impl Render for ThemePicker {
             .items_center()
             .gap_2()
             .px_3()
-            .py_2()
-            .border_t_1()
-            .border_color(theme.border)
+            .pb_2p5()
+            .pt_0p5()
             .text_size(px(12.))
             .text_color(theme.text_dim)
             .child(
@@ -279,17 +279,17 @@ impl Render for ThemePicker {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .px_3()
-                    .pt_2p5()
-                    .pb_1p5()
+                    .px_3p5()
+                    .pt_3()
+                    .pb_2()
                     .text_size(px(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text_muted)
                     .child(icon_el(Icon::Palette, px(13.), theme.text_muted.into()))
                     .child("Select Theme"),
             )
-            .child(div().px_3().pb_2().child(input_box(&self.query, None, window, cx)))
-            .child(div().border_t_1().border_color(theme.border).child(list))
+            .child(div().px_2p5().pb_2().child(input_box(&self.query, Some(Icon::Search), window, cx)))
+            .child(crate::ui::island(&theme).p_0().mx(px(crate::ui::GAP)).mb(px(crate::ui::GAP)).child(list))
             .child(footer)
     }
 }

@@ -620,7 +620,7 @@ impl Render for Picker {
                 let theme = Theme::get(cx).clone();
                 range
                     .map(|ix| {
-                        let row = div().id(ix).w_full().flex().items_center().gap_2().h(px(30.)).px_2().rounded(px(6.));
+                        let row = div().id(ix).relative().w_full().flex().items_center().gap_2().h(px(30.)).px_2p5().rounded(px(8.));
                         let row = match &items[ix] {
                             Item::Header(label) => row
                                 .pt_1()
@@ -632,7 +632,7 @@ impl Render for Picker {
                                 let is_selected = ix == selected;
                                 let row = row
                                     .cursor_pointer()
-                                    .when(is_selected, |el| el.bg(theme.accent_soft))
+                                    .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
                                     .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
                                         this.confirm(ix, ev.modifiers().secondary(), cx)
@@ -749,7 +749,7 @@ impl Render for Picker {
                                 }
                             }
                         };
-                        div().w_full().px_1p5().child(row)
+                        div().w_full().px_1().child(row)
                     })
                     .collect()
             })
@@ -777,9 +777,9 @@ impl Render for Picker {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_3()
-                    .pt_2p5()
-                    .pb_1p5()
+                    .px_3p5()
+                    .pt_3()
+                    .pb_2()
                     .text_size(px(12.))
                     .child(
                         div()
@@ -793,8 +793,8 @@ impl Render for Picker {
                     )
                     .child(div().text_color(theme.text_dim).child(hint)),
             )
-            .child(div().px_3().pb_2().child(input_box(&self.query, None, window, cx)))
-            .child(div().border_t_1().border_color(theme.border).child(if count == 0 {
+            .child(div().px_2p5().pb_2().child(input_box(&self.query, Some(Icon::Search), window, cx)))
+            .child(crate::ui::island(&theme).p_0().mx(px(crate::ui::GAP)).mb(px(crate::ui::GAP)).child(if count == 0 {
                 div()
                     .h(px(38.))
                     .flex()

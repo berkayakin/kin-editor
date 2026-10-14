@@ -235,7 +235,6 @@ impl ProjectSearch {
             .min_h_0()
             .py_2()
             .overflow_hidden()
-            .bg(theme.background)
             .font_family(mono)
             .text_size(px(12.5))
             .children((first..last).map(|row| {
@@ -376,14 +375,16 @@ impl Render for ProjectSearch {
                         let is_selected = ix == selected;
                         div()
                             .id(ix)
+                            .relative()
                             .w_full()
                             .flex()
                             .items_center()
                             .gap_2()
                             .h(px(26.))
                             .px_3()
+                            .rounded(px(7.))
                             .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme.accent_soft))
+                            .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
                             .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
                             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                 this.select(ix, cx);
@@ -450,23 +451,27 @@ impl Render for ProjectSearch {
             .max_h(window.viewport_size().height - px(120.))
             .child(header)
             .child(inputs)
-            .child(div().border_t_1().border_color(theme.border).child(list))
+            .child(crate::ui::island(&theme).mx(px(crate::ui::GAP)).child(list))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(28.))
-                    .px_3()
-                    .border_t_1()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .h(px(30.))
+                    .px_3p5()
                     .text_size(px(12.))
                     .text_color(theme.text_dim)
                     .child(div().flex_1().truncate().child(path_line))
                     .child(kbd("↩", cx))
                     .child("open"),
             )
-            .child(self.render_preview(cx))
+            .child(
+                crate::ui::island(&theme)
+                    .flex_1()
+                    .min_h_0()
+                    .mx(px(crate::ui::GAP))
+                    .mb(px(crate::ui::GAP))
+                    .child(self.render_preview(cx)),
+            )
     }
 }
