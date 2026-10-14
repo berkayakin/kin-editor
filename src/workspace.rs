@@ -40,7 +40,7 @@ use crate::{
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, openable_files},
-    state::{PaneLayout, ProjectSession, SessionState, TabSession},
+    state::{PaneLayout, ProjectSession, SessionState, TabSession, WindowPlacement},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
     run::{self, RunTarget},
@@ -408,6 +408,8 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
+    /// Debounced write of the window's place on screen.
+    placement_task: Option<Task<()>>,
     /// Language servers for this window's files.
     lsp: Entity<LspStore>,
     /// The Preferences page shown last, to reopen there.
@@ -573,9 +575,21 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
+            placement_task: None,
             lsp,
             preferences_page: preferences::Page::Appearance,
-            _subscriptions: vec![find_subscription, git_subscription, log_subscription, activation, quit, settings_observer, updater_observer, lsp_subscription, lsp_observer],
+            _subscriptions: vec![
+                find_subscription,
+                git_subscription,
+                log_subscription,
+                activation,
+                quit,
+                settings_observer,
+                updater_observer,
+                lsp_subscription,
+                lsp_observer,
+                cx.observe_window_bounds(window, |ws, window, cx| ws.remember_placement(window, cx)),
+            ],
         };
         // Problems with settings.json / keymap.json found at startup.
         if let Some(problems) = cx.try_global::<StartupProblems>().map(|p| p.0.clone()) {
@@ -911,10 +925,36 @@ impl Workspace {
             font_zoom: saved.font_zoom,
             diff_side_by_side: saved.diff_side_by_side,
             recent_projects: saved.recent_projects,
+            window: saved.window,
         };
         if let Err(err) = state.save() {
             eprintln!("couldn't save window state: {err}");
         }
+    }
+
+    /// Saves where the window is (after moves and resizes settle), so the
+    /// next launch opens it there.
+    fn remember_placement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (bounds, fullscreen) = match window.window_bounds() {
+            WindowBounds::Fullscreen(bounds) => (bounds, true),
+            WindowBounds::Windowed(bounds) | WindowBounds::Maximized(bounds) => (bounds, false),
+        };
+        let placement = WindowPlacement {
+            display: window.display(cx).and_then(|d| d.uuid().ok()).map(|u| u.to_string()),
+            x: bounds.origin.x.into(),
+            y: bounds.origin.y.into(),
+            width: bounds.size.width.into(),
+            height: bounds.size.height.into(),
+            fullscreen,
+        };
+        self.placement_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(Duration::from_millis(400)).await;
+            let mut state = SessionState::load();
+            state.window = Some(placement);
+            if let Err(err) = state.save() {
+                eprintln!("couldn't save window state: {err}");
+            }
+        }));
     }
 
     /// Rescans project files in the background (for Go to File).
@@ -5517,12 +5557,14 @@ pub fn open_window(
     cx: &mut App,
     setup: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) -> Option<WindowHandle<Workspace>> {
-    let bounds = match near {
-        Some(b) => Bounds { origin: b.origin + point(px(28.), px(28.)), size: b.size },
-        None => Bounds::centered(None, size(px(1280.), px(820.)), cx),
+    let (bounds, display_id) = match near {
+        Some(b) => (WindowBounds::Windowed(Bounds { origin: b.origin + point(px(28.), px(28.)), size: b.size }), None),
+        None => saved_placement(cx)
+            .unwrap_or_else(|| (WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx)), None)),
     };
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(bounds),
+        display_id,
         titlebar: Some(TitlebarOptions {
             title: Some("Kin".into()),
             appears_transparent: true,
@@ -5546,6 +5588,28 @@ pub fn open_window(
         })
         .ok();
     Some(window)
+}
+
+/// Where the last window was, if it was saved: on the same display when it's
+/// still connected (kept fully on screen), else centered with the same size.
+fn saved_placement(cx: &App) -> Option<(WindowBounds, Option<gpui::DisplayId>)> {
+    let saved = SessionState::load().window?;
+    let display = saved.display.as_ref().and_then(|uuid| {
+        cx.displays().into_iter().find(|d| d.uuid().ok().is_some_and(|u| u.to_string() == *uuid))
+    });
+    let mut size = size(px(saved.width.max(480.)), px(saved.height.max(320.)));
+    let bounds = match &display {
+        Some(display) => {
+            let area = display.bounds().size;
+            size = size.min(&area);
+            let x = saved.x.clamp(0., f32::from(area.width - size.width));
+            let y = saved.y.clamp(0., f32::from(area.height - size.height));
+            Bounds { origin: point(px(x), px(y)), size }
+        }
+        None => Bounds::centered(None, size, cx),
+    };
+    let bounds = if saved.fullscreen { WindowBounds::Fullscreen(bounds) } else { WindowBounds::Windowed(bounds) };
+    Some((bounds, display.map(|d| d.id())))
 }
 
 /// The window that has `root` open as its project. The window that's

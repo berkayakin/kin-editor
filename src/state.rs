@@ -37,6 +37,25 @@ pub struct SessionState {
     /// Recently opened project folders, newest first (the welcome screen's list).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_projects: Vec<PathBuf>,
+    /// Where the last moved or resized window was, for the next launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowPlacement>,
+}
+
+/// A window's place on screen, in points.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct WindowPlacement {
+    /// The display it was on (its UUID), so it reopens there while connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    /// Top-left corner, relative to that display.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fullscreen: bool,
 }
 
 impl SessionState {

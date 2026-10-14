@@ -400,7 +400,8 @@ These are all in the File menu and Find Action.
 Kin reopens the last project folder when started without arguments, lists the last ten
 folders under Recent Projects (shared by all windows; hover a welcome-screen row to remove it), and remembers
 panel sizes, whether the sidebar, Problems panel, terminal and Git log are open (all but the sidebar start
-closed the first time), which sidebar view (Files or Commit) shows, the font zoom and the diff layout. This lives in
+closed the first time), which sidebar view (Files or Commit) shows, the font zoom, the diff layout and the window's size and
+position (on the same display while it's connected, full screen included). This lives in
 `state.json` next to `settings.json` in the config folder.
 
 Each project also reopens with the tabs it had, the active tab, each caret and the folders
