@@ -5,7 +5,7 @@ use std::{
     borrow::Cow,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 use ropey::Rope;
@@ -36,7 +36,7 @@ pub fn find_for(file: &Path) -> Option<ExternalLinter> {
 impl ExternalLinter {
     /// Runs the linter; blocking, so call it from a background thread.
     pub fn run(&self, file: &Path, rope: &Rope) -> Result<Vec<Diagnostic>, String> {
-        let mut command = Command::new(&self.program);
+        let mut command = crate::process::command(&self.program);
         command
             .current_dir(&self.project_dir)
             .args(["--format", "json", "--stdin", "--stdin-filename"])
@@ -44,12 +44,6 @@ impl ExternalLinter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
         let mut child = command.spawn().map_err(|e| e.to_string())?;
         if let Some(mut stdin) = child.stdin.take() {
             for chunk in rope.chunks() {

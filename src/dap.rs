@@ -231,7 +231,7 @@ pub fn free_port() -> std::io::Result<u16> {
 
 /// Where an adapter's working directory and PATH come from.
 pub fn command(program: &Path, args: &[String], cwd: &Path) -> Command {
-    let mut command = Command::new(program);
+    let mut command = crate::process::command(program);
     command.args(args).current_dir(cwd).env("PATH", crate::lsp::servers::search_path());
     command
 }

@@ -125,7 +125,7 @@ pub struct Branch {
 }
 
 fn command(root: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::process::command("git");
     cmd.current_dir(root)
         // Never block on an interactive prompt: fail fast instead.
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -136,11 +136,6 @@ fn command(root: &Path) -> Command {
         .stdin(Stdio::null());
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     cmd
 }
@@ -209,7 +204,7 @@ fn error_text(stderr: &[u8], stdout: &[u8]) -> String {
 }
 
 pub fn is_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+    crate::process::command("git").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// The working-tree root of the repository containing `path`.

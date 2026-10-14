@@ -292,13 +292,8 @@ fn curl_error(stderr: &[u8]) -> String {
 
 /// A command without a console window (Kin is a GUI app on Windows).
 fn command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::process::command(program);
     cmd.stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     cmd
 }
 

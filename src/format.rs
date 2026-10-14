@@ -7,7 +7,7 @@ use std::{
     io::Write,
     ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -106,7 +106,7 @@ impl Formatter {
     /// after ten seconds.
     pub fn run(&self, text: &str, file: &Path) -> Result<String, String> {
         let dir = file.parent().unwrap_or(Path::new("."));
-        let mut child = Command::new(&self.program)
+        let mut child = crate::process::command(&self.program)
             .args(&self.args)
             .current_dir(dir)
             .env("PATH", servers::search_path())

@@ -49,7 +49,7 @@ pub fn install() -> Result<(), String> {
         staged.display()
     );
     let apple_script = format!("do shell script \"{shell}\" with administrator privileges");
-    let output = std::process::Command::new("osascript").arg("-e").arg(apple_script).output().map_err(|e| e.to_string())?;
+    let output = crate::process::command("osascript").arg("-e").arg(apple_script).output().map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&staged);
     if output.status.success() {
         Ok(())

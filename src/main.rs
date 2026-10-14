@@ -32,6 +32,7 @@ mod markdown_preview;
 mod onboarding;
 mod picker;
 mod preview;
+mod process;
 mod preferences;
 mod run;
 mod project_search;

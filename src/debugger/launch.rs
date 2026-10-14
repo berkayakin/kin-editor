@@ -8,7 +8,7 @@
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex},
 };
 
@@ -66,7 +66,7 @@ fn delve() -> Result<Adapter, String> {
 
 fn debugpy(cwd: &Path) -> Result<Adapter, String> {
     let python = python_for(cwd).ok_or("Debugging Python needs python3 on PATH.")?;
-    let has_debugpy = Command::new(&python)
+    let has_debugpy = crate::process::command(&python)
         .args(["-c", "import debugpy"])
         .env("PATH", servers::search_path())
         .stdout(Stdio::null())
@@ -103,7 +103,7 @@ fn js_debug() -> Result<Adapter, String> {
 /// (For others it says why not, and still exits with 0.)
 fn is_go_program(program: &Path) -> bool {
     let Some(go) = servers::which("go") else { return false };
-    let Ok(output) = Command::new(go).arg("version").arg(program).stderr(Stdio::null()).output() else { return false };
+    let Ok(output) = crate::process::command(go).arg("version").arg(program).stderr(Stdio::null()).output() else { return false };
     let text = String::from_utf8_lossy(&output.stdout);
     text.trim().rsplit(": ").next().is_some_and(|version| version.starts_with("go") || version.starts_with("devel"))
 }
@@ -113,7 +113,7 @@ fn xcrun_lldb_dap() -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let output = Command::new("xcrun").args(["-f", "lldb-dap"]).stderr(Stdio::null()).output().ok()?;
+    let output = crate::process::command("xcrun").args(["-f", "lldb-dap"]).stderr(Stdio::null()).output().ok()?;
     let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     (output.status.success() && path.is_file()).then_some(path)
 }
@@ -222,8 +222,8 @@ pub fn launch_arguments(spec: &DebugSpec, cwd: &Path, program: Option<&Path>, ad
 /// port, from `--inspect…` flags or Node's default.
 pub fn open_node_inspector(pid: u32) -> u16 {
     let pid = pid.to_string();
-    let command = Command::new("ps").args(["-o", "args=", "-p", &pid]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    let _ = Command::new("kill").args(["-USR1", &pid]).status();
+    let command = crate::process::command("ps").args(["-o", "args=", "-p", &pid]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let _ = crate::process::command("kill").args(["-USR1", &pid]).status();
     inspector_port(&command.unwrap_or_default()).unwrap_or(9229)
 }
 
@@ -256,7 +256,7 @@ pub struct Process {
 /// The user's processes, newest first (from `ps`), without Kin itself.
 pub fn processes() -> Vec<Process> {
     let column = |name: &str| -> Vec<(u32, String)> {
-        let Ok(output) = Command::new("ps").args(["x", "-o", "pid=", "-o"]).arg(format!("{name}=")).output() else { return Vec::new() };
+        let Ok(output) = crate::process::command("ps").args(["x", "-o", "pid=", "-o"]).arg(format!("{name}=")).output() else { return Vec::new() };
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| {
@@ -283,7 +283,7 @@ pub fn processes() -> Vec<Process> {
 
 /// LLDB commands that load the toolchain's Rust formatters.
 fn rust_formatters(cwd: &Path) -> Option<Vec<String>> {
-    let output = Command::new("rustc")
+    let output = crate::process::command("rustc")
         .args(["--print", "sysroot"])
         .current_dir(cwd)
         .env("PATH", servers::search_path())
@@ -307,7 +307,7 @@ pub type Build = Arc<Mutex<Option<std::process::Child>>>;
 /// executable it made. Cargo's progress and compiler messages go to
 /// `on_line` as they come. Blocks: run it off the main thread.
 pub fn cargo_build(cwd: &Path, args: &[String], build: &Build, mut on_line: impl FnMut(String) + Send + 'static) -> Result<PathBuf, String> {
-    let mut command = Command::new("cargo");
+    let mut command = crate::process::command("cargo");
     command
         .args(args)
         .arg("--message-format=json-render-diagnostics")

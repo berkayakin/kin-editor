@@ -262,7 +262,7 @@ fn login_shell_path() -> Option<OsString> {
     use std::{io::Read, os::unix::process::CommandExt, process::Stdio, time::Duration};
     const MARK: &str = "__KIN_PATH__";
     let shell = std::env::var("SHELL").ok()?;
-    let mut command = std::process::Command::new(shell);
+    let mut command = crate::process::command(shell);
     command
         .args(["-l", "-i", "-c", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
         .stdin(Stdio::null())

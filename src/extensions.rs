@@ -24,7 +24,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{LazyLock, Mutex, OnceLock, RwLock},
 };
 
@@ -673,7 +673,7 @@ fn compile(grammar: &Grammar) -> Result<(), String> {
     let cpp = src.join("scanner.cc").is_file();
     let compiler = std::env::var("CC").ok().filter(|_| !cpp).unwrap_or_else(|| if cpp { "c++".into() } else { "cc".into() });
     let temp = grammar.library.with_extension("building");
-    let mut command = Command::new(&compiler);
+    let mut command = crate::process::command(&compiler);
     command.env("PATH", servers::search_path()).args(["-shared", "-fPIC", "-O2", "-w"]).arg("-I").arg(src);
     if cpp {
         command.args(["-x", "c"]).arg(src.join("parser.c")).args(["-x", "c++"]).arg(src.join("scanner.cc"));

@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Read, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
@@ -60,7 +60,7 @@ impl Client {
         cwd: &Path,
         path_env: &std::ffi::OsStr,
     ) -> std::io::Result<(Arc<Client>, async_mpsc::UnboundedReceiver<Incoming>)> {
-        let mut command = Command::new(program);
+        let mut command = crate::process::command(program);
         command
             .args(args)
             .current_dir(cwd)
@@ -69,12 +69,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
