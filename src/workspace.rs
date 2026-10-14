@@ -5227,55 +5227,22 @@ impl Workspace {
             .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx)))
     }
 
-    /// A thin grab area straddling a panel border. The highlight and the
-    /// resize cursor share the same hit area.
+    /// A thin, invisible grab area straddling a panel border; only the cursor
+    /// shows it.
     fn resize_handle(&self, edge: Edge, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
-        let active = self.resizing.is_some_and(|r| r.edge == edge);
-        let group: gpui::SharedString = match edge {
+        let id: gpui::SharedString = match edge {
             Edge::Problems => "resize-problems".into(),
             Edge::Sidebar => "resize-sidebar".into(),
             Edge::Pane(ix) => format!("resize-pane-{ix}").into(),
         };
-        let line = div()
-            .when(active, |el| el.bg(theme.accent))
-            .when(!active, |el| el.group_hover(group.clone(), |s| s.bg(Hsla::from(theme.accent).alpha(0.6))));
-        let handle = div().id(group.clone()).group(group).absolute().flex();
+        let handle = div().id(id).absolute();
         let handle = match edge {
-            Edge::Problems => handle
-                .top(px(-3.))
-                .left_0()
-                .right_0()
-                .h(px(6.))
-                .flex_col()
-                .justify_center()
-                .cursor(CursorStyle::ResizeUpDown)
-                .child(line.h(px(2.)).w_full()),
-            Edge::Sidebar => handle
-                .top_0()
-                .bottom_0()
-                .right(px(-3.))
-                .w(px(6.))
-                .justify_center()
-                .cursor(CursorStyle::ResizeLeftRight)
-                .child(line.w(px(2.)).h_full()),
-            Edge::Pane(_) if self.pane_axis == PaneAxis::Row => handle
-                .top_0()
-                .bottom_0()
-                .right(px(-3.))
-                .w(px(6.))
-                .justify_center()
-                .cursor(CursorStyle::ResizeLeftRight)
-                .child(line.w(px(2.)).h_full()),
-            Edge::Pane(_) => handle
-                .left_0()
-                .right_0()
-                .bottom(px(-3.))
-                .h(px(6.))
-                .flex_col()
-                .justify_center()
-                .cursor(CursorStyle::ResizeUpDown)
-                .child(line.h(px(2.)).w_full()),
+            Edge::Problems => handle.top(px(-3.)).left_0().right_0().h(px(6.)).cursor(CursorStyle::ResizeUpDown),
+            Edge::Sidebar => handle.top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor(CursorStyle::ResizeLeftRight),
+            Edge::Pane(_) if self.pane_axis == PaneAxis::Row => {
+                handle.top_0().bottom_0().right(px(-3.)).w(px(6.)).cursor(CursorStyle::ResizeLeftRight)
+            }
+            Edge::Pane(_) => handle.left_0().right_0().bottom(px(-3.)).h(px(6.)).cursor(CursorStyle::ResizeUpDown),
         };
         handle.on_mouse_down(
             MouseButton::Left,
