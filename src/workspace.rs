@@ -420,6 +420,8 @@ pub struct Workspace {
     debug_location: Option<(PathBuf, u32)>,
     /// Breakpoints of files that aren't open; open files keep theirs in their documents.
     breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
+    /// Errors and warnings the last Run printed: its name and what was found.
+    run_problems: Option<(String, Vec<run::OutputProblem>)>,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -624,6 +626,7 @@ impl Workspace {
             last_debug: None,
             debug_location: None,
             breakpoints: HashMap::new(),
+            run_problems: None,
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
             resizing: None,
@@ -853,6 +856,7 @@ impl Workspace {
         self.expanded.insert(root.clone());
         // The folders that were open last time, if they still exist.
         self.breakpoints.clear();
+        self.run_problems = None;
         if let Some(session) = ProjectSession::load(&root) {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
             self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
@@ -2838,6 +2842,38 @@ impl Workspace {
         self.open_terminal(cwd, None, None, true, window, cx);
     }
 
+    /// A Run tab finished: what its output reports goes to Problems (a run
+    /// without problems clears the last one's).
+    fn collect_run_problems(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        let Some((target, _)) = terminal.read(cx).run().cloned() else { return };
+        let output = terminal.read(cx).output_text();
+        let task = cx.spawn(async move |ws, cx| {
+            let cwd = target.cwd.clone();
+            let problems = cx.background_executor().spawn(async move { run::output_problems(&output, &cwd) }).await;
+            ws.update(cx, |ws, cx| {
+                ws.run_problems = (!problems.is_empty()).then(|| (target.name, problems));
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+        cx.notify();
+    }
+
+    /// The last Run's problems, without the ones the active file shows
+    /// already (its language server reports the same compiler errors).
+    fn run_problems_shown(&self, cx: &App) -> Vec<&run::OutputProblem> {
+        let Some((_, problems)) = &self.run_problems else { return Vec::new() };
+        let doc = self.active_editor().map(|e| &e.read(cx).doc);
+        let known = |p: &run::OutputProblem| {
+            doc.is_some_and(|doc| {
+                doc.path.as_deref() == Some(p.path.as_path())
+                    && doc.diagnostics.iter().any(|d| d.severity == p.severity && doc.row_of(d.range.start) + 1 == p.line as usize)
+            })
+        };
+        problems.iter().filter(|p| !known(p)).collect()
+    }
+
     /// Adds a terminal tab (at `at`, or last). A Run tab stays open when its
     /// program ends, showing how it went.
     fn open_terminal(
@@ -2853,7 +2889,7 @@ impl Workspace {
             Ok(terminal) => {
                 self._subscriptions.push(cx.subscribe_in(&terminal, window, |ws, terminal, event: &TerminalEvent, window, cx| match event {
                     TerminalEvent::TitleChanged => cx.notify(),
-                    TerminalEvent::Exited if terminal.read(cx).run().is_some() => cx.notify(),
+                    TerminalEvent::Exited if terminal.read(cx).run().is_some() => ws.collect_run_problems(terminal, cx),
                     TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
                     TerminalEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
                 }));
@@ -6102,6 +6138,7 @@ impl Workspace {
 
     fn render_problems(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let run_problems = self.run_problems_shown(cx);
         let editor = self.active_editor().cloned();
         let diagnostics = editor
             .as_ref()
@@ -6145,14 +6182,73 @@ impl Workspace {
                     .bg(theme.active)
                     .text_size(px(11.))
                     .text_color(theme.text_muted)
-                    .child(diagnostics.len().to_string()),
+                    .child((diagnostics.len() + run_problems.len()).to_string()),
             )
             .child(div().flex_1())
             .child(self.icon_button("close-problems", Icon::X, false, cx, |ws, _, window, cx| {
                 ws.toggle_problems(&ToggleProblems, window, cx)
             }));
 
-        let list = if diagnostics.is_empty() {
+        // A section per source when the last Run reported problems too.
+        let section = |id: SharedString, icon: Icon, title: String| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(24.))
+                .px_3()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text_dim)
+                .child(icon_el(icon, px(12.), theme.text_dim.into()))
+                .child(title)
+        };
+        let row = |id: SharedString, icon: Icon, color: Hsla, message: String| {
+            div()
+                .id(id)
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .h(px(26.))
+                .mx_1p5()
+                .px_2()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .child(icon_el(icon, px(14.), color))
+                .child(div().min_w_0().text_color(theme.text).truncate().child(message))
+        };
+        let run_rows: Vec<AnyElement> = self
+            .run_problems
+            .iter()
+            .filter(|_| !run_problems.is_empty())
+            .flat_map(|(name, _)| {
+                let title = section("run-problems".into(), Icon::Play, name.clone()).into_any_element();
+                let rows = run_problems.iter().enumerate().map(|(ix, p)| {
+                    let (icon, color) = severity_icon(p.severity, &theme);
+                    let place = match p.column {
+                        Some(column) => format!("{}:{}:{column}", self.display_rel(&p.path), p.line),
+                        None => format!("{}:{}", self.display_rel(&p.path), p.line),
+                    };
+                    let (path, line, column) = (p.path.clone(), p.line, p.column);
+                    row(SharedString::from(format!("run-problem-{ix}")), icon, color, p.message.clone())
+                        .on_click(cx.listener(move |ws, _, window, cx| ws.open_at(path.clone(), Some(line), column, window, cx)))
+                        .child(div().flex_1())
+                        .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.text_dim).child(place))
+                        .into_any_element()
+                });
+                std::iter::once(title).chain(rows).collect::<Vec<_>>()
+            })
+            .collect();
+        let file_title = (!run_rows.is_empty() && !diagnostics.is_empty())
+            .then(|| editor.as_ref().and_then(|e| e.read(cx).doc.path.as_deref().map(folder_name)))
+            .flatten()
+            .map(|name| section("file-problems".into(), Icon::File, name).into_any_element());
+
+        let list = if diagnostics.is_empty() && run_rows.is_empty() {
             div()
                 .flex()
                 .items_center()
@@ -6168,6 +6264,7 @@ impl Workspace {
                 .flex_1()
                 .overflow_y_scroll()
                 .py_1()
+                .children(file_title)
                 .children(diagnostics.into_iter().zip(positions).enumerate().map(|(ix, (d, (line, col)))| {
                     let (icon, color) = severity_icon(d.severity, &theme);
                     let target = d.range.start;
@@ -6175,25 +6272,12 @@ impl Workspace {
                     // One row per problem: a multi-line message (Pyright's
                     // details) reads as one line, like the inline hint.
                     let message = d.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
-                    div()
-                        .id(("problem", ix))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .h(px(26.))
-                        .mx_1p5()
-                        .px_2()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
+                    row(SharedString::from(format!("problem-{ix}")), icon, color, message)
                         .on_click(move |_, window, cx| {
                             if let Some(editor) = editor.as_ref() {
                                 editor.update(cx, |e, cx| e.go_to(target, window, cx));
                             }
                         })
-                        .child(icon_el(icon, px(14.), color))
-                        .child(div().min_w_0().text_color(theme.text).truncate().child(message))
                         .child(div().text_color(theme.text_dim).flex_shrink_0().child(SharedString::from(d.rule.to_string())))
                         .child(div().flex_1())
                         .child(
@@ -6204,6 +6288,7 @@ impl Workspace {
                                 .child(format!("Ln {line}, Col {col}")),
                         )
                 }))
+                .children(run_rows)
                 .into_any_element()
         };
 
@@ -6328,8 +6413,11 @@ impl Workspace {
         let lsp_item = self.render_lsp_status(&theme, cx);
         let active_editor = self.active_editor().cloned();
         let editor = self.active_editor().map(|e| e.read(cx));
+        // The file's problems and the last Run's.
+        let run_problems = self.run_problems_shown(cx);
         let count = |sev: Severity| {
             editor.map_or(0, |e| e.doc.diagnostics.iter().filter(|d| d.severity == sev).count())
+                + run_problems.iter().filter(|p| p.severity == sev).count()
         };
         let (errors, warnings, infos) = (count(Severity::Error), count(Severity::Warning), count(Severity::Info));
         let files_on = self.show_sidebar && self.sidebar_mode == SidebarMode::Files;

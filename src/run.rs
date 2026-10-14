@@ -1,12 +1,17 @@
 //! Run configurations: what can run in a file (`main`, tests) and in the
 //! project (cargo, npm scripts, go, make, pytest), as shell commands that
-//! the workspace runs in a terminal tab.
+//! the workspace runs in a terminal tab, and the problems their output
+//! reports (for the Problems panel).
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
+use regex::Regex;
 use tree_sitter::{Node, Tree};
 
-use crate::syntax::Language;
+use crate::{lint::Severity, syntax::Language};
 
 /// Something runnable: a configuration in Run…, or a gutter ▶ on `row`.
 #[derive(Clone, Debug, PartialEq)]
@@ -474,6 +479,139 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
     out
 }
 
+// ---- Problems in output ------------------------------------------------------------
+
+/// An error or warning that a compiler, test runner or crash printed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputProblem {
+    pub path: PathBuf,
+    /// 1-based, like `column`.
+    pub line: u32,
+    pub column: Option<u32>,
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// Enough to be useful when something prints thousands.
+const MAX_PROBLEMS: usize = 500;
+
+/// The problems in a Run tab's output: rustc and cargo (`error[E…]: …`, then
+/// `--> file:line:col`), Rust panics, tsc, Python tracebacks, Node stack
+/// traces, and the common `file:line[:col]: message` (Go, gcc/clang,
+/// linters). Only files that exist, relative to `cwd`, count.
+pub fn output_problems(output: &str, cwd: &Path) -> Vec<OutputProblem> {
+    fn re(pattern: &str) -> Regex {
+        Regex::new(pattern).expect("valid pattern")
+    }
+    static RUST: LazyLock<Regex> = LazyLock::new(|| re(r"^(error|warning)(?:\[\w+\])?: (.+)$"));
+    static RUST_AT: LazyLock<Regex> = LazyLock::new(|| re(r"^\s*--> (.+?):(\d+):(\d+)$"));
+    static PANIC: LazyLock<Regex> = LazyLock::new(|| re(r"panicked at (.+?):(\d+):(\d+):?$"));
+    static TSC: LazyLock<Regex> = LazyLock::new(|| re(r"^(.+?)(?:\((\d+),(\d+)\):|:(\d+):(\d+) -) (error|warning) (TS\d+: .+)$"));
+    static PY_FRAME: LazyLock<Regex> = LazyLock::new(|| re(r#"^\s*File "(.+?)", line (\d+)"#));
+    static JS_ERROR: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:Uncaught )?(?:[A-Z]\w*)?Error(?: \[\w+\])?: .+$"));
+    static JS_FRAME: LazyLock<Regex> = LazyLock::new(|| re(r"^\s+at (?:.+? \()?(?:file://)?(.+?):(\d+):(\d+)\)?$"));
+    static PLAIN: LazyLock<Regex> = LazyLock::new(|| re(r"^\s*([^\s:]+):(\d+)(?::(\d+))?: ?(.+)$"));
+
+    let file = |text: &str| -> Option<PathBuf> {
+        let path = Path::new(text.trim());
+        // Without `./` in it, so it matches the path of an open tab.
+        let path: PathBuf = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }.components().collect();
+        path.is_file().then_some(path)
+    };
+    let number = |text: Option<regex::Match>| text.and_then(|m| m.as_str().parse::<u32>().ok());
+    let mut out: Vec<OutputProblem> = Vec::new();
+    let mut add = |path: PathBuf, line: u32, column: Option<u32>, severity: Severity, message: &str| {
+        let message = message.trim().to_string();
+        if out.len() < MAX_PROBLEMS && !out.iter().any(|p| p.path == path && p.line == line && p.message == message) {
+            out.push(OutputProblem { path, line, column, severity, message });
+        }
+    };
+    let severity = |word: &str| if word == "warning" { Severity::Warning } else { Severity::Error };
+
+    let lines: Vec<&str> = output.lines().collect();
+    // Waiting for where they happened: rustc's message (its `-->` follows),
+    // a Python traceback's innermost frame in the project (the exception
+    // follows), Node's error (its stack follows).
+    let mut rust: Option<(Severity, &str)> = None;
+    let mut python: Option<(PathBuf, u32)> = None;
+    let mut js: Option<&str> = None;
+    for (ix, line) in lines.iter().enumerate() {
+        if let Some(c) = RUST.captures(line) {
+            rust = Some((severity(&c[1]), c.get(2).map_or("", |m| m.as_str())));
+            continue;
+        }
+        if let Some(c) = RUST_AT.captures(line) {
+            if let Some((severity, message)) = rust.take()
+                && let Some(path) = file(&c[1])
+            {
+                add(path, number(c.get(2)).unwrap_or(1), number(c.get(3)), severity, message);
+            }
+            continue;
+        }
+        if let Some(c) = PANIC.captures(line) {
+            if let Some(path) = file(&c[1]) {
+                let message = lines[ix + 1..].iter().find(|l| !l.trim().is_empty()).copied().unwrap_or("panicked");
+                add(path, number(c.get(2)).unwrap_or(1), number(c.get(3)), Severity::Error, message);
+            }
+            continue;
+        }
+        if let Some(c) = TSC.captures(line) {
+            if let Some(path) = file(&c[1]) {
+                let line = number(c.get(2).or(c.get(4))).unwrap_or(1);
+                add(path, line, number(c.get(3).or(c.get(5))), severity(&c[6]), &c[7]);
+            }
+            continue;
+        }
+        if let Some(c) = PY_FRAME.captures(line) {
+            if let Some(path) = file(&c[1]) {
+                python = Some((path, number(c.get(2)).unwrap_or(1)));
+            }
+            continue;
+        }
+        let indented = line.starts_with([' ', '\t']);
+        if !indented && !line.trim().is_empty() && !line.starts_with("Traceback") {
+            if let Some((path, at)) = python.take() {
+                add(path, at, None, Severity::Error, line);
+                continue;
+            }
+        }
+        if JS_ERROR.is_match(line) {
+            js = Some(line);
+            continue;
+        }
+        if let Some(c) = JS_FRAME.captures(line) {
+            if let Some(message) = js
+                && !c[1].contains("node_modules")
+                && let Some(path) = file(&c[1])
+            {
+                add(path, number(c.get(2)).unwrap_or(1), number(c.get(3)), Severity::Error, message);
+                js = None;
+            }
+            continue;
+        }
+        js = None;
+        if let Some(c) = PLAIN.captures(line) {
+            let message = &c[4];
+            let lower = message.to_ascii_lowercase();
+            // Pointers to related places, not problems of their own.
+            if lower.starts_with("note") || lower.starts_with("help") {
+                continue;
+            }
+            let (severity, message) = match lower.split_once(':') {
+                Some((word, _)) if word.trim() == "warning" => (Severity::Warning, message.split_once(':').map_or(message, |m| m.1)),
+                Some((word, _)) if word.trim() == "error" || word.trim() == "fatal error" => {
+                    (Severity::Error, message.split_once(':').map_or(message, |m| m.1))
+                }
+                _ => (Severity::Error, message),
+            };
+            if let Some(path) = file(&c[1]) {
+                add(path, number(c.get(2)).unwrap_or(1), number(c.get(3)), severity, message);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,6 +665,47 @@ mod tests {
         let got = targets(Language::TypeScript, &dir.join("a.test.ts"), ts);
         assert_eq!(got[0].0, "Tests in 'math'");
         assert!(got[1].1.starts_with("npx vitest run ") && got[1].1.ends_with("-t 'adds 1\\+1'"), "{}", got[1].1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn finds_problems_in_output() {
+        let dir = temp_project(&[("src/main.rs", ""), ("main.go", ""), ("src/a.ts", ""), ("app.py", ""), ("app.js", "")]);
+        let output = format!(
+            "   Compiling demo v0.1.0\n\
+             warning: unused variable: `x`\n --> src/main.rs:2:9\n  |\n\
+             error[E0308]: mismatched types\n --> src/main.rs:4:18\n\
+             note: function defined here\n --> src/lib.rs:1:4\n\
+             error: could not compile `demo` (bin \"demo\") due to 1 previous error\n\
+             thread 'tests::adds' panicked at src/main.rs:17:9:\nassertion `left == right` failed\n\
+             ./main.go:5:2: undefined: total\n\
+             src/a.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.\n\
+             src/a.ts:7:1 - warning TS6133: 'y' is declared but its value is never read.\n\
+             Traceback (most recent call last):\n  File \"{py}\", line 9, in <module>\n    main()\n  File \"/usr/lib/python3/x.py\", line 3, in f\nValueError: bad value\n\
+             TypeError: foo is not a function\n    at node:internal/main:1:1\n    at Object.<anonymous> ({js}:3:5)\n\
+             missing.c:1:1: error: nothing here\n\
+             Process finished with exit code 1\n",
+            py = dir.join("app.py").display(),
+            js = dir.join("app.js").display(),
+        );
+        let found: Vec<(String, u32, Option<u32>, Severity, String)> = output_problems(&output, &dir)
+            .into_iter()
+            .map(|p| (p.path.strip_prefix(&dir).unwrap().display().to_string(), p.line, p.column, p.severity, p.message))
+            .collect();
+        let e = Severity::Error;
+        assert_eq!(
+            found,
+            [
+                ("src/main.rs".into(), 2, Some(9), Severity::Warning, "unused variable: `x`".into()),
+                ("src/main.rs".into(), 4, Some(18), e, "mismatched types".into()),
+                ("src/main.rs".into(), 17, Some(9), e, "assertion `left == right` failed".into()),
+                ("main.go".into(), 5, Some(2), e, "undefined: total".into()),
+                ("src/a.ts".into(), 3, Some(5), e, "TS2322: Type 'string' is not assignable to type 'number'.".into()),
+                ("src/a.ts".into(), 7, Some(1), Severity::Warning, "TS6133: 'y' is declared but its value is never read.".into()),
+                ("app.py".into(), 9, None, e, "ValueError: bad value".into()),
+                ("app.js".into(), 3, Some(5), e, "TypeError: foo is not a function".into()),
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

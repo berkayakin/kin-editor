@@ -65,7 +65,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - 31 built-in themes (24 dark, 7 light) and JSON user themes with live preview
 - Multiple windows, one project each (like Zed), with a Recent Projects picker
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
-  full-screen programs, selection and copy/paste; shell keys like Ctrl+R reach the shell
+  full-screen programs, selection and copy/paste, Find in the output and scrollback; shell keys
+  like Ctrl+R reach the shell
 - Code folding by indentation (Markdown by section), with gutter arrows and a `⋯` placeholder;
   folds are kept with the project
 - Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
@@ -212,6 +213,7 @@ The table below is the JetBrains keymap.
 | Next pane | ⌥⇥ | — |
 | New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
 | Copy / paste / clear (in the terminal) | ⌘C / ⌘V / ⌘K | Ctrl+Shift+C / Ctrl+Shift+V / — |
+| Find (in the terminal) | ⌘F | Ctrl+Shift+F |
 | Close tab / next / previous | ⌘W / ⌃→ / ⌃← | Ctrl+F4 / Alt+→ / Alt+← |
 | Open file / folder | ⌘O / ⌥⌘O | Ctrl+O / Ctrl+Alt+O |
 | New window / close window | ⌘⇧N / ⌘⇧W | — / Alt+F4 |
@@ -342,6 +344,10 @@ at that line and column. Paths are relative to the terminal's folder and must ex
 button in the panel header (or **Split Terminal** in Find Action) shows a second shell beside the
 current one; press it again to unsplit (both stay as tabs).
 
+**Find** (⌘F / Ctrl+Shift+F in the terminal; the selection becomes the query) highlights matches in
+the scrollback and on screen and jumps to the newest; ↵ or ↑ goes to older ones, ⇧↵ or ↓ to newer,
+Esc closes it. Matching ignores case unless the query has capitals.
+
 ## Run and test
 
 A ▶ in the gutter marks what can run in the file; click it to run that one thing:
@@ -372,6 +378,12 @@ Unsaved files are saved first. Add your own commands in `settings.json`:
 
 `cwd` is relative to the project folder. Commands run through your login shell, so aliases and
 PATH work as in the terminal.
+
+When a run ends, the errors and warnings in its output go to **Problems** (under the run's name,
+below the current file's own), each opening its file at the line: rustc and cargo messages, Rust
+panics, `tsc`, Python tracebacks, Node stack traces, and the common `file:line:col: message` of Go,
+gcc/clang and linters. The status bar's counts include them. The next run replaces them; one that
+reports nothing clears them.
 
 ## Debugging
 

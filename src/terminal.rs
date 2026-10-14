@@ -2,7 +2,7 @@
 //! `alacritty_terminal` and painted with GPUI like the editor. Keys go to
 //! the shell (the keymap turns off app shortcuts in the "Terminal"
 //! context); text arrives through the input handler, so dead keys and IMEs
-//! work.
+//! work. Find (⌘F) searches the scrollback and the screen.
 
 use std::{
     borrow::Cow,
@@ -16,10 +16,15 @@ use alacritty_terminal::{
     event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize},
     event_loop::{EventLoop, Msg, Notifier},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point as GridPoint, Side},
+    index::{Column, Direction, Line, Point as GridPoint, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, Term, TermMode, cell::Flags, test::TermSize},
+    term::{
+        Config, Term, TermMode,
+        cell::Flags,
+        search::{Match, RegexIter, RegexSearch},
+        test::TermSize,
+    },
     tty,
     vte::ansi::{Color, CursorShape, NamedColor, Rgb},
 };
@@ -29,13 +34,36 @@ use gpui::{
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
     Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    ScrollWheelEvent, ShapedLine, SharedString, Style, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, font, point, prelude::*, px, relative, size,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
+    Window, actions, div, fill, font, point, prelude::*, px, relative, size,
 };
 
-use crate::{run::RunTarget, settings::Settings, theme::Theme};
+use crate::{
+    assets::Icon,
+    editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline, NewlineBelow},
+    run::RunTarget,
+    settings::Settings,
+    theme::Theme,
+    ui::{icon_el, input_box, tooltip_view},
+};
 
-actions!(terminal, [TerminalCopy, TerminalPaste, TerminalClear]);
+actions!(terminal, [TerminalCopy, TerminalPaste, TerminalClear, TerminalFind]);
+
+/// Matches beyond this aren't collected (a huge scrollback full of hits).
+const MAX_MATCHES: usize = 5000;
+
+/// Find in the output: the query field and its matches.
+struct Search {
+    input: Entity<Editor>,
+    /// In grid coordinates as of `history`, top to bottom.
+    matches: Vec<Match>,
+    /// Scrollback lines when `matches` were found: new output moves lines up.
+    history: usize,
+    current: Option<usize>,
+    /// Output arrived since `matches` were found.
+    stale: bool,
+    _subscription: Subscription,
+}
 
 /// Forwards the emulator's events to the view's task.
 #[derive(Clone)]
@@ -82,6 +110,7 @@ pub struct TerminalView {
     /// The link under the pointer while ⌘/Ctrl is held: screen row, columns.
     link: Option<(usize, Range<usize>, Link)>,
     last_mouse: Option<Point<Pixels>>,
+    search: Option<Search>,
     _events: Task<()>,
 }
 
@@ -146,6 +175,28 @@ impl TerminalView {
         self.run.as_ref()
     }
 
+    /// Everything on screen and in the scrollback, as text (wrapped lines joined).
+    pub fn output_text(&self) -> String {
+        let term = self.term.lock();
+        let columns = term.columns();
+        let mut out = String::new();
+        for line in term.topmost_line().0..=term.bottommost_line().0 {
+            let row = &term.grid()[Line(line)];
+            let text: String = (0..columns)
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER))
+                .map(|cell| cell.c)
+                .collect();
+            if row[Column(columns - 1)].flags.contains(Flags::WRAPLINE) {
+                out.push_str(&text);
+            } else {
+                out.push_str(text.trim_end());
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// Interrupts the running program (Ctrl+C).
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         self.input(&b"\x03"[..], cx);
@@ -196,6 +247,7 @@ impl TerminalView {
             cwd,
             link: None,
             last_mouse: None,
+            search: None,
             _events: events,
         }
     }
@@ -240,6 +292,11 @@ impl TerminalView {
                 }
                 cx.emit(TerminalEvent::Exited);
             }
+            TermEvent::Wakeup => {
+                if let Some(search) = self.search.as_mut() {
+                    search.stale = true;
+                }
+            }
             _ => {}
         }
     }
@@ -263,7 +320,11 @@ impl TerminalView {
         *self.term.lock().mode()
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed into Find aren't for the shell.
+        if self.search.as_ref().is_some_and(|s| s.input.focus_handle(cx).is_focused(window)) {
+            return;
+        }
         if let Some(bytes) = escape_for(&event.keystroke, self.mode()) {
             cx.stop_propagation();
             self.input(bytes, cx);
@@ -294,6 +355,170 @@ impl TerminalView {
         // Ctrl+L redraws the prompt at the top; the scrollback goes too.
         self.term.lock().grid_mut().clear_history();
         self.input(&b"\x0c"[..], cx);
+    }
+
+    // ---- Find --------------------------------------------------------------------------
+
+    /// Find (⌘F / Ctrl+Shift+F in the terminal): opens the query field, with
+    /// the selection as the query.
+    fn open_search(&mut self, _: &TerminalFind, window: &mut Window, cx: &mut Context<Self>) {
+        let selected = self.term.lock().selection_to_string().filter(|t| !t.trim().is_empty() && !t.contains('\n'));
+        let input = match &self.search {
+            Some(search) => search.input.clone(),
+            None => {
+                let input = cx.new(|cx| Editor::single_line("Find", cx));
+                let subscription = cx.subscribe(&input, |this: &mut Self, _, _: &EditorEvent, cx| {
+                    this.find_matches(cx);
+                    // The newest output first: the bottom match.
+                    if let Some(search) = this.search.as_mut() {
+                        search.current = search.matches.len().checked_sub(1);
+                    }
+                    this.reveal_match();
+                    cx.notify();
+                });
+                self.search = Some(Search {
+                    input: input.clone(),
+                    matches: Vec::new(),
+                    history: 0,
+                    current: None,
+                    stale: false,
+                    _subscription: subscription,
+                });
+                input
+            }
+        };
+        if let Some(text) = selected {
+            input.update(cx, |e, cx| e.set_text(text.trim(), cx));
+        }
+        input.update(cx, |e, cx| e.select_all_text(cx));
+        window.focus(&input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_search(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    /// Finds the query in the scrollback and on screen (case-insensitive
+    /// unless it has capitals), keeping the current match where it was.
+    fn find_matches(&mut self, cx: &App) {
+        let Some(search) = self.search.as_mut() else { return };
+        let query = search.input.read(cx).text();
+        let term = self.term.lock();
+        let history = term.grid().history_size();
+        // Lines move up as output scrolls; their place from the top doesn't.
+        let from_top = |m: &Match, history: usize| (m.start().line.0 + history as i32, m.start().column.0);
+        let current = search.current.and_then(|i| search.matches.get(i)).map(|m| from_top(m, search.history));
+        search.matches.clear();
+        search.history = history;
+        search.stale = false;
+        if !query.is_empty()
+            && let Ok(mut regex) = RegexSearch::new(&regex::escape(&query))
+        {
+            let start = GridPoint::new(term.topmost_line(), Column(0));
+            let end = GridPoint::new(term.bottommost_line(), term.last_column());
+            search.matches.extend(RegexIter::new(start, end, Direction::Right, &term, &mut regex).take(MAX_MATCHES));
+        }
+        search.current = match current {
+            Some(at) => search.matches.iter().position(|m| from_top(m, history) == at),
+            None => None,
+        };
+    }
+
+    /// ↵ / ↑ goes to older output, ⇧↵ / ↓ to newer, wrapping around.
+    fn step_match(&mut self, older: bool, cx: &mut Context<Self>) {
+        if self.search.as_ref().is_some_and(|s| s.stale) {
+            self.find_matches(cx);
+        }
+        let Some(search) = self.search.as_mut() else { return };
+        let len = search.matches.len();
+        if len == 0 {
+            return;
+        }
+        search.current = Some(match (search.current, older) {
+            (None, _) => len - 1,
+            (Some(i), true) => (i + len - 1) % len,
+            (Some(i), false) => (i + 1) % len,
+        });
+        self.reveal_match();
+        cx.notify();
+    }
+
+    /// Scrolls the current match into view, centered when it was off screen.
+    fn reveal_match(&mut self) {
+        let Some(search) = self.search.as_ref() else { return };
+        let Some(m) = search.current.and_then(|i| search.matches.get(i)) else { return };
+        let mut term = self.term.lock();
+        let rows = term.screen_lines() as i32;
+        let offset = term.grid().display_offset() as i32;
+        let line = m.start().line.0;
+        if !(-offset..rows - offset).contains(&line) {
+            let target = (rows / 2 - line).clamp(0, term.grid().history_size() as i32);
+            term.scroll_display(Scroll::Delta(target - offset));
+        }
+    }
+
+    fn on_find_older(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(true, cx);
+    }
+
+    fn on_find_newer(&mut self, _: &NewlineBelow, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(false, cx);
+    }
+
+    fn on_find_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(true, cx);
+    }
+
+    fn on_find_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_match(false, cx);
+    }
+
+    fn render_search(&self, search: &Search, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let count = match (search.current, search.matches.len()) {
+            (_, 0) if search.input.read(cx).text().is_empty() => String::new(),
+            (_, 0) => "No results".into(),
+            (Some(i), n) => format!("{}/{n}{}", i + 1, if n == MAX_MATCHES { "+" } else { "" }),
+            (None, n) => n.to_string(),
+        };
+        let button = |id: &'static str, icon: Icon, tip: &'static str, cx: &mut Context<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            div()
+                .id(id)
+                .size(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover))
+                .tooltip(move |_, cx| tooltip_view(tip, cx))
+                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| f(this, window, cx)))
+                .child(icon_el(icon, px(13.), theme.text_muted.into()))
+        };
+        div()
+            .absolute()
+            .top_1()
+            .right_4()
+            .flex()
+            .items_center()
+            .gap_1()
+            .p_1()
+            .rounded(px(8.))
+            .bg(theme.panel)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            // Clicks here aren't selections in the output.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().w(px(220.)).child(input_box(&search.input, Some(Icon::Search), window, cx)))
+            .child(div().min_w(px(64.)).px_1().text_size(px(12.)).text_color(theme.text_dim).child(count))
+            .child(button("terminal-find-older", Icon::ChevronUp, "Previous Match (↵)", cx, |this, _, cx| this.step_match(true, cx)))
+            .child(button("terminal-find-newer", Icon::ChevronDown, "Next Match (⇧↵)", cx, |this, _, cx| this.step_match(false, cx)))
+            .child(button("terminal-find-close", Icon::X, "Close (Esc)", cx, |this, window, cx| this.close_search(&Cancel, window, cx)))
     }
 
     // ---- Mouse -------------------------------------------------------------------------
@@ -474,12 +699,36 @@ impl TerminalView {
         self.origin = inner.origin;
         self.cell = (cell_w, cell_h);
         let focused = self.focus_handle.is_focused(window) && window.is_window_active();
+        if self.search.as_ref().is_some_and(|s| s.stale) {
+            self.find_matches(cx);
+        }
 
         let term = self.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
         let default_bg: Hsla = theme.background.into();
         let mut frame = TerminalFrame { bounds, line_height: cell_h, ..Default::default() };
+        // Find's matches on screen, a row at a time (a match can wrap).
+        if let Some(search) = &self.search {
+            for (ix, m) in search.matches.iter().enumerate() {
+                let (start, end) = (m.start(), m.end());
+                if end.line.0 + offset < 0 || start.line.0 + offset >= rows as i32 {
+                    continue;
+                }
+                let color = if search.current == Some(ix) { theme.search_active } else { theme.search_match };
+                for line in start.line.0..=end.line.0 {
+                    let row = line + offset;
+                    if !(0..rows as i32).contains(&row) {
+                        continue;
+                    }
+                    let from = if line == start.line.0 { start.column.0 } else { 0 };
+                    let to = if line == end.line.0 { end.column.0 + 1 } else { cols as usize };
+                    let x = inner.origin.x + cell_w * from as f32;
+                    let y = inner.origin.y + cell_h * row as f32;
+                    frame.highlights.push(fill(Bounds::new(point(x, y), size(cell_w * (to - from) as f32, cell_h)), color));
+                }
+            }
+        }
         // Cells per row: (column, char, fg, bg, flags).
         let mut rows_cells: Vec<Vec<(usize, char, Hsla, Hsla, Flags)>> = vec![Vec::new(); rows as usize];
         let cursor = content.cursor;
@@ -648,6 +897,8 @@ pub struct TerminalFrame {
     bounds: Bounds<Pixels>,
     line_height: Pixels,
     backgrounds: Vec<PaintQuad>,
+    /// Find's matches, over the cell backgrounds and under the text.
+    highlights: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
     /// Under the link the pointer is on (⌘/Ctrl held).
@@ -839,18 +1090,26 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let search = self.search.as_ref().map(|search| self.render_search(search, window, cx).into_any_element());
         let theme = Theme::get(cx);
         div()
             .id("terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
             .bg(theme.background)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::clear))
+            .on_action(cx.listener(Self::open_search))
+            .on_action(cx.listener(Self::close_search))
+            .on_action(cx.listener(Self::on_find_older))
+            .on_action(cx.listener(Self::on_find_newer))
+            .on_action(cx.listener(Self::on_find_up))
+            .on_action(cx.listener(Self::on_find_down))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -858,6 +1117,7 @@ impl Render for TerminalView {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(TerminalElement { view: cx.entity() })
+            .children(search)
     }
 }
 
@@ -974,7 +1234,7 @@ impl Element for TerminalElement {
             if let Some(underline) = frame.link.take() {
                 window.paint_quad(underline);
             }
-            for quad in frame.backgrounds.drain(..) {
+            for quad in frame.backgrounds.drain(..).chain(frame.highlights.drain(..)) {
                 window.paint_quad(quad);
             }
             if let Some(cursor) = frame.cursor.take() {

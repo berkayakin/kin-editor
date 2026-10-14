@@ -17,7 +17,7 @@ use crate::{
     editor::*,
     picker::ActionEntry,
     push_dialog::ConfirmPush,
-    terminal::{TerminalClear, TerminalCopy, TerminalPaste},
+    terminal::{TerminalClear, TerminalCopy, TerminalFind, TerminalPaste},
     settings::{BaseKeymap, strip_jsonc},
     theme::{self, config_dir},
     workspace::{
@@ -159,6 +159,7 @@ fn common(mac: bool) -> Vec<KeyBinding> {
             KeyBinding::new("cmd-c", TerminalCopy, Some("Terminal")),
             KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
             KeyBinding::new("cmd-k", TerminalClear, Some("Terminal")),
+            KeyBinding::new("cmd-f", TerminalFind, Some("Terminal")),
             // macOS text navigation.
             KeyBinding::new("cmd-left", MoveLineStart, e),
             KeyBinding::new("cmd-right", MoveLineEnd, e),
@@ -187,6 +188,7 @@ fn common(mac: bool) -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-shift-w", CloseTerminal, Some("Terminal")),
             KeyBinding::new("ctrl-shift-c", TerminalCopy, Some("Terminal")),
             KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
+            KeyBinding::new("ctrl-shift-f", TerminalFind, Some("Terminal")),
             KeyBinding::new("ctrl-home", MoveDocStart, e),
             KeyBinding::new("ctrl-end", MoveDocEnd, e),
             KeyBinding::new("ctrl-shift-home", SelectDocStart, e),
@@ -813,10 +815,14 @@ fn terminal_passthrough(defaults: &[KeyBinding]) -> Vec<KeyBinding> {
         "workspace::ToggleProblems",
         "workspace::Quit",
     ];
+    // Keys the terminal itself uses (Ctrl+Shift+C/V/F) stay its own.
+    let terminal_keys: Vec<String> =
+        defaults.iter().filter(|b| b.predicate().is_some_and(|p| p.to_string() == "Terminal")).map(binding_keys).collect();
     defaults
         .iter()
         .filter(|b| b.predicate().is_none() && !KEEP.contains(&b.action().name()))
         .filter(|b| !b.keystrokes().iter().any(|k| k.inner().modifiers.platform))
+        .filter(|b| !terminal_keys.contains(&binding_keys(b)))
         .map(|b| {
             let keys: Vec<String> = b.keystrokes().iter().map(|k| k.inner().unparse()).collect();
             KeyBinding::new(&keys.join(" "), NoAction, Some("Terminal"))
