@@ -450,12 +450,16 @@ impl GitPanel {
         let commit_button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
-                .h(px(28.))
-                .px_3()
+                // Sized by their labels, sharing what's left.
+                .flex_auto()
+                .min_w_0()
+                .h(px(26.))
+                .px_2()
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(7.))
+                .rounded(px(6.))
+                .text_size(px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .when(!can_commit, |el| el.opacity(0.45))
                 .when(can_commit, |el| el.cursor_pointer())
@@ -465,13 +469,14 @@ impl GitPanel {
                         .when(can_commit, |el| el.hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24))))
                 })
                 .when(!primary, |el| el.bg(theme.hover).text_color(theme.text).when(can_commit, |el| el.hover(|s| s.bg(theme.active))))
-                .child(label)
+                .child(div().truncate().child(label))
         };
         div()
             .flex()
             .flex_col()
             .gap_2()
             .p_2()
+            .pb_1p5()
             .border_t_1()
             .border_color(theme.border_subtle)
             .child(
@@ -489,8 +494,29 @@ impl GitPanel {
             .child(
                 div()
                     .flex()
-                    .items_center()
                     .gap_1p5()
+                    .child(
+                        commit_button("commit", label, true)
+                            .tooltip(|_, cx| tooltip_view(if cfg!(target_os = "macos") { "Commit (⌘↩)" } else { "Commit (Ctrl+Enter)" }, cx))
+                            .on_click(cx.listener(|this, _, _, cx| this.commit(false, cx))),
+                    )
+                    .child(
+                        commit_button("commit-push", "Commit & Push", false)
+                            .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx))),
+                    ),
+            )
+            // Amend is rarely used, so it shares the hint's row instead of the buttons'.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .text_size(px(11.))
+                    .text_color(theme.text_dim)
+                    .child(kbd(if cfg!(target_os = "macos") { "⌘↩" } else { "Ctrl+Enter" }, cx))
+                    .child("to commit")
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("amend")
@@ -498,24 +524,14 @@ impl GitPanel {
                             .items_center()
                             .gap_1()
                             .cursor_pointer()
-                            .text_color(theme.text_muted)
+                            .hover(|s| s.text_color(theme.text_muted))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx)))
                             .child(icon_el(
                                 if self.amend { Icon::SquareCheck } else { Icon::Square },
-                                px(15.),
+                                px(13.),
                                 if self.amend { theme.accent.into() } else { theme.text_dim.into() },
                             ))
                             .child("Amend"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        commit_button("commit", label, true)
-                            .tooltip(|_, cx| tooltip_view(if cfg!(target_os = "macos") { "Commit (⌘↩)" } else { "Commit (Ctrl+Enter)" }, cx))
-                            .on_click(cx.listener(|this, _, _, cx| this.commit(false, cx))),
-                    )
-                    .child(
-                        commit_button("commit-push", "Commit and Push", false)
-                            .on_click(cx.listener(|this, _, _, cx| this.commit(true, cx))),
                     ),
             )
     }
@@ -605,18 +621,6 @@ impl Render for GitPanel {
             .when_some(self.status.state, |el, state| el.child(self.render_state_banner(state, cx)))
             .child(list)
             .child(self.render_commit_box(window, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_3()
-                    .pb_2()
-                    .text_size(px(11.))
-                    .text_color(theme.text_dim)
-                    .child(kbd(if cfg!(target_os = "macos") { "⌘↩" } else { "Ctrl+Enter" }, cx))
-                    .child("to commit"),
-            )
             .into_any_element()
     }
 }

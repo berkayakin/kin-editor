@@ -622,7 +622,7 @@ message instead of hanging; use an SSH agent or a credential helper.
 - **Commit panel** (⌘K / ⌘0, or the Commit button at the left of the status bar, which shows the
   number of changes): the branch with fetch, pull and push at the top, then staged and unstaged
   changes with stage, unstage, open and roll back on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
-  staged, everything is committed), or use **Commit and Push**. **Amend** starts from the
+  staged, everything is committed), or use **Commit & Push**. **Amend** starts from the
   previous message. In a folder that isn't a repository it offers **Initialize Repository**.
 - **Diffs** show side by side or unified (the choice is remembered), with syntax colors and the
   changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
