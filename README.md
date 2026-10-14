@@ -117,9 +117,32 @@ and show **Restart to Update** in the status bar. They only install an update wh
 don't update themselves. **About Kin** (first in the app menu, and in Find Action) shows the
 version and the commit it was built from; **Copy Version** copies both for bug reports.
 
-The macOS app is only ad-hoc signed (no Apple Developer ID), so macOS blocks the first launch
-of a downloaded copy: allow it under System Settings → Privacy & Security → **Open Anyway**, or
-run `xattr -dr com.apple.quarantine /Applications/Kin.app`. Updates don't need this.
+Until the macOS app is signed with a Developer ID (below), it's only ad-hoc signed, so macOS
+blocks the first launch of a downloaded copy: allow it under System Settings → Privacy &
+Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/Kin.app`.
+Updates don't need this.
+
+### Signing the macOS app
+
+The workflow signs `Kin.app` and the `.dmg` with a Developer ID and has Apple notarize them as
+soon as these repository secrets exist (Settings → Secrets and variables → Actions). It needs
+an [Apple Developer Program](https://developer.apple.com/programs/) membership.
+
+1. **Certificate:** in Xcode → Settings → Accounts → Manage Certificates, add a **Developer ID
+   Application** certificate. In Keychain Access → My Certificates, export it (with its private
+   key) as a `.p12` with a password.
+   - `MACOS_CERTIFICATE`: the file as base64, `base64 -i Certificates.p12 | pbcopy`
+   - `MACOS_CERTIFICATE_PASSWORD`: the export password
+2. **Notarization key:** in [App Store Connect](https://appstoreconnect.apple.com) → Users and
+   Access → Integrations → App Store Connect API, generate a team key with the Developer role and
+   download `AuthKey_….p8` (possible only once).
+   - `APPLE_API_KEY`: the `.p8` file's text, `pbcopy < AuthKey_….p8`
+   - `APPLE_API_KEY_ID`: the key's ID
+   - `APPLE_API_ISSUER`: the Issuer ID shown above the keys
+
+With only the certificate, releases are signed but not notarized, which macOS still blocks.
+Notarizing adds a few minutes per release; a rejection fails the macOS build with Apple's log
+([`scripts/notarize.sh`](scripts/notarize.sh)).
 
 ## Key bindings
 

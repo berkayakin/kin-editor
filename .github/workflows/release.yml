@@ -50,6 +50,7 @@ jobs:
     runs-on: macos-14
     env:
       VERSION: ${{ needs.create.outputs.version }}
+      APP: target/aarch64-apple-darwin/release/bundle/osx/Kin.app
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -63,18 +64,87 @@ jobs:
           cargo build --release --locked --target x86_64-apple-darwin
       - name: Make a universal Kin.app
         run: |
-          app=target/aarch64-apple-darwin/release/bundle/osx/Kin.app
-          lipo -create -output "$app/Contents/MacOS/kin" \
+          lipo -create -output "$APP/Contents/MacOS/kin" \
             target/aarch64-apple-darwin/release/kin target/x86_64-apple-darwin/release/kin
-          # Ad-hoc signature: Apple Silicon refuses unsigned code. Without a
-          # Developer ID, the first launch of a downloaded copy needs Open Anyway
-          # (Privacy & Security); updates, fetched by Kin itself, don't.
-          codesign --force --deep --sign - "$app"
+
+      # Developer ID signing and notarization turn on once their repository
+      # secrets exist (README: "Signing the macOS app"). Secrets are only given
+      # to the steps below, never to the build, which runs dependencies' code.
+      - id: signing
+        name: Check for signing secrets
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          if [ -n "$MACOS_CERTIFICATE" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+            [ -n "$APPLE_API_KEY" ] && echo "notarize=true" >> "$GITHUB_OUTPUT"
+          fi
+          true
+      - name: Sign ad hoc
+        if: steps.signing.outputs.sign != 'true'
+        # Apple Silicon refuses unsigned code. Without a Developer ID, the first
+        # launch of a downloaded copy needs Open Anyway (Privacy & Security);
+        # updates, fetched by Kin itself, don't.
+        run: codesign --force --deep --sign - "$APP"
+      - name: Sign with the Developer ID
+        if: steps.signing.outputs.sign == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          # A throwaway keychain holds the certificate for this job only.
+          keychain="$RUNNER_TEMP/kin-signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/kin.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/kin.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/kin.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n 1)
+          if [ -z "$identity" ]; then
+            echo "::error::MACOS_CERTIFICATE doesn't contain a Developer ID Application certificate with its private key"
+            exit 1
+          fi
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          # Notarization requires the hardened runtime and a secure timestamp.
+          codesign --force --options runtime --timestamp --sign "$identity" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+      - name: Notarize Kin.app
+        if: steps.signing.outputs.notarize == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/Kin.zip"
+          scripts/notarize.sh "$RUNNER_TEMP/Kin.zip"
+          # Attach the ticket so Gatekeeper can check it offline.
+          xcrun stapler staple "$APP"
+
+      - name: Package
+        run: |
           mkdir -p dist dmg
-          ditto -c -k --keepParent "$app" "dist/Kin-$VERSION-macos.zip"
-          cp -R "$app" dmg/
+          ditto -c -k --keepParent "$APP" "dist/Kin-$VERSION-macos.zip"
+          cp -R "$APP" dmg/
           ln -s /Applications dmg/Applications
           hdiutil create -volname Kin -srcfolder dmg -format UDZO -ov "dist/Kin-$VERSION-macos.dmg"
+      - name: Sign the disk image
+        if: steps.signing.outputs.sign == 'true'
+        run: codesign --timestamp --sign "$SIGNING_IDENTITY" "dist/Kin-$VERSION-macos.dmg"
+      - name: Notarize the disk image
+        if: steps.signing.outputs.notarize == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          scripts/notarize.sh "dist/Kin-$VERSION-macos.dmg"
+          xcrun stapler staple "dist/Kin-$VERSION-macos.dmg"
       - run: gh release upload "$TAG" dist/* --clobber
 
   windows:
