@@ -129,8 +129,9 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The release gets a universal macOS `Kin.app` (`.dmg` and `.zip`), a Windows `.zip` and a
-Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
+The release gets a universal macOS `Kin.app` (`.dmg` and `.zip`), a Windows installer
+(`-setup.exe`, per user, no admin rights; made with Inno Setup from
+[`scripts/kin.iss`](scripts/kin.iss)) and `.zip`, and a Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
 [minisign](https://jedisct1.github.io/minisign/) using the `MINISIGN_SECRET_KEY` repository
 secret. Tags with a hyphen (`v0.3.0-beta.1`) become pre-releases, which the updater skips.
 

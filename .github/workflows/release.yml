@@ -171,6 +171,12 @@ jobs:
           mkdir -p dist pkg
           cp target/release/kin.exe LICENSE-MIT LICENSE-APACHE pkg/
           (cd pkg && 7z a -tzip "../dist/kin-$VERSION-windows-x86_64.zip" .)
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$env:VERSION" scripts\kin.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: gh release upload "$TAG" dist/* --clobber
 
   linux:
