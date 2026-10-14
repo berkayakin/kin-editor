@@ -8,6 +8,7 @@ use std::{
 };
 
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     encoding::{self, TextEncoding},
@@ -39,6 +40,25 @@ impl Selection {
 
     pub fn reversed(&self) -> bool {
         self.head < self.anchor
+    }
+}
+
+/// A line breakpoint. A `condition` makes it stop only when that expression
+/// is true; a `log_message` makes it a logpoint, which logs (with
+/// `{expression}`s filled in) instead of stopping.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Breakpoint {
+    /// 0-based.
+    pub row: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_message: Option<String>,
+}
+
+impl Breakpoint {
+    pub fn at(row: usize) -> Self {
+        Self { row, ..Self::default() }
     }
 }
 
@@ -94,9 +114,9 @@ pub struct Document {
     /// Folded (hidden) text: from the start of the first hidden line to the
     /// end of the last. Edits that touch a fold open it.
     folds: Vec<Range<usize>>,
-    /// Line breakpoints, as the offsets their lines start at (sorted), so
+    /// Line breakpoints with the offsets their lines start at (sorted), so
     /// they stay on their lines as text is edited above them.
-    breakpoints: Vec<usize>,
+    breakpoints: Vec<(usize, Breakpoint)>,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// Modification time of the file when it was last read or written, to
@@ -272,9 +292,9 @@ impl Document {
             return false;
         }
         // Breakpoints keep their line numbers across a reload.
-        let breakpoints = self.breakpoint_rows();
+        let breakpoints = self.breakpoints();
         self.rope = Rope::from_str(&text);
-        self.set_breakpoint_rows(&breakpoints);
+        self.set_breakpoints(&breakpoints);
         self.syntax = Syntax::new(self.language, &self.rope);
         self.lsp_changes.mark_full();
         self.folds.clear();
@@ -556,28 +576,46 @@ impl Document {
         self.folds.len() != before
     }
 
-    /// Rows (0-based) with a breakpoint.
-    pub fn breakpoint_rows(&self) -> Vec<usize> {
-        self.breakpoints.iter().map(|&o| self.row_of(o)).collect()
+    /// The breakpoints, by row.
+    pub fn breakpoints(&self) -> Vec<Breakpoint> {
+        self.breakpoints.iter().map(|(_, b)| b.clone()).collect()
     }
 
-    pub fn set_breakpoint_rows(&mut self, rows: &[usize]) {
+    pub fn breakpoint(&self, row: usize) -> Option<&Breakpoint> {
+        self.breakpoints.iter().map(|(_, b)| b).find(|b| b.row == row)
+    }
+
+    pub fn set_breakpoints(&mut self, breakpoints: &[Breakpoint]) {
         let lines = self.line_count();
-        self.breakpoints = rows.iter().filter(|&&r| r < lines).map(|&r| self.line_start(r)).collect();
-        self.breakpoints.sort_unstable();
-        self.breakpoints.dedup();
+        let mut placed: Vec<(usize, Breakpoint)> =
+            breakpoints.iter().filter(|b| b.row < lines).map(|b| (self.line_start(b.row), b.clone())).collect();
+        placed.sort_by_key(|(start, _)| *start);
+        placed.dedup_by_key(|(start, _)| *start);
+        self.breakpoints = placed;
+    }
+
+    /// Puts `breakpoint` on its row, replacing the one there.
+    pub fn set_breakpoint(&mut self, breakpoint: Breakpoint) {
+        if breakpoint.row >= self.line_count() {
+            return;
+        }
+        let start = self.line_start(breakpoint.row);
+        match self.breakpoints.binary_search_by_key(&start, |(s, _)| *s) {
+            Ok(ix) => self.breakpoints[ix].1 = breakpoint,
+            Err(ix) => self.breakpoints.insert(ix, (start, breakpoint)),
+        }
     }
 
     /// Adds or removes the breakpoint on `row`; true when one is there now.
     pub fn toggle_breakpoint(&mut self, row: usize) -> bool {
         let start = self.line_start(row);
-        match self.breakpoints.binary_search(&start) {
+        match self.breakpoints.binary_search_by_key(&start, |(s, _)| *s) {
             Ok(ix) => {
                 self.breakpoints.remove(ix);
                 false
             }
             Err(ix) => {
-                self.breakpoints.insert(ix, start);
+                self.breakpoints.insert(ix, (start, Breakpoint::at(row)));
                 true
             }
         }
@@ -591,18 +629,18 @@ impl Document {
             return;
         }
         let delta = new_len as isize - range.len() as isize;
-        let mut moved: Vec<usize> = Vec::with_capacity(self.breakpoints.len());
-        for &offset in &self.breakpoints {
+        let mut moved = Vec::with_capacity(self.breakpoints.len());
+        for (offset, breakpoint) in std::mem::take(&mut self.breakpoints) {
             if range.start < offset && offset <= range.end {
                 continue;
             }
             let offset = if offset >= range.end { (offset as isize + delta) as usize } else { offset };
             // Typing at the start of a line leaves it where it is; a new
             // line inserted there pushes it down.
-            let offset = offset.min(self.rope.len_bytes());
-            moved.push(self.line_start(self.row_of(offset)));
+            let row = self.row_of(offset.min(self.rope.len_bytes()));
+            moved.push((self.line_start(row), Breakpoint { row, ..breakpoint }));
         }
-        moved.dedup();
+        moved.dedup_by_key(|(start, _)| *start);
         self.breakpoints = moved;
     }
 
@@ -742,19 +780,21 @@ mod tests {
     #[test]
     fn breakpoints_follow_their_lines() {
         let mut doc = Document::from_text("a\nb\nc\nd\n".into(), None);
+        let rows = |doc: &Document| doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>();
         assert!(doc.toggle_breakpoint(2));
-        assert_eq!(doc.breakpoint_rows(), [2]);
-        // A line added above moves it down; typing at its start doesn't.
+        assert_eq!(rows(&doc), [2]);
+        // A line added above moves it down (with its condition); typing at its start doesn't.
+        doc.set_breakpoint(Breakpoint { condition: Some("x > 1".into()), ..Breakpoint::at(2) });
         doc.edit(vec![(0..0, "new\n".into())], &[], EditKind::Other);
-        assert_eq!(doc.breakpoint_rows(), [3]);
+        assert_eq!(doc.breakpoint(3).and_then(|b| b.condition.as_deref()), Some("x > 1"));
         let c = doc.line_start(3);
         doc.edit(vec![(c..c, "x".into())], &[], EditKind::Other);
-        assert_eq!(doc.breakpoint_rows(), [3]);
+        assert_eq!(rows(&doc), [3]);
         // Joining it with the line above removes it.
         doc.edit(vec![(c - 1..c, String::new())], &[], EditKind::Other);
-        assert!(doc.breakpoint_rows().is_empty());
-        doc.set_breakpoint_rows(&[0, 9]);
-        assert_eq!(doc.breakpoint_rows(), [0]);
+        assert!(doc.breakpoints().is_empty());
+        doc.set_breakpoints(&[Breakpoint::at(0), Breakpoint::at(9)]);
+        assert_eq!(rows(&doc), [0]);
         assert!(!doc.toggle_breakpoint(0));
     }
 

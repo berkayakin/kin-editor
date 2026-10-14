@@ -1,4 +1,5 @@
-//! A small modal asking for one line of text (new file names, renames).
+//! A small modal asking for one line of text (new file names, renames,
+//! breakpoint conditions).
 
 use std::ops::Range;
 
@@ -25,6 +26,8 @@ pub struct InputDialog {
     hint: SharedString,
     input: Entity<Editor>,
     error: Option<String>,
+    /// Empty text is an answer (it clears something) rather than an error.
+    allow_empty: bool,
 }
 
 impl EventEmitter<InputDialogEvent> for InputDialog {}
@@ -55,7 +58,12 @@ impl InputDialog {
             }
         })
         .detach();
-        Self { title: title.into(), icon, hint: hint.into(), input, error: None }
+        Self { title: title.into(), icon, hint: hint.into(), input, error: None, allow_empty: false }
+    }
+
+    pub fn allow_empty(mut self) -> Self {
+        self.allow_empty = true;
+        self
     }
 
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -65,7 +73,7 @@ impl InputDialog {
 
     fn on_enter(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && !self.allow_empty {
             self.set_error("Enter a name".into(), cx);
         } else {
             cx.emit(InputDialogEvent::Confirm(text));

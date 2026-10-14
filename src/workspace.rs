@@ -19,7 +19,7 @@ use gpui::{
 
 use crate::{
     assets::{self, Icon},
-    document::Document,
+    document::{Breakpoint, Document},
     branch_picker::{BranchPicker, BranchPickerEvent},
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
@@ -30,8 +30,11 @@ use crate::{
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     push_dialog::{PushDialog, PushDialogEvent},
     git_log::{GitLog, GitLogEvent},
-    debugger::{DebugEvent, DebugSession},
-    editor::{self, Cancel, Editor, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent, EditorRunEvent, GitFile},
+    debugger::{DebugEvent, DebugSession, launch},
+    editor::{
+        self, Cancel, Editor, EditorBreakpointMenu, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent,
+        EditorRunEvent, GitFile,
+    },
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
     find_bar::{FindBar, FindBarEvent},
@@ -47,7 +50,7 @@ use crate::{
     state::{FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, WindowPlacement},
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
-    run::{self, RunTarget},
+    run::{self, DebugSpec, RunTarget},
     terminal::{RunState, TerminalEvent, TerminalView},
     theme::{self, Theme},
     preferences::{self, Preferences, PreferencesEvent},
@@ -85,6 +88,9 @@ actions!(
         Rerun,
         StopRun,
         DebugConfiguration,
+        AttachToProcess,
+        AddConditionalBreakpoint,
+        AddLogpoint,
         Resume,
         PauseProgram,
         StepOver,
@@ -308,6 +314,16 @@ enum MenuAction {
     Encoding(TextEncoding, Entity<Editor>),
     /// A gutter ▶'s Run (false) or Debug (true).
     Launch(RunTarget, bool),
+    /// A line number's breakpoint menu.
+    Breakpoint(BreakpointEdit, Entity<Editor>, usize),
+}
+
+/// What the breakpoint menu does with a row's breakpoint.
+#[derive(Clone, Copy, PartialEq)]
+enum BreakpointEdit {
+    Toggle,
+    Condition,
+    LogMessage,
 }
 
 impl Clone for MenuAction {
@@ -320,6 +336,7 @@ impl Clone for MenuAction {
             MenuAction::LineEndings(crlf, editor) => MenuAction::LineEndings(*crlf, editor.clone()),
             MenuAction::Encoding(encoding, editor) => MenuAction::Encoding(*encoding, editor.clone()),
             MenuAction::Launch(target, debug) => MenuAction::Launch(target.clone(), *debug),
+            MenuAction::Breakpoint(edit, editor, row) => MenuAction::Breakpoint(*edit, editor.clone(), *row),
         }
     }
 }
@@ -402,7 +419,7 @@ pub struct Workspace {
     /// Where the debug session is paused (file, 1-based line), to mark it in that file's editor.
     debug_location: Option<(PathBuf, u32)>,
     /// Breakpoints of files that aren't open; open files keep theirs in their documents.
-    breakpoints: HashMap<PathBuf, Vec<usize>>,
+    breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
     sidebar_width: Pixels,
     /// The panel edge being dragged, if any.
     resizing: Option<Resize>,
@@ -749,11 +766,14 @@ impl Workspace {
         self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
             ws.breakpoints_changed(&editor, cx);
         }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
+            ws.open_breakpoint_menu(editor.clone(), event.row, event.position, window, cx);
+        }));
         // Breakpoints it had while closed, and the paused line if it's here.
         let path = editor.read(cx).doc.path.clone();
         if let Some(path) = path {
-            if let Some(rows) = self.breakpoints.remove(&path) {
-                editor.update(cx, |e, cx| e.set_breakpoint_rows(&rows, cx));
+            if let Some(breakpoints) = self.breakpoints.remove(&path) {
+                editor.update(cx, |e, cx| e.set_breakpoints(&breakpoints, cx));
             }
             if let Some((at, line)) = self.debug_location.clone().filter(|(at, _)| *at == path) {
                 let _ = at;
@@ -835,7 +855,7 @@ impl Workspace {
         self.breakpoints.clear();
         if let Some(session) = ProjectSession::load(&root) {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
-            self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.rows.clone())).collect();
+            self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
         }
         self.root = Some(root);
         self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
@@ -910,7 +930,7 @@ impl Workspace {
         let mut breakpoints: Vec<FileBreakpoints> = self
             .all_breakpoints(cx)
             .into_iter()
-            .filter_map(|(path, rows)| Some(FileBreakpoints { path: path.strip_prefix(&root).ok()?.to_path_buf(), rows }))
+            .filter_map(|(path, breakpoints)| Some(FileBreakpoints { path: path.strip_prefix(&root).ok()?.to_path_buf(), breakpoints }))
             .collect();
         breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
         ProjectSession { root, tabs, active, layout, expanded, breakpoints }.save()
@@ -1976,9 +1996,9 @@ impl Workspace {
         let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
         if let Some(path) = editor.read(cx).doc.path.clone() {
             self.lsp.update(cx, |s, _| s.did_close(&path));
-            let rows = editor.read(cx).breakpoint_rows();
-            if !rows.is_empty() {
-                self.breakpoints.insert(path, rows);
+            let breakpoints = editor.read(cx).breakpoints();
+            if !breakpoints.is_empty() {
+                self.breakpoints.insert(path, breakpoints);
             }
         }
         self.schedule_session_save(cx);
@@ -2925,7 +2945,7 @@ impl Workspace {
     /// Starts debugging `target` in the Debug panel; one session at a time.
     fn debug_target(&mut self, target: RunTarget, window: &mut Window, cx: &mut Context<Self>) {
         if target.debug.is_none() {
-            self.toast(ToastKind::Info, "This can't be debugged", Some("Rust, Go and Python tests and programs can be".into()), cx);
+            self.toast(ToastKind::Info, "This can't be debugged", Some("Rust, Go, Python and JavaScript tests and programs can be".into()), cx);
             return;
         }
         // What's debugged is what's on screen.
@@ -2942,7 +2962,10 @@ impl Workspace {
         let session = cx.new(|cx| DebugSession::new(target.clone(), breakpoints, cx));
         let subscription = cx.subscribe_in(&session, window, |ws, _, event: &DebugEvent, window, cx| ws.on_debug_event(event, window, cx));
         self.debug = Some((session, subscription));
-        self.last_debug = Some(target);
+        // Debug… offers the last one again; a process attached to may be gone.
+        if !matches!(target.debug, Some(DebugSpec::Attach { .. })) {
+            self.last_debug = Some(target);
+        }
         self.show_debug = true;
         self.show_problems = false;
         self.show_terminal = false;
@@ -2980,16 +3003,16 @@ impl Workspace {
     }
 
     /// Every breakpoint: open files' (which move with edits) and the rest.
-    fn all_breakpoints(&self, cx: &App) -> HashMap<PathBuf, Vec<usize>> {
+    fn all_breakpoints(&self, cx: &App) -> HashMap<PathBuf, Vec<Breakpoint>> {
         let mut all = self.breakpoints.clone();
         for editor in &self.tabs {
             let e = editor.read(cx);
             if let Some(path) = e.doc.path.clone() {
-                let rows = e.breakpoint_rows();
-                if rows.is_empty() {
+                let breakpoints = e.breakpoints();
+                if breakpoints.is_empty() {
                     all.remove(&path);
                 } else {
-                    all.insert(path, rows);
+                    all.insert(path, breakpoints);
                 }
             }
         }
@@ -2997,14 +3020,95 @@ impl Workspace {
     }
 
     fn breakpoints_changed(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let (path, rows) = {
+        let (path, breakpoints) = {
             let e = editor.read(cx);
-            (e.doc.path.clone(), e.breakpoint_rows())
+            (e.doc.path.clone(), e.breakpoints())
         };
         if let (Some(path), Some((session, _))) = (path, &self.debug) {
-            session.update(cx, |s, _| s.set_breakpoints(path, rows));
+            session.update(cx, |s, _| s.set_breakpoints(path, breakpoints));
         }
         self.schedule_session_save(cx);
+    }
+
+    /// Right-click on a line number: add or remove its breakpoint, or give it
+    /// a condition or a log message.
+    fn open_breakpoint_menu(&mut self, editor: Entity<Editor>, row: usize, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = editor.read(cx).breakpoint(row).is_some();
+        let toggle = binding_label(&editor::ToggleBreakpoint, window);
+        let entries = if existing {
+            vec![
+                MenuEntry::item("Remove Breakpoint", Icon::Minus).shortcut(toggle),
+                MenuEntry::item("Edit Condition…", Icon::Pencil).shortcut(binding_label(&AddConditionalBreakpoint, window)),
+                MenuEntry::item("Edit Log Message…", Icon::Terminal).shortcut(binding_label(&AddLogpoint, window)),
+            ]
+        } else {
+            vec![
+                MenuEntry::item("Add Breakpoint", Icon::Plus).shortcut(toggle),
+                MenuEntry::item("Add Conditional Breakpoint…", Icon::Pencil).shortcut(binding_label(&AddConditionalBreakpoint, window)),
+                MenuEntry::item("Add Logpoint…", Icon::Terminal).shortcut(binding_label(&AddLogpoint, window)),
+            ]
+        };
+        let actions = [BreakpointEdit::Toggle, BreakpointEdit::Condition, BreakpointEdit::LogMessage]
+            .into_iter()
+            .map(|edit| Some(MenuAction::Breakpoint(edit, editor.clone(), row)))
+            .collect();
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    /// Add Conditional Breakpoint… (⇧⌘F8 / Ctrl+Shift+F8 in JetBrains): on the caret's line.
+    fn add_conditional_breakpoint(&mut self, _: &AddConditionalBreakpoint, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_breakpoint_at_caret(BreakpointEdit::Condition, window, cx);
+    }
+
+    /// Add Logpoint…: on the caret's line.
+    fn add_logpoint(&mut self, _: &AddLogpoint, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_breakpoint_at_caret(BreakpointEdit::LogMessage, window, cx);
+    }
+
+    fn edit_breakpoint_at_caret(&mut self, edit: BreakpointEdit, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        if !editor.read(cx).can_break() {
+            self.toast(ToastKind::Info, "Breakpoints work in Rust, Go, Python, JavaScript and TypeScript files", None, cx);
+            return;
+        }
+        let row = editor.read(cx).caret_row();
+        self.edit_breakpoint(edit, editor, row, window, cx);
+    }
+
+    /// Asks for a breakpoint's condition or log message; confirming adds the
+    /// breakpoint if the line has none, and an empty text clears the option.
+    fn edit_breakpoint(&mut self, edit: BreakpointEdit, editor: Entity<Editor>, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let current = editor.read(cx).breakpoint(row).unwrap_or(Breakpoint::at(row));
+        let line = row + 1;
+        let (title, hint, initial) = match edit {
+            BreakpointEdit::Condition => (
+                format!("Breakpoint Condition · Line {line}"),
+                "Stops only when this expression is true, e.g. count > 10",
+                current.condition.clone(),
+            ),
+            _ => (
+                format!("Log Message · Line {line}"),
+                "Logs instead of stopping; {expression} shows a value, e.g. count = {count}",
+                current.log_message.clone(),
+            ),
+        };
+        let initial = initial.unwrap_or_default();
+        self.close_modal(window, cx);
+        let dialog = cx.new(|cx| InputDialog::new(title, Icon::Bug, hint, &initial, Some(0..initial.len()), window, cx).allow_empty());
+        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
+            if let InputDialogEvent::Confirm(text) = event {
+                let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+                let mut breakpoint = editor.read(cx).breakpoint(row).unwrap_or(Breakpoint::at(row));
+                match edit {
+                    BreakpointEdit::Condition => breakpoint.condition = text,
+                    _ => breakpoint.log_message = text,
+                }
+                editor.update(cx, |e, cx| e.set_breakpoint(breakpoint, cx));
+            }
+            ws.close_modal(window, cx);
+        }));
+        self.modal = Some(Modal::Input(dialog));
+        cx.notify();
     }
 
     fn debug_session(&self) -> Option<Entity<DebugSession>> {
@@ -3097,7 +3201,7 @@ impl Workspace {
         let Some(mut targets) = self.configurations(self.last_debug.clone(), cx) else { return };
         targets.retain(|t| t.debug.is_some());
         if targets.is_empty() {
-            self.toast(ToastKind::Info, "Nothing to debug here", Some("Rust, Go and Python tests and programs can be debugged".into()), cx);
+            self.toast(ToastKind::Info, "Nothing to debug here", Some("Rust, Go, Python and JavaScript tests and programs can be debugged".into()), cx);
             return;
         }
         self.close_modal(window, cx);
@@ -3105,6 +3209,41 @@ impl Workspace {
         if let Some(Modal::Picker(picker)) = &self.modal {
             picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
         }
+    }
+
+    /// Attach to Process… (⌥⇧F5 / Ctrl+Alt+F5 in JetBrains): debug a program
+    /// that's already running; the adapter depends on what it runs.
+    fn attach_to_process(&mut self, _: &AttachToProcess, window: &mut Window, cx: &mut Context<Self>) {
+        if cfg!(windows) {
+            self.toast(ToastKind::Info, "Attaching to a process isn't supported on Windows yet", None, cx);
+            return;
+        }
+        self.close_modal(window, cx);
+        self.open_picker(PickerMode::Attach, window, cx);
+        let cwd = self.root.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_default();
+        let task = cx.spawn(async move |ws, cx| {
+            let processes = cx.background_executor().spawn(async move { launch::processes() }).await;
+            let targets: Vec<RunTarget> = processes
+                .into_iter()
+                .map(|p| RunTarget {
+                    name: format!("{} ({})", p.name, p.pid),
+                    command: p.command,
+                    cwd: cwd.clone(),
+                    row: None,
+                    rows: 0..0,
+                    debug: Some(DebugSpec::Attach { pid: p.pid, program: p.program }),
+                })
+                .collect();
+            ws.update(cx, |ws, cx| {
+                if let Some(Modal::Picker(picker)) = &ws.modal
+                    && picker.read(cx).mode() == PickerMode::Attach
+                {
+                    picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
+                }
+            })
+            .ok();
+        });
+        task.detach();
     }
 
     /// Run… and Debug…'s list: settings' configurations, the project's, the
@@ -3886,6 +4025,8 @@ impl Workspace {
                     Some(MenuAction::Encoding(encoding, editor)) => ws.choose_encoding(encoding, editor, window, cx),
                     Some(MenuAction::Launch(target, true)) => ws.debug_target(target, window, cx),
                     Some(MenuAction::Launch(target, false)) => ws.run_target(target, window, cx),
+                    Some(MenuAction::Breakpoint(BreakpointEdit::Toggle, editor, row)) => editor.update(cx, |e, cx| e.toggle_breakpoint_at(row, cx)),
+                    Some(MenuAction::Breakpoint(edit, editor, row)) => ws.edit_breakpoint(edit, editor, row, window, cx),
                     None => {}
                 }
             }
@@ -6544,6 +6685,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::split_terminal))
             .on_action(cx.listener(Self::select_opened_file))
             .on_action(cx.listener(Self::debug_configuration))
+            .on_action(cx.listener(Self::attach_to_process))
+            .on_action(cx.listener(Self::add_conditional_breakpoint))
+            .on_action(cx.listener(Self::add_logpoint))
             .on_action(cx.listener(Self::resume))
             .on_action(cx.listener(Self::pause_program))
             .on_action(cx.listener(Self::step_over))

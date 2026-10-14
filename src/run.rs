@@ -35,6 +35,11 @@ pub enum DebugSpec {
     Go { mode: &'static str, program: PathBuf, args: Vec<String> },
     /// Python, through debugpy: a script, or a module (pytest) with arguments.
     Python { program: Option<PathBuf>, module: Option<String>, args: Vec<String> },
+    /// JavaScript and TypeScript, through js-debug: a command (`node`, `npm`,
+    /// `npx`…) whose Node processes are all debugged.
+    Node { runtime: String, args: Vec<String> },
+    /// A running process; its executable decides the adapter.
+    Attach { pid: u32, program: PathBuf },
 }
 
 /// Quotes for a POSIX shell when needed.
@@ -320,6 +325,10 @@ fn pytest(path: &Path, parts: &[&str]) -> Option<DebugSpec> {
 
 // ---- JavaScript / TypeScript -------------------------------------------------------
 
+fn node_debug(runtime: &str, args: &[&str]) -> Option<DebugSpec> {
+    Some(DebugSpec::Node { runtime: runtime.into(), args: args.iter().map(|a| a.to_string()).collect() })
+}
+
 /// The test runner a package uses.
 fn js_test_runner(package_dir: &Path) -> &'static str {
     let package = std::fs::read_to_string(package_dir.join("package.json")).unwrap_or_default();
@@ -359,8 +368,15 @@ fn js_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
             "jest" => format!("npx jest {file} -t {}", sh_quote(&pattern)),
             _ => format!("node --test --test-name-pattern={} {file}", sh_quote(&pattern)),
         };
+        let path = path.to_string_lossy().into_owned();
+        let debug = match runner {
+            "vitest" => node_debug("npx", &["vitest", "run", &path, "-t", &pattern]),
+            // In one process, so breakpoints don't depend on attaching to workers.
+            "jest" => node_debug("npx", &["jest", &path, "-t", &pattern, "--runInBand"]),
+            _ => node_debug("node", &["--test", &format!("--test-name-pattern={pattern}"), &path]),
+        };
         let label = if base == "describe" { format!("Tests in '{title}'") } else { format!("Test '{title}'") };
-        out.push(target(label, command, &package_dir, node, node, None));
+        out.push(target(label, command, &package_dir, node, node, debug));
     }
 }
 
@@ -405,7 +421,9 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
             "npm"
         };
         for name in scripts.keys() {
-            add(format!("{manager} run {name}"), format!("{manager} run {}", sh_quote(name)), root, None);
+            // Bun isn't Node: js-debug can't debug it.
+            let debug = if manager == "bun" { None } else { node_debug(manager, &["run", name]) };
+            add(format!("{manager} run {name}"), format!("{manager} run {}", sh_quote(name)), root, debug);
         }
     }
     if root.join("go.mod").is_file() {
@@ -439,8 +457,8 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
                 let debug = DebugSpec::Python { program: Some(path.to_path_buf()), module: None, args: Vec::new() };
                 (Some(format!("python3 {file}")), Some(debug))
             }
-            Language::JavaScript => (Some(format!("node {file}")), None),
-            Language::TypeScript | Language::Tsx => (Some(format!("npx tsx {file}")), None),
+            Language::JavaScript => (Some(format!("node {file}")), node_debug("node", &[&path.to_string_lossy()])),
+            Language::TypeScript | Language::Tsx => (Some(format!("npx tsx {file}")), node_debug("npx", &["tsx", &path.to_string_lossy()])),
             Language::Shell => (Some(format!("bash {file}")), None),
             Language::Go => {
                 let debug = DebugSpec::Go { mode: "debug", program: path.to_path_buf(), args: Vec::new() };
@@ -519,8 +537,15 @@ mod tests {
             ("pnpm-lock.yaml", ""),
             ("Makefile", "VERSION := 1\n.PHONY: all\nall: build\nbuild:\n\tcc x.c\n"),
         ]);
-        let names: Vec<String> = project_targets(&dir, None).into_iter().map(|t| t.name).collect();
+        let targets = project_targets(&dir, None);
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["pnpm run dev", "pnpm run test", "make all", "make build"]);
+        // Scripts debug through js-debug, with the package manager starting them.
+        assert_eq!(targets[0].debug, Some(DebugSpec::Node { runtime: "pnpm".into(), args: vec!["run".into(), "dev".into()] }));
+        assert_eq!(targets[2].debug, None);
+        let current = project_targets(&dir, Some((&dir.join("a.ts"), Language::TypeScript)));
+        let path = dir.join("a.ts").to_string_lossy().into_owned();
+        assert_eq!(current.last().unwrap().debug, Some(DebugSpec::Node { runtime: "npx".into(), args: vec!["tsx".into(), path] }));
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(sh_quote("a b'c"), "'a b'\\''c'");
         assert_eq!(sh_quote("src/a.rs"), "src/a.rs");

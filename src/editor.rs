@@ -10,7 +10,7 @@ mod snippet;
 mod sticky;
 
 pub use lsp::EditorLspEvent;
-pub use run::{EditorBreakpointsChanged, EditorRunEvent};
+pub use run::{EditorBreakpointMenu, EditorBreakpointsChanged, EditorRunEvent};
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -2004,17 +2004,9 @@ impl Editor {
                 }
             }
             // A line number sets or clears a breakpoint (in files that can be debugged).
-            let number_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT + 18.);
-            if self.can_break()
-                && event.position.x >= layout.bounds.left() + px(5. + RUN_ICON + 4.)
-                && event.position.x <= number_right + px(4.)
-            {
-                let y = event.position.y - layout.bounds.top() + self.scroll.y;
-                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
-                if seg == 0 && row < self.doc.line_count() {
-                    self.toggle_breakpoint_at(row, cx);
-                    return;
-                }
+            if let Some(row) = self.breakpoint_row_at(event.position, &layout) {
+                self.toggle_breakpoint_at(row, cx);
+                return;
             }
             // Accept Current / Incoming / Both on a conflict.
             if let Some(&(_, start, resolution)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&event.position)) {
@@ -2093,8 +2085,20 @@ impl Editor {
         self.restart_blink(window, cx);
     }
 
+    /// The row whose line number is at `position`, where clicks set breakpoints.
+    fn breakpoint_row_at(&self, position: Point<Pixels>, layout: &LayoutSnapshot) -> Option<usize> {
+        let number_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT + 18.);
+        if !self.can_break() || position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) || position.x > number_right + px(4.) {
+            return None;
+        }
+        let y = position.y - layout.bounds.top() + self.scroll.y;
+        let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
+        (seg == 0 && row < self.doc.line_count()).then_some(row)
+    }
+
     /// Right-click: place the caret (unless clicking inside a selection, so
-    /// Cut/Copy apply to it) and ask the workspace for the context menu.
+    /// Cut/Copy apply to it) and ask the workspace for the context menu. On
+    /// a line number, the breakpoint menu instead.
     fn on_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode != EditorMode::Full {
             return;
@@ -2102,6 +2106,12 @@ impl Editor {
         window.focus(&self.focus_handle);
         self.sync_wrap(window, cx);
         self.open_hunk = None;
+        if let Some(layout) = self.layout.clone()
+            && let Some(row) = self.breakpoint_row_at(event.position, &layout)
+        {
+            cx.emit(EditorBreakpointMenu { row, position: event.position });
+            return;
+        }
         let offset = self.offset_for_position(event.position, window, cx);
         let inside = self.selections.iter().any(|s| !s.is_empty() && s.range().contains(&offset));
         if !inside {
@@ -2351,7 +2361,7 @@ impl Editor {
             .filter(|d| d.range.start <= range_end && d.range.end >= range_start)
             .collect();
 
-        let breakpoints: Vec<usize> = if single { Vec::new() } else { self.doc.breakpoint_rows() };
+        let breakpoints = if single { Vec::new() } else { self.doc.breakpoints() };
         let head_rows: Vec<usize> = self
             .selections
             .iter()
@@ -2707,13 +2717,34 @@ impl Editor {
                         None,
                     );
                     let nx = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.) - number_line.width;
-                    if breakpoints.contains(&row) {
-                        // A breakpoint covers its line number, as in JetBrains.
+                    if let Some(breakpoint) = breakpoints.iter().find(|b| b.row == row) {
+                        // A breakpoint covers its line number, as in JetBrains:
+                        // a dot, "=" in it with a condition, a diamond for a logpoint.
                         let d = (line_height * 0.62).min(px(13.));
                         let right = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.);
-                        frame.gutter_marks.push(
-                            fill(Bounds::new(point(right - d, y + (line_height - d) / 2.), size(d, d)), theme.error).corner_radii(d / 2.),
-                        );
+                        let mark = Bounds::new(point(right - d, y + (line_height - d) / 2.), size(d, d));
+                        if breakpoint.log_message.is_some() {
+                            let r = d * 0.6;
+                            let c = mark.center();
+                            let mut diamond = gpui::PathBuilder::fill();
+                            diamond.move_to(point(c.x, c.y - r));
+                            diamond.line_to(point(c.x + r, c.y));
+                            diamond.line_to(point(c.x, c.y + r));
+                            diamond.line_to(point(c.x - r, c.y));
+                            diamond.close();
+                            if let Ok(path) = diamond.build() {
+                                frame.gutter_paths.push((path, theme.error.into()));
+                            }
+                        } else {
+                            frame.gutter_marks.push(fill(mark, theme.error).corner_radii(d / 2.));
+                            if breakpoint.condition.is_some() {
+                                let (w, h) = (d * 0.5, px(1.5));
+                                for dy in [-d * 0.13, d * 0.13] {
+                                    let bar = Bounds::new(point(mark.center().x - w / 2., mark.center().y + dy - h / 2.), size(w, h));
+                                    frame.gutter_marks.push(fill(bar, theme.background));
+                                }
+                            }
+                        }
                     } else {
                         frame.numbers.push((point(nx, y), number_line));
                     }
@@ -3928,6 +3959,8 @@ pub struct FrameLayout {
     cursors: Vec<PaintQuad>,
     numbers: Vec<(Point<Pixels>, ShapedLine)>,
     gutter_marks: Vec<PaintQuad>,
+    /// Shapes that aren't rectangles (logpoints' diamonds).
+    gutter_paths: Vec<(gpui::Path<Pixels>, Hsla)>,
     /// Fold arrows: bounds, icon and color.
     fold_icons: Vec<(Bounds<Pixels>, &'static str, Hsla)>,
     inline_bgs: Vec<PaintQuad>,
@@ -4040,6 +4073,9 @@ impl Element for EditorElement {
         }
         for q in frame.gutter_marks.drain(..) {
             window.paint_quad(q);
+        }
+        for (path, color) in frame.gutter_paths.drain(..) {
+            window.paint_path(path, color);
         }
         for (bounds, icon, color) in frame.fold_icons.drain(..) {
             window.paint_svg(bounds, icon.into(), gpui::TransformationMatrix::unit(), color, cx).ok();

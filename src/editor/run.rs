@@ -8,6 +8,7 @@ use gpui::{Context, Pixels, Point, Window};
 
 use super::{Editor, EditorLspEvent, EditorMode};
 use crate::{
+    document::Breakpoint,
     run::{self, RunTarget},
     syntax::Language,
 };
@@ -26,6 +27,14 @@ impl gpui::EventEmitter<EditorRunEvent> for Editor {}
 pub struct EditorBreakpointsChanged;
 
 impl gpui::EventEmitter<EditorBreakpointsChanged> for Editor {}
+
+/// A line number was right-clicked: offer the breakpoint options for `row`.
+pub struct EditorBreakpointMenu {
+    pub row: usize,
+    pub position: Point<Pixels>,
+}
+
+impl gpui::EventEmitter<EditorBreakpointMenu> for Editor {}
 
 impl Editor {
     /// What can run in this file (cached per version).
@@ -84,13 +93,16 @@ impl Editor {
     // ---- Breakpoints ---------------------------------------------------------------
 
     /// Breakpoints only go where a debugger can stop.
-    pub(super) fn can_break(&self) -> bool {
+    pub fn can_break(&self) -> bool {
         self.mode == EditorMode::Full
             && self.doc.path.is_some()
-            && matches!(self.doc.language, Language::Rust | Language::Go | Language::Python)
+            && matches!(
+                self.doc.language,
+                Language::Rust | Language::Go | Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx
+            )
     }
 
-    pub(super) fn toggle_breakpoint_at(&mut self, row: usize, cx: &mut Context<Self>) {
+    pub fn toggle_breakpoint_at(&mut self, row: usize, cx: &mut Context<Self>) {
         self.doc.toggle_breakpoint(row);
         cx.emit(EditorBreakpointsChanged);
         cx.notify();
@@ -99,7 +111,7 @@ impl Editor {
     /// Toggle Line Breakpoint (⌘F8 / F9) on the caret's line.
     pub(super) fn toggle_breakpoint(&mut self, _: &super::ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
         if !self.can_break() {
-            cx.emit(EditorLspEvent::Message("Breakpoints work in Rust, Go and Python files".into()));
+            cx.emit(EditorLspEvent::Message("Breakpoints work in Rust, Go, Python, JavaScript and TypeScript files".into()));
             return;
         }
         let mut rows: Vec<usize> = self.selections.iter().map(|s| self.doc.row_of(s.head)).collect();
@@ -111,13 +123,30 @@ impl Editor {
         cx.notify();
     }
 
-    pub fn breakpoint_rows(&self) -> Vec<usize> {
-        self.doc.breakpoint_rows()
+    pub fn breakpoints(&self) -> Vec<Breakpoint> {
+        self.doc.breakpoints()
     }
 
-    pub fn set_breakpoint_rows(&mut self, rows: &[usize], cx: &mut Context<Self>) {
-        self.doc.set_breakpoint_rows(rows);
+    /// Restores breakpoints (a file opening, a session).
+    pub fn set_breakpoints(&mut self, breakpoints: &[Breakpoint], cx: &mut Context<Self>) {
+        self.doc.set_breakpoints(breakpoints);
         cx.notify();
+    }
+
+    pub fn breakpoint(&self, row: usize) -> Option<Breakpoint> {
+        self.doc.breakpoint(row).cloned()
+    }
+
+    /// Adds or changes one breakpoint (a condition or log message was edited).
+    pub fn set_breakpoint(&mut self, breakpoint: Breakpoint, cx: &mut Context<Self>) {
+        self.doc.set_breakpoint(breakpoint);
+        cx.emit(EditorBreakpointsChanged);
+        cx.notify();
+    }
+
+    /// The caret's row.
+    pub fn caret_row(&self) -> usize {
+        self.doc.row_of(self.primary_selection().head)
     }
 
     /// Highlights the line a debug session paused on (None: running or done).

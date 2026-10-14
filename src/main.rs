@@ -58,7 +58,7 @@ use crate::{
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
         ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol, InstallShellCommand,
-        DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut,
+        DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, AttachToProcess, AddConditionalBreakpoint, AddLogpoint,
     },
 };
 
@@ -166,7 +166,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Debug at Caret", DebugAtCaret),
                 MenuItem::action("Debug…", DebugConfiguration),
+                MenuItem::action("Attach to Process…", AttachToProcess),
                 MenuItem::action("Toggle Line Breakpoint", ToggleBreakpoint),
+                MenuItem::action("Add Conditional Breakpoint…", AddConditionalBreakpoint),
+                MenuItem::action("Add Logpoint…", AddLogpoint),
                 MenuItem::action("Resume Program", Resume),
                 MenuItem::action("Pause Program", PauseProgram),
                 MenuItem::action("Step Over", StepOver),

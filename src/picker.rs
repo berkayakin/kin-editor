@@ -44,6 +44,8 @@ pub enum PickerMode {
     Run,
     /// The same list, to debug instead (only targets that can be).
     Debug,
+    /// Running processes to debug, as targets with `DebugSpec::Attach`.
+    Attach,
     /// Symbols across the project from the language servers; the workspace
     /// answers [`PickerEvent::SymbolQuery`] with [`Picker::set_locations`].
     Symbols,
@@ -166,6 +168,7 @@ impl Picker {
             PickerMode::Locations => "Filter",
             PickerMode::Run => "Run configuration",
             PickerMode::Debug => "Debug configuration",
+            PickerMode::Attach => "Search processes by name, command or PID",
             PickerMode::Symbols => "Search symbols in the project",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
@@ -415,7 +418,7 @@ impl Picker {
             items.extend(scored.into_iter().take(limit).map(|(_, i)| i));
         }
 
-        if matches!(self.mode, PickerMode::Run | PickerMode::Debug) {
+        if matches!(self.mode, PickerMode::Run | PickerMode::Debug | PickerMode::Attach) {
             let targets = self.run_targets.clone();
             let mut scored: Vec<(u32, Item)> = Vec::new();
             for (ix, target) in targets.iter().enumerate() {
@@ -424,6 +427,11 @@ impl Picker {
                         let mut buf = Vec::new();
                         let mut indices = Vec::new();
                         let Some(score) = p.indices(Utf32Str::new(&target.name, &mut buf), &mut self.matcher, &mut indices) else {
+                            // A process is also found by text in its command line
+                            // (which script), after the ones whose name matches.
+                            if self.mode == PickerMode::Attach && target.command.to_lowercase().contains(&text.trim().to_lowercase()) {
+                                scored.push((0, Item::Run { ix, hl: Vec::new() }));
+                            }
                             continue;
                         };
                         let hl = indices
@@ -510,7 +518,7 @@ impl Picker {
             Some(Item::Symbol { ix, .. }) => cx.emit(PickerEvent::GoTo(self.symbols[*ix].0.offset)),
             Some(Item::Run { ix, .. }) => {
                 let target = self.run_targets[*ix].clone();
-                cx.emit(if self.mode == PickerMode::Debug { PickerEvent::Debug(target) } else { PickerEvent::Run(target) })
+                cx.emit(if self.mode == PickerMode::Run { PickerEvent::Run(target) } else { PickerEvent::Debug(target) })
             }
             Some(Item::Location { ix }) => cx.emit(PickerEvent::OpenLocation {
                 location: self.locations[*ix].location.clone(),
@@ -585,6 +593,7 @@ impl Render for Picker {
             PickerMode::Locations => ("", Icon::Search, ""),
             PickerMode::Run => ("Run", Icon::Play, ""),
             PickerMode::Debug => ("Debug", Icon::Bug, ""),
+            PickerMode::Attach => ("Attach to Process", Icon::Bug, ""),
             PickerMode::Symbols => ("Symbols", Icon::Braces, ""),
         };
         let title: SharedString = match &self.title {
@@ -694,7 +703,7 @@ impl Render for Picker {
                                     }
                                     Item::Run { ix, hl } => {
                                         let target = &run_targets[*ix];
-                                        let icon = if mode == PickerMode::Debug { Icon::Bug } else { Icon::Play };
+                                        let icon = if mode == PickerMode::Run { Icon::Play } else { Icon::Bug };
                                         row.child(icon_el(icon, px(13.), theme.success.into()))
                                             .child(
                                                 div()

@@ -8,6 +8,7 @@ pub mod launch;
 
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
 };
@@ -22,6 +23,7 @@ use serde_json::{Value, json};
 use crate::{
     assets::Icon,
     dap::{DapClient, Incoming},
+    document::Breakpoint,
     editor::{Editor, Newline},
     run::{DebugSpec, RunTarget},
     theme::Theme,
@@ -77,17 +79,31 @@ enum Line {
 /// Keep the console bounded.
 const MAX_CONSOLE: usize = 5000;
 
+/// A connection to the adapter. js-debug debugs each Node process in a child
+/// session of its own, which it asks for with `startDebugging`.
+struct Connection {
+    /// 0 for the adapter's own, then child sessions in order.
+    id: usize,
+    client: Arc<DapClient>,
+    /// It said `initialized` and got its breakpoints.
+    configured: bool,
+}
+
 pub struct DebugSession {
     pub target: RunTarget,
     status: Status,
-    client: Option<Arc<DapClient>>,
-    /// Set once the adapter said `initialized` and got its breakpoints.
-    configured: bool,
-    /// Stop was pressed: the end is "Stopped", not "Finished".
-    stopping: bool,
+    /// The adapter's connection, then child sessions'.
+    connections: Vec<Connection>,
+    /// The connection that paused last (or started last): stepping, the
+    /// stack and evaluation go to it.
+    active: usize,
+    next_connection: usize,
+    /// Where a TCP adapter listens, for child sessions.
+    server: Option<SocketAddr>,
+    adapter_id: &'static str,
     capabilities: Value,
-    /// Rows (0-based) per file, as the workspace last sent them.
-    breakpoints: HashMap<PathBuf, Vec<usize>>,
+    /// Per file, as the workspace last sent them.
+    breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
     thread: Option<i64>,
     frames: Vec<Frame>,
     frame: usize,
@@ -110,7 +126,7 @@ impl EventEmitter<DebugEvent> for DebugSession {}
 
 impl DebugSession {
     /// Starts debugging `target` (which has a [`DebugSpec`]) with these breakpoints.
-    pub fn new(target: RunTarget, breakpoints: HashMap<PathBuf, Vec<usize>>, cx: &mut Context<Self>) -> Self {
+    pub fn new(target: RunTarget, breakpoints: HashMap<PathBuf, Vec<Breakpoint>>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| Editor::single_line("Evaluate an expression", cx));
         let watch_input = cx.new(|cx| Editor::single_line("Add a watch", cx));
         let build = launch::Build::default();
@@ -123,9 +139,11 @@ impl DebugSession {
         Self {
             target,
             status,
-            client: None,
-            configured: false,
-            stopping: false,
+            connections: Vec::new(),
+            active: 0,
+            next_connection: 1,
+            server: None,
+            adapter_id: "",
             capabilities: Value::Null,
             breakpoints,
             thread: None,
@@ -152,6 +170,16 @@ impl DebugSession {
 
     pub fn is_paused(&self) -> bool {
         matches!(self.status, Status::Paused(_))
+    }
+
+    fn is_attach(&self) -> bool {
+        matches!(self.target.debug, Some(DebugSpec::Attach { .. }))
+    }
+
+    /// Where requests go: the active connection, else the adapter's own.
+    fn client(&self) -> Option<Arc<DapClient>> {
+        let active = self.connections.iter().find(|c| c.id == self.active).or(self.connections.first());
+        active.map(|c| c.client.clone())
     }
 
     /// Build if needed, start the adapter, then handle what it sends.
@@ -184,11 +212,16 @@ impl DebugSession {
 
         let (cwd2, spec2) = (cwd.clone(), spec.clone());
         let adapter = cx.background_executor().spawn(async move { launch::adapter(&spec2, &cwd2) }).await?;
-        let launch_args = {
-            let (cwd2, spec2, program2) = (cwd.clone(), spec.clone(), program.clone());
-            cx.background_executor().spawn(async move { launch::launch_arguments(&spec2, &cwd2, program2.as_deref()) }).await
-        };
         let id = adapter.id;
+        let mut launch_args = {
+            let (cwd2, spec2, program2) = (cwd.clone(), spec.clone(), program.clone());
+            cx.background_executor().spawn(async move { launch::launch_arguments(&spec2, &cwd2, program2.as_deref(), id) }).await
+        };
+        if let (DebugSpec::Attach { pid, .. }, "pwa-node") = (&spec, id) {
+            let pid = *pid;
+            launch_args["port"] = json!(cx.background_executor().spawn(async move { launch::open_node_inspector(pid) }).await);
+        }
+        let server = adapter.port.map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
         let started = cx
             .background_executor()
             .spawn(async move {
@@ -201,7 +234,9 @@ impl DebugSession {
             .await;
         let (client, mut incoming) = started.map_err(|e| format!("Couldn't start the debugger: {e}"))?;
         this.update(cx, |s, cx| {
-            s.client = Some(client.clone());
+            s.connections.push(Connection { id: 0, client: client.clone(), configured: false });
+            s.server = server;
+            s.adapter_id = id;
             cx.notify();
         })
         .map_err(|_| String::new())?;
@@ -209,12 +244,14 @@ impl DebugSession {
         let capabilities = client.request("initialize", launch::initialize_arguments(id)).await.map_err(|_| "The debugger stopped".to_string())??;
         this.update(cx, |s, _| s.capabilities = capabilities).ok();
 
-        // The launch answer can come after configurationDone, so don't wait for it here.
-        let launched = client.request("launch", launch_args);
+        // The answer can come after configurationDone, so don't wait for it here.
+        let request = launch::request(&spec);
+        let launched = client.request(request, launch_args);
         let reporter = this.clone();
         cx.spawn(async move |cx| {
             if let Ok(Err(message)) = launched.await {
-                reporter.update(cx, |s, cx| s.end(format!("Couldn't start: {message}"), cx)).ok();
+                let verb = if request == "attach" { "attach" } else { "start" };
+                reporter.update(cx, |s, cx| s.end(format!("Couldn't {verb}: {message}"), cx)).ok();
             }
         })
         .detach();
@@ -223,7 +260,7 @@ impl DebugSession {
         // must end the adapter, so this loop mustn't keep it alive.
         drop(client);
         while let Some(message) = incoming.next().await {
-            let alive = this.update(cx, |s, cx| s.handle(message, cx)).is_ok();
+            let alive = this.update(cx, |s, cx| s.handle(0, message, cx)).is_ok();
             if !alive {
                 break;
             }
@@ -231,16 +268,72 @@ impl DebugSession {
         Ok(())
     }
 
-    fn handle(&mut self, message: Incoming, cx: &mut Context<Self>) {
+    /// js-debug's `startDebugging`: a Node process to debug in a child session,
+    /// on a new connection to the same server.
+    fn start_child(&mut self, arguments: Value, cx: &mut Context<Self>) {
+        let Some(server) = self.server else { return };
+        let id = self.next_connection;
+        self.next_connection += 1;
+        let adapter_id = self.adapter_id;
+        let request = arguments["request"].as_str().unwrap_or("launch").to_string();
+        let configuration = arguments["configuration"].clone();
+        let task = cx.spawn(async move |this, cx| {
+            let (client, mut incoming) = match cx.background_executor().spawn(async move { DapClient::connect_tcp(server) }).await {
+                Ok(connected) => connected,
+                Err(err) => {
+                    this.update(cx, |s, cx| s.push_line(Line::Error, &format!("Couldn't debug a child process: {err}"), cx)).ok();
+                    return;
+                }
+            };
+            let added = this.update(cx, |s, _| {
+                s.connections.push(Connection { id, client: client.clone(), configured: false });
+                // The newest process is most likely the program (npm starts it last).
+                if !s.is_paused() {
+                    s.active = id;
+                    s.thread = None;
+                }
+            });
+            if added.is_err() || !matches!(client.request("initialize", launch::initialize_arguments(adapter_id)).await, Ok(Ok(_))) {
+                return;
+            }
+            let _ = client.request(&request, configuration);
+            drop(client);
+            while let Some(message) = incoming.next().await {
+                if this.update(cx, |s, cx| s.handle(id, message, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        task.detach();
+    }
+
+    /// A child session ended.
+    fn remove_connection(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.connections.retain(|c| c.id != id);
+        if self.active == id {
+            self.active = self.connections.last().map_or(0, |c| c.id);
+            if self.is_paused() {
+                self.resumed(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// What connection `id` sent.
+    fn handle(&mut self, id: usize, message: Incoming, cx: &mut Context<Self>) {
         match message {
             Incoming::Event { event, body } => match event.as_str() {
-                "initialized" => self.configure(cx),
+                "initialized" => self.configure(id, cx),
                 "stopped" => {
+                    if self.active != id {
+                        self.active = id;
+                        self.thread = None;
+                    }
                     self.status = Status::Paused(pause_reason(&body));
                     self.thread = body["threadId"].as_i64().or(self.thread);
                     self.load_stack(cx);
                 }
-                "continued" => self.resumed(cx),
+                "continued" if id == self.active => self.resumed(cx),
                 "output" => {
                     let category = body["category"].as_str().unwrap_or("console");
                     if category != "telemetry"
@@ -251,13 +344,17 @@ impl DebugSession {
                             "stdout" => Line::Output,
                             _ => Line::Info,
                         };
-                        if category == "console" {
-                            let text = without_chatter(text);
-                            if !text.is_empty() {
-                                self.push_text(kind, &text, cx);
-                            }
-                        } else {
-                            self.push_text(kind, text, cx);
+                        let text = match category {
+                            "console" => without_chatter(text),
+                            // Node announces its inspector, which js-debug uses.
+                            "stderr" => text
+                                .split_inclusive('\n')
+                                .filter(|l| !matches!(l.trim_end(), "Debugger attached." | "Waiting for the debugger to disconnect..."))
+                                .collect(),
+                            _ => text.to_string(),
+                        };
+                        if !text.is_empty() {
+                            self.push_text(kind, &text, cx);
                         }
                     }
                 }
@@ -266,16 +363,27 @@ impl DebugSession {
                         self.note(format!("Process finished with exit code {code}"), cx);
                     }
                 }
-                "terminated" => self.end(if self.stopping { "Stopped" } else { "Finished" }.into(), cx),
+                "terminated" if id != 0 => self.remove_connection(id, cx),
+                "terminated" => self.end("Finished".into(), cx),
                 _ => {}
             },
-            // Kin runs programs itself (no runInTerminal and the like).
-            Incoming::Request { seq, command, .. } => {
-                if let Some(client) = &self.client {
+            Incoming::Request { seq, command, arguments } => {
+                let Some(client) = self.connections.iter().find(|c| c.id == id).map(|c| c.client.clone()) else { return };
+                if command == "startDebugging" && self.server.is_some() {
+                    client.respond(seq, &command, true, json!({}));
+                    self.start_child(arguments, cx);
+                } else {
+                    // Kin runs programs itself (no runInTerminal and the like).
                     client.respond(seq, &command, false, json!({ "error": { "format": "Not supported by Kin" } }));
                 }
             }
-            Incoming::Output(line) => self.push_line(Line::Info, &line, cx),
+            Incoming::Output(line) => {
+                let line = without_chatter(&line);
+                if !line.is_empty() {
+                    self.push_line(Line::Info, &line, cx);
+                }
+            }
+            Incoming::Closed { .. } if id != 0 => self.remove_connection(id, cx),
             Incoming::Closed { tail } => {
                 if self.is_active() {
                     let tail = tail.trim();
@@ -289,30 +397,34 @@ impl DebugSession {
     }
 
     /// Breakpoints, then configurationDone: the program starts running.
-    fn configure(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else { return };
-        for (path, rows) in &self.breakpoints {
-            let _ = client.request("setBreakpoints", breakpoints_arguments(path, rows));
+    fn configure(&mut self, id: usize, cx: &mut Context<Self>) {
+        // js-debug's child sessions say `initialized` twice.
+        let Some(connection) = self.connections.iter_mut().find(|c| c.id == id && !c.configured) else { return };
+        connection.configured = true;
+        let client = connection.client.clone();
+        for (path, breakpoints) in &self.breakpoints {
+            let _ = client.request("setBreakpoints", breakpoints_arguments(path, breakpoints));
         }
         if self.capabilities["exceptionBreakpointFilters"].is_array() {
             let _ = client.request("setExceptionBreakpoints", json!({ "filters": [] }));
         }
         let _ = client.request("configurationDone", json!({}));
-        self.configured = true;
-        self.status = Status::Running;
+        if !self.is_paused() {
+            self.status = Status::Running;
+        }
         cx.notify();
     }
 
     /// A file's breakpoints changed in the editor.
-    pub fn set_breakpoints(&mut self, path: PathBuf, rows: Vec<usize>) {
-        if let Some(client) = self.client.as_ref().filter(|_| self.configured) {
-            let _ = client.request("setBreakpoints", breakpoints_arguments(&path, &rows));
+    pub fn set_breakpoints(&mut self, path: PathBuf, breakpoints: Vec<Breakpoint>) {
+        for connection in self.connections.iter().filter(|c| c.configured) {
+            let _ = connection.client.request("setBreakpoints", breakpoints_arguments(&path, &breakpoints));
         }
-        self.breakpoints.insert(path, rows);
+        self.breakpoints.insert(path, breakpoints);
     }
 
     fn load_stack(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(thread)) = (self.client.clone(), self.thread) else {
+        let (Some(client), Some(thread)) = (self.client(), self.thread) else {
             cx.notify();
             return;
         };
@@ -354,7 +466,7 @@ impl DebugSession {
         if let Some(path) = frame.path.clone().filter(|p| p.is_file()) {
             cx.emit(DebugEvent::Stopped { path, line: frame.line });
         }
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client() else { return };
         let frame_id = frame.id;
         let task = cx.spawn(async move |this, cx| {
             let Ok(Ok(body)) = client.request("scopes", json!({ "frameId": frame_id })).await else { return };
@@ -396,7 +508,7 @@ impl DebugSession {
             cx.notify();
             return;
         }
-        let Some(client) = self.client.clone() else { return };
+        let Some(client) = self.client() else { return };
         let task = cx.spawn(async move |this, cx| {
             let Ok(Ok(body)) = client.request("variables", json!({ "variablesReference": reference })).await else { return };
             let vars: Vec<Var> = body["variables"]
@@ -430,7 +542,7 @@ impl DebugSession {
     }
 
     fn evaluate_watch(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let (Some(client), Some(frame)) = (self.client.clone(), self.frame_id()) else { return };
+        let (Some(client), Some(frame)) = (self.client(), self.frame_id()) else { return };
         let expression = self.watches[ix].0.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = client.request("evaluate", json!({ "expression": expression, "frameId": frame, "context": "watch" })).await;
@@ -453,7 +565,7 @@ impl DebugSession {
     /// Console input: evaluates in the selected frame (or globally while running).
     fn evaluate(&mut self, expression: String, cx: &mut Context<Self>) {
         self.push_line(Line::Input, &format!("> {expression}"), cx);
-        let Some(client) = self.client.clone() else {
+        let Some(client) = self.client() else {
             self.push_line(Line::Error, "Not debugging", cx);
             return;
         };
@@ -489,7 +601,7 @@ impl DebugSession {
 
     /// `continue`, `next`, `stepIn` or `stepOut` on the paused thread.
     fn step(&mut self, command: &'static str, cx: &mut Context<Self>) {
-        let (Some(client), Some(thread)) = (self.client.clone(), self.thread) else { return };
+        let (Some(client), Some(thread)) = (self.client(), self.thread) else { return };
         if !self.is_paused() {
             return;
         }
@@ -514,7 +626,7 @@ impl DebugSession {
     }
 
     pub fn pause(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone().filter(|_| self.status == Status::Running) else { return };
+        let Some(client) = self.client().filter(|_| self.status == Status::Running) else { return };
         let known = self.thread;
         let task = cx.spawn(async move |_, _| {
             let thread = match known {
@@ -538,28 +650,28 @@ impl DebugSession {
         if let Some(mut child) = self.build.lock().unwrap().take() {
             let _ = child.kill();
         }
-        let Some(client) = self.client.clone() else {
-            self.end("Stopped".into(), cx);
-            return;
-        };
-        self.stopping = true;
-        let disconnect = client.request("disconnect", json!({ "terminateDebuggee": true, "restart": false }));
-        let task = cx.spawn(async move |this, cx| {
-            // Give it a moment to clean up, then drop it either way.
-            let timeout = cx.background_executor().timer(std::time::Duration::from_millis(1500));
-            futures::future::select(disconnect, Box::pin(timeout)).await;
-            this.update(cx, |s, cx| s.end("Stopped".into(), cx)).ok();
-        });
-        task.detach();
+        self.end(if self.is_attach() { "Detached" } else { "Stopped" }.into(), cx);
     }
 
+    /// The session is over: the adapter is told to disconnect (ending a
+    /// launched program, not an attached one), so it can clean up (Delve
+    /// removes its build), then it's dropped, which ends its process.
     fn end(&mut self, message: String, cx: &mut Context<Self>) {
         if !self.is_active() {
             return;
         }
         self.status = Status::Ended(message);
-        // Dropping the client ends the adapter process.
-        self.client = None;
+        if let Some(adapter) = self.connections.first().map(|c| c.client.clone()) {
+            let disconnect = adapter.request("disconnect", json!({ "terminateDebuggee": !self.is_attach(), "restart": false }));
+            let timeout = cx.background_executor().timer(std::time::Duration::from_millis(1500));
+            cx.background_executor()
+                .spawn(async move {
+                    futures::future::select(disconnect, Box::pin(timeout)).await;
+                    drop(adapter);
+                })
+                .detach();
+        }
+        self.connections.clear();
         self.frames.clear();
         self.scopes.clear();
         self.children.clear();
@@ -666,7 +778,8 @@ fn pause_reason(body: &Value) -> String {
 }
 
 /// An adapter's console output without its own bookkeeping: lldb echoes
-/// the init commands and reports the exit that Kin already notes.
+/// the init commands and reports the exit that Kin already notes; Delve and
+/// js-debug say where they listen.
 fn without_chatter(text: &str) -> String {
     let chatter = |line: &str| {
         let line = line.trim_end();
@@ -674,6 +787,8 @@ fn without_chatter(text: &str) -> String {
             || line.starts_with("Running ") && line.ends_with("Commands:")
             || line.starts_with("Executing commands in ")
             || line.starts_with("Process ") && line.contains(" exited with status = ")
+            || line.contains("server listening at")
+            || line.starts_with("Type 'dlv help'")
     };
     text.split_inclusive('\n').filter(|line| !chatter(line)).collect()
 }
@@ -716,10 +831,23 @@ fn frame_name(name: &str) -> String {
     decoded.join("::")
 }
 
-fn breakpoints_arguments(path: &std::path::Path, rows: &[usize]) -> Value {
+fn breakpoints_arguments(path: &std::path::Path, breakpoints: &[Breakpoint]) -> Value {
+    let breakpoints: Vec<Value> = breakpoints
+        .iter()
+        .map(|b| {
+            let mut breakpoint = json!({ "line": b.row + 1 });
+            if let Some(condition) = &b.condition {
+                breakpoint["condition"] = json!(condition);
+            }
+            if let Some(message) = &b.log_message {
+                breakpoint["logMessage"] = json!(message);
+            }
+            breakpoint
+        })
+        .collect();
     json!({
         "source": { "path": path, "name": path.file_name().map(|n| n.to_string_lossy().into_owned()) },
-        "breakpoints": rows.iter().map(|r| json!({ "line": r + 1 })).collect::<Vec<_>>(),
+        "breakpoints": breakpoints,
         "sourceModified": false,
     })
 }
@@ -1017,6 +1145,11 @@ mod tests {
         assert_eq!(frame_name("main.main"), "main.main");
         let text = "Running initCommands:\n(lldb) command source -s 0 \"x\"\nhello\nProcess 41434 exited with status = 0 (0x00000000) \n";
         assert_eq!(without_chatter(text), "hello\n");
+        assert_eq!(without_chatter("Debug server listening at 127.0.0.1:51234"), "");
+        let conditional = Breakpoint { condition: Some("i > 2".into()), ..Breakpoint::at(4) };
+        let logpoint = Breakpoint { log_message: Some("i = {i}".into()), ..Breakpoint::at(6) };
+        let args = breakpoints_arguments(std::path::Path::new("/p/a.rs"), &[conditional, logpoint]);
+        assert_eq!(args["breakpoints"], json!([{ "line": 5, "condition": "i > 2" }, { "line": 7, "logMessage": "i = {i}" }]));
         assert_eq!(pause_reason(&json!({"reason": "breakpoint", "description": "breakpoint 1.1"})), "Paused at a breakpoint");
         assert_eq!(pause_reason(&json!({"reason": "exception", "text": "ZeroDivisionError"})), "Exception: ZeroDivisionError");
     }
@@ -1043,7 +1176,7 @@ mod tests {
             let (client, mut incoming) = DapClient::spawn_stdio(&mut command).unwrap();
             futures::executor::block_on(async {
                 client.request("initialize", launch::initialize_arguments(adapter.id)).await.unwrap().unwrap();
-                let _launched = client.request("launch", launch::launch_arguments(&spec, &work, Some(&exe)));
+                let _launched = client.request("launch", launch::launch_arguments(&spec, &work, Some(&exe), adapter.id));
                 let mut event = async |name: &str| loop {
                     match incoming.next().await {
                         Some(Incoming::Event { event, body }) if event == name => return body,
@@ -1052,7 +1185,7 @@ mod tests {
                     }
                 };
                 event("initialized").await;
-                let set = client.request("setBreakpoints", breakpoints_arguments(&work.join("src/main.rs"), &[2])).await.unwrap().unwrap();
+                let set = client.request("setBreakpoints", breakpoints_arguments(&work.join("src/main.rs"), &[Breakpoint::at(2)])).await.unwrap().unwrap();
                 assert_eq!(set["breakpoints"][0]["verified"], true, "{set}");
                 client.request("configurationDone", json!({})).await.unwrap().unwrap();
 

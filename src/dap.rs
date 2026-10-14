@@ -28,8 +28,9 @@ use crate::lsp::rpc::read_message;
 #[derive(Debug)]
 pub enum Incoming {
     Event { event: String, body: Value },
-    /// A "reverse request" (`runInTerminal`…); answer with [`DapClient::respond`].
-    Request { seq: i64, command: String },
+    /// A "reverse request" (`startDebugging`, `runInTerminal`…); answer
+    /// with [`DapClient::respond`].
+    Request { seq: i64, command: String, arguments: Value },
     /// A line the adapter process printed (TCP adapters: their own stdout and stderr).
     Output(String),
     /// The adapter exited or its connection closed.
@@ -42,7 +43,8 @@ pub struct DapClient {
     writer: mpsc::Sender<Vec<u8>>,
     seq: AtomicI64,
     pending: Pending,
-    child: Mutex<Child>,
+    /// The adapter's process (none for a child session's connection).
+    child: Mutex<Option<Child>>,
 }
 
 impl DapClient {
@@ -54,7 +56,7 @@ impl DapClient {
         let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("no stderr"))?;
         let (incoming_tx, incoming) = async_mpsc::unbounded();
         let tail = keep_tail(stderr, None);
-        let client = Self::start(child, stdin, stdout, tail, incoming_tx)?;
+        let client = Self::start(Some(child), stdin, stdout, tail, incoming_tx)?;
         Ok((client, incoming))
     }
 
@@ -82,12 +84,22 @@ impl DapClient {
             }
         };
         let reader = stream.try_clone()?;
-        let client = Self::start(child, stream, reader, tail, incoming_tx)?;
+        let client = Self::start(Some(child), stream, reader, tail, incoming_tx)?;
+        Ok((client, incoming))
+    }
+
+    /// Another connection to an adapter that's listening already: js-debug
+    /// runs each Node process as a child session on one of these.
+    pub fn connect_tcp(addr: SocketAddr) -> std::io::Result<(Arc<DapClient>, async_mpsc::UnboundedReceiver<Incoming>)> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        let reader = stream.try_clone()?;
+        let (incoming_tx, incoming) = async_mpsc::unbounded();
+        let client = Self::start(None, stream, reader, Arc::default(), incoming_tx)?;
         Ok((client, incoming))
     }
 
     fn start(
-        child: Child,
+        child: Option<Child>,
         writer: impl Write + Send + 'static,
         reader: impl Read + Send + 'static,
         tail: Arc<Mutex<String>>,
@@ -148,7 +160,7 @@ impl DapClient {
 
 impl Drop for DapClient {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
+        if let Some(mut child) = self.child.lock().ok().and_then(|mut c| c.take()) {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -205,7 +217,8 @@ fn dispatch(mut message: Value, pending: &Pending, incoming: &async_mpsc::Unboun
         "request" => {
             let seq = message.get("seq").and_then(Value::as_i64).unwrap_or(0);
             let command = message.get("command").and_then(Value::as_str).unwrap_or_default().to_string();
-            let _ = incoming.unbounded_send(Incoming::Request { seq, command });
+            let arguments = message.get_mut("arguments").map(Value::take).unwrap_or(Value::Null);
+            let _ = incoming.unbounded_send(Incoming::Request { seq, command, arguments });
         }
         _ => {}
     }
@@ -246,7 +259,8 @@ mod tests {
         assert_eq!(err_rx.try_recv().unwrap().unwrap().unwrap_err(), "Could not launch: no such file");
         dispatch(json!({"type": "event", "event": "stopped", "body": {"threadId": 1}}), &pending, &tx);
         assert!(matches!(incoming.try_recv(), Ok(Incoming::Event { event, body }) if event == "stopped" && body["threadId"] == 1));
-        dispatch(json!({"type": "request", "seq": 9, "command": "runInTerminal", "arguments": {}}), &pending, &tx);
-        assert!(matches!(incoming.try_recv(), Ok(Incoming::Request { seq: 9, command, .. }) if command == "runInTerminal"));
+        dispatch(json!({"type": "request", "seq": 9, "command": "startDebugging", "arguments": {"request": "launch"}}), &pending, &tx);
+        assert!(matches!(incoming.try_recv(), Ok(Incoming::Request { seq: 9, command, arguments })
+            if command == "startDebugging" && arguments["request"] == "launch"));
     }
 }

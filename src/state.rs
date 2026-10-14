@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::theme::config_dir;
+use crate::{document::Breakpoint, theme::config_dir};
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
@@ -132,8 +132,7 @@ pub struct ProjectSession {
 pub struct FileBreakpoints {
     /// Relative to the project.
     pub path: PathBuf,
-    /// 0-based.
-    pub rows: Vec<usize>,
+    pub breakpoints: Vec<Breakpoint>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
@@ -245,7 +244,10 @@ mod tests {
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
             expanded: vec!["src".into(), "src/lsp".into()],
-            breakpoints: vec![FileBreakpoints { path: "src/a.rs".into(), rows: vec![3, 9] }],
+            breakpoints: vec![FileBreakpoints {
+                path: "src/a.rs".into(),
+                breakpoints: vec![Breakpoint::at(3), Breakpoint { condition: Some("i > 2".into()), ..Breakpoint::at(9) }],
+            }],
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);
