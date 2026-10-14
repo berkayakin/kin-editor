@@ -130,6 +130,9 @@ fn command(root: &Path) -> Command {
         // Never block on an interactive prompt: fail fast instead.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
+        // `git status` would otherwise refresh .git/index, which the project
+        // watcher sees as a change and answers with another status.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null());
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");

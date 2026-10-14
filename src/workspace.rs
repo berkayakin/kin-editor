@@ -24,6 +24,7 @@ use crate::{
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
     input_dialog::{InputDialog, InputDialogEvent},
+    watcher::{self, FsChange, GitPath, Watcher},
     onboarding::{Onboarding, OnboardingEvent},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     push_dialog::{PushDialog, PushDialogEvent},
@@ -412,6 +413,13 @@ pub struct Workspace {
     session_task: Option<Task<()>>,
     /// Debounced write of the window's place on screen.
     placement_task: Option<Task<()>>,
+    /// Watches the project folder; `watch_task` applies what it reports.
+    watcher: Option<Watcher>,
+    watch_task: Option<Task<()>>,
+    /// The project's .gitignore, to skip Git refreshes for ignored churn.
+    ignore: Option<ignore::gitignore::Gitignore>,
+    /// A Git refresh was asked for while one was running.
+    git_refresh_again: bool,
     /// Welcome Setup, shown in place of everything below the title bar.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     /// Language servers for this window's files.
@@ -581,6 +589,10 @@ impl Workspace {
             session_task: None,
             placement_task: None,
             onboarding: None,
+            watcher: None,
+            watch_task: None,
+            ignore: None,
+            git_refresh_again: false,
             lsp,
             preferences_page: preferences::Page::Appearance,
             _subscriptions: vec![
@@ -732,6 +744,7 @@ impl Workspace {
         self.show_sidebar = true;
         self.rebuild_tree();
         self.refresh_file_index(cx);
+        self.start_watching(cx);
         if let Some(root) = self.root.clone() {
             self.detect_repo(root, cx);
         }
@@ -997,6 +1010,85 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- Watching the disk --------------------------------------------------------
+
+    /// Watches the project folder so changes made outside Kin show up right away.
+    fn start_watching(&mut self, cx: &mut Context<Self>) {
+        self.watcher = None;
+        self.watch_task = None;
+        let Some(root) = self.root.clone() else { return };
+        self.ignore = project_ignore(&root);
+        let (watcher, mut changes) = match Watcher::new(&root) {
+            Ok(watching) => watching,
+            Err(err) => {
+                eprintln!("couldn't watch {}: {err}", root.display());
+                return;
+            }
+        };
+        self.watcher = Some(watcher);
+        self.watch_task = Some(cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
+            while let Some(mut batch) = changes.next().await {
+                // A burst (a checkout, npm install) becomes one update.
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                while let Ok(more) = changes.try_recv() {
+                    batch.extend(more);
+                }
+                if this.update(cx, |ws, cx| ws.disk_changed(batch, cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Updates what a batch of changes on disk affects: the tree (only for
+    /// folders it shows), Go to File, Git status and open files.
+    fn disk_changed(&mut self, changes: Vec<FsChange>, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else { return };
+        let (mut tree, mut index, mut git) = (false, false, false);
+        let mut paths = HashSet::new();
+        for change in changes {
+            match watcher::git_path(&change.path) {
+                GitPath::Metadata => git = true,
+                GitPath::Internal => {}
+                GitPath::WorkTree => {
+                    if change.structural && change.path.parent().is_some_and(|p| self.expanded.contains(p)) {
+                        tree = true;
+                    }
+                    if watcher::in_heavy_folder(&root, &change.path) || !change.path.starts_with(&root) {
+                        continue;
+                    }
+                    if change.path.file_name().is_some_and(|n| n == ".gitignore") {
+                        self.ignore = project_ignore(&root);
+                    }
+                    let ignored = |path: &Path| {
+                        path.starts_with(&root)
+                            && self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(path, false).is_ignore())
+                    };
+                    // Go to File lists ignored files, but not inside ignored folders.
+                    index |= change.structural && !change.path.parent().is_some_and(ignored);
+                    git |= !ignored(&change.path);
+                    paths.insert(change.path);
+                }
+            }
+        }
+        if tree {
+            self.rebuild_tree();
+            cx.notify();
+        }
+        if index {
+            self.refresh_file_index(cx);
+        }
+        if git {
+            self.refresh_git(cx);
+        }
+        for editor in self.tabs.clone() {
+            if editor.read(cx).doc.path.as_ref().is_some_and(|p| paths.contains(p)) {
+                editor.update(cx, |e, cx| e.reload_if_changed(cx));
+            }
+        }
+    }
+
     /// Rescans project files in the background (for Go to File).
     fn refresh_file_index(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.root.clone() else {
@@ -1187,6 +1279,8 @@ impl Workspace {
         self.recent.clear();
         self.file_index = Arc::new(Vec::new());
         self.index_task = None;
+        self.watcher = None;
+        self.watch_task = None;
         self.root = None;
         self.repo = None;
         self.git_remote = None;
@@ -2044,6 +2138,13 @@ impl Workspace {
                 ws.last_commit = None;
                 ws.git_status = Arc::new(RepoStatus::default());
                 ws.git_paths = Arc::new(HashMap::new());
+                // A repository above the project folder: watch its .git too.
+                if let (Some(repo), Some(root), Some(watcher)) = (&repo, &ws.root, ws.watcher.as_mut())
+                    && !repo.starts_with(root)
+                    && let Err(err) = watcher.add(&repo.join(".git"))
+                {
+                    eprintln!("couldn't watch {}: {err}", repo.display());
+                }
                 ws.git_log.update(cx, |l, cx| l.set_repo(repo.clone(), cx));
                 ws.git_panel.update(cx, |p, cx| {
                     p.set_repo(repo, project, cx);
@@ -2064,6 +2165,8 @@ impl Workspace {
     fn refresh_git(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
         if self.status_task.is_some() {
+            // Changes made while git was reading must not be missed.
+            self.git_refresh_again = true;
             return;
         }
         self.status_task = Some(cx.spawn(async move |this, cx| {
@@ -2074,6 +2177,9 @@ impl Workspace {
                 .await;
             this.update(cx, |ws, cx| {
                 ws.status_task = None;
+                if std::mem::take(&mut ws.git_refresh_again) {
+                    ws.refresh_git(cx);
+                }
                 if ws.last_commit != last_commit {
                     ws.last_commit = last_commit;
                     cx.notify();
@@ -5549,6 +5655,14 @@ impl Render for Workspace {
 }
 
 use crate::ui::{file_icon, folder_icon};
+
+/// The project's .gitignore and .git/info/exclude.
+fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.add(root.join(".gitignore"));
+    builder.add(root.join(".git/info/exclude"));
+    builder.build().ok()
+}
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }

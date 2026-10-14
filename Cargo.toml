@@ -51,6 +51,7 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 url = "2.5.8"
+notify = "8"
 
 [target.'cfg(unix)'.dependencies]
 # setsid for the login shell that reports PATH, so it can't take over Kin's terminal.

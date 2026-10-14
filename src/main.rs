@@ -35,6 +35,7 @@ mod theme;
 mod theme_picker;
 mod ui;
 mod updater;
+mod watcher;
 mod workspace;
 mod wrap;
 

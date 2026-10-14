@@ -66,6 +66,8 @@ platform-native text rendering (CoreText / DirectWrite).
   in its own terminal tab with a pass/fail icon; see [Run and test](#run-and-test)
 - Image preview: PNG, JPEG, GIF (animated), WebP, BMP, TIFF, ICO, TGA and QOI files open as a
   picture with their dimensions and size (SVG stays text); Git diffs show an image's before and after
+- Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
+  follow changes made outside Kin (a checkout, a generator, another editor) as they happen
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
   Reveal in Finder; tabs, custom title bar, IME support
 - A Settings dialog for every option, with search across its pages; see [Settings](#settings)
