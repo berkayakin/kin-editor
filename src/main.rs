@@ -1,6 +1,7 @@
 mod about;
 mod assets;
 mod branch_picker;
+mod cli;
 mod clone_dialog;
 mod conflict;
 mod context_menu;
@@ -53,7 +54,7 @@ use crate::{
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
-        ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol,
+        ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol, InstallShellCommand,
     },
 };
 
@@ -67,6 +68,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Welcome Setup…", WelcomeSetup),
+                MenuItem::action("Install 'kin' Shell Command", InstallShellCommand),
                 MenuItem::separator(),
                 MenuItem::action("Quit Kin", Quit),
             ],
@@ -220,65 +222,98 @@ fn main() {
     #[cfg(target_os = "macos")]
     set_app_name();
 
-    Application::new()
-        .with_assets(assets::Assets)
-        .run(move |cx: &mut App| {
-            #[cfg(target_os = "macos")]
-            set_dock_icon();
-            assets::load_fonts(cx);
-            // Settings first: the theme and key bindings come from them.
-            let problems = settings::init(cx);
-            cx.set_global(settings::StartupProblems(problems));
-            theme::init(cx);
-            updater::init(cx);
-            cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));
-            cx.on_action(|_: &DecreaseFontSize, cx| theme::zoom(Some(-1.), cx));
-            cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));
-            // Quitting asks each window with unsaved edits in turn.
-            cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
-            cx.on_action(|_: &about::About, cx| about::open(cx));
-            cx.on_action(|_: &NewWindow, cx| {
-                workspace::open_window(None, cx, |_, _, _| {});
-            });
-            cx.set_menus(menus());
-            // Menu items show their shortcuts; another keymap changes them.
-            cx.observe_global::<keymap::Installed>(|cx| cx.set_menus(menus())).detach();
-
-            // Each folder on the command line gets its own window, like Zed;
-            // files open in the first one. Without paths, reopen the last project.
-            let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = args
-                .into_iter()
-                .map(|p| p.canonicalize().unwrap_or(p))
-                .partition(|p| p.is_dir());
-            let mut dirs = dirs.into_iter();
-            let first_dir = dirs.next();
-            let restore = first_dir.is_none() && files.is_empty();
-            let onboarding = state::SessionState::needs_onboarding();
-            let mut last = workspace::open_window(None, cx, move |workspace, window, cx| {
-                if restore {
-                    workspace.restore_last_project(window, cx);
+    // Finder (Open With, double-click) and the `kin` command send paths as
+    // open-file events; they're handled once the app is running.
+    let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    let app = Application::new().with_assets(assets::Assets);
+    app.on_open_urls(move |urls| {
+        let _ = open_tx.unbounded_send(urls);
+    });
+    app.run(move |cx: &mut App| {
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+            while let Some(urls) = open_rx.next().await {
+                let paths = cli::paths_from_urls(&urls);
+                if !paths.is_empty() && cx.update(|cx| open_external(paths, cx)).is_err() {
+                    break;
                 }
-                if let Some(dir) = first_dir {
-                    workspace.set_root(dir, window, cx);
-                }
-                for path in files {
-                    workspace.open_path(path, window, cx);
-                }
-                if onboarding {
-                    workspace.show_onboarding(window, cx);
-                }
-            });
-            for dir in dirs {
-                let near = last.and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok());
-                last = workspace::open_window(near, cx, move |workspace, window, cx| workspace.set_root(dir, window, cx)).or(last);
             }
-            cx.activate(true);
-            // The About window alone doesn't keep Kin running.
-            cx.on_window_closed(|cx| {
-                if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {
-                    cx.quit();
-                }
-            })
-            .detach();
+        })
+        .detach();
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
+        assets::load_fonts(cx);
+        // Settings first: the theme and key bindings come from them.
+        let problems = settings::init(cx);
+        cx.set_global(settings::StartupProblems(problems));
+        theme::init(cx);
+        updater::init(cx);
+        cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));
+        cx.on_action(|_: &DecreaseFontSize, cx| theme::zoom(Some(-1.), cx));
+        cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));
+        // Quitting asks each window with unsaved edits in turn.
+        cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
+        cx.on_action(|_: &about::About, cx| about::open(cx));
+        cx.on_action(|_: &NewWindow, cx| {
+            workspace::open_window(None, cx, |_, _, _| {});
         });
+        cx.set_menus(menus());
+        // Menu items show their shortcuts; another keymap changes them.
+        cx.observe_global::<keymap::Installed>(|cx| cx.set_menus(menus())).detach();
+
+        // Each folder on the command line gets its own window, like Zed;
+        // files open in the first one. Without paths, reopen the last project.
+        let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = args
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .partition(|p| p.is_dir());
+        let mut dirs = dirs.into_iter();
+        let first_dir = dirs.next();
+        let restore = first_dir.is_none() && files.is_empty();
+        let onboarding = state::SessionState::needs_onboarding();
+        let mut last = workspace::open_window(None, cx, move |workspace, window, cx| {
+            if restore {
+                workspace.restore_last_project(window, cx);
+            }
+            if let Some(dir) = first_dir {
+                workspace.set_root(dir, window, cx);
+            }
+            for path in files {
+                workspace.open_path(path, window, cx);
+            }
+            if onboarding {
+                workspace.show_onboarding(window, cx);
+            }
+        });
+        for dir in dirs {
+            let near = last.and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok());
+            last = workspace::open_window(near, cx, move |workspace, window, cx| workspace.set_root(dir, window, cx)).or(last);
+        }
+        cx.activate(true);
+        // The About window alone doesn't keep Kin running.
+        cx.on_window_closed(|cx| {
+            if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {
+                cx.quit();
+            }
+        })
+        .detach();
+    });
+}
+
+/// Opens paths from another app in the frontmost Kin window (a new one
+/// when there's none).
+fn open_external(paths: Vec<std::path::PathBuf>, cx: &mut App) {
+    cx.activate(true);
+    let window = cx
+        .active_window()
+        .and_then(|w| w.downcast::<workspace::Workspace>())
+        .or_else(|| cx.windows().into_iter().find_map(|w| w.downcast::<workspace::Workspace>()));
+    match window {
+        Some(window) => {
+            window.update(cx, |ws, window, cx| ws.open_external(paths, window, cx)).ok();
+        }
+        None => {
+            workspace::open_window(None, cx, move |ws, window, cx| ws.open_external(paths, window, cx));
+        }
+    }
 }

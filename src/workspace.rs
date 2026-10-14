@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
     CursorStyle, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, PromptLevel, Render,
     SharedString, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
@@ -124,6 +124,8 @@ actions!(
         WelcomeSetup,
         GoToSymbol,
         SplitTerminal,
+        SelectOpenedFile,
+        InstallShellCommand,
     ]
 );
 
@@ -245,6 +247,13 @@ struct DraggedTab {
     name: SharedString,
 }
 
+/// A file tree entry being dragged onto a folder.
+#[derive(Clone)]
+struct DraggedEntry {
+    path: PathBuf,
+    name: SharedString,
+}
+
 /// What the drag shows under the pointer.
 struct DraggedTabView(SharedString);
 
@@ -275,6 +284,7 @@ enum TabAction {
     TogglePin,
     SplitRight,
     SplitDown,
+    SelectInTree,
 }
 
 /// What a context menu item does.
@@ -369,6 +379,9 @@ pub struct Workspace {
     active_terminal: usize,
     /// A second terminal shown beside the active one.
     split_terminal: Option<Entity<TerminalView>>,
+    /// While dragging over the tree: the folder a drop would go into.
+    tree_drop: Option<PathBuf>,
+
     /// For Rerun.
     last_run: Option<RunTarget>,
     sidebar_width: Pixels,
@@ -564,6 +577,8 @@ impl Workspace {
             terminals: Vec::new(),
             active_terminal: 0,
             split_terminal: None,
+            tree_drop: None,
+
             last_run: None,
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
@@ -2080,6 +2095,11 @@ impl Workspace {
                 cx.notify();
                 return;
             }
+            TabAction::SelectInTree => {
+                self.activate_editor(editor, window, cx);
+                self.select_opened_file(&SelectOpenedFile, window, cx);
+                return;
+            }
             TabAction::SplitRight | TabAction::SplitDown => {
                 self.activate_editor(editor, window, cx);
                 let axis = if action == TabAction::SplitRight { PaneAxis::Row } else { PaneAxis::Column };
@@ -2119,6 +2139,12 @@ impl Workspace {
         );
         if let Some(path) = path {
             add(MenuEntry::Separator, None);
+            if self.root.as_deref().is_some_and(|r| path.starts_with(r)) {
+                add(
+                    MenuEntry::item("Select in File Tree", Icon::FolderTree).shortcut(binding_label(&SelectOpenedFile, window)),
+                    tab(TabAction::SelectInTree),
+                );
+            }
             add(MenuEntry::item("Copy Path", Icon::Clipboard), Some(MenuAction::Tree(TreeAction::CopyPath(path.clone()))));
             add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(MenuAction::Tree(TreeAction::Reveal(path))));
         }
@@ -3977,6 +4003,151 @@ impl Workspace {
         }
     }
 
+    /// Moves a dragged file or folder into `dir`, keeping open tabs on it.
+    fn move_entry(&mut self, from: PathBuf, dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = from.file_name() else { return };
+        let to = dir.join(name);
+        if from.parent() == Some(dir.as_path()) || to == from {
+            return;
+        }
+        let problem = if dir.starts_with(&from) {
+            Some("A folder can't go inside itself".to_string())
+        } else if to.exists() {
+            Some(format!("{} already has {}", folder_name(&dir), name.to_string_lossy()))
+        } else {
+            std::fs::rename(&from, &to).err().map(|e| e.to_string())
+        };
+        if let Some(problem) = problem {
+            self.toast(ToastKind::Error, "Couldn't move", Some(problem), cx);
+            return;
+        }
+        self.moved(&from, &to, cx);
+        self.expanded.insert(dir);
+        self.reveal_in_tree(&to);
+        self.after_fs_change(cx);
+        self.schedule_session_save(cx);
+    }
+
+    fn set_tree_drop(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.tree_drop != target {
+            self.tree_drop = target;
+            cx.notify();
+        }
+    }
+
+
+    /// Finder files dropped on the tree: copied into `dir` (under a free
+    /// name if taken); then, like JetBrains, an offer to add them to Git.
+    fn drop_into_tree(&mut self, paths: Vec<PathBuf>, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_drop = None;
+        let mut added = Vec::new();
+        let mut problems = Vec::new();
+        for source in paths {
+            let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if dir.starts_with(&source) {
+                problems.push(format!("{name} can't go inside itself"));
+                continue;
+            }
+            match copy_into(&source, &dir) {
+                Ok(path) => added.push(path),
+                Err(err) => problems.push(format!("{name}: {err}")),
+            }
+        }
+        if !problems.is_empty() {
+            self.toast(ToastKind::Error, "Couldn't copy everything", Some(problems.join("\n")), cx);
+        }
+        let Some(first) = added.first().cloned() else { return };
+        self.expanded.insert(dir.clone());
+        self.reveal_in_tree(&first);
+        self.after_fs_change(cx);
+        self.schedule_session_save(cx);
+        let Some(repo) = self.repo.clone().filter(|r| added.iter().all(|p| p.starts_with(r))) else { return };
+        let ignored: Vec<bool> = added.iter().map(|p| self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(p, p.is_dir()).is_ignore())).collect();
+        let added: Vec<PathBuf> = added.into_iter().zip(ignored).filter(|(_, ignored)| !ignored).map(|(p, _)| p).collect();
+        if added.is_empty() {
+            return;
+        }
+        let names: Vec<String> = added.iter().filter_map(|p| p.strip_prefix(&repo).ok()).map(|p| p.display().to_string()).collect();
+        let message = if names.len() == 1 { "Add the file to Git?".to_string() } else { format!("Add {} files to Git?", names.len()) };
+        let detail = names.iter().take(6).cloned().collect::<Vec<_>>().join("\n");
+        let answer = window.prompt(PromptLevel::Info, &message, Some(&detail), &["Add", "Don't Add"], cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let mut args = vec!["add".to_string(), "--".to_string()];
+            args.extend(names);
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let repo = repo.clone();
+                    async move { git::run(&repo, &args.iter().map(String::as_str).collect::<Vec<_>>()) }
+                })
+                .await;
+            this.update(cx, |ws, cx| {
+                if let Err(err) = result {
+                    ws.toast(ToastKind::Error, "Couldn't add to Git", Some(err), cx);
+                }
+                ws.refresh_git(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Files and folders dropped from Finder: folders open as projects,
+    /// files in this window.
+    fn open_dropped(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        for path in paths {
+            if path.is_dir() {
+                self.open_project(path.clone(), OpenIn::Auto, window, cx);
+            } else {
+                self.open_path(path.clone(), window, cx);
+            }
+        }
+    }
+
+    /// Opens what another app asked Kin to open (Finder, the `kin` command).
+    pub fn open_external(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        window.activate_window();
+        self.open_dropped(&paths, window, cx);
+    }
+
+    /// Installs the `kin` command (it may ask for an administrator password).
+    fn install_shell_command(&mut self, _: &InstallShellCommand, _: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(async { crate::cli::install() }).await;
+            this.update(cx, |ws, cx| match result {
+                Ok(()) => {
+                    let detail = format!("{} opens files and folders here: kin . or kin file.rs", crate::cli::COMMAND_PATH);
+                    ws.toast(ToastKind::Success, "Installed the kin command", Some(detail), cx);
+                }
+                Err(err) if err == "Cancelled" => {}
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't install the kin command", Some(err), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows the active file in the tree: opens its folders and scrolls to it.
+    fn select_opened_file(&mut self, _: &SelectOpenedFile, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) else { return };
+        if !self.root.as_deref().is_some_and(|r| path.starts_with(r)) {
+            return;
+        }
+        self.show_sidebar = true;
+        self.sidebar_mode = SidebarMode::Files;
+        self.reveal_in_tree(&path);
+        self.rebuild_tree();
+        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
+            self.tree_scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        }
+        self.save_state();
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
     /// Expands the folders above `path` so it's visible in the tree.
     fn reveal_in_tree(&mut self, path: &Path) {
         let Some(root) = self.root.clone() else { return };
@@ -4394,6 +4565,8 @@ impl Workspace {
             let expanded = self.expanded.clone();
             let git_paths = self.git_paths.clone();
             let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
+            let tree_drop = self.tree_drop.clone();
+            let drop_on_root = tree_drop.is_some() && tree_drop == self.root;
             uniform_list(
                 "file-tree",
                 entries.len(),
@@ -4411,6 +4584,10 @@ impl Workspace {
                             };
                             let is_open = e.is_dir && expanded.contains(&e.path);
                             let icon = if e.is_dir { folder_icon(is_open, px(16.), theme) } else { file_icon(&e.path, px(16.), theme) };
+                            // Dropping on a file moves into the folder it's in.
+                            let drop_dir = if e.is_dir { e.path.clone() } else { e.path.parent().map(Path::to_path_buf).unwrap_or_default() };
+                            let dragged = DraggedEntry { path: e.path.clone(), name: e.name.clone() };
+                            let is_target = e.is_dir && tree_drop.as_deref() == Some(e.path.as_path());
                             div().w_full().px_1p5().child(div()
                                 .id(ix)
                                 .w_full()
@@ -4426,6 +4603,36 @@ impl Workspace {
                                 .when(selected, |el| el.bg(theme.accent_soft))
                                 .when(!selected, |el| el.hover(|s| s.bg(theme.hover)))
                                 .on_click(cx.listener(move |ws, _, window, cx| ws.click_entry(ix, window, cx)))
+                                .on_drag(dragged, |entry, _, _, cx| cx.new(|_| DraggedTabView(entry.name.clone())))
+                                // While dragging, the folder a drop goes into lights up (see `tree_drop`).
+                                .when(is_target, |el| el.bg(theme.accent_soft).border_1().border_color(Hsla::from(theme.accent).alpha(0.7)))
+                                .on_drag_move(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, ev: &DragMoveEvent<DraggedEntry>, _, cx| {
+                                        if ev.bounds.contains(&ev.event.position) {
+                                            ws.set_tree_drop(Some(dir.clone()), cx);
+                                        }
+                                    }
+                                }))
+                                .on_drag_move(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, ev: &DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                                        if ev.bounds.contains(&ev.event.position) {
+                                            ws.set_tree_drop(Some(dir.clone()), cx);
+                                        }
+                                    }
+                                }))
+                                .on_drop(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, dragged: &DraggedEntry, _, cx| {
+                                        cx.stop_propagation();
+                                        ws.move_entry(dragged.path.clone(), dir.clone(), cx);
+                                    }
+                                }))
+                                .on_drop(cx.listener(move |ws, paths: &gpui::ExternalPaths, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.drop_into_tree(paths.paths().to_vec(), drop_dir.clone(), window, cx);
+                                }))
                                 .when(menu_target.as_deref() == Some(e.path.as_path()), |el| {
                                     el.border_1().border_color(Hsla::from(theme.accent).alpha(0.6))
                                 })
@@ -4466,6 +4673,29 @@ impl Workspace {
                 }),
             )
             .track_scroll(self.tree_scroll.clone())
+            // Over the tree but not on a row, a drop goes to the project folder;
+            // rows (told later) narrow it to theirs.
+            .on_drag_move(cx.listener(|ws, ev: &DragMoveEvent<DraggedEntry>, _, cx| {
+                let target = ev.bounds.contains(&ev.event.position).then(|| ws.root.clone()).flatten();
+                ws.set_tree_drop(target, cx);
+            }))
+            .on_drag_move(cx.listener(|ws, ev: &DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                let target = ev.bounds.contains(&ev.event.position).then(|| ws.root.clone()).flatten();
+                ws.set_tree_drop(target, cx);
+            }))
+            // The project folder itself has no row: outline the tree instead.
+            .when(drop_on_root, |el| el.border_1().border_color(Hsla::from(theme.accent).alpha(0.7)).rounded(px(6.)))
+            .on_drop(cx.listener(|ws, dragged: &DraggedEntry, _, cx| {
+                if let Some(root) = ws.root.clone() {
+                    ws.move_entry(dragged.path.clone(), root, cx);
+                }
+            }))
+            .on_drop(cx.listener(|ws, paths: &gpui::ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                if let Some(root) = ws.root.clone() {
+                    ws.drop_into_tree(paths.paths().to_vec(), root, window, cx);
+                }
+            }))
             .flex_1()
             .pt_1p5()
             .pb_2()
@@ -4767,6 +4997,7 @@ impl Workspace {
                 .into_any_element(),
         };
         let multiple = self.panes.len() > 1;
+        let drop_group = SharedString::from(format!("pane-drop-{pane_ix}"));
         div()
             .relative()
             .flex()
@@ -4804,6 +5035,52 @@ impl Workspace {
                     }))
                     .child(content),
             )
+            // Finder files dragged anywhere over the pane (tabs included) open in it.
+            .group(drop_group.clone())
+            .child(
+                // Shown by GPUI while Finder files are over the pane, so there's no
+                // state to go stale. Being the drop target also gives it the
+                // hitbox GPUI needs to apply drag styles; hidden, it takes no events.
+                div()
+                    .invisible()
+                    .group_drag_over::<gpui::ExternalPaths>(drop_group, |s| s.visible())
+                    .on_drop(cx.listener(move |ws, paths: &gpui::ExternalPaths, window, cx| {
+                        cx.stop_propagation();
+                        ws.active_pane = pane_ix;
+                        ws.open_dropped(paths.paths(), window, cx);
+                    }))
+                    .absolute()
+                    .inset_0()
+                    .p_2()
+                    .child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(10.))
+                        .border_2()
+                        .border_dashed()
+                        .border_color(Hsla::from(theme.accent).alpha(0.8))
+                        .bg(Hsla::from(theme.accent).alpha(0.08))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_1p5()
+                                .rounded(px(8.))
+                                .bg(theme.elevated)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_lg()
+                                .text_color(theme.text)
+                                .child(icon_el(Icon::FileCode, px(15.), theme.accent.into()))
+                                .child("Drop to open"),
+                        ),
+                    ),
+            )
             .when(pane_ix + 1 < self.panes.len(), |el| el.child(self.resize_handle(Edge::Pane(pane_ix), cx)))
             .into_any_element()
     }
@@ -4814,9 +5091,14 @@ impl Workspace {
         let (path, symbols) = editor.update(cx, |e, _| (e.doc.path.clone(), e.doc.image.is_none().then(|| e.breadcrumbs())));
         let path = path?;
         let theme = Theme::get(cx).clone();
+        let inside = self.root.as_deref().is_some_and(|r| path.starts_with(r));
         let rel = self.display_rel(&path);
         let mut parts: Vec<String> = rel.split(['/', '\\']).map(str::to_string).collect();
         let file = parts.pop().unwrap_or_default();
+        // A file outside the project: its folder is enough context.
+        if !inside {
+            parts = parts.pop().into_iter().collect();
+        }
         let chevron = || icon_el(Icon::ChevronRight, px(11.), theme.text_dim.into());
         let mut row = div()
             .flex()
@@ -5555,7 +5837,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Forgets where a drag would drop. Called when a drag ends any way at
+    /// all, since GPUI doesn't redraw by itself when one is cancelled.
+    fn clear_drag_state(&mut self, cx: &mut Context<Self>) {
+        // The drop overlays are drag_over styles: they only need a redraw.
+        self.tree_drop = None;
+        cx.notify();
+    }
+
     fn on_root_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_drop.is_some() {
+            self.clear_drag_state(cx);
+        }
         if self.resizing.take().is_some() {
             self.save_state();
             self.schedule_session_save(cx);
@@ -5886,6 +6179,10 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_window_title(window, cx);
+        // A drag that ended without a drop (Escape, left the window) leaves no highlight.
+        if !cx.has_active_drag() {
+            self.tree_drop = None;
+        }
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
@@ -5954,6 +6251,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::welcome_setup))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::split_terminal))
+            .on_action(cx.listener(Self::select_opened_file))
+            .on_action(cx.listener(Self::install_shell_command))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))
@@ -5964,6 +6263,7 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
+            .on_drop(cx.listener(|ws, paths: &gpui::ExternalPaths, window, cx| ws.open_dropped(paths.paths(), window, cx)))
             .when_some(self.resizing, |el, r| {
                 el.cursor(match r.edge {
                     Edge::Problems => CursorStyle::ResizeUpDown,
@@ -6007,10 +6307,60 @@ impl Render for Workspace {
             .children(toasts)
             .children(self.render_context_menu(cx))
             .children(modal)
+            .child({
+                // A Finder drag that leaves the window or is cancelled only sends
+                // FileDropEvent::Exited; listen for it to drop the highlights.
+                let this = cx.entity().downgrade();
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let this = this.clone();
+                        window.on_mouse_event(move |event: &gpui::FileDropEvent, _, _, cx| {
+                            if matches!(event, gpui::FileDropEvent::Exited) {
+                                this.update(cx, |ws, cx| ws.clear_drag_state(cx)).ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_0()
+            })
     }
 }
 
 use crate::ui::{file_icon, folder_icon};
+
+/// Copies a file or folder into `dir`, as "name copy" when the name is
+/// taken. Returns where it went.
+fn copy_into(source: &Path, dir: &Path) -> std::io::Result<PathBuf> {
+    let name = source.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let mut target = dir.join(name);
+    if target.exists() {
+        let path = Path::new(name);
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().filter(|_| !source.is_dir()).map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let stem = if source.is_dir() { name.to_string_lossy().into_owned() } else { stem };
+        target = (1..1000)
+            .map(|n| dir.join(if n == 1 { format!("{stem} copy{ext}") } else { format!("{stem} copy {n}{ext}") }))
+            .find(|p| !p.exists())
+            .ok_or_else(|| std::io::Error::other("no free name"))?;
+    }
+    copy_recursive(source, &target)?;
+    Ok(target)
+}
+
+fn copy_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(source, target).map(|_| ())
+    }
+}
 
 /// The project's .gitignore and .git/info/exclude.
 fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {

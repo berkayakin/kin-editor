@@ -79,7 +79,8 @@ platform-native text rendering (CoreText / DirectWrite).
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
   follow changes made outside Kin (a checkout, a generator, another editor) as they happen
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
-  Reveal in Finder; tabs, custom title bar, IME support
+  Reveal in Finder; drag entries onto a folder to move them (open tabs follow); **Select Opened File**
+  (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; tabs, custom title bar, IME support
 - A Settings dialog for every option, with search across its pages; see [Settings](#settings)
 - Automatic updates from GitHub Releases (signed), installed with **Restart to Update**; see
   [Releases and updates](#releases-and-updates)
@@ -429,6 +430,12 @@ Each window holds one project folder, so several projects can be open side by si
   window. The welcome screen's Recent Projects list works the same way.
 - **New Window** (⌘⇧N) opens an empty window.
 - Opening a folder that's already open in another window brings that window forward.
+- Files and folders dragged from Finder go where you drop them: onto the editor area they open
+  (a "Drop to open" frame shows while dragging); onto the file tree they're copied into the
+  highlighted folder, and in a Git project Kin offers to add them to Git. Kin is listed in Finder's
+  **Open With** for files and folders (the release app). **Install 'kin' Shell Command** (Kin menu
+  or Find Action) adds `/usr/local/bin/kin`, asking for an administrator password if needed:
+  `kin .` or `kin src/main.rs` opens them in the running Kin.
 - Quitting or closing a project window doesn't ask about unsaved edits: they're kept and come back
   with the project's tabs. Windows without a project folder still ask.
 

@@ -11,6 +11,10 @@ icon = ["assets/app-icon/macos/Kin.icns", "assets/app-icon/linux/hicolor/*/apps/
 category = "public.app-category.developer-tools"
 short_description = "A small, fast GPU-rendered code editor"
 
+[package.metadata.bundle.osx]
+# Lets Finder offer Kin in Open With for folders and files (Alternate: never the default app).
+info_plist_exts = ["assets/macos/document-types.plist"]
+
 [dependencies]
 alacritty_terminal = { version = "0.26.0", default-features = false }
 futures = "0.3.34"

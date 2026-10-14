@@ -26,7 +26,7 @@ use crate::{
         PrevTab, Quit, RecentFiles, RecentProjects, Replace,
         GitBranches, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
-        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal,
+        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, SelectOpenedFile, InstallShellCommand,
     },
 };
 
@@ -214,6 +214,7 @@ fn jetbrains(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-alt-b", GoToImplementation, e),
         KeyBinding::new("ctrl-shift-b", GoToTypeDefinition, e),
         KeyBinding::new("alt-f7", FindUsages, e),
+        KeyBinding::new("alt-f1", SelectOpenedFile, None),
         KeyBinding::new("shift-f6", RenameSymbol, e),
         KeyBinding::new("alt-enter", ShowContextActions, e),
         KeyBinding::new("secondary-alt-l", ReformatCode, e),
@@ -615,6 +616,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Go to Type Definition", GoToTypeDefinition),
         a("Go to Symbol", GoToSymbol),
         a("Split Terminal", SplitTerminal),
+        a("Select Opened File", SelectOpenedFile),
+        a("Install 'kin' Shell Command", InstallShellCommand),
         a("Find Usages", FindUsages),
         a("Rename…", RenameSymbol),
         a("Show Context Actions", ShowContextActions),
