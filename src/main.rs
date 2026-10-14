@@ -58,7 +58,7 @@ use crate::{
     workspace::{
         CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings, OpenExtensions,
         ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
-        GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
+        GitInit, GitPull, GitPush, GoToFile, GoToLine, MinimizeWindow, ZoomWindow, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
         ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol, InstallShellCommand,
@@ -197,6 +197,15 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Clone Repository…", GitClone),
                 MenuItem::action("Initialize Repository", GitInit),
+            ],
+        },
+        // GPUI makes the menu named "Window" the app's windows menu: macOS then
+        // lists the open windows in it and in the Dock icon's menu.
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", MinimizeWindow),
+                MenuItem::action("Zoom", ZoomWindow),
             ],
         },
     ]

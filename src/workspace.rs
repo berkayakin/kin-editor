@@ -66,6 +66,8 @@ actions!(
         NewFile,
         NewWindow,
         CloseWindow,
+        MinimizeWindow,
+        ZoomWindow,
         OpenFile,
         OpenFolder,
         OpenFolderInThisWindow,
@@ -1357,6 +1359,14 @@ impl Workspace {
 
     fn new_window(&mut self, _: &NewWindow, window: &mut Window, cx: &mut Context<Self>) {
         open_window(Some(window.bounds()), cx, |_, _, _| {});
+    }
+
+    fn minimize_window(&mut self, _: &MinimizeWindow, window: &mut Window, _: &mut Context<Self>) {
+        window.minimize_window();
+    }
+
+    fn zoom_window(&mut self, _: &ZoomWindow, window: &mut Window, _: &mut Context<Self>) {
+        window.zoom_window();
     }
 
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -6860,6 +6870,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::install_shell_command))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
+            .on_action(cx.listener(Self::minimize_window))
+            .on_action(cx.listener(Self::zoom_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))
             .on_action(cx.listener(Self::recent_projects))
             .on_action(cx.listener(Self::cancel))
