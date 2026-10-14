@@ -42,6 +42,9 @@ pub enum PickerMode {
     Locations,
     /// Run configurations; see [`Picker::set_run_targets`].
     Run,
+    /// Symbols across the project from the language servers; the workspace
+    /// answers [`PickerEvent::SymbolQuery`] with [`Picker::set_locations`].
+    Symbols,
 }
 
 /// One place in a [`PickerMode::Locations`] list.
@@ -51,8 +54,9 @@ pub struct LocationRow {
     pub file: String,
     /// 1-based.
     pub line: usize,
-    /// The line's text, trimmed.
+    /// The line's text, trimmed (Symbols: the symbol's name).
     pub preview: String,
+    pub encoding: Encoding,
 }
 
 pub struct ActionEntry {
@@ -67,6 +71,8 @@ pub enum PickerEvent {
     /// Jump to an offset in the active editor.
     GoTo(usize),
     OpenLocation { location: Location, encoding: Encoding },
+    /// Symbols mode: the query changed.
+    SymbolQuery(String),
     Run(RunTarget),
     Dismissed,
 }
@@ -120,7 +126,6 @@ pub struct Picker {
     /// The symbol around the caret, preselected like JetBrains.
     current_symbol: Option<usize>,
     locations: Arc<Vec<LocationRow>>,
-    location_encoding: Encoding,
     run_targets: Arc<Vec<RunTarget>>,
     /// Overrides the mode's title (Locations: "Usages of foo").
     title: Option<SharedString>,
@@ -157,11 +162,20 @@ impl Picker {
             PickerMode::Structure => "Search symbols",
             PickerMode::Locations => "Filter",
             PickerMode::Run => "Run configuration",
+            PickerMode::Symbols => "Search symbols in the project",
         };
         let query = cx.new(|cx| Editor::single_line(placeholder, cx));
         window.focus(&query.focus_handle(cx));
         let shortcuts = Arc::new(actions.iter().map(|a| binding_label(a.action.as_ref(), window)).collect());
-        let subscription = cx.subscribe(&query, |this, _, _: &EditorEvent, cx| this.update_items(cx));
+        let subscription = cx.subscribe(&query, |this, query, _: &EditorEvent, cx| {
+            if this.mode == PickerMode::Symbols {
+                // The current results stay put until the server answers the
+                // new query, so the list doesn't jump on every key.
+                cx.emit(PickerEvent::SymbolQuery(query.read(cx).text()));
+                return;
+            }
+            this.update_items(cx)
+        });
         let mut this = Self {
             mode,
             query,
@@ -173,7 +187,7 @@ impl Picker {
             symbols: Arc::new(Vec::new()),
             current_symbol: None,
             locations: Arc::new(Vec::new()),
-            location_encoding: Encoding::Utf16,
+
             run_targets: Arc::new(Vec::new()),
             title: None,
             items: Arc::new(Vec::new()),
@@ -214,10 +228,11 @@ impl Picker {
     }
 
     /// Fills a Locations picker.
-    pub fn set_locations(&mut self, title: SharedString, rows: Vec<LocationRow>, encoding: Encoding, cx: &mut Context<Self>) {
-        self.title = Some(title);
+    pub fn set_locations(&mut self, title: Option<SharedString>, rows: Vec<LocationRow>, cx: &mut Context<Self>) {
+        if title.is_some() {
+            self.title = title;
+        }
         self.locations = Arc::new(rows);
-        self.location_encoding = encoding;
         self.update_items(cx);
     }
 
@@ -422,7 +437,7 @@ impl Picker {
             items.extend(scored.into_iter().map(|(_, i)| i));
         }
 
-        if self.mode == PickerMode::Locations {
+        if matches!(self.mode, PickerMode::Locations | PickerMode::Symbols) {
             let locations = self.locations.clone();
             let mut scored: Vec<(u32, Item)> = Vec::new();
             for (ix, row) in locations.iter().enumerate() {
@@ -432,6 +447,8 @@ impl Picker {
                         let mut buf = Vec::new();
                         match p.score(Utf32Str::new(&text, &mut buf), &mut self.matcher) {
                             Some(score) => score,
+                            // The server already matched these; just rank them.
+                            None if self.mode == PickerMode::Symbols => 0,
                             None => continue,
                         }
                     }
@@ -490,7 +507,7 @@ impl Picker {
             Some(Item::Run { ix, .. }) => cx.emit(PickerEvent::Run(self.run_targets[*ix].clone())),
             Some(Item::Location { ix }) => cx.emit(PickerEvent::OpenLocation {
                 location: self.locations[*ix].location.clone(),
-                encoding: self.location_encoding,
+                encoding: self.locations[*ix].encoding,
             }),
             _ => {}
         }
@@ -560,12 +577,17 @@ impl Render for Picker {
             PickerMode::Structure => ("File Structure", Icon::Braces, ""),
             PickerMode::Locations => ("", Icon::Search, ""),
             PickerMode::Run => ("Run", Icon::Play, ""),
+            PickerMode::Symbols => ("Symbols", Icon::Braces, ""),
         };
         let title: SharedString = match &self.title {
             Some(t) => t.clone(),
             None => title.into(),
         };
-        let hint = if self.mode == PickerMode::Locations { format!("{} found", self.locations.len()) } else { hint.to_string() };
+        let hint = match self.mode {
+            PickerMode::Locations => format!("{} found", self.locations.len()),
+            PickerMode::Symbols if !self.locations.is_empty() => format!("{} found", self.locations.len()),
+            _ => hint.to_string(),
+        };
         let items = self.items.clone();
         let actions = self.actions.clone();
         let symbols = self.symbols.clone();
@@ -573,6 +595,7 @@ impl Render for Picker {
         let run_targets = self.run_targets.clone();
         let shortcuts = self.shortcuts.clone();
         let selected = self.selected;
+        let mode = self.mode;
         let count = items.len();
 
         let list = uniform_list("picker-items", count, {
@@ -683,7 +706,8 @@ impl Render for Picker {
                                     }
                                     Item::Location { ix } => {
                                         let row_data = &locations[*ix];
-                                        row.child(icon_el(Icon::FileCode, px(14.), theme.text_muted.into()))
+                                        let icon = if mode == PickerMode::Symbols { Icon::Braces } else { Icon::FileCode };
+                                        row.child(icon_el(icon, px(14.), theme.text_muted.into()))
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -693,8 +717,11 @@ impl Render for Picker {
                                                     .child(row_data.preview.clone()),
                                             )
                                             .child(
+                                                // Long paths give way to the name, not the other way round.
                                                 div()
-                                                    .flex_shrink_0()
+                                                    .min_w_0()
+                                                    .max_w(gpui::relative(0.5))
+                                                    .truncate()
                                                     .text_size(px(12.))
                                                     .text_color(theme.text_dim)
                                                     .child(format!("{}:{}", row_data.file, row_data.line)),
@@ -710,9 +737,11 @@ impl Render for Picker {
             })
         })
         .track_scroll(self.scroll.clone())
-        .h(px((count.clamp(1, 12) * 30 + 8) as f32))
-        .w_full()
-        .py_1();
+        .h(px((count.clamp(1, 12) * 30) as f32))
+        .w_full();
+        // Padding goes on a wrapper: GPUI's scroll-to-item counts a list's own
+        // padding twice, so a list that fits its rows would scroll by 8px.
+        let list = div().py_1().child(list);
 
         modal_panel(cx)
             .key_context("Picker")

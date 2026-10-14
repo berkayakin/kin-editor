@@ -163,6 +163,22 @@ pub fn locations(value: &Value) -> Vec<Location> {
     }
 }
 
+/// `workspace/symbol` results: each symbol's name, what it's in (a module,
+/// class…) and where. A `WorkspaceSymbol` may name only its file.
+pub fn workspace_symbols(value: &Value) -> Vec<(String, Option<String>, Location)> {
+    let Some(items) = value.as_array() else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|item| {
+            let location = item.get("location")?;
+            let path = uri_to_path(location.get("uri")?.as_str()?)?;
+            let range = location.get("range").and_then(LspRange::from_json).unwrap_or_default();
+            let container = item.get("containerName").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
+            Some((item.get("name")?.as_str()?.to_string(), container, Location { path, range }))
+        })
+        .collect()
+}
+
 /// The text edits of a WorkspaceEdit, per file. File creation, renames and
 /// deletions are not supported and skipped.
 pub fn workspace_edit(value: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
@@ -607,6 +623,22 @@ pub fn code_actions(value: &Value) -> Vec<CodeAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_symbols_take_both_shapes() {
+        let value = json!([
+            { "name": "parse", "kind": 12, "containerName": "config",
+              "location": { "uri": "file:///p/src/config.rs", "range": { "start": { "line": 4, "character": 7 }, "end": { "line": 4, "character": 12 } } } },
+            // WorkspaceSymbol may point at a file only.
+            { "name": "Config", "kind": 23, "location": { "uri": "file:///p/src/lib.rs" } },
+        ]);
+        let symbols = workspace_symbols(&value);
+        assert_eq!(symbols.len(), 2);
+        assert_eq!((symbols[0].0.as_str(), symbols[0].1.as_deref()), ("parse", Some("config")));
+        assert_eq!(symbols[0].2.range.start, Position { line: 4, character: 7 });
+        assert_eq!(symbols[1].2.path, PathBuf::from("/p/src/lib.rs"));
+        assert_eq!(symbols[1].2.range, LspRange::default());
+    }
 
     #[test]
     fn converts_positions() {

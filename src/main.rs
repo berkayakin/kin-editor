@@ -51,7 +51,7 @@ use crate::{
         GitInit, GitPull, GitPush, GoToFile, GoToLine, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
-        ToggleProblems, ToggleSidebar, WelcomeSetup,
+        ToggleProblems, ToggleSidebar, WelcomeSetup, GoToSymbol,
     },
 };
 
@@ -119,8 +119,11 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Recent Files…", RecentFiles),
                 MenuItem::action("Go to Line…", GoToLine),
                 MenuItem::action("File Structure…", FileStructure),
+                MenuItem::action("Go to Symbol…", GoToSymbol),
                 MenuItem::separator(),
                 MenuItem::action("Go to Declaration", GoToDeclaration),
+                MenuItem::action("Go to Implementation", GoToImplementation),
+                MenuItem::action("Go to Type Definition", GoToTypeDefinition),
                 MenuItem::action("Find Usages", FindUsages),
                 MenuItem::action("Find Action…", FindAction),
             ],

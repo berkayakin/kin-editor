@@ -115,6 +115,8 @@ actions!(
         ShowCompletions,
         QuickDocumentation,
         GoToDeclaration,
+        GoToImplementation,
+        GoToTypeDefinition,
         FindUsages,
         RenameSymbol,
         ShowContextActions,
@@ -688,6 +690,7 @@ impl Editor {
         self.blink_epoch += 1;
         self.blink_task = None;
         self.unfold_at_carets();
+        self.schedule_symbol_highlights(cx);
         self.lsp_selection_changed(cx);
         cx.notify();
     }
@@ -2396,6 +2399,19 @@ impl Editor {
                     frame.search.push(quad);
                 }
 
+                // Other uses of the symbol at the caret (from the language server).
+                let symbols = self.current_symbol_highlights();
+                for r in symbols.iter().skip(symbols.partition_point(|r| r.end < line_start)) {
+                    if r.start > line_end {
+                        break;
+                    }
+                    let Some((s, e, _)) = clip(r.start.max(line_start) - line_start, r.end.min(line_end) - line_start, false) else {
+                        continue;
+                    };
+                    let bounds = Bounds::from_corners(point(origin.x + x_of(s), y + px(1.)), point(origin.x + x_of(e), y + line_height - px(1.)));
+                    frame.search.push(fill(bounds, theme.bracket_match).corner_radii(px(3.)));
+                }
+
                 // Matching brackets (painted with search highlights, under the text).
                 for &b in brackets.iter().filter(|&&b| b >= line_start && b < line_end) {
                     let col = dl.to_display(b - line_start);
@@ -3591,6 +3607,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::show_completions))
             .on_action(cx.listener(Self::quick_documentation))
             .on_action(cx.listener(Self::go_to_declaration))
+            .on_action(cx.listener(Self::go_to_implementation))
+            .on_action(cx.listener(Self::go_to_type_definition))
             .on_action(cx.listener(Self::find_usages))
             .on_action(cx.listener(Self::rename_symbol))
             .on_action(cx.listener(Self::show_context_actions))

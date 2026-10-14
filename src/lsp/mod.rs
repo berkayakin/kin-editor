@@ -463,6 +463,17 @@ impl LspStore {
     }
 
     /// The running server for an open document.
+    /// Every server that's up, for project-wide requests.
+    pub fn running_servers(&self) -> Vec<Arc<Server>> {
+        self.servers
+            .values()
+            .filter_map(|s| match s {
+                ServerState::Running(server) => Some(server.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn server_for(&self, path: &Path) -> Option<Arc<Server>> {
         let doc = self.documents.get(path).filter(|d| d.opened)?;
         match self.servers.get(&doc.server)? {

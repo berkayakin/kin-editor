@@ -33,8 +33,9 @@ platform-native text rendering (CoreText / DirectWrite).
   - **CSS, Rust, Go, Python, PHP, shell, JSON, YAML, TOML** — syntax errors from the tree-sitter parser
     (unexpected and missing tokens)
 - Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
-  signature help, Go to Declaration, Find Usages, Rename and context actions (quick fixes and
-  refactorings); see [Language servers](#language-servers)
+  signature help, Go to Declaration / Implementation / Type Definition, Find Usages, highlighted
+  uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
+  (quick fixes and refactorings); see [Language servers](#language-servers)
 - Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
   (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
 - Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
@@ -205,6 +206,9 @@ The table below is the JetBrains keymap.
 | Collapse all / expand all | ⌘⇧- / ⌘⇧= | Ctrl+Shift+- / Ctrl+Shift+= |
 | Basic completion | ⌃Space | Ctrl+Space |
 | Go to Declaration | ⌘B or ⌘-click | Ctrl+B or Ctrl+click |
+| Go to Implementation | ⌥⌘B | Ctrl+Alt+B |
+| Go to Type Definition | ⌃⇧B | Ctrl+Shift+B |
+| Go to Symbol (project) | Find Action | Ctrl+Alt+Shift+N |
 | Find Usages | ⌥F7 | Alt+F7 |
 | Rename | ⇧F6 | Shift+F6 |
 | Show Context Actions | ⌥↩ | Alt+Enter |

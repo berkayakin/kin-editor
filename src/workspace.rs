@@ -120,6 +120,7 @@ actions!(
         ToggleAutoSave,
         CheckForUpdates,
         WelcomeSetup,
+        GoToSymbol,
     ]
 );
 
@@ -420,6 +421,8 @@ pub struct Workspace {
     ignore: Option<ignore::gitignore::Gitignore>,
     /// A Git refresh was asked for while one was running.
     git_refresh_again: bool,
+    /// The running Go to Symbol request; replaced as the query changes.
+    symbol_task: Option<Task<()>>,
     /// Welcome Setup, shown in place of everything below the title bar.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     /// Language servers for this window's files.
@@ -593,6 +596,7 @@ impl Workspace {
             watch_task: None,
             ignore: None,
             git_refresh_again: false,
+            symbol_task: None,
             lsp,
             preferences_page: preferences::Page::Appearance,
             _subscriptions: vec![
@@ -1424,12 +1428,12 @@ impl Workspace {
                 None => std::fs::read_to_string(&location.path).unwrap_or_default().lines().map(str::to_string).collect(),
             });
             let preview = lines.get(line).map(|l| l.trim().to_string()).unwrap_or_default();
-            rows.push(LocationRow { file: self.display_rel(&location.path), line: line + 1, preview, location });
+            rows.push(LocationRow { file: self.location_label(&location.path), line: line + 1, preview, location, encoding });
         }
         self.close_modal(window, cx);
         self.open_picker(PickerMode::Locations, window, cx);
         if let Some(Modal::Picker(picker)) = &self.modal {
-            picker.update(cx, |p, cx| p.set_locations(title, rows, encoding, cx));
+            picker.update(cx, |p, cx| p.set_locations(Some(title), rows, cx));
         }
     }
 
@@ -3046,6 +3050,7 @@ impl Workspace {
                     editor.update(cx, |e, cx| e.go_to(*offset, window, cx));
                 }
             }
+            PickerEvent::SymbolQuery(query) => ws.query_symbols(query.clone(), cx),
             PickerEvent::Dismissed => ws.close_modal(window, cx),
         }));
         self.modal = Some(Modal::Picker(picker));
@@ -3100,6 +3105,56 @@ impl Workspace {
 
     fn find_action(&mut self, _: &FindAction, window: &mut Window, cx: &mut Context<Self>) {
         self.open_picker(PickerMode::Actions, window, cx);
+    }
+
+    /// Go to Symbol: symbols across the project, from the running language servers.
+    fn go_to_symbol(&mut self, _: &GoToSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        let servers = self.lsp.read(cx).running_servers();
+        if !servers.iter().any(|s| s.capability("workspaceSymbolProvider")) {
+            self.toast(ToastKind::Info, "No language server to ask", Some("Go to Symbol uses the project's language servers. Open one of its source files first.".into()), cx);
+            return;
+        }
+        self.open_picker(PickerMode::Symbols, window, cx);
+    }
+
+    fn query_symbols(&mut self, query: String, cx: &mut Context<Self>) {
+        let query = query.trim().to_string();
+        let servers: Vec<_> = self.lsp.read(cx).running_servers().into_iter().filter(|s| s.capability("workspaceSymbolProvider")).collect();
+        if query.is_empty() || servers.is_empty() {
+            self.symbol_task = None;
+            self.set_symbol_rows(Vec::new(), cx);
+            return;
+        }
+        self.symbol_task = Some(cx.spawn(async move |this, cx| {
+            // Typing fast sends one request, not one per key.
+            cx.background_executor().timer(Duration::from_millis(120)).await;
+            let requests = servers.iter().map(|server| server.request("workspace/symbol", serde_json::json!({ "query": query })));
+            let results = futures::future::join_all(requests).await;
+            this.update(cx, |ws, cx| {
+                let mut rows = Vec::new();
+                for (server, result) in servers.iter().zip(results) {
+                    for (name, container, location) in result.map(|v| protocol::workspace_symbols(&v)).unwrap_or_default() {
+                        let preview = match container {
+                            Some(container) => format!("{name}  ·  {container}"),
+                            None => name,
+                        };
+                        let file = ws.location_label(&location.path);
+                        let line = location.range.start.line as usize + 1;
+                        rows.push(LocationRow { location, file, line, preview, encoding: server.encoding });
+                    }
+                }
+                ws.set_symbol_rows(rows, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn set_symbol_rows(&mut self, rows: Vec<LocationRow>, cx: &mut Context<Self>) {
+        if let Some(Modal::Picker(picker)) = &self.modal
+            && picker.read(cx).mode() == PickerMode::Symbols
+        {
+            picker.update(cx, |p, cx| p.set_locations(None, rows, cx));
+        }
     }
 
     fn file_structure(&mut self, _: &FileStructure, window: &mut Window, cx: &mut Context<Self>) {
@@ -3442,6 +3497,7 @@ impl Workspace {
         // Code intelligence first, as in VS Code and JetBrains.
         for (label, action) in [
             ("Go to Declaration", Box::new(editor::GoToDeclaration) as Box<dyn gpui::Action>),
+            ("Go to Implementation", Box::new(editor::GoToImplementation)),
             ("Find Usages", Box::new(editor::FindUsages)),
             ("Rename…", Box::new(editor::RenameSymbol)),
             ("Show Context Actions", Box::new(editor::ShowContextActions)),
@@ -3633,6 +3689,17 @@ impl Workspace {
             Some(rel) => rel.display().to_string(),
             None => path.display().to_string(),
         }
+    }
+
+    /// A location's file for usage and symbol lists: relative to the project,
+    /// or, outside it (a library's sources), just its folder and name.
+    fn location_label(&self, path: &Path) -> String {
+        if self.root.as_deref().is_some_and(|r| path.starts_with(r)) {
+            return self.display_rel(path);
+        }
+        let mut parts: Vec<_> = path.iter().rev().take(2).map(|p| p.to_string_lossy()).collect();
+        parts.reverse();
+        format!("…/{}", parts.join("/"))
     }
 
     /// Creates or renames according to the open input dialog.
@@ -5598,6 +5665,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_auto_save))
             .on_action(cx.listener(Self::check_for_updates))
             .on_action(cx.listener(Self::welcome_setup))
+            .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::new_window))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_folder_in_this_window))

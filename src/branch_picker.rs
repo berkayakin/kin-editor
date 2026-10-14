@@ -210,9 +210,11 @@ impl Render for BranchPicker {
             })
         })
         .track_scroll(self.scroll.clone())
-        .h(px((count.clamp(1, 12) * 30 + 8) as f32))
-        .w_full()
-        .py_1();
+        .h(px((count.clamp(1, 12) * 30) as f32))
+        .w_full();
+        // Padding goes on a wrapper: GPUI's scroll-to-item counts a list's own
+        // padding twice, so a list that fits its rows would scroll by 8px.
+        let list = div().py_1().child(list);
 
         modal_panel(cx)
             .key_context("BranchPicker")

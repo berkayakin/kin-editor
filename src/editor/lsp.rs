@@ -96,6 +96,10 @@ pub(super) struct EditorLsp {
     raw_diagnostics: Vec<Value>,
     /// The server reports diagnostics, so the built-in syntax check is redundant.
     pub(super) active: bool,
+    /// Other uses of the symbol at the caret (`textDocument/documentHighlight`),
+    /// for the document version they were computed on.
+    pub(super) symbol_highlights: (u64, Vec<std::ops::Range<usize>>),
+    symbol_highlight_task: Option<Task<()>>,
 }
 
 fn is_word_char(c: char) -> bool {
@@ -520,6 +524,60 @@ impl Editor {
         ))
     }
 
+    // ---- Symbol highlights ---------------------------------------------------------------
+
+    /// After the caret settles, asks for the other uses of the symbol under it.
+    pub(super) fn schedule_symbol_highlights(&mut self, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Full {
+            return;
+        }
+        let head = self.primary_selection().head;
+        // Leaving the highlighted symbol drops them now rather than after the request.
+        let (version, ranges) = &self.lsp.symbol_highlights;
+        if *version != self.doc.version() || !ranges.iter().any(|r| r.start <= head && head <= r.end) {
+            self.lsp.symbol_highlights.1.clear();
+        }
+        self.lsp.symbol_highlight_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+            let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
+                let server = e.lsp_server(cx).filter(|s| s.capability("documentHighlightProvider"))?;
+                let params = e.position_params(e.primary_selection().head, &server)?;
+                Some((server, params, e.doc.version()))
+            }) else {
+                return;
+            };
+            let result = server.request("textDocument/documentHighlight", params).await;
+            this.update(cx, |e, cx| {
+                if e.doc.version() != version {
+                    return;
+                }
+                let rope = e.doc.rope();
+                let mut ranges: Vec<std::ops::Range<usize>> = result
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|h| protocol::LspRange::from_json(h.get("range")?))
+                    .map(|r| protocol::range_to_offsets(rope, r, server.encoding))
+                    .collect();
+                ranges.sort_by_key(|r| r.start);
+                // A lone match is just the word itself: nothing worth pointing out.
+                if ranges.len() < 2 {
+                    ranges.clear();
+                }
+                e.lsp.symbol_highlights = (version, ranges);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The highlights that still match the text.
+    pub(super) fn current_symbol_highlights(&self) -> &[std::ops::Range<usize>] {
+        let (version, ranges) = &self.lsp.symbol_highlights;
+        if *version == self.doc.version() { ranges } else { &[] }
+    }
+
     // ---- Navigation, rename and code actions ------------------------------------------------
 
     pub(super) fn go_to_declaration(&mut self, _: &super::GoToDeclaration, _: &mut Window, cx: &mut Context<Self>) {
@@ -529,16 +587,37 @@ impl Editor {
 
     /// Go to Declaration from an offset (⌘/Ctrl-click passes the click's).
     pub(super) fn navigate_from(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.locations_request("textDocument/definition", offset, "Declaration", Value::Null, cx);
+        self.locations_request("textDocument/definition", offset, "Declaration", "No declaration found", Value::Null, cx);
+    }
+
+    pub(super) fn go_to_implementation(&mut self, _: &super::GoToImplementation, _: &mut Window, cx: &mut Context<Self>) {
+        let head = self.primary_selection().head;
+        let name = self.doc.slice(super::word_range(&self.doc, head));
+        let title = format!("Implementations of {name}");
+        self.locations_request("textDocument/implementation", head, &title, "No implementations found", Value::Null, cx);
+    }
+
+    pub(super) fn go_to_type_definition(&mut self, _: &super::GoToTypeDefinition, _: &mut Window, cx: &mut Context<Self>) {
+        let head = self.primary_selection().head;
+        self.locations_request("textDocument/typeDefinition", head, "Type Definition", "No type definition found", Value::Null, cx);
     }
 
     pub(super) fn find_usages(&mut self, _: &super::FindUsages, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
         let name = self.doc.slice(super::word_range(&self.doc, head));
-        self.locations_request("textDocument/references", head, &format!("Usages of {name}"), json!({ "includeDeclaration": true }), cx);
+        let context = json!({ "includeDeclaration": true });
+        self.locations_request("textDocument/references", head, &format!("Usages of {name}"), "No usages found", context, cx);
     }
 
-    fn locations_request(&mut self, method: &'static str, offset: usize, title: &str, context: Value, cx: &mut Context<Self>) {
+    fn locations_request(
+        &mut self,
+        method: &'static str,
+        offset: usize,
+        title: &str,
+        none: &'static str,
+        context: Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some(server) = self.lsp_server(cx) else {
             cx.emit(EditorLspEvent::Message("No language server for this file".into()));
             return;
@@ -554,8 +633,7 @@ impl Editor {
                 Ok(value) => {
                     let locations = protocol::locations(&value);
                     if locations.is_empty() {
-                        let what = if method.ends_with("references") { "No usages found" } else { "No declaration found" };
-                        cx.emit(EditorLspEvent::Message(what.into()));
+                        cx.emit(EditorLspEvent::Message(none.into()));
                     } else {
                         cx.emit(EditorLspEvent::Navigate { title, locations, encoding: server.encoding });
                     }
