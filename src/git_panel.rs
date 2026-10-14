@@ -6,7 +6,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, Stateful, Window, div, prelude::*, px,
+    IntoElement, Render, SharedString, Stateful, Task, Window, div, prelude::*, px,
 };
 
 use crate::{
@@ -85,6 +85,10 @@ pub struct GitPanel {
     project: Option<PathBuf>,
     status: Arc<RepoStatus>,
     busy: Option<SharedString>,
+    /// Whether `busy` has lasted long enough to show; quick operations
+    /// (staging a file) finish before it would only flash.
+    busy_shown: bool,
+    _busy_timer: Option<Task<()>>,
     selected: Option<(String, bool)>,
 }
 
@@ -113,6 +117,8 @@ impl GitPanel {
             project: None,
             status: Arc::new(RepoStatus::default()),
             busy: None,
+            busy_shown: false,
+            _busy_timer: None,
             selected: None,
         }
     }
@@ -144,7 +150,18 @@ impl GitPanel {
     }
 
     pub fn set_busy(&mut self, busy: Option<SharedString>, cx: &mut Context<Self>) {
+        self._busy_timer = busy.is_some().then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
+                this.update(cx, |this, cx| {
+                    this.busy_shown = true;
+                    cx.notify();
+                })
+                .ok();
+            })
+        });
         self.busy = busy;
+        self.busy_shown = false;
         cx.notify();
     }
 
@@ -603,23 +620,39 @@ impl Render for GitPanel {
             }
         }
 
-        root.when_some(self.busy.clone(), |el, busy| {
-                el.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .h(px(26.))
-                        .text_size(px(12.))
-                        .text_color(theme.text_muted)
-                        .bg(theme.accent_soft)
-                        .child(icon_el(Icon::Refresh, px(12.), theme.accent.into()))
-                        .child(busy),
-                )
-            })
+        root
             .when_some(self.status.state, |el, state| el.child(self.render_state_banner(state, cx)))
-            .child(list)
+            .child(
+                // Progress floats over the list so the rows don't move.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(list)
+                    .when_some(self.busy.clone().filter(|_| self.busy_shown), |el, busy| {
+                        el.child(
+                            div().absolute().left_0().right_0().bottom(px(8.)).flex().justify_center().child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .h(px(26.))
+                                    .px_2p5()
+                                    .rounded_full()
+                                    .bg(theme.elevated)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .shadow_md()
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_muted)
+                                    .child(icon_el(Icon::Refresh, px(12.), theme.accent.into()))
+                                    .child(busy),
+                            ),
+                        )
+                    }),
+            )
             .child(self.render_commit_box(window, cx))
             .into_any_element()
     }
