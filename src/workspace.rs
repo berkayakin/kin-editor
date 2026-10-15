@@ -9,10 +9,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
     CursorStyle, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, PromptLevel, Render,
-    SharedString, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
+    SharedString, Stateful, StyleRefinement, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
     WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions, div, img, point,
     prelude::*, px, relative, rgb, size, uniform_list,
 };
@@ -3067,7 +3067,7 @@ impl Workspace {
         island(&theme)
             .h(self.problems_height)
             .flex_shrink_0()
-            .child(self.git_log.clone())
+            .child(cached(&self.git_log))
             .child(self.resize_handle(Edge::Problems, cx))
     }
 
@@ -3633,7 +3633,7 @@ impl Workspace {
             island(&theme)
                 .h(self.problems_height)
                 .flex_shrink_0()
-                .child(session.clone())
+                .child(cached(session))
                 .child(self.resize_handle(Edge::Problems, cx)),
         )
     }
@@ -4138,7 +4138,7 @@ impl Workspace {
                             .flex()
                             .flex_1()
                             .min_h_0()
-                            .children(tabs.get(active).cloned().map(|t| div().flex_1().min_w_0().child(t))),
+                            .children(tabs.get(active).map(|t| div().flex_1().min_w_0().child(cached(t)))),
                     ),
             )
             // After the island, so the current tab paints over its top border.
@@ -6105,7 +6105,7 @@ impl Workspace {
         });
 
         let body: AnyElement = if self.sidebar_mode == SidebarMode::Commit {
-            div().flex_1().min_h_0().child(self.git_panel.clone()).into_any_element()
+            div().flex_1().min_h_0().child(cached(&self.git_panel)).into_any_element()
         } else if self.root.is_some() {
             let active_path = self.active_editor().and_then(|e| e.read(cx).doc.path.clone());
             let entries = self.entries.clone();
@@ -6768,7 +6768,7 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let share = relative(self.pane_sizes.get(pane_ix).copied().unwrap_or(1.));
         let content: AnyElement = match pane.tabs.get(pane.active) {
-            Some(editor) => editor.clone().into_any_element(),
+            Some(editor) => cached(editor).into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(window, cx).into_any_element(),
             None => div()
                 .size_full()
@@ -8305,6 +8305,14 @@ fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     builder.add(root.join(".gitignore"));
     builder.add(root.join(".git/info/exclude"));
     builder.build().ok()
+}
+
+/// A child view (editor, terminal, panel) drawn from its last layout until it
+/// notifies, so a caret blink or terminal output doesn't lay out the whole
+/// window again. It fills its parent. State it draws must reach it through
+/// its own `cx.notify()`; focus changes and theme switches refresh the window.
+fn cached<V: Render>(view: &Entity<V>) -> AnyView {
+    AnyView::from(view.clone()).cached(StyleRefinement::default().size_full())
 }
 
 fn plural(n: usize) -> &'static str {
