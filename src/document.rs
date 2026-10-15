@@ -169,6 +169,18 @@ impl Document {
         Self::from_text(String::new(), None)
     }
 
+    /// A stand-in for a file not read yet (a restored tab, see
+    /// `Editor::new_unloaded`): no text and no parse; dirty when the session
+    /// kept unsaved edits for it.
+    pub fn unloaded(path: Option<PathBuf>, dirty: bool) -> Self {
+        let mut doc = Self::empty();
+        doc.path = path;
+        if dirty {
+            doc.mark_unsaved();
+        }
+        doc
+    }
+
     pub fn open(path: &Path) -> std::io::Result<Self> {
         if crate::preview::is_image(path) {
             std::fs::metadata(path)?;

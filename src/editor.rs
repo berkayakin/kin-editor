@@ -10,10 +10,12 @@ mod run;
 mod snippet;
 mod sticky;
 mod transform;
+mod unloaded;
 mod vim;
 
 pub use lsp::EditorLspEvent;
 pub use run::{EditorBreakpointMenu, EditorBreakpointsChanged, EditorRunEvent};
+pub use unloaded::{EditorLoaded, Unloaded};
 
 use std::{ops::Range, sync::Arc, time::Duration};
 
@@ -314,12 +316,26 @@ pub struct Editor {
     conflicts: derived::Derived<u64, Vec<crate::conflict::Conflict>>,
     /// Accept labels on screen last frame: (bounds, conflict start row, choice).
     conflict_hits: Vec<(Bounds<Pixels>, usize, crate::conflict::Resolution)>,
+    /// A restored tab whose file isn't read yet (`load` reads it).
+    unloaded: Option<Unloaded>,
 }
 
 impl Editor {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::blank(doc, cx);
+        this.apply_settings(cx);
+        this.detect_external_linter();
+        this.schedule_lint(Duration::ZERO, cx);
+        this.run_external_linter(cx);
+        this.schedule_parse(cx);
+        this
+    }
+
+    /// The editor's state for `doc`, before anything reads settings or
+    /// starts work on the text.
+    fn blank(doc: Document, cx: &mut Context<Self>) -> Self {
         let file_settings = Settings::get(cx).for_file(doc.language, doc.path.as_deref());
-        let mut this = Self {
+        Self {
             doc,
             mode: EditorMode::Full,
             placeholder: SharedString::default(),
@@ -383,13 +399,8 @@ impl Editor {
             conflicts: derived::Derived::new(),
             conflict_hits: Vec::new(),
             image_info: None,
-        };
-        this.apply_settings(cx);
-        this.detect_external_linter();
-        this.schedule_lint(Duration::ZERO, cx);
-        this.run_external_linter(cx);
-        this.schedule_parse(cx);
-        this
+            unloaded: None,
+        }
     }
 
     /// Finishes in the background a parse that ran out of time on the UI
@@ -648,7 +659,8 @@ impl Editor {
     /// Re-reads the file if it changed on disk and has no unsaved edits
     /// (e.g. after a checkout, pull or discard).
     pub fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
-        if self.doc.is_dirty() {
+        // An unloaded tab reads the file as it is when it's shown.
+        if self.doc.is_dirty() || !self.is_loaded() {
             return;
         }
         if let Ok(true) = self.doc.reload_from_disk() {
@@ -677,6 +689,10 @@ impl Editor {
     /// Re-reads the settings and `.editorconfig` for this file: tab size,
     /// indentation, soft wrap and what saving does.
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        // Applied when an unloaded tab is read.
+        if !self.is_loaded() {
+            return;
+        }
         let fs = Settings::get(cx).for_file(self.doc.language, self.doc.path.as_deref());
         // Settings reloads come for every editor; most files resolve the same.
         self.sync_vim(cx);
@@ -735,6 +751,8 @@ impl Editor {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
+        // A restored tab saved before it was shown (Save All).
+        self.load(cx)?;
         self.apply_save_actions(cx);
         self.doc.save()?;
         self.lsp_did_save(cx);
@@ -748,7 +766,7 @@ impl Editor {
     /// Extensions changed: the file may have a language now, or a grammar
     /// for it. True when it was parsed again.
     pub fn refresh_language(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(path) = self.doc.path.clone() else { return false };
+        let Some(path) = self.doc.path.clone().filter(|_| self.is_loaded()) else { return false };
         let language = crate::syntax::Language::from_path(&path);
         if language == self.doc.language && language.extension().is_none() {
             return false;
@@ -764,12 +782,20 @@ impl Editor {
 
     /// The project's trust changed: ESLint may run now, or must stop.
     pub fn trust_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.is_loaded() {
+            return;
+        }
         self.detect_external_linter();
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
     }
 
     pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        // The language and settings come with the text.
+        if !self.is_loaded() {
+            self.doc.path = Some(path);
+            return;
+        }
         self.doc.set_path(path);
         self.apply_settings(cx);
         self.detect_external_linter();

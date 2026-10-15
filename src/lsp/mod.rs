@@ -185,8 +185,9 @@ impl LspStore {
         let (path, language) = {
             let e = editor.read(cx);
             match e.doc.path.clone() {
-                Some(path) => (path, e.doc.language),
-                None => return,
+                // An unloaded tab registers once its file is read.
+                Some(path) if e.is_loaded() => (path, e.doc.language),
+                _ => return,
             }
         };
         if self.documents.get(&path).is_some_and(|d| d.editor.upgrade().as_ref() == Some(editor)) {

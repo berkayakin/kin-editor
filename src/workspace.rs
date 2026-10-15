@@ -33,8 +33,8 @@ use crate::{
     debugger::{DebugEvent, DebugSession, launch},
     extensions,
     editor::{
-        self, Cancel, Editor, EditorBreakpointMenu, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLspEvent,
-        EditorRunEvent, GitFile,
+        self, Cancel, Editor, EditorBreakpointMenu, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLoaded,
+        EditorLspEvent, EditorRunEvent, GitFile, Unloaded,
     },
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
@@ -896,6 +896,12 @@ impl Workspace {
     }
 
     fn add_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.insert_tab(editor, window, cx);
+        self.activate_in(self.active_pane, at, window, cx);
+    }
+
+    /// Adds a tab to the active pane without showing it; returns its index.
+    fn insert_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self._subscriptions.push(cx.observe(&editor, |_, _, cx| cx.notify()));
         self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| {
             ws.schedule_auto_save(&editor, cx);
@@ -916,6 +922,27 @@ impl Workspace {
         self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
             ws.open_breakpoint_menu(editor.clone(), event.row, event.position, window, cx);
         }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
+            ws.run_git(event.0.clone(), window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorLoaded, window, cx| {
+            ws.tab_loaded(editor, event, window, cx);
+        }));
+        if editor.read(cx).is_loaded() {
+            self.file_opened(&editor, cx);
+        }
+        self.tabs.push(editor.clone());
+        let pane = &mut self.panes[self.active_pane];
+        // After the current tab, but never among pinned ones.
+        let pinned = pane.tabs.iter().filter(|t| self.pinned.contains(&t.entity_id())).count();
+        let at = if pane.tabs.is_empty() { 0 } else { (pane.active + 1).max(pinned).min(pane.tabs.len()) };
+        pane.tabs.insert(at, editor);
+        at
+    }
+
+    /// What starts once a tab's text is there (when it opens, or when a
+    /// restored tab is first shown): breakpoints, language server, Git changes.
+    fn file_opened(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         // Breakpoints it had while closed, and the paused line if it's here.
         let path = editor.read(cx).doc.path.clone();
         if let Some(path) = path {
@@ -927,25 +954,42 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.set_debug_line(Some(line.saturating_sub(1) as usize), cx));
             }
         }
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
-            ws.run_git(event.0.clone(), window, cx);
-        }));
-        self.lsp.update(cx, |s, cx| s.register(&editor, cx));
+        self.lsp.update(cx, |s, cx| s.register(editor, cx));
         if self.repo.is_none() && self.root.is_none() {
             // A lone file: use the repository it lives in, if any.
             if let Some(dir) = editor.read(cx).doc.path.as_deref().and_then(Path::parent) {
                 self.detect_repo(dir.to_path_buf(), cx);
             }
         } else {
-            self.load_diff_base(&editor, cx);
+            self.load_diff_base(editor, cx);
         }
-        self.tabs.push(editor.clone());
-        let pane = &mut self.panes[self.active_pane];
-        // After the current tab, but never among pinned ones.
-        let pinned = pane.tabs.iter().filter(|t| self.pinned.contains(&t.entity_id())).count();
-        let at = if pane.tabs.is_empty() { 0 } else { (pane.active + 1).max(pinned).min(pane.tabs.len()) };
-        pane.tabs.insert(at, editor);
-        self.activate_in(self.active_pane, at, window, cx);
+    }
+
+    /// A restored tab read its file (or couldn't: it closes).
+    fn tab_loaded(&mut self, editor: &Entity<Editor>, event: &EditorLoaded, window: &mut Window, cx: &mut Context<Self>) {
+        match &event.error {
+            None => self.file_opened(editor, cx),
+            Some(err) => {
+                let name = editor.read(cx).doc.file_name();
+                self.toast(ToastKind::Error, format!("Couldn't open {name}"), Some(err.clone()), cx);
+                self.remove_tab(editor, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reads the restored tabs that are showing: each pane's current one.
+    /// Activation reads its tab already; this covers a pane whose current tab
+    /// changed otherwise (a tab closed or moved out of it).
+    fn load_shown_tabs(&mut self, cx: &mut Context<Self>) {
+        for pane in &self.panes {
+            if let Some(editor) = pane.tabs.get(pane.active)
+                && !editor.read(cx).is_loaded()
+            {
+                // A failure is reported (and the tab closed) through `EditorLoaded`.
+                let _ = editor.update(cx, |e, cx| e.load(cx));
+            }
+        }
     }
 
     /// Shows an open editor in its pane and focuses it.
@@ -976,6 +1020,8 @@ impl Workspace {
             }
             self.active_pane = pane;
             self.panes[pane].active = ix;
+            // A restored tab reads its file when first shown.
+            let _ = editor.update(cx, |e, cx| e.load(cx));
             window.focus(&editor.focus_handle(cx));
             if let Some(path) = editor.read(cx).doc.path.clone() {
                 self.recent.retain(|p| p != &path);
@@ -1077,6 +1123,29 @@ impl Workspace {
             for (ix, tab) in pane.tabs.iter().enumerate() {
                 let e = tab.read(cx);
                 let dirty = e.doc.is_dirty();
+                // A tab not read yet goes back as it was restored.
+                if let Some(u) = e.unloaded() {
+                    if ix == pane.active {
+                        active_in_pane = count;
+                        if pane_ix == self.active_pane {
+                            active = tabs.len();
+                        }
+                    }
+                    count += 1;
+                    if let Some(text) = &u.unsaved {
+                        unsaved.push((tabs.len(), text.clone()));
+                    }
+                    tabs.push(TabSession {
+                        path: e.doc.path.clone(),
+                        cursor: u.cursor,
+                        unsaved: None,
+                        pane: pane_ix,
+                        pinned: self.pinned.contains(&tab.entity_id()),
+                        folds: u.folds.clone(),
+                        encoding: u.encoding.filter(|&enc| enc != TextEncoding::UTF8).map(TextEncoding::key),
+                    });
+                    continue;
+                }
                 // An untitled buffer without edits has nothing to bring back.
                 if e.doc.path.is_none() && !dirty {
                     continue;
@@ -1179,30 +1248,20 @@ impl Workspace {
         let Some(session) = self.root.as_deref().and_then(ProjectSession::load) else {
             return;
         };
+        // Tabs read their files when first shown (see `Editor::load`): the
+        // current tab of each pane right away, the others when activated.
         for tab in session.tabs {
-            let doc = match tab.path.as_deref().map(Document::open) {
-                Some(Ok(mut doc)) => {
-                    // An encoding picked last time, rather than the guess.
-                    if let Some(encoding) = tab.encoding.as_deref().and_then(TextEncoding::from_key)
-                        && encoding != doc.encoding
-                    {
-                        let _ = doc.reload_with_encoding(encoding);
-                    }
-                    doc
-                }
-                // The file is gone and there's nothing unsaved to keep.
-                Some(Err(_)) if tab.unsaved.is_none() => continue,
-                // Untitled, or a deleted file with edits: keep the text.
-                _ => Document::empty(),
-            };
-            let editor = cx.new(|cx| Editor::new(doc, cx));
-            if let Some(text) = tab.unsaved {
-                // An edit on top of the file, so undo gets back to the saved text.
-                editor.update(cx, |e, cx| {
-                    let len = e.doc.len();
-                    e.replace_ranges(vec![(0..len, text)], cx);
-                });
+            // The file is gone and there's nothing unsaved to keep.
+            if tab.unsaved.is_none() && tab.path.as_deref().is_none_or(|p| !p.is_file()) {
+                continue;
             }
+            let unloaded = Unloaded {
+                cursor: tab.cursor,
+                unsaved: tab.unsaved.as_deref().map(ropey::Rope::from_str),
+                folds: tab.folds,
+                encoding: tab.encoding.as_deref().and_then(TextEncoding::from_key),
+            };
+            let editor = cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx));
             // Into the pane it was in, creating panes as needed.
             while self.panes.len() <= tab.pane.min(7) {
                 self.panes.push(Pane::new());
@@ -1212,12 +1271,14 @@ impl Workspace {
             if tab.pinned {
                 self.pinned.insert(editor.entity_id());
             }
-            self.add_tab(editor.clone(), window, cx);
-            editor.update(cx, |e, cx| {
-                e.restore_folds(&tab.folds, cx);
-                e.go_to(tab.cursor.min(e.doc.len()), window, cx);
-            });
+            let at = self.insert_tab(editor, window, cx);
+            self.panes[self.active_pane].active = at;
+            if let Some(path) = tab.path {
+                self.recent.retain(|p| p != &path);
+                self.recent.insert(0, path);
+            }
         }
+        self.recent.truncate(50);
         // Panes left empty (their files are gone) aren't worth keeping.
         self.drop_empty_panes();
         if let Some(layout) = session.layout.filter(|l| l.sizes.len() == self.panes.len()) {
@@ -1232,6 +1293,7 @@ impl Workspace {
         if let Some(editor) = self.tabs_in_order().get(session.active).cloned() {
             self.activate_editor(&editor, window, cx);
         }
+        self.load_shown_tabs(cx);
     }
 
     /// Tabs in pane order, as the session lists them.
@@ -2640,7 +2702,8 @@ impl Workspace {
     /// Loads the file's HEAD text so the editor can show changed lines.
     fn load_diff_base(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
-        let Some(path) = editor.read(cx).doc.path.clone() else { return };
+        // A tab not read yet gets it when it is (`file_opened`).
+        let Some(path) = editor.read(cx).doc.path.clone().filter(|_| editor.read(cx).is_loaded()) else { return };
         // Images have no lines to mark.
         if editor.read(cx).doc.image.is_some() {
             return;
@@ -3478,7 +3541,8 @@ impl Workspace {
         let mut all = self.breakpoints.clone();
         for editor in &self.tabs {
             let e = editor.read(cx);
-            if let Some(path) = e.doc.path.clone() {
+            // A tab not read yet has its file's breakpoints in `self.breakpoints`.
+            if let Some(path) = e.doc.path.clone().filter(|_| e.is_loaded()) {
                 let breakpoints = e.breakpoints();
                 if breakpoints.is_empty() {
                     all.remove(&path);
@@ -4447,8 +4511,13 @@ impl Workspace {
         self.tabs
             .iter()
             .filter_map(|t| {
-                let doc = &t.read(cx).doc;
-                Some((doc.path.clone()?, Arc::from(doc.rope().to_string())))
+                let e = t.read(cx);
+                let text = match e.unloaded() {
+                    // Not read yet: its unsaved text, else the file on disk.
+                    Some(u) => u.unsaved.as_ref()?.to_string(),
+                    None => e.doc.rope().to_string(),
+                };
+                Some((e.doc.path.clone()?, Arc::from(text)))
             })
             .collect()
     }
@@ -4533,6 +4602,10 @@ impl Workspace {
                 for path in &files {
                     if let Some(editor) = ws.tabs.iter().find(|t| t.read(cx).doc.path.as_deref() == Some(path.as_path())) {
                         editor.update(cx, |e, cx| {
+                            // A restored tab not shown yet is read first, like any open file.
+                            if e.load(cx).is_err() {
+                                return;
+                            }
                             let text = e.text();
                             let edits = query
                                 .find_all(&text)
@@ -8072,6 +8145,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.load_shown_tabs(cx);
         self.update_window_title(window, cx);
         // A drag that ended without a drop (Escape, left the window) leaves no highlight.
         if !cx.has_active_drag() {
