@@ -609,7 +609,11 @@ impl Workspace {
                 ws.lsp.read(cx).respond(&key, id, serde_json::json!({ "applied": applied }));
             }
             LspEvent::Message(message) => ws.toast(ToastKind::Error, message.clone(), None, cx),
+            LspEvent::Installed(command) => ws.toast(ToastKind::Success, format!("Installed {command}"), None, cx),
         });
+        // A server was installed (here or in another window): start the missing ones.
+        let servers_observer =
+            cx.observe_global::<crate::lsp::install::ServersInstalled>(|ws, cx| ws.lsp.update(cx, |s, cx| s.retry_missing(cx)));
         let lsp_observer = cx.observe(&lsp, |_, _, cx| cx.notify());
         let settings = Settings::get(cx).clone();
         // Settings changed (saved settings.json): re-apply everywhere.
@@ -738,6 +742,7 @@ impl Workspace {
                 trust_observer,
                 lsp_subscription,
                 lsp_observer,
+                servers_observer,
                 cx.observe_window_bounds(window, |ws, window, cx| ws.remember_placement(window, cx)),
             ],
         };
@@ -7102,16 +7107,22 @@ impl Workspace {
                 (short, dim, Some(work.clone()))
             }
             LspStatus::Ready(name) => (name.clone(), dim, None),
-            LspStatus::Missing(install) => {
-                ("No language server".into(), theme.warning.into(), Some(format!("Install one with `{install}`. Click to copy.")))
+            LspStatus::Missing { installer: Some(installer), .. } => (
+                format!("Install {}", installer.command),
+                theme.warning.into(),
+                Some(format!("No language server yet. {}, into Kin's own folder; one you install yourself is used instead.", installer.describe())),
+            ),
+            LspStatus::Missing { command, installer: None } => {
+                ("No language server".into(), theme.warning.into(), Some(format!("Install one with `{command}`. Click to copy.")))
             }
+            LspStatus::Installing(command) => (format!("Installing {command}…"), dim, None),
             LspStatus::Failed(message) => ("Language server stopped".into(), theme.error.into(), Some(format!("{message}. Click to restart."))),
         };
         // A small light: green when ready, the accent while working.
         let light: Hsla = match &status {
             LspStatus::Ready(_) => theme.success.into(),
-            LspStatus::Starting | LspStatus::Busy(_) => theme.accent.into(),
-            LspStatus::Missing(_) => theme.warning.into(),
+            LspStatus::Starting | LspStatus::Busy(_) | LspStatus::Installing(_) => theme.accent.into(),
+            LspStatus::Missing { .. } => theme.warning.into(),
             LspStatus::Failed(_) => theme.error.into(),
         };
         Some(
@@ -7129,11 +7140,16 @@ impl Workspace {
                         spread_radius: px(0.),
                     }]),
                 )
-                .when(matches!(status, LspStatus::Missing(_) | LspStatus::Failed(_)), |el| el.cursor_pointer())
+                .when(matches!(status, LspStatus::Missing { .. } | LspStatus::Failed(_)), |el| el.cursor_pointer())
                 .child(label)
                 .when_some(tip, |el, tip| el.tooltip(move |_, cx| tooltip_view(tip.clone(), cx)))
                 .on_click(cx.listener(move |ws, _, window, cx| match &status {
-                    LspStatus::Missing(install) => {
+                    LspStatus::Missing { installer: Some(_), .. } => {
+                        if let Some(path) = ws.active_editor().and_then(|e| e.read(cx).doc.path.clone()) {
+                            ws.lsp.update(cx, |s, cx| s.install_server(&path, cx));
+                        }
+                    }
+                    LspStatus::Missing { command: install, installer: None } => {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(install.to_string()));
                         ws.toast(
                             ToastKind::Success,

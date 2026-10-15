@@ -247,7 +247,7 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     matches!((parse(candidate), parse(current)), (Some(a), Some(b)) if a > b)
 }
 
-fn sha256_hex(path: &Path) -> Option<String> {
+pub(crate) fn sha256_hex(path: &Path) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut file, &mut hasher).ok()?;
@@ -261,7 +261,7 @@ fn curl() -> Command {
     cmd
 }
 
-fn fetch(url: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let output = curl().args(["--max-time", "60", url]).output().map_err(|e| format!("couldn't run curl: {e}"))?;
     if output.status.success() {
         Ok(output.stdout)
@@ -270,7 +270,7 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn download(url: &str, to: &Path) -> Result<(), String> {
+pub(crate) fn download(url: &str, to: &Path) -> Result<(), String> {
     let output = curl()
         .args(["--max-time", "900", "--output"])
         .arg(to)

@@ -6,6 +6,7 @@
 //! what servers send back. Editors talk to their document's [`Server`]
 //! directly for requests; see `Editor::lsp_request`.
 
+pub mod install;
 pub mod protocol;
 pub mod rpc;
 pub mod servers;
@@ -40,12 +41,12 @@ pub struct ServerKey {
 enum ServerState {
     /// Looking for the executable and starting it.
     Finding,
-    /// Running, waiting for `initialize` to finish; holds the install
-    /// command in case it turns out not to be installed after all.
-    Starting(Arc<Client>, &'static str),
+    /// Running, waiting for `initialize` to finish; holds its spec in case
+    /// it turns out not to be installed after all (rustup's proxy).
+    Starting(Arc<Client>, &'static servers::ServerSpec),
     Running(Arc<Server>),
-    /// Not installed; holds the install command.
-    Missing(&'static str),
+    /// Not installed (Install can fix that when the spec has an installer).
+    Missing(&'static servers::ServerSpec),
     Failed(String),
 }
 
@@ -135,7 +136,10 @@ pub enum LspStatus {
     /// Work in progress, e.g. "Indexing 40%".
     Busy(String),
     Ready(String),
-    Missing(&'static str),
+    /// Not installed: how to install it by hand, and Kin's installer if it has one.
+    Missing { command: &'static str, installer: Option<&'static install::Installer> },
+    /// Kin is installing it (this command).
+    Installing(&'static str),
     Failed(String),
 }
 
@@ -145,6 +149,8 @@ pub enum LspEvent {
     ApplyEdit { key: ServerKey, request_id: Value, encoding: Encoding, edits: Vec<(PathBuf, Vec<TextEdit>)> },
     /// An error message from a server.
     Message(String),
+    /// Kin installed this server.
+    Installed(&'static str),
 }
 
 impl EventEmitter<LspEvent> for LspStore {}
@@ -248,14 +254,20 @@ impl LspStore {
                         Some(command) => servers::custom(command),
                         None => servers::find(spec, &file, venv.as_deref()),
                     };
-                    let path = crate::python::path_with(venv.as_deref(), servers::search_path());
-                    command.map(|c| (Client::spawn(&c.program, &c.args, &root, &path), c))
+                    // Kin's own Node.js runs the npm servers it installed.
+                    let path = crate::python::path_with(venv.as_deref(), &install::path_with(install::node_bin().as_deref()));
+                    let spawned = command.map(|c| (Client::spawn(&c.program, &c.args, &root, &path), c));
+                    if let Some((Ok(_), c)) = &spawned {
+                        let program = c.program.clone();
+                        std::thread::spawn(move || install::check_for_update(&program));
+                    }
+                    spawned
                 })
                 .await;
             let (client, incoming, command) = match spawned {
                 None => {
                     this.update(cx, |s, cx| {
-                        s.servers.insert(key.clone(), ServerState::Missing(spec.install));
+                        s.servers.insert(key.clone(), ServerState::Missing(spec));
                         cx.notify();
                     })
                     .ok();
@@ -270,7 +282,7 @@ impl LspStore {
             };
             let name = command.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             this.update(cx, |s, cx| {
-                s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec.install));
+                s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec));
                 s.listen(key.clone(), incoming, cx);
             })
             .ok();
@@ -414,11 +426,11 @@ impl LspStore {
                     return;
                 }
                 // rustup's proxy runs, but exits when the component is missing.
-                if let Some(ServerState::Starting(_, install)) = self.servers.get(key)
+                if let Some(ServerState::Starting(_, spec)) = self.servers.get(key)
                     && (stderr_tail.contains("Unknown binary") || stderr_tail.contains("is not installed"))
                 {
-                    let install = *install;
-                    self.servers.insert(key.clone(), ServerState::Missing(install));
+                    let spec = *spec;
+                    self.servers.insert(key.clone(), ServerState::Missing(spec));
                     cx.notify();
                     return;
                 }
@@ -549,6 +561,49 @@ impl LspStore {
         }
     }
 
+    /// Installs the missing server of `path`'s document; when it's done,
+    /// every window starts the servers it was missing.
+    pub fn install_server(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(key) = self.documents.get(path).map(|d| d.server.clone()) else { return };
+        let Some(ServerState::Missing(spec)) = self.servers.get(&key) else { return };
+        let Some(installer) = install::for_spec(spec) else { return };
+        if install::installing(installer.command) {
+            return;
+        }
+        let task = cx.background_executor().spawn(async move { install::install(installer) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |_, cx| match result {
+                Ok(()) => {
+                    cx.emit(LspEvent::Installed(installer.command));
+                    install::installed_now(cx);
+                }
+                Err(err) => {
+                    cx.emit(LspEvent::Message(format!("Couldn't install {}: {err}", installer.command)));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        // Shown as Installing from now on (`status`).
+        cx.notify();
+    }
+
+    /// Starts again every server that was missing (one was installed).
+    pub fn retry_missing(&mut self, cx: &mut Context<Self>) {
+        let missing: Vec<ServerKey> = self.servers.iter().filter(|(_, s)| matches!(s, ServerState::Missing(_))).map(|(k, _)| k.clone()).collect();
+        for key in missing {
+            self.servers.remove(&key);
+            let editors: Vec<Entity<Editor>> = self.documents.iter().filter(|(_, d)| d.server == key).filter_map(|(_, d)| d.editor.upgrade()).collect();
+            self.documents.retain(|_, d| d.server != key);
+            for editor in editors {
+                self.register(&editor, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Restarts the server for a document (after installing it, or if it's stuck).
     pub fn restart(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(key) = self.documents.get(path).map(|d| d.server.clone()) else { return };
@@ -577,7 +632,10 @@ impl LspStore {
                 Some(work) => LspStatus::Busy(format!("{}: {}", server.name, work.label())),
                 None => LspStatus::Ready(server.name.clone()),
             },
-            ServerState::Missing(install) => LspStatus::Missing(install),
+            ServerState::Missing(spec) => match install::for_spec(spec) {
+                Some(installer) if install::installing(installer.command) => LspStatus::Installing(installer.command),
+                installer => LspStatus::Missing { command: spec.install, installer },
+            },
             ServerState::Failed(message) => LspStatus::Failed(message.clone()),
         })
     }

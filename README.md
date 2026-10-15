@@ -281,11 +281,19 @@ in a more specific context (like `"Editor"`) still wins there. Mistakes show up 
 ## Language servers
 
 Kin starts a language server the first time you open a file it handles, one per server and
-project, and shows it in the status bar (with indexing progress). It never downloads anything:
-it uses the server in the project's `node_modules/.bin` or on your PATH (also the login shell's
-PATH, `~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kin is opened from the Dock).
-If none is installed, the status bar says **No language server**; click it to copy the install
-command.
+project, and shows it in the status bar (with indexing progress). It uses the server in the
+project's `node_modules/.bin` or venv, else one on your PATH (also the login shell's PATH,
+`~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kin is opened from the Dock).
+
+If none is installed, the status bar offers **Install <server>**: one click puts it in Kin's own
+folder (`~/.config/kin/servers/`) and starts it. rust-analyzer, taplo and marksman come from their
+GitHub releases (checked against GitHub's SHA-256); vtsls, basedpyright, intelephense, the
+vscode-langservers (HTML, CSS, JSON), yaml-language-server and bash-language-server are npm
+packages, installed with your Node.js or, without one, a Node.js LTS Kin downloads once (checked
+against its SHASUMS256.txt); gopls comes from `go install`. A server you install yourself is
+always used instead, and Kin looks for a newer version of its own copies once a week (it runs from
+the next start). Servers without an installer show **No language server**; click it to copy the
+install command.
 
 | Language | Server | Install |
 | --- | --- | --- |

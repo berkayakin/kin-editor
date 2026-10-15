@@ -1,6 +1,6 @@
-//! Which language server each language uses, and finding it on disk. Kin
-//! never downloads servers: it uses what's installed (in the project's
-//! `node_modules/.bin` or on PATH) and suggests an install command otherwise.
+//! Which language server each language uses, and finding it on disk: the
+//! project's (`node_modules/.bin`, a venv), then one on PATH, then a copy Kin
+//! installed itself (see `install.rs`, the status bar's Install).
 
 use std::{
     ffi::OsString,
@@ -176,17 +176,33 @@ pub struct Command {
 /// Finds an installed server: the project's `node_modules/.bin` or Python
 /// venv first (a pinned version), then the search path.
 pub fn find(spec: &ServerSpec, file: &Path, venv: Option<&Path>) -> Option<Command> {
+    let command = |program: PathBuf, args: &[&str]| Command { program, args: args.iter().map(|a| a.to_string()).collect() };
     for (name, args) in spec.candidates {
         let local = file
             .ancestors()
             .skip(1)
             .find_map(|d| executable(&d.join("node_modules").join(".bin").join(name)))
             .or_else(|| executable(&crate::python::bin_dir(venv?).join(name)));
-        if let Some(program) = local.or_else(|| which(name)) {
-            return Some(Command { program, args: args.iter().map(|a| a.to_string()).collect() });
+        if let Some(program) = local.or_else(|| which(name).filter(|p| !broken_rustup_proxy(p))) {
+            return Some(command(program, args));
         }
     }
-    None
+    // Only then Kin's own copies: the user's servers, any of them, come first.
+    spec.candidates.iter().find_map(|(name, args)| Some(command(super::install::installed(name)?, args)))
+}
+
+/// rustup's `rust-analyzer` in `~/.cargo/bin` is there without the component
+/// installed; it then only says so. Such a proxy doesn't count as a server.
+fn broken_rustup_proxy(program: &Path) -> bool {
+    program.file_stem().is_some_and(|n| n == "rust-analyzer")
+        && program.parent().is_some_and(|dir| dir.ends_with(".cargo/bin"))
+        && !crate::process::command(program)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
 }
 
 /// A user-configured command (`language_servers` in settings).
@@ -201,7 +217,7 @@ pub fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(search_path()).find_map(|dir| executable(&dir.join(name)))
 }
 
-fn executable(path: &Path) -> Option<PathBuf> {
+pub(crate) fn executable(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         for ext in ["exe", "cmd", "bat"] {
