@@ -93,7 +93,7 @@ impl Workspace {
             let files = cx.background_executor().spawn(async move { openable_files(&root) }).await;
             this.update(cx, |ws, cx| {
                 ws.file_index = Arc::new(files);
-                if let Some(Modal::Picker(picker)) = &ws.modal {
+                if let Some(Modal::Picker(picker)) = &ws.modals.current {
                     let files = ws.file_index.clone();
                     picker.update(cx, |p, cx| p.set_files(files, cx));
                 }

@@ -196,7 +196,7 @@ impl Workspace {
         };
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| InputDialog::new(title, icon, hint, &initial, select, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, dialog, event: &InputDialogEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&dialog, window, |ws, dialog, event: &InputDialogEvent, window, cx| match event {
             InputDialogEvent::Confirm(name) => match ws.apply_name(name, window, cx) {
                 Ok(()) => {
                     let in_tree = matches!(ws.pending_input, Some(PendingInput::Rename(_) | PendingInput::NewFolder(_)));
@@ -213,9 +213,9 @@ impl Workspace {
                 ws.pending_input = None;
                 ws.close_modal(window, cx);
             }
-        }));
+        });
         self.pending_input = Some(pending);
-        self.modal = Some(Modal::Input(dialog));
+        self.modals.open(Modal::Input(dialog), subscription);
         cx.notify();
     }
 
@@ -695,7 +695,7 @@ impl Workspace {
     }
 
     pub(super) fn render_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let content: AnyElement = match self.modal.as_ref()? {
+        let content: AnyElement = match self.modals.current.as_ref()? {
             Modal::Picker(p) => p.clone().into_any_element(),
             Modal::GoToLine(g) => g.clone().into_any_element(),
             Modal::ProjectSearch(s) => s.clone().into_any_element(),
@@ -729,7 +729,7 @@ impl Workspace {
                         MouseButton::Left,
                         cx.listener(|ws, _, window, cx| {
                             // A running clone keeps its dialog open; it has a Stop button.
-                            if let Some(Modal::Clone(c)) = &ws.modal
+                            if let Some(Modal::Clone(c)) = &ws.modals.current
                                 && c.read(cx).is_busy()
                             {
                                 return;

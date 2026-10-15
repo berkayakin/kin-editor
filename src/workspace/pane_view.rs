@@ -234,7 +234,7 @@ impl Workspace {
     }
 
     pub(super) fn diff_view(&self) -> Option<Entity<DiffView>> {
-        match &self.modal {
+        match &self.modals.current {
             Some(Modal::Diff(view)) => Some(view.clone()),
             _ => None,
         }

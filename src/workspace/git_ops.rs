@@ -268,7 +268,7 @@ impl Workspace {
                         ws.load_diff_base(&editor, cx);
                     }
                 }
-                if let Some(Modal::Diff(view)) = &ws.modal {
+                if let Some(Modal::Diff(view)) = &ws.modals.current {
                     view.update(cx, |v, cx| v.reload(cx));
                 }
                 ws.status_task = None;
@@ -319,14 +319,14 @@ impl Workspace {
         };
         self.close_modal(window, cx);
         let picker = cx.new(|cx| BranchPicker::new(repo, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&picker, window, |ws, _, event: &BranchPickerEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&picker, window, |ws, _, event: &BranchPickerEvent, window, cx| match event {
             BranchPickerEvent::Run(op) => {
                 ws.close_modal(window, cx);
                 ws.run_git(op.clone(), window, cx);
             }
             BranchPickerEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::Branches(picker));
+        });
+        self.modals.open(Modal::Branches(picker), subscription);
         cx.notify();
     }
 
@@ -338,15 +338,15 @@ impl Workspace {
         self.close_modal(window, cx);
         let parent = clone_dialog::default_parent(self.root.as_deref());
         let dialog = cx.new(|cx| CloneDialog::new(parent, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, _, event: &CloneDialogEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&dialog, window, |ws, _, event: &CloneDialogEvent, window, cx| match event {
             CloneDialogEvent::Cloned(path) => {
                 ws.close_modal(window, cx);
                 ws.toast(ToastKind::Success, format!("Cloned {}", folder_name(path)), Some(clone_dialog::display_path(path)), cx);
                 ws.open_project(path.clone(), OpenIn::Auto, window, cx);
             }
             CloneDialogEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::Clone(dialog));
+        });
+        self.modals.open(Modal::Clone(dialog), subscription);
         cx.notify();
     }
 
@@ -403,7 +403,7 @@ impl Workspace {
     }
 
     pub(super) fn open_push_modal(&mut self, dialog: Entity<PushDialog>, window: &mut Window, cx: &mut Context<Self>) {
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, dialog, event: &PushDialogEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&dialog, window, |ws, dialog, event: &PushDialogEvent, window, cx| match event {
             PushDialogEvent::Push { force } => {
                 ws.close_modal(window, cx);
                 ws.run_git(GitOp::PushNow { force: *force }, window, cx);
@@ -413,9 +413,9 @@ impl Workspace {
                 ws.show_diff(source.clone(), window, cx);
             }
             PushDialogEvent::Dismissed => ws.close_modal(window, cx),
-        }));
+        });
         dialog.read(cx).focus(window);
-        self.modal = Some(Modal::Push(dialog));
+        self.modals.open(Modal::Push(dialog), subscription);
         cx.notify();
     }
 
@@ -424,7 +424,7 @@ impl Workspace {
         self.close_modal(window, cx);
         let side_by_side = SessionState::load().diff_side_by_side.unwrap_or(true);
         let view = cx.new(|cx| DiffView::new(repo, source, side_by_side, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&view, window, |ws, _, event: &DiffViewEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&view, window, |ws, _, event: &DiffViewEvent, window, cx| match event {
             DiffViewEvent::Close => {
                 ws.close_modal(window, cx);
                 // Back to the Push dialog the diff came from.
@@ -451,8 +451,8 @@ impl Workspace {
                 state.diff_side_by_side = Some(*side_by_side);
                 state.save().ok();
             }
-        }));
-        self.modal = Some(Modal::Diff(view));
+        });
+        self.modals.open(Modal::Diff(view), subscription);
         cx.notify();
     }
 

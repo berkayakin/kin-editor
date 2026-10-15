@@ -51,28 +51,27 @@ impl Workspace {
 
     pub(super) fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Text typed into Preferences a moment ago still gets saved.
-        if let Some(Modal::Preferences(preferences)) = &self.modal {
+        if let Some(Modal::Preferences(preferences)) = &self.modals.current {
             let preferences = preferences.clone();
             self.preferences_page = preferences.read(cx).page();
             preferences.update(cx, |p, cx| p.flush(cx));
         }
         // Leaving the theme picker without confirming undoes the preview.
-        if let Some(Modal::Theme(picker)) = &self.modal {
+        if let Some(Modal::Theme(picker)) = &self.modals.current {
             let picker = picker.read(cx);
             if !picker.confirmed {
                 let original = picker.original.clone();
                 theme::apply_theme(&original, cx);
             }
         }
-        if self.modal.take().is_some() {
-            self.modal_subscription = None;
+        if self.modals.take().is_some() {
             self.focus_active(window, cx);
             cx.notify();
         }
     }
 
     pub(super) fn open_picker(&mut self, mode: PickerMode, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(Modal::Picker(p)) = &self.modal
+        if let Some(Modal::Picker(p)) = &self.modals.current
             && p.read(cx).mode() == mode
         {
             // Pressing the shortcut again closes it, like JetBrains.
@@ -90,7 +89,7 @@ impl Workspace {
         let recent = if mode == PickerMode::Projects { self.recent_projects.clone() } else { self.recent.clone() };
         let (root, actions) = (self.root.clone(), self.actions.clone());
         let picker = cx.new(|cx| Picker::new(mode, root, files, recent, actions, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&picker, window, |ws, _, event: &PickerEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&picker, window, |ws, _, event: &PickerEvent, window, cx| match event {
             PickerEvent::OpenFile(path) => {
                 ws.close_modal(window, cx);
                 ws.open_path(path.clone(), window, cx);
@@ -123,19 +122,19 @@ impl Workspace {
             }
             PickerEvent::SymbolQuery(query) => ws.query_symbols(query.clone(), cx),
             PickerEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::Picker(picker));
+        });
+        self.modals.open(Modal::Picker(picker), subscription);
         cx.notify();
     }
 
     pub(super) fn select_theme(&mut self, _: &SelectTheme, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modal, Some(Modal::Theme(_))) {
+        if matches!(self.modals.current, Some(Modal::Theme(_))) {
             self.close_modal(window, cx);
             return;
         }
         self.close_modal(window, cx);
         let picker = cx.new(|cx| ThemePicker::new(window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&picker, window, |ws, _, event: &ThemePickerEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&picker, window, |ws, _, event: &ThemePickerEvent, window, cx| match event {
             ThemePickerEvent::Confirmed(name) => {
                 if let Err(err) = Settings::set("theme", name.as_str().into()) {
                     let _ = window.prompt(PromptLevel::Warning, "Couldn't save the theme choice", Some(&err.to_string()), &["OK"], cx);
@@ -144,8 +143,8 @@ impl Workspace {
                 ws.close_modal(window, cx);
             }
             ThemePickerEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::Theme(picker));
+        });
+        self.modals.open(Modal::Theme(picker), subscription);
         cx.notify();
     }
 
@@ -230,7 +229,7 @@ impl Workspace {
     }
 
     pub(super) fn set_symbol_rows(&mut self, rows: Vec<LocationRow>, cx: &mut Context<Self>) {
-        if let Some(Modal::Picker(picker)) = &self.modal
+        if let Some(Modal::Picker(picker)) = &self.modals.current
             && picker.read(cx).mode() == PickerMode::Symbols
         {
             picker.update(cx, |p, cx| p.set_locations(None, rows, cx));
@@ -255,7 +254,7 @@ impl Workspace {
             (symbols, e.primary_selection().head)
         };
         self.open_picker(PickerMode::Structure, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modal
+        if let Some(Modal::Picker(picker)) = &self.modals.current
             && picker.read(cx).mode() == PickerMode::Structure
         {
             picker.update(cx, |p, cx| p.set_symbols(symbols, cursor, cx));
@@ -269,7 +268,7 @@ impl Workspace {
             (e.doc.read(cx).line_count(), e.cursor_position(cx))
         };
         let modal = cx.new(|cx| GoToLineModal::new(line_count, current, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&modal, window, move |ws, _, event: &GoToLineEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&modal, window, move |ws, _, event: &GoToLineEvent, window, cx| match event {
             GoToLineEvent::Confirm { line, column } => {
                 ws.close_modal(window, cx);
                 let (line, column) = (*line, *column);
@@ -282,8 +281,8 @@ impl Workspace {
                 });
             }
             GoToLineEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::GoToLine(modal));
+        });
+        self.modals.open(Modal::GoToLine(modal), subscription);
         cx.notify();
     }
 
@@ -333,7 +332,7 @@ impl Workspace {
         });
         let overrides = self.open_buffers(cx);
         let search = cx.new(|cx| ProjectSearch::new(root, initial, replace, overrides, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&search, window, |ws, _, event: &ProjectSearchEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&search, window, |ws, _, event: &ProjectSearchEvent, window, cx| match event {
             ProjectSearchEvent::Open { path, range } => {
                 let range = range.clone();
                 ws.close_modal(window, cx);
@@ -346,8 +345,8 @@ impl Workspace {
                 ws.confirm_replace_in_files(query.clone(), replacement.clone(), files.clone(), window, cx);
             }
             ProjectSearchEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::ProjectSearch(search));
+        });
+        self.modals.open(Modal::ProjectSearch(search), subscription);
         cx.notify();
     }
 
@@ -409,7 +408,7 @@ impl Workspace {
                     let _ = window.prompt(PromptLevel::Critical, "Some files couldn't be changed", Some(&failures.join("\n")), &["OK"], cx);
                 }
                 let overrides = ws.open_buffers(cx);
-                if let Some(Modal::ProjectSearch(search)) = &ws.modal {
+                if let Some(Modal::ProjectSearch(search)) = &ws.modals.current {
                     search.update(cx, |s, cx| s.refresh(overrides, cx));
                 }
             })

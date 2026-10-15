@@ -203,7 +203,7 @@ impl Workspace {
         };
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| crate::trust_dialog::TrustDialog::new(folder, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, _, event: &crate::trust_dialog::TrustDialogEvent, window, cx| {
+        let subscription = cx.subscribe_in(&dialog, window, |ws, _, event: &crate::trust_dialog::TrustDialogEvent, window, cx| {
             use crate::trust_dialog::TrustDialogEvent;
             match event {
                 TrustDialogEvent::Trust(folder) => {
@@ -216,8 +216,8 @@ impl Workspace {
                 }
                 TrustDialogEvent::Dismissed => ws.close_modal(window, cx),
             }
-        }));
-        self.modal = Some(Modal::Trust(dialog));
+        });
+        self.modals.open(Modal::Trust(dialog), subscription);
         cx.notify();
     }
 

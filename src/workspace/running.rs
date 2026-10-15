@@ -225,7 +225,7 @@ impl Workspace {
         let initial = initial.unwrap_or_default();
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| InputDialog::new(title, Icon::Bug, hint, &initial, Some(0..initial.len()), window, cx).allow_empty());
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
+        let subscription = cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
             if let InputDialogEvent::Confirm(text) = event {
                 let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
                 let mut breakpoint = editor.read(cx).breakpoint(row, cx).unwrap_or(Breakpoint::at(row));
@@ -236,8 +236,8 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.set_breakpoint(breakpoint, cx));
             }
             ws.close_modal(window, cx);
-        }));
-        self.modal = Some(Modal::Input(dialog));
+        });
+        self.modals.open(Modal::Input(dialog), subscription);
         cx.notify();
     }
 
@@ -311,7 +311,7 @@ impl Workspace {
         let Some(targets) = self.configurations(self.last_run.clone(), false, cx) else { return };
         self.close_modal(window, cx);
         self.open_picker(PickerMode::Run, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modal {
+        if let Some(Modal::Picker(picker)) = &self.modals.current {
             picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
         }
     }
@@ -326,7 +326,7 @@ impl Workspace {
         }
         self.close_modal(window, cx);
         self.open_picker(PickerMode::Debug, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modal {
+        if let Some(Modal::Picker(picker)) = &self.modals.current {
             picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
         }
     }
@@ -355,7 +355,7 @@ impl Workspace {
                 })
                 .collect();
             ws.update(cx, |ws, cx| {
-                if let Some(Modal::Picker(picker)) = &ws.modal
+                if let Some(Modal::Picker(picker)) = &ws.modals.current
                     && picker.read(cx).mode() == PickerMode::Attach
                 {
                     picker.update(cx, |p, cx| p.set_run_targets(targets, cx));
@@ -467,7 +467,7 @@ impl Workspace {
         let hint = "Leave empty to show the shell's own title";
         let dialog =
             cx.new(|cx| InputDialog::new("Rename Terminal", Icon::Terminal, hint, &initial, Some(0..initial.len()), window, cx).allow_empty());
-        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
+        let subscription = cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
             if let InputDialogEvent::Confirm(name) = event {
                 terminal.update(cx, |t, cx| t.set_custom_title(Some(name.clone()), cx));
                 ws.schedule_session_save(cx);
@@ -477,8 +477,8 @@ impl Workspace {
             if let Some((g, ix)) = ws.terminal_position(&terminal, cx) {
                 ws.activate_terminal(g, ix, window, cx);
             }
-        }));
-        self.modal = Some(Modal::Input(dialog));
+        });
+        self.modals.open(Modal::Input(dialog), subscription);
         cx.notify();
     }
 

@@ -349,7 +349,7 @@ impl Workspace {
             )
             // Windows and Linux have no app menu, so Settings needs a way in.
             .child({
-                let on = matches!(self.modal, Some(Modal::Preferences(_)));
+                let on = matches!(self.modals.current, Some(Modal::Preferences(_)));
                 toggle(self.icon_button("open-settings", Icon::Settings, on, cx, |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx)), on)
                     .size(px(24.))
                     .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))

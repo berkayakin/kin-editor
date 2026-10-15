@@ -468,6 +468,28 @@ enum Modal {
     Trust(Entity<crate::trust_dialog::TrustDialog>),
 }
 
+/// The modal over the workspace, if any, with its subscription: they're
+/// set and cleared together.
+#[derive(Default)]
+struct ModalLayer {
+    current: Option<Modal>,
+    _subscription: Option<Subscription>,
+}
+
+impl ModalLayer {
+    /// Shows `modal` in place of any other; `subscription` lives as long.
+    fn open(&mut self, modal: Modal, subscription: Subscription) {
+        self.current = Some(modal);
+        self._subscription = Some(subscription);
+    }
+
+    /// Closes the modal; returns it, if there was one.
+    fn take(&mut self) -> Option<Modal> {
+        self._subscription = None;
+        self.current.take()
+    }
+}
+
 /// How long two Shift taps may be apart to count as a double Shift.
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 /// How long Save waits for format on save before saving unformatted.
@@ -555,8 +577,7 @@ pub struct Workspace {
     window_title: String,
     find_bar: Entity<FindBar>,
     show_find: bool,
-    modal: Option<Modal>,
-    modal_subscription: Option<Subscription>,
+    modals: ModalLayer,
     /// All project files, refreshed in the background.
     file_index: Arc<Vec<PathBuf>>,
     index_task: Option<Task<()>>,
@@ -851,8 +872,7 @@ impl Workspace {
             window_title: String::new(),
             find_bar,
             show_find: false,
-            modal: None,
-            modal_subscription: None,
+            modals: ModalLayer::default(),
             file_index: Arc::new(Vec::new()),
             index_task: None,
             recent: Vec::new(),
@@ -1121,9 +1141,8 @@ impl Workspace {
                 self.auto_save(&previous, cx);
             }
             // A diff over the editor area would hide the file being shown.
-            if matches!(self.modal, Some(Modal::Diff(_))) {
-                self.modal = None;
-                self.modal_subscription = None;
+            if matches!(self.modals.current, Some(Modal::Diff(_))) {
+                self.modals.take();
                 self.diff_return = None;
             }
             self.active_pane = pane;

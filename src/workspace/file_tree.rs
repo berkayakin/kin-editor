@@ -51,7 +51,7 @@ impl Workspace {
             self.restore_session(window, cx);
         }
         self.start_terminal_panel(window, cx);
-        if self.restricted(cx) && self.modal.is_none() {
+        if self.restricted(cx) && self.modals.current.is_none() {
             self.open_trust_dialog(window, cx);
         }
         cx.notify();

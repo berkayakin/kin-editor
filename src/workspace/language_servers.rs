@@ -69,7 +69,7 @@ impl Workspace {
         }
         self.close_modal(window, cx);
         self.open_picker(PickerMode::Locations, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modal {
+        if let Some(Modal::Picker(picker)) = &self.modals.current {
             picker.update(cx, |p, cx| p.set_locations(Some(title), rows, cx));
         }
     }
@@ -181,13 +181,13 @@ impl Workspace {
     }
 
     pub(super) fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modal, Some(Modal::Preferences(_))) {
+        if matches!(self.modals.current, Some(Modal::Preferences(_))) {
             self.close_modal(window, cx);
             return;
         }
         self.close_modal(window, cx);
         let preferences = cx.new(|cx| Preferences::new(self.preferences_page, window, cx));
-        self.modal_subscription = Some(cx.subscribe_in(&preferences, window, |ws, _, event: &PreferencesEvent, window, cx| match event {
+        let subscription = cx.subscribe_in(&preferences, window, |ws, _, event: &PreferencesEvent, window, cx| match event {
             PreferencesEvent::OpenSettingsFile => {
                 ws.close_modal(window, cx);
                 ws.open_settings_file(&OpenSettingsFile, window, cx);
@@ -198,8 +198,8 @@ impl Workspace {
             }
             PreferencesEvent::Problems(problems) => ws.report_config_problems(problems.clone(), cx),
             PreferencesEvent::Dismissed => ws.close_modal(window, cx),
-        }));
-        self.modal = Some(Modal::Preferences(preferences));
+        });
+        self.modals.open(Modal::Preferences(preferences), subscription);
         cx.notify();
     }
 
