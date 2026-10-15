@@ -3831,7 +3831,7 @@ impl Workspace {
         }
         add(MenuEntry::text("Clear"), tab(TerminalTabAction::Clear));
         match run {
-            Some(RunState::Running) => add(MenuEntry::item("Stop", Icon::Square).shortcut(binding_label(&StopRun, window)), tab(TerminalTabAction::Stop)),
+            Some(RunState::Running) => add(MenuEntry::item("Stop", Icon::Stop).shortcut(binding_label(&StopRun, window)), tab(TerminalTabAction::Stop)),
             Some(RunState::Exited(_)) => add(MenuEntry::item("Rerun", Icon::Refresh), tab(TerminalTabAction::Rerun)),
             None => {}
         }

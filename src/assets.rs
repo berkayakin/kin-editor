@@ -81,6 +81,7 @@ static ICONS: &[(&str, &[u8])] = icons![
     "play",
     "settings",
     "type",
+    "stop",
 ];
 
 /// The app logo, sized for the 96pt welcome-screen mark (2x pixels).
@@ -191,6 +192,7 @@ pub enum Icon {
     Play,
     Settings,
     Type,
+    Stop,
 }
 
 impl Icon {
@@ -264,6 +266,7 @@ impl Icon {
             Icon::Play => "icons/play.svg",
             Icon::Settings => "icons/settings.svg",
             Icon::Type => "icons/type.svg",
+            Icon::Stop => "icons/stop.svg",
         }
     }
 }
