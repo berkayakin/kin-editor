@@ -1407,6 +1407,61 @@ mod tests {
         assert_eq!(pair("a.go", "package p\n\nvar s = ‸\"a\"\n"), Some((at("\"", 19), at("\"", 21))));
     }
 
+    #[test]
+    fn javascript_and_typescript_text_objects() {
+        let src = "function f(a) {\n  const b = a;\n  return ‸b;\n}\n";
+        assert_eq!(object("a.js", src, "function", false).as_deref(), Some("const b = a;\n  return b;"));
+        assert_eq!(object("a.js", src, "function", true).as_deref(), Some(src.replace('‸', "").trim_end()));
+        let src = "const g = (x) => x ‸* 2;\n";
+        assert_eq!(object("a.js", src, "function", false).as_deref(), Some("x * 2"));
+        assert_eq!(object("a.js", src, "function", true).as_deref(), Some("(x) => x * 2"));
+        assert_eq!(object("a.js", "const h = () => {‸};\n", "function", false).as_deref(), Some("() => {}"));
+        let src = "class A {\n  m() {\n    return 1;\n  }\n  ‸n() {}\n}\n";
+        assert_eq!(object("a.js", src, "class", false).as_deref(), Some("m() {\n    return 1;\n  }\n  n() {}"));
+        assert_eq!(object("a.js", src, "function", true).as_deref(), Some("n() {}"));
+        let src = "interface P {\n  x: number;\n  ‸y: string;\n}\n";
+        assert_eq!(object("a.ts", src, "class", false).as_deref(), Some("x: number;\n  y: string"));
+        assert_eq!(object("a.ts", src, "class", true).as_deref(), Some(src.replace('‸', "").trim_end()));
+        let src = "enum E { A, ‸B }\n";
+        assert_eq!(object("a.ts", src, "class", false).as_deref(), Some("A, B"));
+        let src = "const C = () => <div>‸hi</div>;\n";
+        assert_eq!(object("a.tsx", src, "function", false).as_deref(), Some("<div>hi</div>"));
+        assert_eq!(object("a.tsx", "class A {\n  ‸x = 1;\n}\n", "class", false).as_deref(), Some("x = 1"));
+    }
+
+    #[test]
+    fn web_languages_indent_after_openers() {
+        assert!(indents("a.js", "function f() {‸\n}\n"));
+        assert!(indents("a.js", "foo(a,‸\n  b);\n"));
+        assert!(indents("a.js", "switch (x) {\n  case 1:‸\n    g();\n}\n"));
+        assert!(indents("a.js", "const f = () =>‸\n  1;\n"));
+        assert!(!indents("a.js", "function f() {\n  const a = 1;‸\n}\n"));
+        assert!(indents("a.ts", "interface P {‸\n}\n"));
+        assert!(indents("a.ts", "type T = Map<‸\n  string, number>;\n"));
+        assert!(indents("a.tsx", "const a = (\n  <div>‸\n    hi\n  </div>\n);\n"));
+        assert!(indents("a.tsx", "const a = <div‸\n  id=\"x\" />;\n"));
+        assert!(indents("a.css", "a {‸\n}\n"));
+        assert!(indents("a.css", "a {\n  grid-template-areas:‸\n    \"a b\";\n}\n"));
+        assert!(!indents("a.css", "a {\n  color: red;‸\n}\n"));
+        assert!(indents("a.json", "{\"a\": [1,‸\n  2]}\n"));
+        assert!(!indents("a.json", "{\n  \"a\": 1,‸\n  \"b\": 2\n}\n"));
+    }
+
+    #[test]
+    fn web_languages_pair_quotes_and_tags() {
+        let at = |text: &str, n: usize| (text.to_string(), n);
+        assert_eq!(pair("a.js", "const s = ‸'ab';\n"), Some((at("'", 10), at("'", 13))));
+        assert_eq!(pair("a.js", "const s = ‸`a${b}`;\n"), Some((at("`", 10), at("`", 16))));
+        assert_eq!(pair("a.js", "const s = `a‸${b}`;\n"), Some((at("${", 12), at("}", 15))));
+        assert_eq!(pair("a.js", "f‸(a);\n"), Some((at("(", 1), at(")", 3))));
+        assert_eq!(pair("a.jsx", "const a = ‸<div></div>;\n"), Some((at("<", 10), at(">", 14))));
+        assert_eq!(pair("a.tsx", "const a = <div>‸</div>;\n"), Some((at("</", 15), at(">", 20))));
+        assert_eq!(pair("a.ts", "let a: Array‸<number>;\n"), Some((at("<", 12), at(">", 19))));
+        assert_eq!(pair("a.css", "a { content: ‸\"x\"; }\n"), Some((at("\"", 13), at("\"", 15))));
+        assert_eq!(pair("a.json", "{‸\"a\": 1}\n"), Some((at("\"", 1), at("\"", 3))));
+        assert_eq!(pair("a.json", "‸{\"a\": 1}\n"), Some((at("{", 0), at("}", 7))));
+    }
+
     /// `src` without its `‸`, and the offset the `‸` marks.
     fn caret(src: &str) -> (String, usize) {
         (src.replacen('‸', "", 1), src.find('‸').expect("a ‸ in the source"))
