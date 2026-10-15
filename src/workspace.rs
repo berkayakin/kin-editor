@@ -38,6 +38,7 @@ use crate::{
     },
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
+    problems_panel::{ProblemsEvent, ProblemsPanel},
     find_bar::{FindBar, FindBarEvent},
     keymap,
     lint::Severity,
@@ -576,8 +577,6 @@ pub struct Workspace {
     debug_location: Option<(PathBuf, u32)>,
     /// Breakpoints of files that aren't open; open files keep theirs in their documents.
     breakpoints: HashMap<PathBuf, Vec<Breakpoint>>,
-    /// Errors and warnings the last Run printed: its name and what was found.
-    run_problems: Option<(String, Vec<run::OutputProblem>)>,
     /// The status bar's venv for a folder (looked up once, not every frame).
     venv_shown: std::cell::RefCell<Option<(PathBuf, Option<PathBuf>)>>,
     sidebar_width: Pixels,
@@ -598,6 +597,8 @@ pub struct Workspace {
     last_shift_tap: Option<Instant>,
     sidebar_mode: SidebarMode,
     git_panel: Entity<GitPanel>,
+    /// The active file's problems and the last Run's.
+    problems: Entity<ProblemsPanel>,
     git_log: Entity<GitLog>,
     /// The Push dialog a diff was opened from; it comes back when the diff closes.
     diff_return: Option<Entity<PushDialog>>,
@@ -669,6 +670,11 @@ impl Workspace {
             GitPanelEvent::Run(op) => ws.run_git(op.clone(), window, cx),
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
+        });
+        let problems = cx.new(|_| ProblemsPanel::new());
+        let problems_subscription = cx.subscribe_in(&problems, window, |ws, _, event: &ProblemsEvent, window, cx| match event {
+            ProblemsEvent::Open { path, line, column } => ws.open_at(path.clone(), Some(*line), *column, window, cx),
+            ProblemsEvent::Close => ws.toggle_problems(&ToggleProblems, window, cx),
         });
         let git_log = cx.new(GitLog::new);
         let log_subscription = cx.subscribe_in(&git_log, window, |ws, _, event: &GitLogEvent, window, cx| match event {
@@ -816,7 +822,6 @@ impl Workspace {
             last_debug: None,
             debug_location: None,
             breakpoints: HashMap::new(),
-            run_problems: None,
             venv_shown: Default::default(),
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
             sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(SIDEBAR_MIN_WIDTH, 4000.)),
@@ -834,6 +839,7 @@ impl Workspace {
             last_shift_tap: None,
             sidebar_mode: if state.sidebar_mode.as_deref() == Some("commit") { SidebarMode::Commit } else { SidebarMode::Files },
             git_panel,
+            problems,
             git_log,
             diff_return: None,
             repo: None,
@@ -869,6 +875,7 @@ impl Workspace {
                 find_subscription,
                 git_subscription,
                 log_subscription,
+                problems_subscription,
                 activation,
                 quit,
                 settings_observer,
@@ -1148,14 +1155,6 @@ fn status_tooltip(label: &str, action: &dyn gpui::Action, window: &mut Window, c
         None => label.to_string(),
     };
     tooltip_view(text, cx)
-}
-
-fn severity_icon(severity: Severity, theme: &Theme) -> (Icon, Hsla) {
-    match severity {
-        Severity::Error => (Icon::CircleX, theme.error.into()),
-        Severity::Warning => (Icon::TriangleAlert, theme.warning.into()),
-        Severity::Info => (Icon::CircleAlert, theme.info.into()),
-    }
 }
 
 fn folder_name(path: &Path) -> String {

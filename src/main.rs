@@ -35,6 +35,7 @@ mod markdown_preview;
 mod onboarding;
 mod picker;
 mod preview;
+mod problems_panel;
 mod process;
 mod trust;
 mod trust_dialog;

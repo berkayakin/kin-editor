@@ -78,7 +78,7 @@ impl Workspace {
         let active_editor = self.active_editor().cloned();
         let editor = self.active_editor().map(|e| e.read(cx));
         // The file's problems and the last Run's.
-        let run_problems = self.run_problems_shown(cx);
+        let run_problems = self.problems.read(cx).run_shown(editor.map(|e| e.doc.read(cx)));
         let count = |sev: Severity| {
             editor.map_or(0, |e| e.doc.read(cx).diagnostics.iter().filter(|d| d.severity == sev).count())
                 + run_problems.iter().filter(|p| p.severity == sev).count()

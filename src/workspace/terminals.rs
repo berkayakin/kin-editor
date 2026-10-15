@@ -185,7 +185,8 @@ impl Workspace {
             let cwd = target.cwd.clone();
             let problems = cx.background_executor().spawn(async move { run::output_problems(&output, &cwd) }).await;
             ws.update(cx, |ws, cx| {
-                ws.run_problems = (!problems.is_empty()).then_some((target.name, problems));
+                let run = (!problems.is_empty()).then_some((target.name, problems));
+                ws.problems.update(cx, |p, cx| p.set_run(run, cx));
                 cx.notify();
             })
             .ok();
@@ -290,20 +291,6 @@ impl Workspace {
             .ok();
         })
         .detach();
-    }
-
-    /// The last Run's problems, without the ones the active file shows
-    /// already (its language server reports the same compiler errors).
-    pub(super) fn run_problems_shown(&self, cx: &App) -> Vec<&run::OutputProblem> {
-        let Some((_, problems)) = &self.run_problems else { return Vec::new() };
-        let doc = self.active_editor().map(|e| e.read(cx).doc.read(cx));
-        let known = |p: &run::OutputProblem| {
-            doc.is_some_and(|doc| {
-                doc.path.as_deref() == Some(p.path.as_path())
-                    && doc.diagnostics.iter().any(|d| d.severity == p.severity && doc.row_of(d.range.start) + 1 == p.line as usize)
-            })
-        };
-        problems.iter().filter(|p| !known(p)).collect()
     }
 
     /// Adds a terminal where `place` says. A Run tab stays open when its

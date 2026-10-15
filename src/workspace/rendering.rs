@@ -218,6 +218,11 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The Problems panel lists the active file's diagnostics.
+        if self.show_problems {
+            let active = self.active_editor().cloned();
+            self.problems.update(cx, |p, cx| p.set_editor(active, cx));
+        }
         self.load_shown_tabs(cx);
         self.update_window_title(window, cx);
         // A drag that ended without a drop (Escape, left the window) leaves no highlight.

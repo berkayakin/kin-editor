@@ -14,7 +14,10 @@ impl Workspace {
         self.expanded.insert(root.clone());
         // The folders that were open last time, if they still exist.
         self.breakpoints.clear();
-        self.run_problems = None;
+        self.problems.update(cx, |p, cx| {
+            p.set_run(None, cx);
+            p.set_root(Some(root.clone()), cx);
+        });
         let mut session = ProjectSession::load(&root);
         if let Some(session) = &mut session {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
