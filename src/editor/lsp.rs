@@ -1140,4 +1140,39 @@ mod tests {
         store.update(cx, |s, _| s.shutdown_all());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[gpui::test]
+    fn servers_get_their_settings(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.ts");
+        std::fs::write(&path, "x\n").unwrap();
+        let settings = crate::settings::Settings::parse(
+            r#"{ "lsp": { "fake-configured": {
+                "initialization_options": { "greeting": "hello" },
+                "settings": { "fake.mode": "strict" }
+            } } }"#,
+        )
+        .unwrap();
+        cx.update(|cx| cx.set_global(settings));
+
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("configured", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        // The server echoes its initialization options and the setting it asked for.
+        wait_for(cx, "diagnostics", |cx| {
+            editor.read_with(cx, |e, _| e.doc.diagnostics.iter().any(|d| &*d.message == "configured problem hello strict"))
+        });
+        store.update(cx, |s, _| s.shutdown_all());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

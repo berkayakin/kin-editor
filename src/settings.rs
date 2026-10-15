@@ -44,6 +44,10 @@ pub struct Settings {
     /// Per language: `false` to turn its language server off, or a command
     /// (`["pylsp"]`) to use instead of the built-in choice.
     pub language_servers: HashMap<String, serde_json::Value>,
+    /// Per language server, by id (Kin's, `typescript`, or Zed's, `vtsls`):
+    /// its settings, initialization options and program. Zed's names, so
+    /// Zed users' settings work as they are.
+    pub lsp: HashMap<String, LspSettings>,
     /// Per language: `"language_server"`, a command reading stdin and writing
     /// stdout (`["black", "-q", "-"]`), or `false` to never format.
     pub formatters: HashMap<String, serde_json::Value>,
@@ -66,6 +70,26 @@ pub struct Settings {
     /// The switch `visual_effects` replaced: `true` reads as Minimal. Kept so
     /// a settings.json that has it still works; writing the level removes it.
     pub reduce_visual_effects: Option<bool>,
+}
+
+/// One language server's settings (`lsp.<id>`).
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct LspSettings {
+    /// Answers the server's `workspace/configuration` requests (by section,
+    /// `"python.analysis"` as one key or nested) and is sent when it changes.
+    pub settings: Option<Value>,
+    /// Sent with `initialize`; a change applies when the server restarts.
+    pub initialization_options: Option<Value>,
+    /// Another program to run for it.
+    pub binary: Option<LspBinary>,
+}
+
+#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct LspBinary {
+    pub path: Option<String>,
+    pub arguments: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -285,6 +309,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "editor_line_height",
     "languages",
     "language_servers",
+    "lsp",
     "formatters",
     "terminal_shell",
     "run_configurations",
@@ -756,6 +781,14 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "language_servers": {
   //   "Python": ["pylsp"],
   //   "Markdown": false
+  // },
+
+  // Per server (by id, as in Zed): settings it asks for, initialization
+  // options (applied when it restarts) and another program to run.
+  // "lsp": {
+  //   "basedpyright": { "settings": { "basedpyright.analysis": { "typeCheckingMode": "strict" } } },
+  //   "rust-analyzer": { "initialization_options": { "check": { "command": "clippy" } } },
+  //   "gopls": { "binary": { "path": "/opt/go/bin/gopls" } }
   // },
 
   // Reformat Code uses the project's own formatter (e.g. its Prettier), then

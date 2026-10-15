@@ -195,6 +195,9 @@ pub struct LspStore {
     diagnostics: HashMap<(PathBuf, ServerKey), Value>,
     /// Work-done progress per server, by token.
     progress: HashMap<ServerKey, HashMap<String, Progress>>,
+    /// Each started server's spec, program and the configuration it was
+    /// given, to answer `workspace/configuration` and notice changes.
+    configs: HashMap<ServerKey, (&'static servers::ServerSpec, PathBuf, servers::ServerConfig)>,
     /// Tests: the servers every document gets, instead of its language's.
     #[cfg(test)]
     pub(crate) test_specs: Option<Vec<&'static servers::ServerSpec>>,
@@ -209,6 +212,7 @@ impl LspStore {
             documents: HashMap::new(),
             diagnostics: HashMap::new(),
             progress: HashMap::new(),
+            configs: HashMap::new(),
             #[cfg(test)]
             test_specs: None,
             _tasks: Vec::new(),
@@ -297,9 +301,11 @@ impl LspStore {
     ) {
         self.servers.insert(key.clone(), ServerState::Finding);
         cx.notify();
+        let user = Settings::get(cx).lsp.clone();
         let task = cx.spawn(async move |this, cx| {
             // Finding the executable (and the login shell's PATH) touches the disk.
             let root = key.root.clone();
+            let user_for_find = user.clone();
             let spawned = cx
                 .background_executor()
                 .spawn(async move {
@@ -307,7 +313,8 @@ impl LspStore {
                     let venv = (language == Language::Python).then(|| crate::python::venv(file.parent()?)).flatten();
                     let command = match &custom {
                         Some(command) => servers::custom(command),
-                        None => servers::find(spec, &file, venv.as_deref()),
+                        // `lsp.<id>.binary`, else where Kin finds it.
+                        None => servers::user_binary(spec, &user_for_find).or_else(|| servers::find(spec, &file, venv.as_deref())),
                     };
                     // Kin's own Node.js runs the npm servers it installed.
                     let path = crate::python::path_with(venv.as_deref(), &install::path_with(install::node_bin().as_deref()));
@@ -336,13 +343,16 @@ impl LspStore {
                 Some((Ok((client, incoming)), c)) => (client, incoming, c),
             };
             let name = command.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let config = servers::config(spec, &command.program, &user);
+            let initialization_options = config.initialization_options.clone();
             this.update(cx, |s, cx| {
                 s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec));
+                s.configs.insert(key.clone(), (spec, command.program.clone(), config));
                 s.listen(key.clone(), incoming, cx);
             })
             .ok();
 
-            let init = client.request("initialize", initialize_params(&key.root));
+            let init = client.request("initialize", initialize_params(&key.root, initialization_options));
             let result = match init.await {
                 Ok(result) => result,
                 // An exit is reported (and explained) by `Closed`.
@@ -353,6 +363,12 @@ impl LspStore {
                 }
             };
             client.notify("initialized", json!({}));
+            // Servers that don't ask (`workspace/configuration`) take their settings this way.
+            if let Ok(Some(settings)) = this.update(cx, |s, _| s.configs.get(&key).map(|(_, _, c)| c.settings.clone()))
+                && !settings.is_null()
+            {
+                client.notify("workspace/didChangeConfiguration", json!({ "settings": settings }));
+            }
             let capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
             let encoding = match capabilities.get("positionEncoding").and_then(Value::as_str) {
                 Some("utf-8") => Encoding::Utf8,
@@ -456,10 +472,12 @@ impl LspStore {
             Incoming::Request { id, method, params } => {
                 let Some(client) = self.client(key) else { return };
                 match method.as_str() {
-                    // Kin has no per-server settings; null means "use your defaults".
+                    // From `lsp.<id>.settings` (and Kin's defaults); null means "use yours".
                     "workspace/configuration" => {
-                        let count = params.get("items").and_then(Value::as_array).map_or(0, Vec::len);
-                        client.respond(id, Value::Array(vec![Value::Null; count]));
+                        let settings = self.configs.get(key).map_or(Value::Null, |(_, _, c)| c.settings.clone());
+                        let items = params.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+                        let answers = items.iter().map(|item| servers::configuration(&settings, item.get("section").and_then(Value::as_str)));
+                        client.respond(id, Value::Array(answers.collect()));
                     }
                     "workspace/workspaceFolders" => client.respond(id, workspace_folders(&key.root)),
                     "workspace/applyEdit" => {
@@ -700,6 +718,22 @@ impl LspStore {
         cx.notify();
     }
 
+    /// Settings changed: running servers whose settings differ now are told
+    /// (initialization options and programs apply when a server restarts).
+    pub fn settings_changed(&mut self, cx: &App) {
+        let user = &Settings::get(cx).lsp;
+        for (key, (spec, program, config)) in &mut self.configs {
+            let fresh = servers::config(spec, program, user);
+            if fresh.settings == config.settings {
+                continue;
+            }
+            config.settings = fresh.settings;
+            if let Some(ServerState::Running(server)) = self.servers.get(key) {
+                server.client.notify("workspace/didChangeConfiguration", json!({ "settings": config.settings }));
+            }
+        }
+    }
+
     /// Registers again the documents `which` picks (their servers changed).
     fn reregister(&mut self, which: impl Fn(&OpenDocument) -> bool, cx: &mut Context<Self>) {
         let editors: Vec<Entity<Editor>> = self.documents.values().filter(|d| which(d)).filter_map(|d| d.editor.upgrade()).collect();
@@ -718,6 +752,7 @@ impl LspStore {
             }
             self.servers.remove(key);
             self.progress.remove(key);
+            self.configs.remove(key);
         }
         self.reregister(|d| keys.iter().any(|key| d.has(key)), cx);
     }
@@ -756,6 +791,7 @@ impl LspStore {
     pub fn shutdown_all(&mut self) {
         let clients: Vec<Arc<Client>> = self.servers.keys().cloned().collect::<Vec<_>>().iter().filter_map(|k| self.client(k)).collect();
         self.servers.clear();
+        self.configs.clear();
         self.documents.clear();
         if !clients.is_empty() {
             std::thread::spawn(move || clients.iter().for_each(|c| c.shutdown()));
@@ -769,8 +805,8 @@ fn workspace_folders(root: &Path) -> Value {
 }
 
 /// What Kin tells servers it can do.
-fn initialize_params(root: &Path) -> Value {
-    json!({
+fn initialize_params(root: &Path, initialization_options: Value) -> Value {
+    let mut params = json!({
         "processId": std::process::id(),
         "clientInfo": { "name": "Kin", "version": env!("CARGO_PKG_VERSION") },
         "rootUri": path_to_uri(root),
@@ -818,7 +854,11 @@ fn initialize_params(root: &Path) -> Value {
                 "inlayHint": {},
             },
         },
-    })
+    });
+    if !initialization_options.is_null() {
+        params["initializationOptions"] = initialization_options;
+    }
+    params
 }
 
 impl Default for LspStore {
@@ -828,8 +868,10 @@ impl Default for LspStore {
 }
 
 /// A language server for tests: `python3 -c FAKE_SERVER <name> <trigger chars>`.
-/// It publishes one diagnostic per opened file ("<name> problem"), completes
-/// with "<name>-item", and offers "<name> fix (<diagnostics sent>)".
+/// It publishes one diagnostic per opened file ("<name> problem", followed
+/// by its initialization option `greeting` and the `mode` in its `fake`
+/// settings section when it has them), completes with "<name>-item", and offers "<name> fix
+/// (<diagnostics sent>)".
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
@@ -851,15 +893,26 @@ def send(msg):
     body = json.dumps(msg).encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
+init = {}
 while True:
     m = read()
     method, id = m.get("method"), m.get("id")
     if method == "initialize":
+        init = m["params"].get("initializationOptions") or {}
         caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True}
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
-        problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": name + " problem"}
+        # Asks for its whole section and reads `mode` in it, as basedpyright
+        # asks for "basedpyright" and reads its "analysis".
+        send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})
+        answer = read()
+        while answer.get("id") != "cfg":
+            answer = read()
+        section = answer["result"][0] or {}
+        extra = [str(v) for v in (init.get("greeting"), section.get("mode")) if v is not None]
+        message = " ".join([name + " problem"] + extra)
+        problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [problem]}})
     elif method == "textDocument/completion":
         send({"jsonrpc": "2.0", "id": id, "result": [{"label": name + "-item"}]})
@@ -878,7 +931,7 @@ pub(crate) fn fake_server(name: &str, triggers: &str) -> &'static servers::Serve
     let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
     let args: &'static [&'static str] = Box::leak(vec!["-c", FAKE_SERVER, leak(name.to_string()), leak(triggers.to_string())].into_boxed_slice());
     let candidates: &'static [(&'static str, &'static [&'static str])] = Box::leak(vec![("python3", args)].into_boxed_slice());
-    Box::leak(Box::new(servers::ServerSpec { id: leak(format!("fake-{name}")), candidates, install: "", root_markers: &[] }))
+    Box::leak(Box::new(servers::ServerSpec { id: leak(format!("fake-{name}")), candidates, ..servers::SPEC }))
 }
 
 #[cfg(test)]
@@ -887,7 +940,9 @@ mod tests {
 
     #[test]
     fn advertises_both_encodings() {
-        let params = initialize_params(Path::new("/w"));
+        let params = initialize_params(Path::new("/w"), json!({ "a": 1 }));
+        assert_eq!(params["initializationOptions"], json!({ "a": 1 }));
+        assert!(initialize_params(Path::new("/w"), Value::Null).get("initializationOptions").is_none());
         assert_eq!(params["capabilities"]["general"]["positionEncodings"], json!(["utf-8", "utf-16"]));
         assert_eq!(params["rootUri"], "file:///w");
     }

@@ -505,8 +505,11 @@ fn read_extension(dir: &Path) -> Read {
     // Per language, every server the extension lists for it: one spec with
     // them all as candidates, so the first that's installed runs.
     type Candidate = (&'static str, &'static [&'static str]);
-    // (server ids, candidates, install hint, root markers)
-    let mut per_language: HashMap<String, (Vec<String>, Vec<Candidate>, Option<&'static str>, Vec<&'static str>)> = HashMap::new();
+    type Json = Option<&'static serde_json::Value>;
+    // (server ids, candidates, install hint, root markers, initialization options, settings)
+    #[allow(clippy::type_complexity)]
+    let mut per_language: HashMap<String, (Vec<String>, Vec<Candidate>, Option<&'static str>, Vec<&'static str>, Json, Json)> =
+        HashMap::new();
     for (id, server) in manifest.get("language_servers").and_then(Value::as_table).into_iter().flatten() {
         let name = server.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
         let mut languages = strings(server.get("languages"));
@@ -524,16 +527,24 @@ fn read_extension(dir: &Path) -> Read {
         let candidate: Candidate = (leak(command), Box::leak(args.into_iter().map(leak).collect::<Vec<_>>().into_boxed_slice()));
         let install = server.get("install").and_then(Value::as_str).map(leak);
         let markers: Vec<&'static str> = strings(server.get("root_markers")).into_iter().map(leak).collect();
+        // Kin's own keys: what Zed extensions' code would pass the server.
+        let json = |key: &str| -> Json {
+            let value = serde_json::to_value(server.get(key)?).ok()?;
+            Some(Box::leak(Box::new(value)))
+        };
+        let (initialization_options, settings) = (json("initialization_options"), json("settings"));
         for language in languages {
             let entry = per_language.entry(language).or_default();
             entry.0.push(id.clone());
             entry.1.push(candidate);
             entry.2 = entry.2.or(install);
             entry.3.extend(markers.iter().copied());
+            entry.4 = entry.4.or(initialization_options);
+            entry.5 = entry.5.or(settings);
         }
     }
     let mut servers = HashMap::new();
-    for (language, (ids, candidates, install, markers)) in per_language {
+    for (language, (ids, candidates, install, markers, initialization_options, settings)) in per_language {
         let names: Vec<&str> = candidates.iter().map(|(command, _)| *command).collect();
         let install = install.unwrap_or_else(|| {
             leak(format!("Install {}, or set a command in language_servers (for the {} extension)", names.join(" or "), info.name))
@@ -545,6 +556,8 @@ fn read_extension(dir: &Path) -> Read {
             candidates: Box::leak(candidates.into_boxed_slice()),
             install,
             root_markers: Box::leak(markers.into_boxed_slice()),
+            initialization_options,
+            settings,
         }));
         servers.insert(language, spec);
     }

@@ -313,12 +313,17 @@ With a server running, its diagnostics replace Kin's built-in syntax check (the 
 rules and ESLint still run). Hover a symbol for its documentation and any problem there (the
 popover scrolls, and a copy button that appears on hover copies its text); completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
-server or turn one off, see `language_servers` below.
+server or turn one off, see `language_servers` below; to configure one, `lsp` (Zed's format).
+
+A file can have several servers: Kin's own and any an extension adds for its language (ESLint or
+Tailwind beside TypeScript). All of them get the file; their problems show together, completion
+and code actions list all of theirs, and the rest (hover, Go to Declaration, rename, formatting)
+goes to the first that offers it. The status bar names the ones running.
 
 **Inlay hints** show what the server infers inside the code, on a soft chip: variable types,
-parameter names at call sites and the like. rust-analyzer, basedpyright and clangd send them as
-they come; typescript-language-server and gopls need settings Kin doesn't pass yet. Turn them
-off with `inlay_hints` or, for one editor, **Toggle Inlay Hints**.
+parameter names at call sites and the like. Kin turns them on in typescript-language-server, vtsls
+and gopls, which leave them off unless asked (change that through `lsp`). Turn them off with
+`inlay_hints` or, for one editor, **Toggle Inlay Hints**.
 
 ## Vim mode
 
@@ -554,17 +559,21 @@ rev = "0123456789abcdef0123456789abcdef01234567"
 # path = "dialect"   # the grammar's folder inside the repository
 
 # A language server for this extension's languages, or for a built-in one
-# (it then replaces Kin's choice). Zed extensions find their server in
-# code; Kin runs `command`, else a well-known server's command (zls,
-# gleam lsp, nil, lua-language-server, haskell-language-server…), else the
-# server's id as a program. With several servers for a language, the first
-# one installed runs. Settings' "language_servers" can always override.
+# (it then runs beside Kin's). Zed extensions find their server in code;
+# Kin runs `command`, else a well-known server's command (zls, gleam lsp,
+# nil, lua-language-server, haskell-language-server…), else the server's id
+# as a program. With several servers for a language in one extension, the
+# first one installed runs. Settings' "language_servers" and "lsp" can
+# always override.
 [language_servers.mylang-ls]
 name = "MyLang LS"
 languages = ["MyLang"]
 command = "mylang-ls"
 args = ["--stdio"]
 install = "brew install mylang-ls"   # shown when it isn't found
+# What Zed extensions' code would pass the server (Kin's keys):
+initialization_options = { lint = true }
+settings = { mylang = { formatting = "auto" } }
 ```
 
 ```toml
@@ -643,6 +652,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
+| `lsp` | | per server, by id (Kin's, e.g. `typescript`, or Zed's, e.g. `vtsls`, `basedpyright`): `settings` (what it asks for through `workspace/configuration`; a change is sent to it), `initialization_options` (applied when it restarts) and `binary` (`{ "path", "arguments" }`), as in Zed |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |

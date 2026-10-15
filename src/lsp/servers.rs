@@ -3,12 +3,15 @@
 //! installed itself (see `install.rs`, the status bar's Install).
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
 
-use crate::syntax::Language;
+use serde_json::{Value, json};
+
+use crate::{settings::LspSettings, syntax::Language};
 
 pub struct ServerSpec {
     /// Shared by languages one server handles (JS/TS/TSX).
@@ -19,15 +22,17 @@ pub struct ServerSpec {
     pub install: &'static str,
     /// Files that mark a project root for this server.
     pub root_markers: &'static [&'static str],
+    /// From an extension's manifest: what it passes the server.
+    pub initialization_options: Option<&'static Value>,
+    pub settings: Option<&'static Value>,
 }
 
+/// The fields a spec usually leaves empty, for `..SPEC`.
+pub const SPEC: ServerSpec =
+    ServerSpec { id: "", candidates: &[], install: "", root_markers: &[], initialization_options: None, settings: None };
+
 /// For a language whose server is only a command in `language_servers`.
-pub static CUSTOM: ServerSpec = ServerSpec {
-    id: "custom",
-    candidates: &[],
-    install: "Check the command in language_servers (settings.json)",
-    root_markers: &[],
-};
+pub static CUSTOM: ServerSpec = ServerSpec { id: "custom", install: "Check the command in language_servers (settings.json)", ..SPEC };
 
 /// The main server for `language` (see `specs`).
 pub fn spec(language: Language) -> Option<&'static ServerSpec> {
@@ -62,18 +67,21 @@ fn builtin(language: Language) -> Option<&'static ServerSpec> {
         candidates: &[("rust-analyzer", &[])],
         install: "rustup component add rust-analyzer",
         root_markers: &["Cargo.toml"],
+        ..SPEC
     };
     static GO: ServerSpec = ServerSpec {
         id: "gopls",
         candidates: &[("gopls", &[])],
         install: "go install golang.org/x/tools/gopls@latest",
         root_markers: &["go.mod", "go.work"],
+        ..SPEC
     };
     static TYPESCRIPT: ServerSpec = ServerSpec {
         id: "typescript",
         candidates: &[("typescript-language-server", &["--stdio"]), ("vtsls", &["--stdio"])],
         install: "npm install -g typescript typescript-language-server",
         root_markers: &["tsconfig.json", "jsconfig.json", "package.json"],
+        ..SPEC
     };
     static PYTHON: ServerSpec = ServerSpec {
         id: "python",
@@ -84,54 +92,63 @@ fn builtin(language: Language) -> Option<&'static ServerSpec> {
         ],
         install: "pip install basedpyright",
         root_markers: &["pyproject.toml", "setup.py", "requirements.txt"],
+        ..SPEC
     };
     static PHP: ServerSpec = ServerSpec {
         id: "php",
         candidates: &[("intelephense", &["--stdio"]), ("phpactor", &["language-server"])],
         install: "npm install -g intelephense",
         root_markers: &["composer.json"],
+        ..SPEC
     };
     static CSS: ServerSpec = ServerSpec {
         id: "css",
         candidates: &[("vscode-css-language-server", &["--stdio"])],
         install: "npm install -g vscode-langservers-extracted",
         root_markers: &["package.json"],
+        ..SPEC
     };
     static HTML: ServerSpec = ServerSpec {
         id: "html",
         candidates: &[("vscode-html-language-server", &["--stdio"])],
         install: "npm install -g vscode-langservers-extracted",
         root_markers: &["package.json"],
+        ..SPEC
     };
     static JSON: ServerSpec = ServerSpec {
         id: "json",
         candidates: &[("vscode-json-language-server", &["--stdio"])],
         install: "npm install -g vscode-langservers-extracted",
         root_markers: &["package.json"],
+        ..SPEC
     };
     static YAML: ServerSpec = ServerSpec {
         id: "yaml",
         candidates: &[("yaml-language-server", &["--stdio"])],
         install: "npm install -g yaml-language-server",
         root_markers: &[],
+        ..SPEC
     };
     static TOML: ServerSpec = ServerSpec {
         id: "taplo",
         candidates: &[("taplo", &["lsp", "stdio"])],
         install: "cargo install taplo-cli --locked --features lsp",
         root_markers: &[],
+        ..SPEC
     };
     static SHELL: ServerSpec = ServerSpec {
         id: "bash",
         candidates: &[("bash-language-server", &["start"])],
         install: "npm install -g bash-language-server",
         root_markers: &[],
+        ..SPEC
     };
     static MARKDOWN: ServerSpec = ServerSpec {
         id: "marksman",
         candidates: &[("marksman", &["server"])],
         install: "brew install marksman",
         root_markers: &[],
+        ..SPEC
     };
     Some(match language {
         Language::Rust => &RUST,
@@ -186,6 +203,140 @@ pub fn root_for(spec: &ServerSpec, file: &Path, workspace_root: Option<&Path>) -
         .find(|d| spec.root_markers.iter().chain(&[".git"]).any(|m| d.join(m).exists()))
         .unwrap_or(dir)
         .to_path_buf()
+}
+
+/// Zed's id for a server program where it isn't the program's name, so
+/// `lsp.<id>` settings written for Zed find it.
+fn zed_id(program: &str) -> &str {
+    match program {
+        "basedpyright-langserver" => "basedpyright",
+        "pyright-langserver" => "pyright",
+        "vscode-json-language-server" => "json-language-server",
+        other => other,
+    }
+}
+
+/// The user's `lsp.<id>` entry for a server: by Kin's id, else by the
+/// program's Zed id or name (`program`, else any of its candidates').
+fn user_entry<'a>(spec: &ServerSpec, program: Option<&str>, user: &'a HashMap<String, LspSettings>) -> Option<&'a LspSettings> {
+    let mut keys = vec![spec.id];
+    match program {
+        Some(program) => keys.extend([zed_id(program), program]),
+        None => keys.extend(spec.candidates.iter().flat_map(|(program, _)| [zed_id(program), *program])),
+    }
+    keys.into_iter().find_map(|key| user.get(key))
+}
+
+/// The program `lsp.<id>.binary` sets for a server, if any.
+pub fn user_binary(spec: &ServerSpec, user: &HashMap<String, LspSettings>) -> Option<Command> {
+    let binary = user_entry(spec, None, user)?.binary.as_ref()?;
+    let mut command = vec![binary.path.clone()?];
+    command.extend(binary.arguments.clone().unwrap_or_default());
+    custom(&command)
+}
+
+/// What a server is started with and told: its initialization options and
+/// settings (`Null` for none).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerConfig {
+    pub initialization_options: Value,
+    pub settings: Value,
+}
+
+/// A server's configuration: Kin's defaults for its program, then its
+/// extension's, then the user's `lsp.<id>`, each merged over the one before.
+pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSettings>) -> ServerConfig {
+    let name = program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (mut initialization_options, mut settings) = defaults(&name);
+    merge(&mut initialization_options, spec.initialization_options.unwrap_or(&Value::Null));
+    merge(&mut settings, &expand_dotted(spec.settings.unwrap_or(&Value::Null)));
+    if let Some(entry) = user_entry(spec, Some(&name), user) {
+        merge(&mut initialization_options, entry.initialization_options.as_ref().unwrap_or(&Value::Null));
+        merge(&mut settings, &expand_dotted(entry.settings.as_ref().unwrap_or(&Value::Null)));
+    }
+    ServerConfig { initialization_options, settings }
+}
+
+/// Settings with dotted keys as nested objects, the way servers ask for
+/// them: `{"basedpyright.analysis": {…}}` (as Zed's and VS Code's settings
+/// write it) becomes `{"basedpyright": {"analysis": {…}}}`.
+fn expand_dotted(value: &Value) -> Value {
+    let Value::Object(map) = value else { return value.clone() };
+    let mut out = Value::Object(serde_json::Map::new());
+    for (key, value) in map {
+        let mut nested = expand_dotted(value);
+        for part in key.rsplit('.') {
+            nested = json!({ part: nested });
+        }
+        merge(&mut out, &nested);
+    }
+    out
+}
+
+/// What Kin passes a server program unless told otherwise:
+/// (initialization options, settings). Inlay hints are off in TypeScript's
+/// and Go's servers until asked for.
+fn defaults(program: &str) -> (Value, Value) {
+    match program {
+        "typescript-language-server" => {
+            let hints = json!({
+                "includeInlayParameterNameHints": "all",
+                "includeInlayParameterNameHintsWhenArgumentMatchesName": false,
+                "includeInlayFunctionParameterTypeHints": true,
+                "includeInlayVariableTypeHints": true,
+                "includeInlayVariableTypeHintsWhenTypeMatchesName": false,
+                "includeInlayPropertyDeclarationTypeHints": true,
+                "includeInlayFunctionLikeReturnTypeHints": true,
+                "includeInlayEnumMemberValueHints": true,
+            });
+            (json!({ "preferences": hints }), Value::Null)
+        }
+        "vtsls" => {
+            let hints = json!({ "inlayHints": {
+                "parameterNames": { "enabled": "all", "suppressWhenArgumentMatchesName": true },
+                "parameterTypes": { "enabled": true },
+                "variableTypes": { "enabled": true, "suppressWhenTypeMatchesName": true },
+                "propertyDeclarationTypes": { "enabled": true },
+                "functionLikeReturnTypes": { "enabled": true },
+                "enumMemberValues": { "enabled": true },
+            } });
+            (Value::Null, json!({ "typescript": hints, "javascript": hints }))
+        }
+        "gopls" => {
+            let hints = json!({
+                "assignVariableTypes": true,
+                "compositeLiteralFields": true,
+                "compositeLiteralTypes": true,
+                "constantValues": true,
+                "functionTypeParameters": true,
+                "parameterNames": true,
+                "rangeVariableTypes": true,
+            });
+            (Value::Null, json!({ "gopls": { "hints": hints } }))
+        }
+        _ => (Value::Null, Value::Null),
+    }
+}
+
+/// `over` merged into `base`: objects key by key, anything else replaces
+/// (`null` leaves `base` as it is).
+pub fn merge(base: &mut Value, over: &Value) {
+    match (base, over) {
+        (_, Value::Null) => {}
+        (Value::Object(base), Value::Object(over)) => {
+            for (key, value) in over {
+                merge(base.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+        (base, over) => *base = over.clone(),
+    }
+}
+
+/// The answer to a `workspace/configuration` item: the whole settings, or
+/// the `section` ("python.analysis"), a path into them.
+pub fn configuration(settings: &Value, section: Option<&str>) -> Value {
+    let Some(section) = section.filter(|s| !s.is_empty()) else { return settings.clone() };
+    section.split('.').try_fold(settings, |value, key| value.get(key)).cloned().unwrap_or(Value::Null)
 }
 
 /// A server command: the executable and its arguments.
@@ -351,14 +502,75 @@ mod tests {
 
     #[test]
     fn extension_servers_run_beside_the_built_in_one() {
-        static ESLINT: ServerSpec = ServerSpec { id: "eslint", candidates: &[("vscode-eslint-language-server", &["--stdio"])], install: "", root_markers: &[] };
-        static VTSLS: ServerSpec = ServerSpec { id: "ext:vtsls", candidates: &[("vtsls", &["--stdio"])], install: "", root_markers: &[] };
+        static ESLINT: ServerSpec = ServerSpec { id: "eslint", candidates: &[("vscode-eslint-language-server", &["--stdio"])], ..SPEC };
+        static VTSLS: ServerSpec = ServerSpec { id: "ext:vtsls", candidates: &[("vtsls", &["--stdio"])], ..SPEC };
         let ids = |specs: Vec<&ServerSpec>| specs.iter().map(|s| s.id).collect::<Vec<_>>();
         // ESLint joins TypeScript; an extension's vtsls is one of Kin's own
         // choices for TypeScript already, so it isn't started a second time.
         assert_eq!(ids(combine(builtin(Language::TypeScript), vec![&ESLINT, &VTSLS])), ["typescript", "eslint"]);
         // A language Kin has no server for gets the extensions' alone.
         assert_eq!(ids(combine(None, vec![&VTSLS, &ESLINT])), ["ext:vtsls", "eslint"]);
+    }
+
+    #[test]
+    fn configuration_merges_defaults_extension_and_user_settings() {
+        use crate::settings::{LspBinary, LspSettings};
+        let typescript = builtin(Language::TypeScript).unwrap();
+        // Kin's defaults turn on inlay hints, by program.
+        let none = HashMap::new();
+        let ts = config(typescript, Path::new("/bin/typescript-language-server"), &none);
+        assert_eq!(ts.initialization_options["preferences"]["includeInlayParameterNameHints"], "all");
+        let vtsls = config(typescript, Path::new("/bin/vtsls"), &none);
+        assert_eq!(vtsls.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "all");
+
+        // The user's entry by Kin's id or Zed's, merged over the defaults.
+        let user: HashMap<String, LspSettings> = [(
+            "vtsls".to_string(),
+            LspSettings { settings: Some(json!({ "typescript": { "inlayHints": { "parameterNames": { "enabled": "none" } } } })), ..Default::default() },
+        )]
+        .into();
+        let merged = config(typescript, Path::new("/bin/vtsls"), &user);
+        assert_eq!(merged.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "none");
+        assert_eq!(merged.settings["typescript"]["inlayHints"]["variableTypes"]["enabled"], true);
+        let python = builtin(Language::Python).unwrap();
+        let user: HashMap<String, LspSettings> =
+            [("basedpyright".to_string(), LspSettings { initialization_options: Some(json!({ "a": 1 })), ..Default::default() })].into();
+        assert_eq!(config(python, Path::new("/bin/basedpyright-langserver"), &user).initialization_options, json!({ "a": 1 }));
+
+        // An extension's own values sit between the two.
+        static EXT: ServerSpec = ServerSpec { id: "ext:x", ..SPEC };
+        let ext_settings: &'static Value = Box::leak(Box::new(json!({ "x": { "a": 1, "b": 2 } })));
+        let ext = ServerSpec { settings: Some(ext_settings), ..SPEC };
+        let user: HashMap<String, LspSettings> =
+            [("ext:x".to_string(), LspSettings { settings: Some(json!({ "x": { "b": 3 } })), ..Default::default() })].into();
+        assert_eq!(config(&ServerSpec { id: EXT.id, ..ext }, Path::new("/bin/x"), &user).settings, json!({ "x": { "a": 1, "b": 3 } }));
+
+        // Another program, by any of the server's names.
+        let user: HashMap<String, LspSettings> = [(
+            "pyright".to_string(),
+            LspSettings { binary: Some(LspBinary { path: Some("/bin/sh".into()), arguments: Some(vec!["-c".into()]) }), ..Default::default() },
+        )]
+        .into();
+        let binary = user_binary(python, &user).unwrap();
+        assert_eq!((binary.program, binary.args), (PathBuf::from("/bin/sh"), vec!["-c".to_string()]));
+    }
+
+    #[test]
+    fn configuration_sections() {
+        // basedpyright asks for "basedpyright"; settings say "basedpyright.analysis".
+        let settings = expand_dotted(&json!({
+            "basedpyright.analysis": { "typeCheckingMode": "off" },
+            "basedpyright": { "disableLanguageServices": false },
+            "gopls": { "hints": { "a": true } },
+        }));
+        assert_eq!(
+            configuration(&settings, Some("basedpyright")),
+            json!({ "analysis": { "typeCheckingMode": "off" }, "disableLanguageServices": false })
+        );
+        assert_eq!(configuration(&settings, Some("basedpyright.analysis")), json!({ "typeCheckingMode": "off" }));
+        assert_eq!(configuration(&settings, Some("gopls.hints")), json!({ "a": true }));
+        assert_eq!(configuration(&settings, Some("missing")), Value::Null);
+        assert_eq!(configuration(&settings, None), settings);
     }
 
     #[test]

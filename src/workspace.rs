@@ -707,6 +707,7 @@ impl Workspace {
             for tab in ws.tabs.clone() {
                 tab.update(cx, |e, cx| e.apply_settings(cx));
             }
+            ws.lsp.update(cx, |s, cx| s.settings_changed(cx));
             cx.notify();
         });
         // An update finished downloading: show Restart to Update.
