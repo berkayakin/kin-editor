@@ -464,6 +464,9 @@ pub struct Preferences {
     /// Monospaced fonts, found when the font menu first opens.
     fonts: Option<Arc<Vec<SharedString>>>,
     fonts_task: Option<Task<()>>,
+    /// Extensions' icon theme names, read from their files once rather than
+    /// every frame; cleared when extensions change.
+    icon_themes: Option<Arc<Vec<String>>>,
     language: Language,
     shell: Entity<Editor>,
     rulers: Entity<Editor>,
@@ -504,7 +507,10 @@ impl Preferences {
         let extension_url = cx.new(|cx| Editor::single_line("Git URL of an extension (Zed extensions work too)", cx));
         let mut subscriptions = vec![
             // A grammar finished building, an extension came or went.
-            cx.observe_global::<ExtensionsChanged>(|_, cx| cx.notify()),
+            cx.observe_global::<ExtensionsChanged>(|this, cx| {
+                this.icon_themes = None;
+                cx.notify();
+            }),
             cx.observe_global::<crate::trust::TrustChanged>(|_, cx| cx.notify()),
             cx.subscribe(&search, |this, _, _: &EditorEvent, cx| {
                 this.menu = None;
@@ -529,6 +535,7 @@ impl Preferences {
             font_filter,
             fonts: None,
             fonts_task: None,
+            icon_themes: None,
             language: Language::JavaScript,
             shell,
             rulers,
@@ -1271,7 +1278,10 @@ impl Preferences {
                 const BUILT_IN: &str = "Charmed Icons (built-in)";
                 let current = settings.icon_theme.clone();
                 let mut names: Vec<String> = vec![BUILT_IN.to_string()];
-                names.extend(extensions::icon_themes().into_iter().map(|t| t.name));
+                let installed = self
+                    .icon_themes
+                    .get_or_insert_with(|| Arc::new(extensions::icon_themes().into_iter().map(|t| t.name).collect()));
+                names.extend(installed.iter().cloned());
                 let label = current.clone().unwrap_or_else(|| BUILT_IN.to_string());
                 let options = names.iter().enumerate().map(|(ix, n)| (n.clone().into(), if ix == 0 { current.is_none() } else { current.as_deref() == Some(n.as_str()) })).collect();
                 self.dropdown(Menu::IconTheme, label.into(), px(260.), options, cx, move |this, ix, _, cx| {
@@ -1505,7 +1515,7 @@ impl Preferences {
     fn render_font_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> (AnyElement, Option<AnyElement>) {
         let theme = Theme::get(cx).clone();
         let configured = Settings::get(cx).editor_font_family.clone();
-        let default_font = theme::pick_fonts(cx).1;
+        let default_font = theme::default_fonts(cx).1;
         let label: SharedString = match &configured {
             Some(family) if *family != theme.mono_font.as_ref() => format!("{family} (not installed)").into(),
             Some(family) => family.clone().into(),

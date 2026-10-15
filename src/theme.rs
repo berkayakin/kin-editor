@@ -754,10 +754,23 @@ const EXAMPLE_THEME: &str = r##"{
 }
 "##;
 
+/// The UI and editor fonts `pick_fonts` chose, kept by `apply_fonts`: listing
+/// the installed fonts takes tens of milliseconds, too slow for a render.
+struct DefaultFonts(SharedString, SharedString);
+
+impl Global for DefaultFonts {}
+
+/// The UI and editor fonts used when settings name none.
+pub fn default_fonts(cx: &App) -> (SharedString, SharedString) {
+    match cx.try_global::<DefaultFonts>() {
+        Some(fonts) => (fonts.0.clone(), fonts.1.clone()),
+        None => pick_fonts(&cx.text_system().all_font_names()),
+    }
+}
+
 /// Picks the first installed font from a preference list. Keeps the editor
 /// looking native on each platform without bundling fonts.
-pub fn pick_fonts(cx: &App) -> (SharedString, SharedString) {
-    let installed = cx.text_system().all_font_names();
+fn pick_fonts(installed: &[String]) -> (SharedString, SharedString) {
     let has = |name: &str| installed.iter().any(|f| f == name);
 
     let mono_candidates: &[&str] = if cfg!(target_os = "macos") {
@@ -806,10 +819,12 @@ const DEFAULT_LINE_HEIGHT: f32 = 22.0 / 14.0;
 
 /// Sets the fonts from the settings and the remembered zoom.
 pub fn apply_fonts(cx: &mut App) {
-    let (ui_font, mono_font) = pick_fonts(cx);
+    let installed = cx.text_system().all_font_names();
+    let (ui_font, mono_font) = pick_fonts(&installed);
+    cx.set_global(DefaultFonts(ui_font.clone(), mono_font.clone()));
     let settings = Settings::get(cx).clone();
     let mono_font = match settings.editor_font_family.as_deref() {
-        Some(family) if cx.text_system().all_font_names().iter().any(|f| f == family) => family.to_string().into(),
+        Some(family) if installed.iter().any(|f| f == family) => family.to_string().into(),
         _ => mono_font,
     };
     let zoom = SessionState::load().font_zoom.unwrap_or(0.);
