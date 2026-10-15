@@ -365,6 +365,8 @@ enum MenuAction {
     Venv(Option<crate::python::Choice>),
     /// Status bar: pick a venv folder.
     ChooseVenv,
+    /// A terminal tab from its strip's overflow menu.
+    Terminal(Entity<TerminalView>),
 }
 
 /// What the breakpoint menu does with a row's breakpoint.
@@ -388,6 +390,7 @@ impl Clone for MenuAction {
             MenuAction::Breakpoint(edit, editor, row) => MenuAction::Breakpoint(*edit, editor.clone(), *row),
             MenuAction::Venv(choice) => MenuAction::Venv(choice.clone()),
             MenuAction::ChooseVenv => MenuAction::ChooseVenv,
+            MenuAction::Terminal(terminal) => MenuAction::Terminal(terminal.clone()),
         }
     }
 }
@@ -433,6 +436,8 @@ const TAB_FOOT: f32 = 8.0;
 /// A tab strip's padding at each end: the island's corner radius plus a
 /// foot, so the end tabs' feet land on the island's straight edge.
 const TAB_STRIP_INSET: f32 = crate::ui::ISLAND_RADIUS + TAB_FOOT;
+/// A terminal strip's buttons (+, split, hide), each with its margin.
+const TERMINAL_BUTTON: f32 = 28.0;
 /// Tab widths when they don't all fit (see `fit_tabs`).
 /// Below this, a name is too short to read: inactive tabs show only their icon.
 const TAB_NAMED_MIN: f32 = 96.0;
@@ -491,6 +496,8 @@ pub struct Workspace {
     terminal_groups: Vec<TerminalGroup>,
     /// The group that has (or last had) the keyboard.
     active_group: usize,
+    /// The terminal panel's bounds in the last frame, to fit its groups' tabs.
+    terminal_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// While dragging over the tree: the folder a drop would go into.
     tree_drop: Option<PathBuf>,
 
@@ -713,6 +720,7 @@ impl Workspace {
             show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminal_groups: Vec::new(),
             active_group: 0,
+            terminal_bounds: Default::default(),
             tree_drop: None,
 
             last_run: None,
@@ -3653,154 +3661,207 @@ impl Workspace {
 
     /// The bottom panel's terminals: each group is an island with its own
     /// tab strip, side by side like split panes.
-    fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The bottom panel's terminals: each group is an island with its own
+    /// browser-like tabs on the chrome above it, side by side like split panes.
+    fn render_terminal_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A panel reopened at launch gets its shell in `window_ready`; until
         // then it's one empty group.
         let count = self.terminal_groups.len().max(1);
+        let bounds = self.terminal_bounds.clone();
         div()
             .relative()
             .flex()
             .gap(px(GAP))
             .h(self.problems_height)
             .flex_shrink_0()
-            .children((0..count).map(|g| self.render_terminal_group(g, count, cx)))
+            .child(gpui::canvas(move |b, window, _| track_bounds(&bounds, b, window), |_, _, _, _| {}).absolute().size_full())
+            .children((0..count).map(|g| self.render_terminal_group(g, count, window, cx)))
             .child(self.resize_handle(Edge::Problems, cx))
     }
 
-    fn render_terminal_group(&self, g: usize, count: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_terminal_group(&self, g: usize, count: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
         let group = self.terminal_groups.get(g);
         let current = g == self.active_group;
-        let tabs: Vec<AnyElement> = group
-            .map(|group| {
-                group
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, terminal)| {
-                        let active = ix == group.active;
-                        let hover_group = SharedString::from(format!("terminal-tab-{g}-{ix}"));
-                        let entity = terminal.clone();
+        let last = g + 1 == count;
+        // With splits, the group that has the keyboard is outlined (its current tab too), like a pane.
+        let edge: Hsla = if count > 1 && current {
+            Hsla::from(theme.accent).alpha(0.35)
+        } else {
+            Hsla::from(theme.border).alpha(0.75)
+        };
+        let tabs: Vec<Entity<TerminalView>> = group.map(|g| g.tabs.clone()).unwrap_or_default();
+        let active = group.map_or(0, |g| g.active);
+        // The strip's room for tabs: the group's share of the panel, less the
+        // strip's insets and its buttons (+, split, and hide on the last group).
+        let buttons = TERMINAL_BUTTON * if last { 3. } else { 2. } + 8.;
+        let total = f32::from(self.terminal_bounds.get().size.width);
+        let available = (total > 0.).then(|| (total - GAP * (count - 1) as f32) / count as f32 - 2. * TAB_STRIP_INSET - buttons);
+        let names: Vec<String> = tabs.iter().map(|t| t.read(cx).title().to_string()).collect();
+        let name_widths = measure_tab_names(&names, window, &theme);
+        let naturals: Vec<f32> = name_widths.iter().map(|(w, _)| (TAB_CHROME + w).ceil()).collect();
+        let slots = fit_tabs(&naturals, active, available.unwrap_or(f32::INFINITY));
+        let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i] != TabSlot::Hidden).collect();
+        let hidden: Vec<(Entity<TerminalView>, String)> =
+            (0..slots.len()).filter(|&i| slots[i] == TabSlot::Hidden).map(|i| (tabs[i].clone(), names[i].clone())).collect();
+
+        let tab_elements = visible.iter().enumerate().map(|(pos, &ix)| {
+            let terminal = &tabs[ix];
+            let slot = slots[ix];
+            let is_active = ix == active;
+            let separator = !is_active && visible.get(pos + 1).is_some_and(|&n| n != active);
+            let after_active = pos > 0 && visible[pos - 1] == active;
+            let icon_only = matches!(slot, TabSlot::Icon(_));
+            let compact = matches!(slot, TabSlot::Compact(_));
+            let hover_group = SharedString::from(format!("terminal-tab-{g}-{ix}"));
+            let (for_close, for_middle) = (terminal.clone(), terminal.clone());
+            let label = tab_label(&names[ix], slot, naturals[ix], name_widths[ix]);
+            let name_color: Hsla = if is_active && current { theme.text.into() } else { theme.text_muted.into() };
+            let tab = div()
+                .id(SharedString::from(format!("terminal-tab-{g}-{ix}")))
+                .group(hover_group.clone())
+                .relative()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .h_full()
+                .cursor_pointer();
+            tab_slot_width(tab_shape(tab, is_active, after_active, separator, hover_group.clone(), edge, &theme), slot, naturals[ix])
+                .when(icon_only || compact, |el| {
+                    let name = names[ix].clone();
+                    el.tooltip(move |_, cx| tooltip_view(name.clone(), cx))
+                })
+                .on_click(cx.listener(move |ws, _, window, cx| ws.activate_terminal(g, ix, window, cx)))
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |ws, _, window, cx| ws.remove_terminal(&for_middle, window, cx)),
+                )
+                .child(match terminal.read(cx).run().map(|(_, state)| *state) {
+                    // A Run tab shows how its program is doing.
+                    Some(RunState::Running) => icon_el(Icon::Play, px(13.), theme.success.into()),
+                    Some(RunState::Exited(Some(0))) => icon_el(Icon::CircleCheck, px(13.), theme.success.into()),
+                    Some(RunState::Exited(_)) => icon_el(Icon::CircleX, px(13.), theme.error.into()),
+                    None => icon_el(Icon::Terminal, px(13.), if is_active { theme.accent.into() } else { theme.text_dim.into() }),
+                })
+                .when(!icon_only, |el| {
+                    el.child(
                         div()
-                            .id(SharedString::from(format!("terminal-tab-{g}-{ix}")))
-                            .group(hover_group.clone())
-                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(name_color)
+                            .when(is_active, |el| el.font_weight(FontWeight::MEDIUM))
+                            .when(!is_active, |el| el.group_hover(hover_group.clone(), |s| s.text_color(theme.text)))
+                            .child(label),
+                    )
+                })
+                .when(!icon_only && !compact, |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("close-terminal-{g}-{ix}")))
+                            .size(px(18.))
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
-                            .gap_1p5()
-                            .h(px(28.))
-                            .min_w(px(64.))
-                            .max_w(px(220.))
-                            .pl_2p5()
-                            .pr_1()
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(gpui::transparent_black())
-                            .cursor_pointer()
-                            .text_color(if active && current { theme.text } else { theme.text_muted })
-                            // Like editor tabs: the current one raised, lit in the group with the keyboard.
-                            .when(active && current, |el| el.bg(theme.elevated).border_color(theme.border_subtle).child(tab_glow(&theme)))
-                            .when(active && !current, |el| el.bg(theme.hover))
-                            .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
-                            .on_click(cx.listener(move |ws, _, window, cx| ws.activate_terminal(g, ix, window, cx)))
-                            .child(match terminal.read(cx).run().map(|(_, state)| *state) {
-                                // A Run tab shows how its program is doing.
-                                Some(RunState::Running) => icon_el(Icon::Play, px(12.), theme.success.into()),
-                                Some(RunState::Exited(Some(0))) => icon_el(Icon::CircleCheck, px(12.), theme.success.into()),
-                                Some(RunState::Exited(_)) => icon_el(Icon::CircleX, px(12.), theme.error.into()),
-                                None => icon_el(Icon::Terminal, px(12.), theme.text_muted.into()),
-                            })
-                            .child(div().flex_1().min_w_0().truncate().child(terminal.read(cx).title()))
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("close-terminal-{g}-{ix}")))
-                                    .size(px(18.))
-                                    .flex()
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(5.))
-                                    .when(!active, |el| el.invisible())
-                                    .group_hover(hover_group, |s| s.visible())
-                                    .hover(|s| s.bg(theme.active))
-                                    .on_click(cx.listener(move |ws, _, window, cx| {
-                                        cx.stop_propagation();
-                                        ws.remove_terminal(&entity, window, cx);
-                                    }))
-                                    .child(icon_el(Icon::X, px(12.), theme.text_muted.into())),
-                            )
-                            .into_any_element()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let header = div()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .when(!is_active, |el| el.invisible())
+                            .group_hover(hover_group.clone(), |s| s.visible())
+                            .hover(|s| s.bg(theme.active))
+                            .on_click(cx.listener(move |ws, _, window, cx| {
+                                cx.stop_propagation();
+                                ws.remove_terminal(&for_close, window, cx);
+                            }))
+                            .child(icon_el(Icon::X, px(13.), theme.text_muted.into())),
+                    )
+                })
+                .into_any_element()
+        });
+        // Buttons on the chrome, centered on the tabs.
+        let button = |button: Stateful<gpui::Div>| button.flex_shrink_0().size(px(TERMINAL_BUTTON - 2.)).mb(px(4.)).mr(px(2.));
+        let strip = div()
+            .id(("terminal-tabs", g))
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TAB_STRIP_HEIGHT))
             .flex()
-            .items_center()
-            .gap(px(2.))
-            .h(px(TAB_HEIGHT - ISLAND_INSET))
-            .pb(px(ISLAND_INSET))
-            .flex_shrink_0()
-            .when(g == 0, |el| {
+            .items_end()
+            .pt(px(TAB_STRIP_TOP))
+            .pl(px(TAB_STRIP_INSET))
+            .pr(px(TAB_STRIP_INSET - 6.))
+            .overflow_hidden()
+            .children(tab_elements)
+            // The tabs that don't fit, in a menu.
+            .when(!hidden.is_empty(), |el| {
+                let count = hidden.len();
                 el.child(
                     div()
-                        .px_1p5()
-                        .mr_1()
+                        .id(("terminal-overflow", g))
+                        .flex()
                         .flex_shrink_0()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.text_dim)
-                        .child("TERMINAL"),
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .w(px(TAB_OVERFLOW_WIDTH - 8.))
+                        .h(px(24.))
+                        .ml_1()
+                        .mb(px(4.))
+                        .rounded(px(8.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                        .tooltip(move |_, cx| tooltip_view(format!("{count} more terminal{}", plural(count)), cx))
+                        .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
+                            let entries = hidden.iter().map(|(_, name)| MenuEntry::item(name.clone(), Icon::Terminal)).collect();
+                            let actions = hidden.iter().map(|(t, _)| Some(MenuAction::Terminal(t.clone()))).collect();
+                            ws.show_context_menu(entries, actions, event.position(), None, window, cx);
+                        }))
+                        .child("⋯")
+                        .child(count.to_string()),
                 )
             })
             .child(
-                div()
-                    .id(("terminal-tabs", g))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .min_w_0()
-                    .overflow_x_scroll()
-                    .children(tabs),
-            )
-            .child(
-                self.icon_button("new-terminal", Icon::Plus, false, cx, move |ws, _, window, cx| {
+                button(self.icon_button("new-terminal", Icon::Plus, false, cx, move |ws, _, window, cx| {
                     ws.active_group = g;
                     ws.new_terminal(&NewTerminal, window, cx);
-                })
+                }))
                 .id(("new-terminal", g))
-                .flex_shrink_0()
+                .ml_1()
                 .tooltip(|window, cx| status_tooltip("New Terminal", &NewTerminal, window, cx)),
             )
             .child(div().flex_1())
             .child(
-                self.icon_button("split-terminal", Icon::SplitRight, false, cx, move |ws, _, window, cx| {
+                button(self.icon_button("split-terminal", Icon::SplitRight, false, cx, move |ws, _, window, cx| {
                     ws.active_group = g;
                     ws.split_terminal(&SplitTerminal, window, cx);
-                })
+                }))
                 .id(("split-terminal", g))
-                .flex_shrink_0()
                 .tooltip(|window, cx| status_tooltip("Split Terminal", &SplitTerminal, window, cx)),
             )
             // The panel's own close button, on the group at its right end.
-            .when(g + 1 == count, |el| {
+            .when(last, |el| {
                 el.child(
-                    self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
+                    button(self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
                         ws.show_terminal = false;
                         ws.focus_active(window, cx);
                         ws.save_state();
                         cx.notify();
-                    })
-                    .flex_shrink_0()
+                    }))
                     .tooltip(|window, cx| status_tooltip("Hide Terminal", &ToggleTerminal, window, cx)),
                 )
             });
-        island(&theme)
+        div()
             .id(("terminal-group", g))
+            .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w_0()
-            // With splits, the group that has the keyboard is outlined, like a pane.
-            .when(count > 1 && current, |el| el.border_color(Hsla::from(theme.accent).alpha(0.35)))
             // Clicking into a group makes it the current one.
             .capture_any_mouse_down(cx.listener(move |ws, _, _, cx| {
                 if ws.active_group != g && g < ws.terminal_groups.len() {
@@ -3808,14 +3869,22 @@ impl Workspace {
                     cx.notify();
                 }
             }))
-            .child(header)
+            .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
             .child(
-                div()
-                    .flex()
+                island(&theme)
                     .flex_1()
                     .min_h_0()
-                    .children(group.and_then(|group| group.tabs.get(group.active)).cloned().map(|t| div().flex_1().min_w_0().child(t))),
+                    .border_color(edge)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .children(tabs.get(active).cloned().map(|t| div().flex_1().min_w_0().child(t))),
+                    ),
             )
+            // After the island, so the current tab paints over its top border.
+            .child(strip)
             .into_any_element()
     }
 
@@ -4385,6 +4454,11 @@ impl Workspace {
                     Some(MenuAction::Breakpoint(edit, editor, row)) => ws.edit_breakpoint(edit, editor, row, window, cx),
                     Some(MenuAction::Venv(choice)) => ws.set_venv(choice, cx),
                     Some(MenuAction::ChooseVenv) => ws.choose_venv_folder(window, cx),
+                    Some(MenuAction::Terminal(terminal)) => {
+                        if let Some((g, ix)) = ws.terminal_position(&terminal) {
+                            ws.activate_terminal(g, ix, window, cx);
+                        }
+                    }
                     None => {}
                 }
             }
@@ -6095,27 +6169,8 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
-        // Each name's real width (in the current tab's medium weight, the wider
-        // one), so tabs are as wide as their names and add up exactly.
-        let font = gpui::Font { weight: FontWeight::MEDIUM, ..gpui::font(theme.ui_font.clone()) };
-        let name_widths: Vec<(f32, usize)> = pane
-            .tabs
-            .iter()
-            .map(|e| {
-                let name = e.read(cx).doc.file_name();
-                let len = name.chars().count();
-                let run = gpui::TextRun {
-                    len: name.len(),
-                    font: font.clone(),
-                    color: theme.text.into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let width = window.text_system().shape_line(name.into(), px(theme.ui_font_size), &[run], None).width;
-                (f32::from(width), len.max(1))
-            })
-            .collect();
+        let names: Vec<String> = pane.tabs.iter().map(|e| e.read(cx).doc.file_name()).collect();
+        let name_widths = measure_tab_names(&names, window, &theme);
         let naturals: Vec<f32> = pane
             .tabs
             .iter()
@@ -6167,20 +6222,7 @@ impl Workspace {
                 let errors = e.doc.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
                 let icon = file_icon(e.doc.path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
                 let name = e.doc.file_name();
-                let shown_name = match slot {
-                    // Shortened only when the slot is narrower than the name needs,
-                    // by the name's own average character width.
-                    TabSlot::Fixed(w) if w < naturals[ix] => {
-                        let (text, len) = name_widths[ix];
-                        let room = w - (naturals[ix] - text);
-                        ellipsize(&name, (room / (text / len as f32)).max(1.) as usize)
-                    }
-                    TabSlot::Compact(w) if w - TAB_COMPACT_CHROME < name_widths[ix].0 => {
-                        let (text, len) = name_widths[ix];
-                        ellipsize(&name, ((w - TAB_COMPACT_CHROME) / (text / len as f32)).max(1.) as usize)
-                    }
-                    _ => name.clone(),
-                };
+                let shown_name = tab_label(&name, slot, naturals[ix], name_widths[ix]);
                 let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
                 let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
                 let (for_close, for_menu, for_drag, for_unpin) = (editor.clone(), editor.clone(), editor.clone(), editor.clone());
@@ -6193,12 +6235,7 @@ impl Workspace {
                     .gap_1p5()
                     .h_full()
                     .flex_shrink_0()
-                    .map(|el| match slot {
-                        TabSlot::Natural => el.w(px(naturals[ix])).pl_3().pr_1p5(),
-                        TabSlot::Fixed(w) | TabSlot::Compact(w) => el.w(px(w)).pl_3().pr_1p5(),
-                        TabSlot::Icon(w) => el.w(px(w)).justify_center(),
-                        TabSlot::Hidden => el,
-                    })
+                    .map(|el| tab_slot_width(el, slot, naturals[ix]))
                     .cursor_pointer()
                     .map(|el| tab_shape(el, active, after_active, separator, group.clone(), edge, &theme))
                     .when(icon_only || compact, |el| {
@@ -6345,7 +6382,7 @@ impl Workspace {
             .size_full()
             .when(self.pane_axis == PaneAxis::Column, |el| el.flex_col())
             .child(
-                gpui::canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {})
+                gpui::canvas(move |b, window, _| track_bounds(&bounds, b, window), |_, _, _, _| {})
                     .absolute()
                     .size_full(),
             )
@@ -7707,7 +7744,7 @@ impl Render for Workspace {
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
-        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(cx).into_any_element());
+        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(window, cx).into_any_element());
         let panes = self.render_panes(window, cx).into_any_element();
 
         div()
@@ -7878,7 +7915,7 @@ impl Render for Workspace {
 }
 
 use crate::ui::{
-    GAP, ISLAND_INSET, chrome_bg, dock, soft_shadow, file_icon, folder_icon, island, popover, segment_on, selected_edge,
+    GAP, chrome_bg, dock, soft_shadow, file_icon, folder_icon, island, popover, segment_on, selected_edge,
 };
 
 /// Copies a file or folder into `dir`, as "name copy" when the name is
@@ -8096,21 +8133,6 @@ fn card(theme: &Theme) -> gpui::Div {
         .overflow_hidden()
 }
 
-/// The line of light under the current tab: the accent, fading out to both ends.
-fn tab_glow(theme: &Theme) -> impl IntoElement {
-    let accent: Hsla = theme.accent.into();
-    let clear = accent.alpha(0.);
-    div()
-        .absolute()
-        .bottom(px(-1.))
-        .left(px(6.))
-        .right(px(6.))
-        .h(px(2.))
-        .flex()
-        .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(clear, 0.), gpui::linear_color_stop(accent, 1.))))
-        .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(accent, 0.), gpui::linear_color_stop(clear, 1.))))
-}
-
 /// How a tab fits its strip.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum TabSlot {
@@ -8170,18 +8192,76 @@ fn fit_tabs(naturals: &[f32], active: usize, available: f32) -> Vec<TabSlot> {
         return slots;
     }
     // Room for this many icons beside the current tab and the overflow button,
-    // taken nearest the current tab first.
-    let room = ((available - active_width - TAB_OVERFLOW_WIDTH) / TAB_ICON_WIDTH).max(0.) as usize;
+    // taken nearest the current tab first; they share all of that room, so
+    // they keep the start of their names when it allows.
+    let space = available - active_width - TAB_OVERFLOW_WIDTH;
+    let room = (space / TAB_ICON_WIDTH).max(0.) as usize;
+    let width = if room > 0 { (space / room as f32).min(TAB_NAMED_MIN).floor() } else { 0. };
     let mut shown = 0;
     for distance in 1..n {
         for ix in [active.checked_sub(distance), Some(active + distance)].into_iter().flatten() {
             if ix < n && shown < room {
-                slots[ix] = TabSlot::Icon(TAB_ICON_WIDTH);
+                let wanted = naturals[ix] - (TAB_CHROME - TAB_COMPACT_CHROME);
+                slots[ix] = if width >= TAB_COMPACT_MIN { TabSlot::Compact(width.min(wanted).floor()) } else { TabSlot::Icon(width) };
                 shown += 1;
             }
         }
     }
     slots
+}
+
+/// Remembers an area's bounds for the next frame's layout (tab strips fit
+/// their tabs to them), and asks for that frame when they changed, or a
+/// resize would leave the tabs fitted to the old size.
+fn track_bounds(cell: &std::cell::Cell<Bounds<Pixels>>, bounds: Bounds<Pixels>, window: &mut Window) {
+    if cell.get() != bounds {
+        cell.set(bounds);
+        window.refresh();
+    }
+}
+
+/// Each tab name's width (in the current tab's medium weight, the wider one)
+/// and character count, so tabs are as wide as their names and add up exactly.
+fn measure_tab_names(names: &[String], window: &Window, theme: &Theme) -> Vec<(f32, usize)> {
+    let font = gpui::Font { weight: FontWeight::MEDIUM, ..gpui::font(theme.ui_font.clone()) };
+    names
+        .iter()
+        .map(|name| {
+            let run = gpui::TextRun {
+                len: name.len(),
+                font: font.clone(),
+                color: theme.text.into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let width = window.text_system().shape_line(name.clone().into(), px(theme.ui_font_size), &[run], None).width;
+            (f32::from(width), name.chars().count().max(1))
+        })
+        .collect()
+}
+
+/// A tab's name as its slot shows it: shortened only when the slot is
+/// narrower than the name needs, by the name's own average character width.
+fn tab_label(name: &str, slot: TabSlot, natural: f32, (text, len): (f32, usize)) -> String {
+    let per_char = text / len as f32;
+    match slot {
+        TabSlot::Fixed(w) if w < natural => ellipsize(name, ((w - (natural - text)) / per_char).max(1.) as usize),
+        TabSlot::Compact(w) if w - TAB_COMPACT_CHROME < text => {
+            ellipsize(name, ((w - TAB_COMPACT_CHROME) / per_char).max(1.) as usize)
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// A tab's width and padding for its slot.
+fn tab_slot_width(el: Stateful<gpui::Div>, slot: TabSlot, natural: f32) -> Stateful<gpui::Div> {
+    match slot {
+        TabSlot::Natural => el.w(px(natural)).pl_3().pr_1p5(),
+        TabSlot::Fixed(w) | TabSlot::Compact(w) => el.w(px(w)).pl_3().pr_1p5(),
+        TabSlot::Icon(w) => el.w(px(w)).justify_center(),
+        TabSlot::Hidden => el,
+    }
 }
 
 /// The widest any of `widths` may be so they add up to `available`: the
@@ -8241,7 +8321,9 @@ fn tab_shape(
                         gpui::quad(
                             Bounds::from_corners(point(left, top), point(right, bottom - r)),
                             corners,
-                            gpui::transparent_black(),
+                            // Not transparent black: GPUI blends a rounded border's inner edge
+                            // toward the background color, and black darkens the curves.
+                            edge.alpha(0.),
                             gpui::Edges { top: px(1.), right: px(1.), bottom: px(0.), left: px(1.) },
                             edge,
                             Default::default(),
@@ -8324,7 +8406,9 @@ fn paint_tab_foot(window: &mut Window, x: Pixels, bottom: Pixels, left: bool, fi
         gpui::quad(
             Bounds { origin: point(center.x - outer, center.y - outer), size: size(outer * 2., outer * 2.) },
             outer,
-            gpui::transparent_black(),
+            // The ring's own color, clear: a transparent black background would
+            // darken its inner edge (see `tab_shape`).
+            color.alpha(0.),
             width,
             color,
             Default::default(),
@@ -8361,6 +8445,8 @@ fn tab_foot(left: bool, fill: Hsla, edge: Option<Hsla>) -> gpui::Div {
             .rounded_full()
             .border(px(width))
             .border_color(color)
+            // Its own color, clear (see `paint_tab_foot`).
+            .bg(color.alpha(0.))
     };
     div()
         .absolute()
@@ -8529,9 +8615,21 @@ mod tests {
         // Too many even for icons: the farthest go to the menu, never the current one.
         let slots = fit_tabs(&[150.; 20], 19, 400.);
         assert_eq!(slots[19], Fixed(TAB_ACTIVE_MIN));
-        assert_eq!(slots[18], Icon(TAB_ICON_WIDTH));
+        assert!(matches!(slots[18], Icon(w) if w >= TAB_ICON_WIDTH));
         assert_eq!(slots[0], Hidden);
-        let shown = slots.iter().filter(|s| **s != Hidden).count() as f32;
-        assert!(TAB_ACTIVE_MIN + (shown - 1.) * TAB_ICON_WIDTH + super::TAB_OVERFLOW_WIDTH <= 400.);
+        let widths: f32 = slots
+            .iter()
+            .map(|s| match s {
+                Fixed(w) | Compact(w) | Icon(w) => *w,
+                _ => 0.,
+            })
+            .sum();
+        assert!(widths + super::TAB_OVERFLOW_WIDTH <= 400.);
+        // The overflow mode's tabs share the room: 1 fits beside the current one and
+        // the menu, and gets all of it (enough for the start of its name).
+        let slots = fit_tabs(&[88.; 7], 6, 209.);
+        assert_eq!(slots[6], Fixed(88.));
+        assert_eq!(slots[5], Compact(64.));
+        assert_eq!(slots.iter().filter(|s| **s == Hidden).count(), 5);
     }
 }
