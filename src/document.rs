@@ -149,19 +149,19 @@ impl Document {
         }
         let bytes = std::fs::read(path)?;
         let (text, encoding) = encoding::decode(&bytes, None);
-        let mut doc = Self::from_text(text, Some(path.to_path_buf()));
+        // A large file is shown as plain text: no parsing, linting or language
+        // server. Decided before building the syntax tree, which would parse it.
+        let mut doc = Self::with_text(text, Some(path.to_path_buf()), size > LARGE_FILE_SIZE);
         doc.encoding = encoding;
-        if size > LARGE_FILE_SIZE {
-            // Shown as plain text: no parsing, linting or language server.
-            doc.large = true;
-            doc.language = Language::PlainText;
-            doc.syntax = Syntax::new(Language::PlainText, &doc.rope);
-        }
         doc.disk_mtime = mtime(path);
         Ok(doc)
     }
 
     fn from_text(text: String, path: Option<PathBuf>) -> Self {
+        Self::with_text(text, path, false)
+    }
+
+    fn with_text(text: String, path: Option<PathBuf>, large: bool) -> Self {
         // Normalize to LF internally; remember the style for saving.
         let uses_crlf = text.contains("\r\n");
         let text = if uses_crlf {
@@ -170,10 +170,10 @@ impl Document {
             text
         };
         let rope = Rope::from_str(&text);
-        let language = path
-            .as_deref()
-            .map(Language::from_path)
-            .unwrap_or(Language::PlainText);
+        let language = match path.as_deref() {
+            Some(path) if !large => Language::from_path(path),
+            _ => Language::PlainText,
+        };
         let syntax = Syntax::new(language, &rope);
         Self {
             rope,
@@ -190,7 +190,7 @@ impl Document {
             lsp_diagnostics: Vec::new(),
             uses_crlf,
             encoding: TextEncoding::UTF8,
-            large: false,
+            large,
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
             breakpoints: Vec::new(),
@@ -238,7 +238,11 @@ impl Document {
     }
 
     /// Parses again as `language` (an extension's grammar can arrive later).
+    /// Large files stay plain text.
     pub fn set_language(&mut self, language: Language) {
+        if self.large {
+            return;
+        }
         self.language = language;
         self.syntax = Syntax::new(language, &self.rope);
         self.set_builtin_diagnostics(Vec::new());
@@ -926,6 +930,20 @@ mod tests {
         assert_eq!(doc.rope().to_string(), "abc\ndef");
         doc.redo();
         assert_eq!(doc.rope().to_string(), "bc\nXdef");
+    }
+
+    #[test]
+    fn large_files_are_never_parsed() {
+        let text = "{\"a\": 1}\n".repeat(10);
+        let doc = Document::with_text(text.clone(), Some("big.json".into()), true);
+        assert!(doc.large && doc.language == Language::PlainText);
+        assert!(doc.syntax().tree().is_none());
+        let mut doc = Document::with_text(text, Some("big.json".into()), true);
+        doc.set_path("renamed.rs".into());
+        assert!(doc.language == Language::PlainText && doc.syntax().tree().is_none());
+        // A small one is.
+        let doc = Document::from_text("{}".into(), Some("small.json".into()));
+        assert!(doc.syntax().tree().is_some());
     }
 
     #[test]
