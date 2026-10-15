@@ -556,6 +556,16 @@ impl LspStore {
         }
     }
 
+    /// An editor's file got another path (rename, move, Save As): the server
+    /// closes the old URI and opens the new one (a new name can also mean
+    /// another language and server).
+    pub fn moved(&mut self, old: &Path, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        if editor.read(cx).doc.path.as_deref() != Some(old) {
+            self.did_close(old);
+        }
+        self.register(editor, cx);
+    }
+
     /// Installs the missing server of `path`'s document; when it's done,
     /// every window starts the servers it was missing.
     pub fn install_server(&mut self, path: &Path, cx: &mut Context<Self>) {

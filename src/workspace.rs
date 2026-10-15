@@ -2182,8 +2182,10 @@ impl Workspace {
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
-                    // A new name can mean a new language and server.
-                    ws.lsp.update(cx, |s, cx| s.register(&editor, cx));
+                    match &current {
+                        Some(old) => ws.lsp.update(cx, |s, cx| s.moved(old, &editor, cx)),
+                        None => ws.lsp.update(cx, |s, cx| s.register(&editor, cx)),
+                    }
                     ws.rebuild_tree();
                     cx.notify();
                 })
@@ -5317,8 +5319,9 @@ impl Workspace {
         let remap = |p: &Path| p.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) });
         for editor in self.tabs.clone() {
             let path = editor.read(cx).doc.path.clone();
-            if let Some(moved) = path.as_deref().and_then(remap) {
+            if let Some((path, moved)) = path.as_deref().and_then(|p| Some((p, remap(p)?))) {
                 editor.update(cx, |e, cx| e.set_path(moved, cx));
+                self.lsp.update(cx, |s, cx| s.moved(path, &editor, cx));
                 self.load_diff_base(&editor, cx);
             }
         }
