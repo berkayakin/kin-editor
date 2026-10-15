@@ -4,12 +4,15 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use gpui::{
     Action, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle,
-    Hsla, IntoElement, Render, ScrollStrategy, SharedString, StyledText, Subscription,
+    Hsla, IntoElement, Render, ScrollStrategy, SharedString, StyledText, Subscription, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use nucleo_matcher::{
@@ -138,6 +141,11 @@ pub struct Picker {
     selected: usize,
     scroll: UniformListScrollHandle,
     matcher: Matcher,
+    /// The best files for a query (score, index in `files`), found in the
+    /// background (see `search_files`), and the query and file list they're for.
+    file_matches: Arc<Vec<(u32, usize)>>,
+    file_matches_for: Option<(String, usize)>,
+    file_search: Option<(Arc<AtomicBool>, Task<()>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -205,6 +213,9 @@ impl Picker {
                 config.set_match_paths();
                 config
             }),
+            file_matches: Arc::new(Vec::new()),
+            file_matches_for: None,
+            file_search: None,
             _subscriptions: vec![subscription],
         };
         this.update_items(cx);
@@ -351,21 +362,27 @@ impl Picker {
                     }
                 }
             }
+            let limit = if self.mode == PickerMode::Everywhere { 40 } else { MAX_RESULTS };
             if self.mode != PickerMode::Recent {
                 let files = self.files.clone();
-                let mut matched: Vec<(u32, Item)> = files
-                    .iter()
-                    .filter(|p| pattern.is_some() || !recent.contains(p))
-                    .filter_map(|p| self.file_item(p, pattern.as_ref()))
-                    .collect();
-                if pattern.is_some() {
-                    matched.sort_by(|a, b| b.0.cmp(&a.0));
-                    // Recently used files win ties.
-                    scored.clear();
+                match &pattern {
+                    // Scored in the background; until that's done, the last
+                    // results that still match.
+                    Some(p) => {
+                        let wanted = (text.clone(), Arc::as_ptr(&files) as usize);
+                        if self.file_matches_for.as_ref() != Some(&wanted) {
+                            self.search_files(wanted, limit, cx);
+                        }
+                        scored.clear();
+                        let matches = self.file_matches.clone();
+                        scored.extend(matches.iter().filter_map(|&(_, ix)| self.file_item(files.get(ix)?, Some(p))));
+                    }
+                    None => {
+                        let rest: Vec<&PathBuf> = files.iter().filter(|p| !recent.contains(p)).take(limit).collect();
+                        scored.extend(rest.into_iter().filter_map(|p| self.file_item(p, None)));
+                    }
                 }
-                scored.extend(matched);
             }
-            let limit = if self.mode == PickerMode::Everywhere { 40 } else { MAX_RESULTS };
             if self.mode == PickerMode::Everywhere && !scored.is_empty() {
                 items.push(Item::Header("Files".into()));
             }
@@ -495,6 +512,31 @@ impl Picker {
         self.move_selection(0, cx);
     }
 
+    /// Scores every project file against the query in the background and
+    /// keeps the best `limit`; a newer query cancels it.
+    fn search_files(&mut self, wanted: (String, usize), limit: usize, cx: &mut Context<Self>) {
+        if let Some((cancel, _)) = self.file_search.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (files, root, query, stop) = (self.files.clone(), self.root.clone(), wanted.0.clone(), cancel.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let found = cx.background_executor().spawn(async move { best_files(&files, root.as_deref(), &query, limit, &stop) }).await;
+            this.update(cx, |picker, cx| {
+                let Some(found) = found else { return };
+                if let Some((_, task)) = picker.file_search.take() {
+                    // This task is running; let it finish instead of dropping it.
+                    task.detach();
+                }
+                picker.file_matches = Arc::new(found);
+                picker.file_matches_for = Some(wanted);
+                picker.update_items(cx);
+            })
+            .ok();
+        });
+        self.file_search = Some((cancel, task));
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let selectable: Vec<usize> = (0..self.items.len())
             .filter(|&i| !matches!(self.items[i], Item::Header(_)))
@@ -561,6 +603,38 @@ impl Focusable for Picker {
     fn focus_handle(&self, cx: &gpui::App) -> FocusHandle {
         self.query.focus_handle(cx)
     }
+}
+
+/// The `limit` best matches of `query` among `files` (score, index), best
+/// first, ties in file order; a match in the file name scores higher. None
+/// when cancelled.
+fn best_files(files: &[PathBuf], root: Option<&Path>, query: &str, limit: usize, cancel: &AtomicBool) -> Option<Vec<(u32, usize)>> {
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new({
+        let mut config = Config::DEFAULT;
+        config.set_match_paths();
+        config
+    });
+    let (mut buf, mut indices) = (Vec::new(), Vec::new());
+    let mut found: Vec<(u32, usize)> = Vec::new();
+    for (ix, path) in files.iter().enumerate() {
+        if ix % 2048 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let rel = root.and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path).to_string_lossy();
+        indices.clear();
+        let Some(score) = pattern.indices(Utf32Str::new(&rel, &mut buf), &mut matcher, &mut indices) else { continue };
+        let name_start = rel.rfind(['/', '\\']).map_or(0, |i| rel[..i + 1].chars().count()) as u32;
+        let bonus = if indices.iter().any(|&i| i >= name_start) { 20 } else { 0 };
+        found.push((score + bonus, ix));
+    }
+    let order = |a: &(u32, usize), b: &(u32, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+    if found.len() > limit {
+        found.select_nth_unstable_by(limit, order);
+        found.truncate(limit);
+    }
+    found.sort_by(order);
+    Some(found)
 }
 
 fn highlighted(text: SharedString, ranges: &[Range<usize>], color: Hsla) -> StyledText {
@@ -892,5 +966,26 @@ impl Render for GoToLine {
                         "Enter a line number, optionally followed by :column".into()
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn best_files_ranks_names_first_and_keeps_the_top() {
+        let root = PathBuf::from("/p");
+        let mut files: Vec<PathBuf> = (0..500).map(|i| root.join(format!("src/mod{i}/lib.rs"))).collect();
+        files.push(root.join("docs/editor/notes.md"));
+        files.push(root.join("src/editor.rs"));
+        let found = best_files(&files, Some(&root), "editor", 10, &AtomicBool::new(false)).unwrap();
+        // Both match; the one whose file name matches comes first.
+        assert_eq!(found.iter().map(|&(_, ix)| ix).collect::<Vec<_>>(), [501, 500]);
+
+        // A query everything matches equally: the first ones, in order.
+        let found = best_files(&files, Some(&root), "lib", 3, &AtomicBool::new(false)).unwrap();
+        assert_eq!(found.iter().map(|&(_, ix)| ix).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(best_files(&files, Some(&root), "lib", 3, &AtomicBool::new(true)).is_none(), "cancelled");
     }
 }
