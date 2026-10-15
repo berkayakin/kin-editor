@@ -26,10 +26,10 @@ impl Workspace {
             if let Some(terminals) = session.terminals.take()
                 && self.terminal_groups.is_empty()
             {
-                self.show_terminal = terminals.open;
                 if terminals.open {
-                    self.show_problems = false;
-                    self.show_git_log = false;
+                    self.bottom = Some(BottomPanel::Terminal);
+                } else {
+                    self.hide_bottom(BottomPanel::Terminal);
                 }
                 self.saved_terminals = Some(terminals);
             }

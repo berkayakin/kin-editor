@@ -103,10 +103,7 @@ impl Workspace {
         if !matches!(target.debug, Some(DebugSpec::Attach { .. })) {
             self.last_debug = Some(target);
         }
-        self.show_debug = true;
-        self.show_problems = false;
-        self.show_terminal = false;
-        self.show_git_log = false;
+        self.bottom = Some(BottomPanel::Debug);
         cx.notify();
     }
 
@@ -124,7 +121,7 @@ impl Workspace {
             }
             DebugEvent::Resumed | DebugEvent::Ended => self.clear_debug_location(cx),
             DebugEvent::Hide => {
-                self.show_debug = false;
+                self.hide_bottom(BottomPanel::Debug);
                 self.focus_active(window, cx);
             }
         }
@@ -295,12 +292,8 @@ impl Workspace {
             self.toast(ToastKind::Info, "Not debugging", Some("Start with Debug at Caret or Debug… in the Run menu".into()), cx);
             return;
         }
-        self.show_debug = !self.show_debug;
-        if self.show_debug {
-            self.show_problems = false;
-            self.show_terminal = false;
-            self.show_git_log = false;
-        } else {
+        self.toggle_bottom(BottomPanel::Debug);
+        if !self.shows(BottomPanel::Debug) {
             self.focus_active(window, cx);
         }
         cx.notify();
@@ -468,7 +461,7 @@ impl Workspace {
             self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
         }
         if self.terminal_groups.is_empty() {
-            self.show_terminal = false;
+            self.hide_bottom(BottomPanel::Terminal);
             self.active_group = 0;
             self.save_state();
             self.focus_active(window, cx);
@@ -792,7 +785,7 @@ impl Workspace {
             .when(last, |el| {
                 el.child(
                     button(self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
-                        ws.show_terminal = false;
+                        ws.hide_bottom(BottomPanel::Terminal);
                         ws.focus_active(window, cx);
                         ws.save_state();
                         ws.schedule_session_save(cx);

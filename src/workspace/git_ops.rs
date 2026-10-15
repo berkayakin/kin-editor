@@ -80,7 +80,7 @@ impl Workspace {
                 }
                 let moved = (&ws.git_status.head_oid, &ws.git_status.branch, ws.git_status.ahead, ws.git_status.behind)
                     != (&status.head_oid, &status.branch, status.ahead, status.behind);
-                if moved && ws.show_git_log {
+                if moved && ws.shows(BottomPanel::GitLog) {
                     ws.git_log.update(cx, |l, cx| l.reload(cx));
                 }
                 ws.git_paths = Arc::new(status.path_map(&repo));
@@ -244,7 +244,7 @@ impl Workspace {
                 ) {
                     ws.reload_changed_files(cx);
                 }
-                if ws.show_git_log
+                if ws.shows(BottomPanel::GitLog)
                     && matches!(
                         op,
                         GitOp::Commit { .. }
@@ -457,13 +457,10 @@ impl Workspace {
     }
 
     pub(super) fn toggle_problems(&mut self, _: &ToggleProblems, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_problems = !self.show_problems;
-        if self.show_problems {
-            self.show_git_log = false;
-            self.show_debug = false;
-        }
-        if self.show_problems && self.show_terminal {
-            self.show_terminal = false;
+        // The terminal it replaces had the keyboard; the file gets it back.
+        let had_terminal = self.shows(BottomPanel::Terminal);
+        self.toggle_bottom(BottomPanel::Problems);
+        if had_terminal && self.shows(BottomPanel::Problems) {
             self.focus_active(window, cx);
         }
         self.save_state();

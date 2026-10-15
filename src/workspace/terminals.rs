@@ -8,14 +8,11 @@ impl Workspace {
     /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
     pub(super) fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.all_terminals().any(|t| t.focus_handle(cx).contains_focused(window, cx));
-        if self.show_terminal && focused {
-            self.show_terminal = false;
+        if self.shows(BottomPanel::Terminal) && focused {
+            self.hide_bottom(BottomPanel::Terminal);
             self.focus_active(window, cx);
         } else {
-            self.show_terminal = true;
-            self.show_problems = false;
-            self.show_git_log = false;
-            self.show_debug = false;
+            self.bottom = Some(BottomPanel::Terminal);
             if self.terminal_groups.is_empty() && !self.restore_terminals(window, cx) {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
@@ -29,8 +26,8 @@ impl Workspace {
 
     /// Git log in the bottom panel (⌘9 / Alt+9); again hides it.
     pub(super) fn toggle_git_log(&mut self, _: &ToggleGitLog, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_git_log {
-            self.show_git_log = false;
+        if self.shows(BottomPanel::GitLog) {
+            self.hide_bottom(BottomPanel::GitLog);
             self.focus_active(window, cx);
         } else {
             self.git_log.update(cx, |l, cx| l.show_path(None, cx));
@@ -61,10 +58,7 @@ impl Workspace {
             self.toast(ToastKind::Info, "Not a Git repository", None, cx);
             return;
         }
-        self.show_git_log = true;
-        self.show_problems = false;
-        self.show_terminal = false;
-        self.show_debug = false;
+        self.bottom = Some(BottomPanel::GitLog);
         self.git_log.update(cx, |l, cx| l.reload(cx));
         self.git_log.read(cx).focus_filter(window, cx);
     }
@@ -87,7 +81,7 @@ impl Workspace {
     /// Starts the shells of a terminal panel that shows without any (it was
     /// open last time): the project's saved ones, else a new one.
     pub(super) fn start_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.show_terminal || !self.terminal_groups.is_empty() {
+        if !self.shows(BottomPanel::Terminal) || !self.terminal_groups.is_empty() {
             return;
         }
         let focused = self.active_editor().cloned();
@@ -331,10 +325,7 @@ impl Workspace {
                 };
                 self.terminal_groups[group].active = ix;
                 self.active_group = group;
-                self.show_terminal = true;
-                self.show_problems = false;
-                self.show_git_log = false;
-                self.show_debug = false;
+                self.bottom = Some(BottomPanel::Terminal);
                 if focus {
                     self.focus_terminal(window, cx);
                 }
@@ -346,7 +337,9 @@ impl Workspace {
                 self.terminal_groups.retain(|g| !g.tabs.is_empty());
                 self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
                 // Don't retry on every frame.
-                self.show_terminal = !self.terminal_groups.is_empty();
+                if self.terminal_groups.is_empty() {
+                    self.hide_bottom(BottomPanel::Terminal);
+                }
                 self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
             }
         }

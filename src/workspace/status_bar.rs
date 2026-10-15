@@ -309,10 +309,10 @@ impl Workspace {
                     .when(self.repo.is_some(), |el| {
                         el.child(
                             toggle(
-                                self.icon_button("toggle-git-log", Icon::GitCommit, self.show_git_log, cx, |ws, _, window, cx| {
+                                self.icon_button("toggle-git-log", Icon::GitCommit, self.shows(BottomPanel::GitLog), cx, |ws, _, window, cx| {
                                     ws.toggle_git_log(&ToggleGitLog, window, cx)
                                 }),
-                                self.show_git_log,
+                                self.shows(BottomPanel::GitLog),
                             )
                             .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
                         )
@@ -320,29 +320,29 @@ impl Workspace {
                     .when(self.debug.is_some(), |el| {
                         el.child(
                             toggle(
-                                self.icon_button("toggle-debug", Icon::Bug, self.show_debug, cx, |ws, _, window, cx| {
+                                self.icon_button("toggle-debug", Icon::Bug, self.shows(BottomPanel::Debug), cx, |ws, _, window, cx| {
                                     ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
                                 }),
-                                self.show_debug,
+                                self.shows(BottomPanel::Debug),
                             )
                             .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
                         )
                     })
                     .child(
                         toggle(
-                            self.icon_button("toggle-terminal", Icon::Terminal, self.show_terminal, cx, |ws, _, window, cx| {
+                            self.icon_button("toggle-terminal", Icon::Terminal, self.shows(BottomPanel::Terminal), cx, |ws, _, window, cx| {
                                 ws.toggle_terminal(&ToggleTerminal, window, cx)
                             }),
-                            self.show_terminal,
+                            self.shows(BottomPanel::Terminal),
                         )
                         .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
                     )
                     .child(
                         toggle(
-                            self.icon_button("toggle-problems", Icon::PanelBottom, self.show_problems, cx, |ws, _, window, cx| {
+                            self.icon_button("toggle-problems", Icon::PanelBottom, self.shows(BottomPanel::Problems), cx, |ws, _, window, cx| {
                                 ws.toggle_problems(&ToggleProblems, window, cx)
                             }),
-                            self.show_problems,
+                            self.shows(BottomPanel::Problems),
                         )
                         .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
                     ),

@@ -126,11 +126,11 @@ impl Workspace {
         self.terminal_groups.clear();
         self.active_group = 0;
         self.saved_terminals = None;
-        self.show_terminal = false;
+        self.hide_bottom(BottomPanel::Terminal);
         if let Some((session, _)) = self.debug.take() {
             session.update(cx, |s, cx| s.stop(cx));
         }
-        self.show_debug = false;
+        self.hide_bottom(BottomPanel::Debug);
         self.debug_location = None;
         self.breakpoints.clear();
         self.lsp.update(cx, |s, _| {

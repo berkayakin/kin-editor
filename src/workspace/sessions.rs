@@ -99,7 +99,7 @@ impl Workspace {
         if self.terminal_groups.is_empty()
             && let Some(saved) = &self.saved_terminals
         {
-            return TerminalLayout { open: self.show_terminal, ..saved.clone() };
+            return TerminalLayout { open: self.shows(BottomPanel::Terminal), ..saved.clone() };
         }
         let mut groups = Vec::new();
         let mut active = 0;
@@ -128,7 +128,7 @@ impl Workspace {
             }
             groups.push(TerminalGroupSession { tabs, active: current });
         }
-        TerminalLayout { open: self.show_terminal, groups, active }
+        TerminalLayout { open: self.shows(BottomPanel::Terminal), groups, active }
     }
 
     pub(super) fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -262,13 +262,13 @@ impl Workspace {
             // The sidebar's visibility is remembered for projects only; it's
             // always closed without one.
             show_sidebar: if self.root.is_some() { Some(self.show_sidebar) } else { saved.show_sidebar },
-            show_problems: Some(self.show_problems),
-            show_terminal: Some(self.show_terminal),
+            show_problems: Some(self.shows(BottomPanel::Problems)),
+            show_terminal: Some(self.shows(BottomPanel::Terminal)),
             sidebar_mode: Some(match self.sidebar_mode {
                 SidebarMode::Files => "files".into(),
                 SidebarMode::Commit => "commit".into(),
             }),
-            show_git_log: Some(self.show_git_log),
+            show_git_log: Some(self.shows(BottomPanel::GitLog)),
             // Shared with other windows, so keep what's on disk.
             font_zoom: saved.font_zoom,
             diff_side_by_side: saved.diff_side_by_side,

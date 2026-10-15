@@ -283,6 +283,15 @@ enum PendingInput {
     VimCommand,
 }
 
+/// The panels the bottom area shows, one at a time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BottomPanel {
+    Problems,
+    Terminal,
+    GitLog,
+    Debug,
+}
+
 /// A group of tabs with its own tab bar; panes sit side by side or stacked.
 struct Pane {
     tabs: Vec<Entity<Editor>>,
@@ -550,10 +559,10 @@ pub struct Workspace {
     /// Pinned tabs stay first and survive Close Others / Close All.
     pinned: HashSet<EntityId>,
     show_sidebar: bool,
-    show_problems: bool,
+    /// What the bottom area shows; its height is `problems_height`.
+    bottom: Option<BottomPanel>,
     /// Height of the bottom panel (Problems or Terminal; one shows at a time).
     problems_height: Pixels,
-    show_terminal: bool,
     /// Terminal tabs in groups side by side, each with its own tab strip
     /// (one group unless the terminal is split). Groups are never empty.
     terminal_groups: Vec<TerminalGroup>,
@@ -571,7 +580,6 @@ pub struct Workspace {
     last_run: Option<RunTarget>,
     /// The debug session (running or finished) whose panel shows in the bottom area.
     debug: Option<(Entity<DebugSession>, Subscription)>,
-    show_debug: bool,
     last_debug: Option<RunTarget>,
     /// Where the debug session is paused (file, 1-based line), to mark it in that file's editor.
     debug_location: Option<(PathBuf, u32)>,
@@ -602,8 +610,6 @@ pub struct Workspace {
     git_log: Entity<GitLog>,
     /// The Push dialog a diff was opened from; it comes back when the diff closes.
     diff_return: Option<Entity<PushDialog>>,
-    /// The bottom panel shows the Git log (instead of Problems or the terminal).
-    show_git_log: bool,
     /// Working-tree root of the project's Git repository.
     repo: Option<PathBuf>,
     git_status: Arc<RepoStatus>,
@@ -653,6 +659,22 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    fn shows(&self, panel: BottomPanel) -> bool {
+        self.bottom == Some(panel)
+    }
+
+    /// Closes `panel` if it's the one showing.
+    fn hide_bottom(&mut self, panel: BottomPanel) {
+        if self.shows(panel) {
+            self.bottom = None;
+        }
+    }
+
+    /// Shows `panel` in place of any other, or closes it if it's showing.
+    fn toggle_bottom(&mut self, panel: BottomPanel) {
+        self.bottom = if self.shows(panel) { None } else { Some(panel) };
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
@@ -680,7 +702,7 @@ impl Workspace {
         let log_subscription = cx.subscribe_in(&git_log, window, |ws, _, event: &GitLogEvent, window, cx| match event {
             GitLogEvent::OpenDiff(source) => ws.show_diff(source.clone(), window, cx),
             GitLogEvent::Close => {
-                ws.show_git_log = false;
+                ws.hide_bottom(BottomPanel::GitLog);
                 ws.focus_active(window, cx);
                 ws.save_state();
                 cx.notify();
@@ -806,10 +828,17 @@ impl Workspace {
             // Without a project there's nothing to browse; opening one shows
             // the sidebar as it was left (see `set_root`).
             show_sidebar: false,
-            show_problems: state.show_problems.unwrap_or(false) && !state.show_terminal.unwrap_or(false),
+            // One panel at a time; the terminal wins, as it always opened over the others.
+            bottom: if state.show_terminal.unwrap_or(false) {
+                Some(BottomPanel::Terminal)
+            } else if state.show_problems.unwrap_or(false) {
+                Some(BottomPanel::Problems)
+            } else if state.show_git_log.unwrap_or(false) {
+                Some(BottomPanel::GitLog)
+            } else {
+                None
+            },
             // Closed unless it was open when the window last closed.
-            show_terminal: state.show_terminal.unwrap_or(false),
-            show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminal_groups: Vec::new(),
             active_group: 0,
             saved_terminals: None,
@@ -818,7 +847,6 @@ impl Workspace {
 
             last_run: None,
             debug: None,
-            show_debug: false,
             last_debug: None,
             debug_location: None,
             breakpoints: HashMap::new(),

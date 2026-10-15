@@ -219,7 +219,7 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The Problems panel lists the active file's diagnostics.
-        if self.show_problems {
+        if self.shows(BottomPanel::Problems) {
             let active = self.active_editor().cloned();
             self.problems.update(cx, |p, cx| p.set_editor(active, cx));
         }
@@ -232,7 +232,7 @@ impl Render for Workspace {
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
-        let terminal_panel = self.show_terminal.then(|| self.render_terminal_panel(window, cx).into_any_element());
+        let terminal_panel = self.shows(BottomPanel::Terminal).then(|| self.render_terminal_panel(window, cx).into_any_element());
         let panes = self.render_panes(window, cx).into_any_element();
 
         div()
@@ -372,10 +372,10 @@ impl Render for Workspace {
                             .min_w_0()
                             .gap(px(GAP))
                             .child(div().flex_1().min_h_0().child(panes))
-                            .when(self.show_problems, |el| el.child(self.render_problems(cx)))
-                            .when(self.show_terminal, |el| el.child(terminal_panel.unwrap()))
-                            .when(self.show_git_log, |el| el.child(self.render_git_log_panel(cx)))
-                            .when(self.show_debug, |el| el.children(self.render_debug_panel(cx))),
+                            .when(self.shows(BottomPanel::Problems), |el| el.child(self.render_problems(cx)))
+                            .when(self.shows(BottomPanel::Terminal), |el| el.child(terminal_panel.unwrap()))
+                            .when(self.shows(BottomPanel::GitLog), |el| el.child(self.render_git_log_panel(cx)))
+                            .when(self.shows(BottomPanel::Debug), |el| el.children(self.render_debug_panel(cx))),
                     ),
             )
             .child(self.render_statusbar(cx)))
