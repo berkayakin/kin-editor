@@ -6895,7 +6895,7 @@ impl Workspace {
     /// Under the tabs: the file's folders and name, then the definitions
     /// around the caret; clicking one goes to it.
     fn render_breadcrumbs(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (path, symbols) = editor.update(cx, |e, _| (e.doc.path.clone(), e.doc.image.is_none().then(|| e.breadcrumbs())));
+        let (path, symbols) = editor.update(cx, |e, cx| (e.doc.path.clone(), e.doc.image.is_none().then(|| e.breadcrumbs(cx))));
         let path = path?;
         let theme = Theme::get(cx).clone();
         let inside = self.root.as_deref().is_some_and(|r| path.starts_with(r));

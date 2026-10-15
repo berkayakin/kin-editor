@@ -958,63 +958,10 @@ impl Syntax {
 
     /// The file's definitions in document order, nested by containment.
     pub fn symbols(&self, rope: &Rope) -> Vec<Symbol> {
-        let (Some(tree), Some(config)) = (self.tree.as_ref(), outline_config(self.language)) else {
-            return Vec::new();
-        };
-        // (definition range, kind, name range)
-        let mut found: Vec<(Range<usize>, &'static str, Range<usize>)> = Vec::new();
-        let mut cursor = QueryCursor::new();
-        let mut matches = cursor.matches(&config.query, tree.root_node(), RopeProvider(rope));
-        while let Some(m) = matches.next() {
-            let mut def = None;
-            let mut name = None;
-            let context: Vec<String> = m
-                .captures
-                .iter()
-                .filter(|c| Some(c.index) == config.context && c.node.byte_range().len() < 40)
-                .map(|c| rope.byte_slice(c.node.byte_range()).to_string())
-                .collect();
-            for c in m.captures {
-                if c.index == config.name {
-                    name = Some(c.node.byte_range());
-                } else if let Some(kind) = config.kinds[c.index as usize] {
-                    let kind = match kind {
-                        "symbol" => context_kind(&context).unwrap_or_else(|| guess_kind(c.node.kind())),
-                        kind => node_kind_label(c.node.kind()).unwrap_or(kind),
-                    };
-                    def = Some((c.node.byte_range(), kind));
-                }
-            }
-            if let (Some((range, kind)), Some(name)) = (def, name) {
-                found.push((range, kind, name));
-            }
-            if found.len() >= MAX_SYMBOLS * 2 {
-                break;
-            }
+        match self.tree.as_ref() {
+            Some(tree) => symbols(self.language, tree, rope),
+            None => Vec::new(),
         }
-        // Several patterns can match one definition (a Rust method is also a
-        // function); the first, more specific one wins.
-        found.sort_by_key(|(range, _, _)| (range.start, std::cmp::Reverse(range.end)));
-        found.dedup_by(|b, a| a.0 == b.0);
-
-        let mut symbols = Vec::new();
-        let mut open: Vec<usize> = Vec::new(); // ends of enclosing definitions
-        for (range, kind, name) in found.into_iter().take(MAX_SYMBOLS) {
-            while open.last().is_some_and(|&end| end <= range.start) {
-                open.pop();
-            }
-            let text = rope.byte_slice(name.clone()).to_string();
-            let mut name_text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            if name_text.len() > 100 {
-                name_text.truncate(name_text.floor_char_boundary(100));
-                name_text.push('…');
-            }
-            if !name_text.is_empty() {
-                symbols.push(Symbol { name: name_text, kind, offset: name.start, depth: open.len(), range: range.clone() });
-            }
-            open.push(range.end);
-        }
-        symbols
     }
 
     /// Returns non-overlapping highlighted spans (absolute byte ranges) for `range`.
@@ -1233,6 +1180,68 @@ pub fn input_edit(
         old_end_position,
         new_end_position,
     }
+}
+
+/// File Structure's definitions in `tree` (see `Syntax::symbols`); takes no
+/// `Syntax`, so it can run in the background on a tree's clone.
+pub fn symbols(language: Language, tree: &Tree, rope: &Rope) -> Vec<Symbol> {
+    let Some(config) = outline_config(language) else {
+        return Vec::new();
+    };
+    // (definition range, kind, name range)
+    let mut found: Vec<(Range<usize>, &'static str, Range<usize>)> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&config.query, tree.root_node(), RopeProvider(rope));
+    while let Some(m) = matches.next() {
+        let mut def = None;
+        let mut name = None;
+        let context: Vec<String> = m
+            .captures
+            .iter()
+            .filter(|c| Some(c.index) == config.context && c.node.byte_range().len() < 40)
+            .map(|c| rope.byte_slice(c.node.byte_range()).to_string())
+            .collect();
+        for c in m.captures {
+            if c.index == config.name {
+                name = Some(c.node.byte_range());
+            } else if let Some(kind) = config.kinds[c.index as usize] {
+                let kind = match kind {
+                    "symbol" => context_kind(&context).unwrap_or_else(|| guess_kind(c.node.kind())),
+                    kind => node_kind_label(c.node.kind()).unwrap_or(kind),
+                };
+                def = Some((c.node.byte_range(), kind));
+            }
+        }
+        if let (Some((range, kind)), Some(name)) = (def, name) {
+            found.push((range, kind, name));
+        }
+        if found.len() >= MAX_SYMBOLS * 2 {
+            break;
+        }
+    }
+    // Several patterns can match one definition (a Rust method is also a
+    // function); the first, more specific one wins.
+    found.sort_by_key(|(range, _, _)| (range.start, std::cmp::Reverse(range.end)));
+    found.dedup_by(|b, a| a.0 == b.0);
+
+    let mut symbols = Vec::new();
+    let mut open: Vec<usize> = Vec::new(); // ends of enclosing definitions
+    for (range, kind, name) in found.into_iter().take(MAX_SYMBOLS) {
+        while open.last().is_some_and(|&end| end <= range.start) {
+            open.pop();
+        }
+        let text = rope.byte_slice(name.clone()).to_string();
+        let mut name_text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name_text.len() > 100 {
+            name_text.truncate(name_text.floor_char_boundary(100));
+            name_text.push('…');
+        }
+        if !name_text.is_empty() {
+            symbols.push(Symbol { name: name_text, kind, offset: name.start, depth: open.len(), range: range.clone() });
+        }
+        open.push(range.end);
+    }
+    symbols
 }
 
 #[cfg(test)]

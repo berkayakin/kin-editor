@@ -64,6 +64,10 @@ notify = "8"
 encoding_rs = "0.8"
 pulldown-cmark = { version = "0.13", default-features = false }
 
+[dev-dependencies]
+# TestAppContext for tests of entities and views.
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [target.'cfg(unix)'.dependencies]
 # setsid for the login shell that reports PATH, so it can't take over Kin's terminal.
 libc = "0.2"

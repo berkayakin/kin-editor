@@ -15,22 +15,18 @@ const MAX_STICKY: usize = 4;
 
 impl Editor {
     /// The file's symbols with their ranges, recomputed when the text changes.
-    pub(super) fn outline(&mut self) -> Arc<Vec<Symbol>> {
-        let version = self.doc.version();
-        if let Some((v, symbols)) = &self.outline_cache
-            && *v == version
-        {
-            return symbols.clone();
-        }
-        let symbols = Arc::new(self.doc.syntax().symbols(self.doc.rope()));
-        self.outline_cache = Some((version, symbols.clone()));
-        symbols
+    /// The outline to draw: the last one computed (see `Derived`).
+    fn shown_outline(&mut self, cx: &mut Context<Self>) -> Arc<Vec<Symbol>> {
+        let (language, tree, rope) = (self.doc.language, self.doc.syntax().tree().cloned(), self.doc.rope().clone());
+        let job = move || tree.map(|tree| crate::syntax::symbols(language, &tree, &rope)).unwrap_or_default();
+        self.outline.schedule((self.doc.version(), language), job, |e| &mut e.outline, cx);
+        self.outline.last()
     }
 
     /// The definitions around the caret, outermost first: name and where it starts.
-    pub fn breadcrumbs(&mut self) -> Vec<(SharedString, usize)> {
+    pub fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Vec<(SharedString, usize)> {
         let head = self.primary_selection().head;
-        self.outline()
+        self.shown_outline(cx)
             .iter()
             .filter(|s| s.range.start <= head && head <= s.range.end)
             .map(|s| (SharedString::from(s.name.clone()), s.offset))
@@ -39,8 +35,8 @@ impl Editor {
 
     /// The header rows to pin when `top_row` is the first visible row: scopes
     /// that start above it and continue past it, innermost last.
-    fn sticky_headers(&mut self, top_row: usize, max: usize) -> Vec<(usize, usize)> {
-        let outline = self.outline();
+    fn sticky_headers(&mut self, top_row: usize, max: usize, cx: &mut Context<Self>) -> Vec<(usize, usize)> {
+        let outline = self.shown_outline(cx);
         let mut rows = Vec::new();
         // The pinned lines cover rows of their own, so look below them too.
         for _ in 0..3 {
@@ -82,7 +78,7 @@ impl Editor {
         if max == 0 || self.scroll.y <= px(0.) {
             return;
         }
-        let headers = self.sticky_headers(top_row, max);
+        let headers = self.sticky_headers(top_row, max, cx);
         if headers.is_empty() {
             return;
         }

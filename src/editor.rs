@@ -4,6 +4,7 @@
 mod fold;
 mod format;
 mod conflict;
+mod derived;
 mod lsp;
 mod run;
 mod snippet;
@@ -279,15 +280,15 @@ pub struct Editor {
     wrap: Option<WrapMap>,
     /// Language server state: completion, hover, signature help.
     lsp: lsp::EditorLsp,
-    /// Fold regions for a (version, tab size).
-    fold_cache: Option<((u64, usize), Arc<Vec<crate::fold::FoldRegion>>)>,
+    /// Fold regions for a (version, tab size, language).
+    fold_regions: derived::Derived<(u64, usize, crate::syntax::Language), Vec<crate::fold::FoldRegion>>,
     /// `⋯` placeholders on screen last frame, for clicks: (bounds, fold start).
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
     /// File Structure's symbols for a document version (breadcrumbs, sticky scroll).
-    outline_cache: Option<(u64, Arc<Vec<crate::syntax::Symbol>>)>,
+    outline: derived::Derived<(u64, crate::syntax::Language), Vec<crate::syntax::Symbol>>,
     /// Markdown: the rendered preview shows beside the text.
     md_preview: bool,
-    md_cache: Option<(u64, Arc<Vec<crate::markdown_preview::Block>>)>,
+    md_blocks: derived::Derived<(u64, Option<std::path::PathBuf>), Vec<crate::markdown_preview::Block>>,
     md_scroll: gpui::ScrollHandle,
     /// The preview's text size, relative to the UI font.
     md_zoom: f32,
@@ -297,14 +298,14 @@ pub struct Editor {
     sticky_rows: Vec<(Bounds<Pixels>, usize)>,
     /// The pointer is over the gutter, so fold arrows show.
     gutter_hovered: bool,
-    /// Runnable targets for a version (gutter ▶).
-    run_cache: Option<(u64, Arc<Vec<crate::run::RunTarget>>)>,
+    /// Runnable targets for a version and path (gutter ▶).
+    run_targets: derived::Derived<(u64, Option<std::path::PathBuf>, crate::syntax::Language), Vec<crate::run::RunTarget>>,
     /// The row a debug session is paused on (highlighted).
     debug_line: Option<usize>,
     /// Format, dimensions and size of an image document (read on first show).
     image_info: Option<crate::preview::ImageInfo>,
     /// Merge conflicts for a version.
-    conflict_cache: Option<(u64, Arc<Vec<crate::conflict::Conflict>>)>,
+    conflicts: derived::Derived<u64, Vec<crate::conflict::Conflict>>,
     /// Accept labels on screen last frame: (bounds, conflict start row, choice).
     conflict_hits: Vec<(Bounds<Pixels>, usize, crate::conflict::Resolution)>,
 }
@@ -358,19 +359,19 @@ impl Editor {
             soft_wrap: false,
             wrap: None,
             lsp: lsp::EditorLsp::default(),
-            fold_cache: None,
+            fold_regions: derived::Derived::new(),
             fold_pills: Vec::new(),
-            outline_cache: None,
+            outline: derived::Derived::new(),
             md_preview: false,
-            md_cache: None,
+            md_blocks: derived::Derived::new(),
             md_scroll: gpui::ScrollHandle::new(),
             md_zoom: 1.,
             md_zoom_rest: 0.,
             sticky_rows: Vec::new(),
             gutter_hovered: false,
-            run_cache: None,
+            run_targets: derived::Derived::new(),
             debug_line: None,
-            conflict_cache: None,
+            conflicts: derived::Derived::new(),
             conflict_hits: Vec::new(),
             image_info: None,
         };
@@ -1117,16 +1118,11 @@ impl Editor {
 
     /// The preview beside a Markdown file, parsed again when the text changes.
     fn render_markdown_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let version = self.doc.version();
-        let blocks = match &self.md_cache {
-            Some((v, blocks)) if *v == version => blocks.clone(),
-            _ => {
-                let base = self.doc.path.as_deref().and_then(std::path::Path::parent);
-                let blocks = Arc::new(crate::markdown_preview::parse(&self.doc.rope().to_string(), base));
-                self.md_cache = Some((version, blocks.clone()));
-                blocks
-            }
-        };
+        let path = self.doc.path.clone();
+        let rope = self.doc.rope().clone();
+        let job = move || crate::markdown_preview::parse(&rope.to_string(), path.as_deref().and_then(std::path::Path::parent));
+        self.md_blocks.schedule((self.doc.version(), self.doc.path.clone()), job, |e| &mut e.md_blocks, cx);
+        let blocks = self.md_blocks.last();
         let theme = Theme::get(cx).clone();
         let zoom = self.md_zoom;
         let step = |id: &'static str, icon: crate::assets::Icon, delta: f32, cx: &mut Context<Self>| {
@@ -2268,9 +2264,7 @@ impl Editor {
     /// Whether the caret is in a merge conflict (as of the last frame).
     pub fn has_conflict_at_cursor(&self) -> bool {
         let row = self.doc.row_of(self.primary_selection().head);
-        self.conflict_cache
-            .as_ref()
-            .is_some_and(|(v, c)| *v == self.doc.version() && c.iter().any(|c| c.rows().contains(&row)))
+        self.conflicts.current(&self.doc.version()).is_some_and(|c| c.iter().any(|c| c.rows().contains(&row)))
     }
 
     fn line_range(&self, offset: usize) -> Range<usize> {
@@ -2488,10 +2482,10 @@ impl Editor {
         self.fold_pills.clear();
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
-        let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.fold_regions());
+        let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.shown_fold_regions(cx));
         let run_rows: Vec<usize> =
-            if single { Vec::new() } else { self.run_targets().iter().filter_map(|t| t.row).collect() };
-        let conflicts = if single { Arc::new(Vec::new()) } else { self.conflicts() };
+            if single { Vec::new() } else { self.shown_run_targets(cx).iter().filter_map(|t| t.row).collect() };
+        let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
         self.conflict_hits.clear();
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
         let diagnostics: Vec<&lint::Diagnostic> = self

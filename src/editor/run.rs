@@ -2,7 +2,7 @@
 //! tests in the file, see `crate::run`, run by the workspace in a Run tab
 //! or a debug session), and the file's breakpoints.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use gpui::{Context, Pixels, Point, Window};
 
@@ -39,19 +39,28 @@ impl gpui::EventEmitter<EditorBreakpointMenu> for Editor {}
 impl Editor {
     /// What can run in this file (cached per version).
     pub fn run_targets(&mut self) -> Arc<Vec<RunTarget>> {
-        let version = self.doc.version();
-        if let Some((v, targets)) = &self.run_cache
-            && *v == version
-        {
-            return targets.clone();
-        }
-        let targets = match (self.doc.path.as_deref(), self.doc.syntax().tree()) {
-            (Some(path), Some(tree)) => run::file_targets(self.doc.language, path, &self.doc.rope().to_string(), tree),
+        let (key, job) = self.run_job();
+        self.run_targets.now(key, job)
+    }
+
+    /// The targets to draw (gutter ▶): the last ones found (see `Derived`).
+    pub(super) fn shown_run_targets(&mut self, cx: &mut Context<Self>) -> Arc<Vec<RunTarget>> {
+        let (key, job) = self.run_job();
+        self.run_targets.schedule(key, job, |e| &mut e.run_targets, cx);
+        self.run_targets.last()
+    }
+
+    /// Finding targets reads the disk (the crate, the package), so it runs
+    /// in the background for drawing.
+    fn run_job(&self) -> ((u64, Option<PathBuf>, Language), impl FnOnce() -> Vec<RunTarget> + Send + 'static) {
+        let (path, language) = (self.doc.path.clone(), self.doc.language);
+        let (tree, rope) = (self.doc.syntax().tree().cloned(), self.doc.rope().clone());
+        let key = (self.doc.version(), path.clone(), language);
+        let job = move || match (path, tree) {
+            (Some(path), Some(tree)) => run::file_targets(language, &path, &rope.to_string(), &tree),
             _ => Vec::new(),
         };
-        let targets = Arc::new(targets);
-        self.run_cache = Some((version, targets.clone()));
-        targets
+        (key, job)
     }
 
     /// The target whose ▶ is on `row`.

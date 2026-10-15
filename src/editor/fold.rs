@@ -12,16 +12,21 @@ use crate::fold::{self, FoldRegion};
 impl Editor {
     /// Fold regions for the current text (cached per version).
     pub(super) fn fold_regions(&mut self) -> Arc<Vec<FoldRegion>> {
-        let key = (self.doc.version(), self.tab_size);
-        if let Some((k, regions)) = &self.fold_cache
-            && *k == key
-        {
-            return regions.clone();
-        }
-        let markdown = self.doc.language == crate::syntax::Language::Markdown;
-        let regions = Arc::new(fold::regions(&self.doc.rope().to_string(), self.tab_size, markdown));
-        self.fold_cache = Some((key, regions.clone()));
-        regions
+        let (key, job) = self.fold_job();
+        self.fold_regions.now(key, job)
+    }
+
+    /// The fold regions to draw: the last ones computed (see `Derived`).
+    pub(super) fn shown_fold_regions(&mut self, cx: &mut Context<Self>) -> Arc<Vec<FoldRegion>> {
+        let (key, job) = self.fold_job();
+        self.fold_regions.schedule(key, job, |e| &mut e.fold_regions, cx);
+        self.fold_regions.last()
+    }
+
+    fn fold_job(&self) -> ((u64, usize, crate::syntax::Language), impl FnOnce() -> Vec<FoldRegion> + Send + 'static) {
+        let (rope, tab_size, language) = (self.doc.rope().clone(), self.tab_size, self.doc.language);
+        let job = move || fold::regions(&rope.to_string(), tab_size, language == crate::syntax::Language::Markdown);
+        ((self.doc.version(), tab_size, language), job)
     }
 
     /// Whether a fold hides buffer line `row`.

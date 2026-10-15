@@ -11,15 +11,15 @@ use crate::conflict::{self, Conflict, Resolution};
 impl Editor {
     /// The file's conflicts (cached per version).
     pub(super) fn conflicts(&mut self) -> Arc<Vec<Conflict>> {
-        let version = self.doc.version();
-        if let Some((v, conflicts)) = &self.conflict_cache
-            && *v == version
-        {
-            return conflicts.clone();
-        }
-        let conflicts = Arc::new(conflict::parse(&self.doc.rope().to_string()));
-        self.conflict_cache = Some((version, conflicts.clone()));
-        conflicts
+        let rope = self.doc.rope().clone();
+        self.conflicts.now(self.doc.version(), move || conflict::parse(&rope.to_string()))
+    }
+
+    /// The conflicts to draw: the last ones found (see `Derived`).
+    pub(super) fn shown_conflicts(&mut self, cx: &mut Context<Self>) -> Arc<Vec<Conflict>> {
+        let rope = self.doc.rope().clone();
+        self.conflicts.schedule(self.doc.version(), move || conflict::parse(&rope.to_string()), |e| &mut e.conflicts, cx);
+        self.conflicts.last()
     }
 
     /// Replaces the conflict starting at `start` with the side(s) kept.
