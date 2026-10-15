@@ -19,7 +19,7 @@ impl Editor {
     fn shown_outline(&mut self, cx: &mut Context<Self>) -> Arc<Vec<Symbol>> {
         let (language, tree, rope) = (self.doc.language, self.doc.syntax().tree().cloned(), self.doc.rope().clone());
         let job = move || tree.map(|tree| crate::syntax::symbols(language, &tree, &rope)).unwrap_or_default();
-        self.outline.schedule((self.doc.version(), language), job, |e| &mut e.outline, cx);
+        self.outline.schedule((self.doc.tree_version(), language), job, |e| &mut e.outline, cx);
         self.outline.last()
     }
 

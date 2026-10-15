@@ -5,14 +5,15 @@
 //! the viewport rather than the file.
 
 use std::{
-    ops::{Deref, DerefMut, Range},
+    ops::{ControlFlow, Deref, DerefMut, Range},
     path::Path,
     sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use ropey::Rope;
 use tree_sitter::{
-    InputEdit, Language as TsLanguage, Node, Parser, Query, QueryCursor, StreamingIterator,
+    InputEdit, Language as TsLanguage, Node, ParseOptions, Parser, Query, QueryCursor, StreamingIterator,
     TextProvider, Tree,
 };
 
@@ -801,10 +802,42 @@ pub struct Syntax {
 
 impl Syntax {
     pub fn new(language: Language, rope: &Rope) -> Self {
-        let parser = config(language).and_then(|config| PooledParser::new(&config.language));
-        let mut this = Self { language, parser, tree: None, injections: Vec::new() };
+        let mut this = Self::unparsed(language);
         this.reparse(rope);
         this
+    }
+
+    /// Parsed for at most `budget`; `None` from `tree()` until a parse finishes.
+    pub fn new_within(language: Language, rope: &Rope, budget: Duration) -> (Self, bool) {
+        let mut this = Self::unparsed(language);
+        let done = this.reparse_within(rope, Some(budget));
+        (this, done)
+    }
+
+    fn unparsed(language: Language) -> Self {
+        let parser = config(language).and_then(|config| PooledParser::new(&config.language));
+        Self { language, parser, tree: None, injections: Vec::new() }
+    }
+
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    /// A full parse to run in the background, from this syntax's trees (as
+    /// edited since their last parse) and `rope`.
+    pub fn parse_job(&self, rope: &Rope) -> impl FnOnce() -> Syntax + Send + 'static {
+        let (language, rope, tree) = (self.language, rope.clone(), self.tree.clone());
+        let injections: Vec<(&'static LangConfig, Option<Tree>)> = self.injections.iter().map(|i| (i.config, i.tree.clone())).collect();
+        move || {
+            let mut syntax = Syntax::unparsed(language);
+            syntax.tree = tree;
+            syntax.injections = injections
+                .into_iter()
+                .filter_map(|(config, tree)| Some(Injection { config, parser: PooledParser::new(&config.language)?, tree }))
+                .collect();
+            syntax.reparse(&rope);
+            syntax
+        }
     }
 
     /// The trees of embedded languages, then the file's own.
@@ -816,21 +849,37 @@ impl Syntax {
         self.tree.as_ref()
     }
 
-    /// Informs the old tree about an edit so the next parse can reuse nodes.
+    /// Informs the old trees about an edit so the next parse can reuse nodes
+    /// (embedded languages' trees too).
     pub fn edit(&mut self, edit: &InputEdit) {
-        if let Some(tree) = self.tree.as_mut() {
+        for tree in self.tree.iter_mut().chain(self.injections.iter_mut().filter_map(|i| i.tree.as_mut())) {
             tree.edit(edit);
         }
     }
 
     pub fn reparse(&mut self, rope: &Rope) {
-        let Some(parser) = self.parser.as_mut() else { return };
-        let tree = parser.parse_with_options(
-            &mut |byte, _| rope_chunk(rope, byte),
-            self.tree.as_ref(),
-            None,
-        );
-        self.tree = tree;
+        self.reparse_within(rope, None);
+    }
+
+    /// Parses again, giving up after `budget`: false then, and the trees are
+    /// the old ones, edited, until a later parse finishes (see `parse_job`).
+    pub fn reparse_within(&mut self, rope: &Rope, budget: Option<Duration>) -> bool {
+        let Some(parser) = self.parser.as_mut() else { return true };
+        let started = Instant::now();
+        let mut in_time = |_: &tree_sitter::ParseState| match budget {
+            Some(budget) if started.elapsed() > budget => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        };
+        let options = ParseOptions::new().progress_callback(&mut in_time);
+        match parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), self.tree.as_ref(), Some(options)) {
+            Some(tree) => self.tree = Some(tree),
+            None if budget.is_some() => {
+                // Halted: start over next time rather than resume on other text.
+                parser.reset();
+                return false;
+            }
+            None => self.tree = None,
+        }
 
         let wanted = self.tree.as_ref().map(|tree| injected_ranges(self.language, tree, rope)).unwrap_or_default();
         let mut old = std::mem::take(&mut self.injections);
@@ -842,12 +891,32 @@ impl Syntax {
                     Injection { config, parser, tree: None }
                 }
             };
-            injection.tree = None;
-            if injection.parser.set_included_ranges(&ranges).is_ok() {
-                injection.tree = injection.parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), None, None);
+            if injection.parser.set_included_ranges(&ranges).is_err() {
+                injection.tree = None;
+                self.injections.push(injection);
+                continue;
+            }
+            // Reuses the old tree, edited like the main one; changed ranges are fine.
+            let mut in_time = |_: &tree_sitter::ParseState| match budget {
+                Some(budget) if started.elapsed() > budget => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            };
+            let options = ParseOptions::new().progress_callback(&mut in_time);
+            let parsed = injection.parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), injection.tree.as_ref(), Some(options));
+            let halted = parsed.is_none() && budget.is_some();
+            if halted {
+                injection.parser.reset();
+            } else {
+                injection.tree = parsed;
             }
             self.injections.push(injection);
+            if halted {
+                // The rest keep their edited trees too.
+                self.injections.append(&mut old);
+                return false;
+            }
         }
+        true
     }
 
     /// Whether a line break at `offset` (on `row`) should indent the next
@@ -1274,6 +1343,29 @@ pub fn symbols(language: Language, tree: &Tree, rope: &Rope) -> Vec<Symbol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_trees_are_edited_and_reused() {
+        let before = "<p>x</p><script>let a = 1;\nlet b = 2;</script>";
+        let after = "<p>x</p><script>let a = 10;\nlet b = 2;</script>";
+        let mut syntax = Syntax::new(Language::Html, &Rope::from_str(before));
+        let at = before.find("1;").unwrap() + 1;
+        let rope = Rope::from_str(after);
+        syntax.edit(&InputEdit {
+            start_byte: at,
+            old_end_byte: at,
+            new_end_byte: at + 1,
+            start_position: tree_sitter::Point::new(0, at),
+            old_end_position: tree_sitter::Point::new(0, at),
+            new_end_position: tree_sitter::Point::new(0, at + 1),
+        });
+        syntax.reparse(&rope);
+        let fresh = Syntax::new(Language::Html, &rope);
+        let sexp = |s: &Syntax| s.injections.iter().map(|i| i.tree.as_ref().unwrap().root_node().to_sexp()).collect::<Vec<_>>();
+        assert_eq!(sexp(&syntax), sexp(&fresh));
+        let number = |s: &Syntax| s.injections[0].tree.as_ref().unwrap().root_node().descendant_for_byte_range(at, at).map(|n| n.byte_range());
+        assert_eq!(number(&syntax), number(&fresh));
+    }
 
     #[test]
     fn pooled_parsers_come_back_clean() {

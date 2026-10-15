@@ -280,9 +280,11 @@ pub struct Editor {
     wrap: Option<WrapMap>,
     /// Language server state: completion, hover, signature help.
     lsp: lsp::EditorLsp,
-    /// The carets' bracket pairs, for a version and caret offsets.
+    /// A parse finishing in the background (see `schedule_parse`).
+    parse_task: Option<Task<()>>,
+    /// The carets' bracket pairs, for a tree version and caret offsets.
     bracket_cache: Option<((u64, Vec<usize>), Arc<Vec<Range<usize>>>)>,
-    /// Highlights of what was on screen: for a version, language and ranges.
+    /// Highlights of what was on screen: for a tree version, language and ranges.
     highlight_cache: Option<((u64, crate::syntax::Language, Vec<Range<usize>>), Arc<Vec<(Range<usize>, crate::syntax::Highlight)>>)>,
     /// Fold regions for a (version, tab size, language).
     fold_regions: derived::Derived<(u64, usize, crate::syntax::Language), Vec<crate::fold::FoldRegion>>,
@@ -362,6 +364,7 @@ impl Editor {
             wrap: None,
             lsp: lsp::EditorLsp::default(),
             highlight_cache: None,
+            parse_task: None,
             bracket_cache: None,
             fold_regions: derived::Derived::new(),
             fold_pills: Vec::new(),
@@ -382,7 +385,32 @@ impl Editor {
         this.detect_external_linter();
         this.schedule_lint(Duration::ZERO, cx);
         this.run_external_linter(cx);
+        this.schedule_parse(cx);
         this
+    }
+
+    /// Finishes in the background a parse that ran out of time on the UI
+    /// thread (a big file opening, an edit in one). One at a time: a parse
+    /// that ends behind the edits made meanwhile starts the next.
+    pub(super) fn schedule_parse(&mut self, cx: &mut Context<Self>) {
+        if self.parse_task.is_some() {
+            return;
+        }
+        let Some((version, job)) = self.doc.parse_job() else { return };
+        self.parse_task = Some(cx.spawn(async move |this, cx| {
+            let syntax = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |editor, cx| {
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = editor.parse_task.take() {
+                    task.detach();
+                }
+                if editor.doc.finish_parse(version, syntax) {
+                    editor.schedule_parse(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn single_line(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
@@ -1267,7 +1295,7 @@ impl Editor {
     /// and a caret blink draws again.
     fn bracket_pairs(&mut self) -> Arc<Vec<Range<usize>>> {
         let heads: Vec<usize> = self.selections.iter().filter(|s| s.is_empty()).take(8).map(|s| s.head).collect();
-        let key = (self.doc.version(), heads);
+        let key = (self.doc.tree_version(), heads);
         if let Some((k, pairs)) = &self.bracket_cache
             && *k == key
         {
@@ -1300,7 +1328,7 @@ impl Editor {
         if let (Some(r), Some(b)) = (ranges.last_mut(), self.line_breaks(row).get(seg)) {
             r.end = (self.doc.line_start(row) + b.byte as usize).max(r.start);
         }
-        let key = (self.doc.version(), self.doc.language, ranges);
+        let key = (self.doc.tree_version(), self.doc.language, ranges);
         if let Some((k, highlights)) = &self.highlight_cache
             && *k == key
         {

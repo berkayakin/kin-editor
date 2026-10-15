@@ -9,6 +9,7 @@ use std::{
 
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
+use tree_sitter::InputEdit;
 
 use crate::{
     encoding::{self, TextEncoding},
@@ -89,6 +90,12 @@ pub enum EditKind {
 /// rebuild from scratch.
 const LINE_EDIT_LOG: usize = 10_000;
 
+/// How long an edit may parse on the UI thread; a longer parse finishes in
+/// the background (the editor shows the old tree, edited, meanwhile).
+const PARSE_BUDGET: Duration = Duration::from_millis(1);
+/// The same when a file opens or reloads.
+const OPEN_PARSE_BUDGET: Duration = Duration::from_millis(10);
+
 /// Above this, a file opens as plain text without language features.
 const LARGE_FILE_SIZE: u64 = 20_000_000;
 /// Above this, it doesn't open at all (it would take that much memory twice over).
@@ -131,6 +138,19 @@ pub struct Document {
     /// How many lines are longer than `wrap::LONG_LINE` (they always break
     /// into rows, so the editor needs a wrap map).
     long_lines: usize,
+    /// The last parse ran out of time: the trees are older ones, edited,
+    /// until a background parse (`parse_job`) finishes.
+    parse_behind: bool,
+    /// Edits made while behind, with the version they led to, to replay on
+    /// a background parse of an older version.
+    parse_edits: Vec<(u64, InputEdit)>,
+    /// The version the trees were last fully parsed for (None: not yet).
+    parsed_version: Option<u64>,
+    /// How long an edit may parse here (`PARSE_BUDGET`; tests change it).
+    parse_budget: Duration,
+    /// Changes whenever the trees do (an edit, a parse finishing), for
+    /// caches of what's derived from them.
+    tree_version: u64,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// The language server's inlay hints (sorted); they follow edits until
@@ -165,17 +185,18 @@ impl Document {
         let (text, encoding) = encoding::decode(&bytes, None);
         // A large file is shown as plain text: no parsing, linting or language
         // server. Decided before building the syntax tree, which would parse it.
-        let mut doc = Self::with_text(text, Some(path.to_path_buf()), size > LARGE_FILE_SIZE);
+        let mut doc = Self::with_text(text, Some(path.to_path_buf()), size > LARGE_FILE_SIZE, Some(OPEN_PARSE_BUDGET));
         doc.encoding = encoding;
         doc.disk_mtime = mtime(path);
         Ok(doc)
     }
 
     pub(crate) fn from_text(text: String, path: Option<PathBuf>) -> Self {
-        Self::with_text(text, path, false)
+        Self::with_text(text, path, false, None)
     }
 
-    fn with_text(text: String, path: Option<PathBuf>, large: bool) -> Self {
+    /// `budget`: parse for at most this long here, the rest in the background.
+    fn with_text(text: String, path: Option<PathBuf>, large: bool, budget: Option<Duration>) -> Self {
         // Normalize to LF internally; remember the style for saving.
         let uses_crlf = text.contains("\r\n");
         let text = if uses_crlf {
@@ -188,7 +209,10 @@ impl Document {
             Some(path) if !large => Language::from_path(path),
             _ => Language::PlainText,
         };
-        let syntax = Syntax::new(language, &rope);
+        let (syntax, parsed) = match budget {
+            Some(budget) => Syntax::new_within(language, &rope, budget),
+            None => (Syntax::new(language, &rope), true),
+        };
         let long_lines = long_lines(&rope, 0..usize::MAX);
         Self {
             rope,
@@ -213,6 +237,11 @@ impl Document {
             line_edits: Vec::new(),
             line_edits_base: 0,
             long_lines,
+            parse_behind: !parsed,
+            parse_edits: Vec::new(),
+            parsed_version: parsed.then_some(0),
+            parse_budget: PARSE_BUDGET,
+            tree_version: 0,
             snippet: None,
             inlay_hints: Vec::new(),
             disk_mtime: None,
@@ -263,7 +292,7 @@ impl Document {
             return;
         }
         self.language = language;
-        self.syntax = Syntax::new(language, &self.rope);
+        self.set_syntax(Syntax::new(language, &self.rope), true);
         self.set_builtin_diagnostics(Vec::new());
         self.set_external_diagnostics(Vec::new());
     }
@@ -336,7 +365,8 @@ impl Document {
         self.line_edits_base = self.version + 1;
         self.set_breakpoints(&breakpoints);
         self.set_debug_row(debug_row);
-        self.syntax = Syntax::new(self.language, &self.rope);
+        let (syntax, parsed) = Syntax::new_within(self.language, &self.rope, OPEN_PARSE_BUDGET);
+        self.set_syntax(syntax, parsed);
         self.lsp_changes.mark_full();
         self.folds.clear();
         self.snippet = None;
@@ -526,8 +556,8 @@ impl Document {
         }
 
         if !records.is_empty() {
-            self.syntax.reparse(&self.rope);
             self.version += 1;
+            self.reparse();
             self.redo_stack.clear();
             let now = Instant::now();
             let merge = self.undo_stack.last().is_some_and(|t| {
@@ -595,8 +625,8 @@ impl Document {
             self.raw_replace(range.clone(), &rec.old);
             self.shift_tracked(&Patch::new(vec![(range, rec.old.len())]));
         }
-        self.syntax.reparse(&self.rope);
         self.version += 1;
+        self.reparse();
         let selections = t.before.clone();
         self.redo_stack.push(t);
         Some(selections)
@@ -609,8 +639,8 @@ impl Document {
             self.raw_replace(range.clone(), &rec.new);
             self.shift_tracked(&Patch::new(vec![(range, rec.new.len())]));
         }
-        self.syntax.reparse(&self.rope);
         self.version += 1;
+        self.reparse();
         let selections = t.after.clone();
         self.undo_stack.push(t);
         Some(selections)
@@ -633,12 +663,63 @@ impl Document {
         self.line_edits.push((self.version + 1, lines));
         self.long_lines -= long_lines(&self.rope, row..row + lines.old_rows);
         let edit = input_edit(&self.rope, range.clone(), text);
+        if self.parse_behind {
+            self.parse_edits.push((self.version + 1, edit));
+        }
         let s = self.rope.byte_to_char(range.start);
         let e = self.rope.byte_to_char(range.end);
         self.rope.remove(s..e);
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
         self.long_lines += long_lines(&self.rope, row..row + lines.new_rows);
+    }
+
+    /// Parses after an edit, within `PARSE_BUDGET`.
+    fn reparse(&mut self) {
+        let parsed = self.syntax.reparse_within(&self.rope, Some(self.parse_budget));
+        self.after_parse(parsed);
+    }
+
+    fn set_syntax(&mut self, syntax: Syntax, parsed: bool) {
+        self.syntax = syntax;
+        self.after_parse(parsed);
+    }
+
+    fn after_parse(&mut self, parsed: bool) {
+        self.tree_version += 1;
+        self.parse_behind = !parsed;
+        if parsed {
+            self.parse_edits.clear();
+            self.parsed_version = Some(self.version);
+        }
+    }
+
+    /// When a parse ran out of time: the version it's for and a full parse
+    /// to run in the background; give the result to `finish_parse`.
+    pub fn parse_job(&self) -> Option<(u64, impl FnOnce() -> Syntax + Send + 'static)> {
+        self.parse_behind.then(|| (self.version, self.syntax.parse_job(&self.rope)))
+    }
+
+    /// Takes a background parse of `version`, catching it up with the edits
+    /// made since. True when it's still behind (edits came meanwhile).
+    pub fn finish_parse(&mut self, version: u64, mut syntax: Syntax) -> bool {
+        if self.parsed_version.is_some_and(|parsed| version <= parsed) || version > self.version || syntax.language() != self.language {
+            return self.parse_behind;
+        }
+        for (_, edit) in self.parse_edits.iter().filter(|(v, _)| *v > version) {
+            syntax.edit(edit);
+        }
+        self.parse_edits.retain(|(v, _)| *v > version);
+        self.syntax = syntax;
+        self.tree_version += 1;
+        self.parsed_version = Some(version);
+        self.parse_behind = version != self.version;
+        self.parse_behind
+    }
+
+    /// Changes whenever the syntax trees do.
+    pub fn tree_version(&self) -> u64 {
+        self.tree_version
     }
 
     /// Whether some line is longer than `wrap::LONG_LINE`.
@@ -1145,12 +1226,38 @@ mod tests {
     }
 
     #[test]
+    fn a_parse_that_runs_out_of_time_finishes_in_the_background() {
+        let text: String = (0..3000).map(|i| format!("fn f{i}() {{ let x = {i}; }}\n")).collect();
+        let mut doc = Document::with_text(text, Some("big.rs".into()), false, Some(Duration::ZERO));
+        doc.parse_budget = Duration::ZERO;
+        assert!(doc.syntax().tree().is_none(), "opening ran out of time");
+        let (opened, job) = doc.parse_job().expect("behind");
+        let parsed_on_open = job();
+
+        // An edit while that runs: its own parse runs out of time too.
+        let tree_version = doc.tree_version();
+        doc.edit(vec![(3..5, "renamed".into())], &[], EditKind::Other);
+        assert!(doc.tree_version() > tree_version);
+        assert!(doc.finish_parse(opened, parsed_on_open), "still behind the edit");
+        let root = doc.syntax().tree().unwrap().root_node();
+        assert_eq!(root.child(0).unwrap().byte_range(), 0..27, "the tree took the edit: {}", root.child(0).unwrap().to_sexp());
+
+        let (version, job) = doc.parse_job().expect("behind");
+        assert!(!doc.finish_parse(version, job()));
+        let fresh = Syntax::new(Language::Rust, doc.rope());
+        assert_eq!(doc.syntax().tree().unwrap().root_node().to_sexp(), fresh.tree().unwrap().root_node().to_sexp());
+        // An old result arriving late changes nothing.
+        assert!(!doc.finish_parse(opened, Syntax::new(Language::Rust, &Rope::from_str("fn old() {}"))));
+        assert_eq!(doc.syntax().tree().unwrap().root_node().to_sexp(), fresh.tree().unwrap().root_node().to_sexp());
+    }
+
+    #[test]
     fn large_files_are_never_parsed() {
         let text = "{\"a\": 1}\n".repeat(10);
-        let doc = Document::with_text(text.clone(), Some("big.json".into()), true);
+        let doc = Document::with_text(text.clone(), Some("big.json".into()), true, None);
         assert!(doc.large && doc.language == Language::PlainText);
         assert!(doc.syntax().tree().is_none());
-        let mut doc = Document::with_text(text, Some("big.json".into()), true);
+        let mut doc = Document::with_text(text, Some("big.json".into()), true, None);
         doc.set_path("renamed.rs".into());
         assert!(doc.language == Language::PlainText && doc.syntax().tree().is_none());
         // A small one is.

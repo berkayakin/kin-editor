@@ -55,7 +55,7 @@ impl Editor {
     fn run_job(&self) -> ((u64, Option<PathBuf>, Language), impl FnOnce() -> Vec<RunTarget> + Send + 'static) {
         let (path, language) = (self.doc.path.clone(), self.doc.language);
         let (tree, rope) = (self.doc.syntax().tree().cloned(), self.doc.rope().clone());
-        let key = (self.doc.version(), path.clone(), language);
+        let key = (self.doc.tree_version(), path.clone(), language);
         let job = move || match (path, tree) {
             (Some(path), Some(tree)) => run::file_targets(language, &path, &rope.to_string(), &tree),
             _ => Vec::new(),

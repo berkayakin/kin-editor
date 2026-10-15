@@ -120,6 +120,7 @@ impl Editor {
     /// Records an edit: tells the server and the workspace, and drops
     /// popovers that no longer apply.
     pub(super) fn edited(&mut self, cx: &mut Context<Self>) {
+        self.schedule_parse(cx);
         if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.path.clone()) {
             let changes = self.doc.take_lsp_changes();
             store.read(cx).did_change(&path, self.doc.version(), changes, self.doc.rope());
