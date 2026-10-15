@@ -165,10 +165,10 @@ mod tests {
     #[test]
     fn folders_cover_their_contents() {
         *TRUSTED.write().unwrap() = Some(vec![PathBuf::from("/work/clients")]);
-        assert!(is_trusted(Path::new("/work/clients/acme")));
-        assert!(is_trusted(Path::new("/work/clients/acme/src/main.rs")));
-        assert!(!is_trusted(Path::new("/work/clients-old")));
-        assert!(!is_trusted(Path::new("/work")));
+        // `trusted_by`, not `is_trusted`: LSP tests turn trust-all on meanwhile.
+        assert!(trusted_by(Path::new("/work/clients/acme/src/main.rs")).is_some());
+        assert!(trusted_by(Path::new("/work/clients-old")).is_none());
+        assert!(trusted_by(Path::new("/work")).is_none());
         assert_eq!(trusted_by(Path::new("/work/clients/acme")), Some(PathBuf::from("/work/clients")));
     }
 

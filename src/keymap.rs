@@ -1123,7 +1123,10 @@ mod tests {
             ("Select Next Occurrence", Box::new(SelectNextOccurrence)),
         ];
         for base in BaseKeymap::ALL {
-            for mac in [true, false] {
+            // GPUI turns `secondary` into the host's ⌘ or Ctrl, so only the
+            // host's variant can be checked (CI runs on macOS, Linux and Windows).
+            {
+                let mac = cfg!(target_os = "macos");
                 let bindings = layers(base, mac);
                 // The same keys in the same context must mean one thing.
                 let mut seen: HashMap<(String, String), &'static str> = HashMap::new();

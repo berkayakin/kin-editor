@@ -1571,9 +1571,11 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
-        for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com"), ("init.defaultBranch", "main")] {
+        for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com")] {
             run(&dir, &["config", k, v]).unwrap();
         }
+        // `main` whatever the machine's init.defaultBranch (Git's own default is master).
+        run(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
         let root = discover(&dir).unwrap();
         let lines: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.join("f.txt"), &lines).unwrap();
