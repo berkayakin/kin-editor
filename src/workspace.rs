@@ -260,6 +260,28 @@ impl Pane {
     }
 }
 
+/// Terminal tabs shown together in the bottom panel; splitting the terminal
+/// adds a group beside it, like a pane.
+struct TerminalGroup {
+    tabs: Vec<Entity<TerminalView>>,
+    active: usize,
+}
+
+impl TerminalGroup {
+    fn new(terminal: Entity<TerminalView>) -> Self {
+        Self { tabs: vec![terminal], active: 0 }
+    }
+}
+
+/// Where `open_terminal` puts a new terminal.
+#[derive(Clone, Copy)]
+enum TerminalPlace {
+    /// A tab in a group: at `ix` (clamped), or after its tabs.
+    Tab { group: usize, ix: Option<usize> },
+    /// A group of its own right after this one (a split).
+    GroupAfter(usize),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PaneAxis {
     /// Side by side.
@@ -424,10 +446,11 @@ pub struct Workspace {
     /// Height of the bottom panel (Problems or Terminal; one shows at a time).
     problems_height: Pixels,
     show_terminal: bool,
-    terminals: Vec<Entity<TerminalView>>,
-    active_terminal: usize,
-    /// A second terminal shown beside the active one.
-    split_terminal: Option<Entity<TerminalView>>,
+    /// Terminal tabs in groups side by side, each with its own tab strip
+    /// (one group unless the terminal is split). Groups are never empty.
+    terminal_groups: Vec<TerminalGroup>,
+    /// The group that has (or last had) the keyboard.
+    active_group: usize,
     /// While dragging over the tree: the folder a drop would go into.
     tree_drop: Option<PathBuf>,
 
@@ -644,9 +667,8 @@ impl Workspace {
             // Closed unless it was open when the window last closed.
             show_terminal: state.show_terminal.unwrap_or(false),
             show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
-            terminals: Vec::new(),
-            active_terminal: 0,
-            split_terminal: None,
+            terminal_groups: Vec::new(),
+            active_group: 0,
             tree_drop: None,
 
             last_run: None,
@@ -1462,8 +1484,8 @@ impl Workspace {
         self.pane_sizes = vec![1.0];
         self.pinned.clear();
         self.session_task = None;
-        self.terminals.clear();
-        self.split_terminal = None;
+        self.terminal_groups.clear();
+        self.active_group = 0;
         self.show_terminal = false;
         if let Some((session, _)) = self.debug.take() {
             session.update(cx, |s, cx| s.stop(cx));
@@ -2834,7 +2856,7 @@ impl Workspace {
 
     /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = self.terminals.get(self.active_terminal).is_some_and(|t| t.focus_handle(cx).contains_focused(window, cx));
+        let focused = self.all_terminals().any(|t| t.focus_handle(cx).contains_focused(window, cx));
         if self.show_terminal && focused {
             self.show_terminal = false;
             self.focus_active(window, cx);
@@ -2843,7 +2865,7 @@ impl Workspace {
             self.show_problems = false;
             self.show_git_log = false;
             self.show_debug = false;
-            if self.terminals.is_empty() {
+            if self.terminal_groups.is_empty() {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
                 self.focus_terminal(window, cx);
@@ -2907,7 +2929,7 @@ impl Workspace {
     /// After `open_window`'s setup: start the shell for a terminal panel that
     /// was open last time, now that the project (its folder) is known.
     fn window_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_terminal && self.terminals.is_empty() {
+        if self.show_terminal && self.terminal_groups.is_empty() {
             let focused = self.active_editor().cloned();
             self.new_terminal(&NewTerminal, window, cx);
             // Keep the editor focused, as it was before quitting.
@@ -2918,20 +2940,48 @@ impl Workspace {
     }
 
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.terminals.get(self.active_terminal) {
+        if let Some(terminal) = self.active_terminal() {
             window.focus(&terminal.focus_handle(cx));
         }
     }
 
-    /// Starts a shell in the project folder (or the current file's folder).
-    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let cwd = self
-            .root
+    /// The current tab of the current group.
+    fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
+        let group = self.terminal_groups.get(self.active_group)?;
+        group.tabs.get(group.active)
+    }
+
+    fn all_terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        self.terminal_groups.iter().flat_map(|g| g.tabs.iter())
+    }
+
+    /// (group, tab) of a terminal.
+    fn terminal_position(&self, terminal: &Entity<TerminalView>) -> Option<(usize, usize)> {
+        self.terminal_groups.iter().enumerate().find_map(|(g, group)| group.tabs.iter().position(|t| t == terminal).map(|ix| (g, ix)))
+    }
+
+    /// Where a new shell starts: the project folder (or the current file's).
+    fn terminal_cwd(&self, cx: &App) -> PathBuf {
+        self.root
             .clone()
             .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)))
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .unwrap_or_else(|| PathBuf::from("/"));
-        self.open_terminal(cwd, None, None, true, window, cx);
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// Starts a shell in a new tab of the current group.
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.terminal_cwd(cx);
+        self.open_terminal(cwd, None, TerminalPlace::Tab { group: self.active_group, ix: None }, true, window, cx);
+    }
+
+    /// Makes a tab current, and its group the one with the keyboard.
+    fn activate_terminal(&mut self, group: usize, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(g) = self.terminal_groups.get_mut(group) else { return };
+        g.active = ix.min(g.tabs.len().saturating_sub(1));
+        self.active_group = group;
+        self.focus_terminal(window, cx);
+        cx.notify();
     }
 
     /// A Run tab finished: what its output reports goes to Problems (a run
@@ -3031,13 +3081,13 @@ impl Workspace {
         problems.iter().filter(|p| !known(p)).collect()
     }
 
-    /// Adds a terminal tab (at `at`, or last). A Run tab stays open when its
+    /// Adds a terminal where `place` says. A Run tab stays open when its
     /// program ends, showing how it went.
     fn open_terminal(
         &mut self,
         cwd: PathBuf,
         run: Option<RunTarget>,
-        at: Option<usize>,
+        place: TerminalPlace,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3050,9 +3100,25 @@ impl Workspace {
                     TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
                     TerminalEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
                 }));
-                let ix = at.unwrap_or(self.terminals.len()).min(self.terminals.len());
-                self.terminals.insert(ix, terminal);
-                self.active_terminal = ix;
+                let (group, ix) = match place {
+                    TerminalPlace::Tab { group, ix } if group < self.terminal_groups.len() => {
+                        let tabs = &mut self.terminal_groups[group].tabs;
+                        let ix = ix.unwrap_or(tabs.len()).min(tabs.len());
+                        tabs.insert(ix, terminal);
+                        (group, ix)
+                    }
+                    TerminalPlace::GroupAfter(group) if group < self.terminal_groups.len() => {
+                        self.terminal_groups.insert(group + 1, TerminalGroup::new(terminal));
+                        (group + 1, 0)
+                    }
+                    // No group to put it in yet.
+                    _ => {
+                        self.terminal_groups.push(TerminalGroup::new(terminal));
+                        (self.terminal_groups.len() - 1, 0)
+                    }
+                };
+                self.terminal_groups[group].active = ix;
+                self.active_group = group;
                 self.show_terminal = true;
                 self.show_problems = false;
                 self.show_git_log = false;
@@ -3063,8 +3129,11 @@ impl Workspace {
                 self.save_state();
             }
             Err(err) => {
+                // A Run tab being replaced may have left its group empty.
+                self.terminal_groups.retain(|g| !g.tabs.is_empty());
+                self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
                 // Don't retry on every frame.
-                self.show_terminal = !self.terminals.is_empty();
+                self.show_terminal = !self.terminal_groups.is_empty();
                 self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
             }
         }
@@ -3082,13 +3151,22 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
         }
-        let previous = self.terminals.iter().position(|t| t.read(cx).run().is_some_and(|(r, _)| r.name == target.name && r.command == target.command));
-        if let Some(ix) = previous {
-            self.terminals.remove(ix);
+        // A rerun takes the previous run's place, in whichever group it is.
+        let previous = self
+            .all_terminals()
+            .find(|t| t.read(cx).run().is_some_and(|(r, _)| r.name == target.name && r.command == target.command))
+            .cloned()
+            .and_then(|t| self.terminal_position(&t));
+        if let Some((group, ix)) = previous {
+            self.terminal_groups[group].tabs.remove(ix);
         }
+        let place = match previous {
+            Some((group, ix)) => TerminalPlace::Tab { group, ix: Some(ix) },
+            None => TerminalPlace::Tab { group: self.active_group, ix: None },
+        };
         self.last_run = Some(target.clone());
         let focused = self.active_editor().cloned();
-        self.open_terminal(target.cwd.clone(), Some(target), previous, false, window, cx);
+        self.open_terminal(target.cwd.clone(), Some(target), place, false, window, cx);
         if let Some(editor) = focused {
             window.focus(&editor.focus_handle(cx));
         }
@@ -3109,7 +3187,7 @@ impl Workspace {
             session.update(cx, |s, cx| s.stop(cx));
             return;
         }
-        let running = self.terminals.iter().rev().find(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running)).cloned();
+        let running = self.all_terminals().filter(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running)).last().cloned();
         if let Some(terminal) = running {
             terminal.update(cx, |t, cx| t.interrupt(cx));
         }
@@ -3479,181 +3557,217 @@ impl Workspace {
     }
 
     fn close_terminal(&mut self, _: &CloseTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.terminals.get(self.active_terminal).cloned() {
+        if let Some(terminal) = self.active_terminal().cloned() {
             self.remove_terminal(&terminal, window, cx);
         }
     }
 
-    /// Shows a new terminal beside the active one, or ends the split (both stay as tabs).
+    /// Opens a new shell in a group of its own beside the current group.
     fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if self.split_terminal.take().is_some() {
-            self.focus_terminal(window, cx);
-            cx.notify();
-            return;
-        }
-        let left = self.terminals.get(self.active_terminal).cloned();
-        self.new_terminal(&NewTerminal, window, cx);
-        if let Some(left) = left {
-            self.split_terminal = self.terminals.get(self.active_terminal).cloned();
-            self.active_terminal = self.terminals.iter().position(|t| *t == left).unwrap_or(0);
-        }
-        cx.notify();
+        let cwd = self.terminal_cwd(cx);
+        let place = if self.terminal_groups.is_empty() {
+            TerminalPlace::Tab { group: 0, ix: None }
+        } else {
+            TerminalPlace::GroupAfter(self.active_group)
+        };
+        self.open_terminal(cwd, None, place, true, window, cx);
     }
 
     fn remove_terminal(&mut self, terminal: &Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.terminals.iter().position(|t| t == terminal) else { return };
+        let Some((g, ix)) = self.terminal_position(terminal) else { return };
         let was_focused = terminal.focus_handle(cx).contains_focused(window, cx);
-        // Closing one side of a split leaves the other.
-        if self.split_terminal.as_ref() == Some(terminal) {
-            self.split_terminal = None;
-        } else if ix == self.active_terminal
-            && let Some(split) = self.split_terminal.take()
-        {
-            self.active_terminal = self.terminals.iter().position(|t| *t == split).unwrap_or(0);
+        let group = &mut self.terminal_groups[g];
+        group.tabs.remove(ix);
+        // The current tab stays current when another one closes.
+        if ix < group.active {
+            group.active -= 1;
         }
-        // The active tab stays active when another one closes.
-        let keep = self.terminals.get(self.active_terminal).filter(|t| *t != terminal).cloned();
-        self.terminals.remove(ix);
-        if let Some(keep) = keep {
-            self.active_terminal = self.terminals.iter().position(|t| *t == keep).unwrap_or(0);
+        group.active = group.active.min(group.tabs.len().saturating_sub(1));
+        // A group goes with its last tab; the one after it (else before) takes over.
+        if group.tabs.is_empty() {
+            self.terminal_groups.remove(g);
+            if self.active_group > g {
+                self.active_group -= 1;
+            }
+            self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
         }
-        if self.terminals.is_empty() {
+        if self.terminal_groups.is_empty() {
             self.show_terminal = false;
-            self.active_terminal = 0;
+            self.active_group = 0;
             self.save_state();
             self.focus_active(window, cx);
-        } else {
-            self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
-            if was_focused {
-                self.focus_terminal(window, cx);
-            }
+        } else if was_focused {
+            self.focus_terminal(window, cx);
         }
         cx.notify();
     }
 
+    /// The bottom panel's terminals: each group is an island with its own
+    /// tab strip, side by side like split panes.
     fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // A panel reopened at launch gets its shell in `window_ready`.
+        // A panel reopened at launch gets its shell in `window_ready`; until
+        // then it's one empty group.
+        let count = self.terminal_groups.len().max(1);
+        div()
+            .relative()
+            .flex()
+            .gap(px(GAP))
+            .h(self.problems_height)
+            .flex_shrink_0()
+            .children((0..count).map(|g| self.render_terminal_group(g, count, cx)))
+            .child(self.resize_handle(Edge::Problems, cx))
+    }
+
+    fn render_terminal_group(&self, g: usize, count: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::get(cx).clone();
-        let tabs: Vec<AnyElement> = self
-            .terminals
-            .iter()
-            .enumerate()
-            .map(|(ix, terminal)| {
-                let split = self.split_terminal.as_ref() == Some(terminal);
-                let active = ix == self.active_terminal || split;
-                let title = terminal.read(cx).title();
-                let entity = terminal.clone();
-                let tab = terminal.clone();
-                div()
-                    .id(("terminal-tab", ix))
-                    .group("terminal-tab")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .h(px(24.))
-                    .pl_2()
-                    .pr_1()
-                    .max_w(px(220.))
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .text_color(if active { theme.text } else { theme.text_muted })
-                    .when(active, |el| el.bg(theme.active))
-                    .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
-                    .on_click(cx.listener(move |ws, _, window, cx| {
-                        // The split side keeps its place; it just gets focus.
-                        if split {
-                            window.focus(&tab.focus_handle(cx));
-                            return;
-                        }
-                        ws.active_terminal = ix;
-                        ws.focus_terminal(window, cx);
-                        cx.notify();
-                    }))
-                    .child(match terminal.read(cx).run().map(|(_, state)| *state) {
-                        // A Run tab shows how its program is doing.
-                        Some(RunState::Running) => icon_el(Icon::Play, px(12.), theme.success.into()),
-                        Some(RunState::Exited(Some(0))) => icon_el(Icon::CircleCheck, px(12.), theme.success.into()),
-                        Some(RunState::Exited(_)) => icon_el(Icon::CircleX, px(12.), theme.error.into()),
-                        None => icon_el(Icon::Terminal, px(12.), theme.text_muted.into()),
-                    })
-                    .child(div().truncate().child(title))
-                    .child(
+        let group = self.terminal_groups.get(g);
+        let current = g == self.active_group;
+        let tabs: Vec<AnyElement> = group
+            .map(|group| {
+                group
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, terminal)| {
+                        let active = ix == group.active;
+                        let hover_group = SharedString::from(format!("terminal-tab-{g}-{ix}"));
+                        let entity = terminal.clone();
                         div()
-                            .id(("close-terminal", ix))
-                            .size(px(16.))
+                            .id(SharedString::from(format!("terminal-tab-{g}-{ix}")))
+                            .group(hover_group.clone())
+                            .relative()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(3.))
-                            .invisible()
-                            .group_hover("terminal-tab", |s| s.visible())
-                            .hover(|s| s.bg(theme.hover))
-                            .on_click(cx.listener(move |ws, _, window, cx| {
-                                cx.stop_propagation();
-                                ws.remove_terminal(&entity, window, cx);
-                            }))
-                            .child(icon_el(Icon::X, px(11.), theme.text_muted.into())),
-                    )
-                    .into_any_element()
+                            .gap_1p5()
+                            .h(px(28.))
+                            .min_w(px(64.))
+                            .max_w(px(220.))
+                            .pl_2p5()
+                            .pr_1()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .cursor_pointer()
+                            .text_color(if active && current { theme.text } else { theme.text_muted })
+                            // Like editor tabs: the current one raised, lit in the group with the keyboard.
+                            .when(active && current, |el| el.bg(theme.elevated).border_color(theme.border_subtle).child(tab_glow(&theme)))
+                            .when(active && !current, |el| el.bg(theme.hover))
+                            .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
+                            .on_click(cx.listener(move |ws, _, window, cx| ws.activate_terminal(g, ix, window, cx)))
+                            .child(match terminal.read(cx).run().map(|(_, state)| *state) {
+                                // A Run tab shows how its program is doing.
+                                Some(RunState::Running) => icon_el(Icon::Play, px(12.), theme.success.into()),
+                                Some(RunState::Exited(Some(0))) => icon_el(Icon::CircleCheck, px(12.), theme.success.into()),
+                                Some(RunState::Exited(_)) => icon_el(Icon::CircleX, px(12.), theme.error.into()),
+                                None => icon_el(Icon::Terminal, px(12.), theme.text_muted.into()),
+                            })
+                            .child(div().flex_1().min_w_0().truncate().child(terminal.read(cx).title()))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("close-terminal-{g}-{ix}")))
+                                    .size(px(18.))
+                                    .flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .when(!active, |el| el.invisible())
+                                    .group_hover(hover_group, |s| s.visible())
+                                    .hover(|s| s.bg(theme.active))
+                                    .on_click(cx.listener(move |ws, _, window, cx| {
+                                        cx.stop_propagation();
+                                        ws.remove_terminal(&entity, window, cx);
+                                    }))
+                                    .child(icon_el(Icon::X, px(12.), theme.text_muted.into())),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         let header = div()
             .flex()
             .items_center()
-            .gap_1()
-            .h(px(32.))
-            .px_2()
+            .gap(px(2.))
+            .h(px(TAB_HEIGHT - ISLAND_INSET))
+            .pb(px(ISLAND_INSET))
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border_subtle)
+            .when(g == 0, |el| {
+                el.child(
+                    div()
+                        .px_1p5()
+                        .mr_1()
+                        .flex_shrink_0()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_dim)
+                        .child("TERMINAL"),
+                )
+            })
             .child(
                 div()
-                    .px_1()
-                    .mr_1()
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_muted)
-                    .child("TERMINAL"),
+                    .id(("terminal-tabs", g))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .children(tabs),
             )
-            .children(tabs)
             .child(
-                self.icon_button("new-terminal", Icon::Plus, false, cx, |ws, _, window, cx| ws.new_terminal(&NewTerminal, window, cx))
-                    .tooltip(|window, cx| status_tooltip("New Terminal", &NewTerminal, window, cx)),
+                self.icon_button("new-terminal", Icon::Plus, false, cx, move |ws, _, window, cx| {
+                    ws.active_group = g;
+                    ws.new_terminal(&NewTerminal, window, cx);
+                })
+                .id(("new-terminal", g))
+                .flex_shrink_0()
+                .tooltip(|window, cx| status_tooltip("New Terminal", &NewTerminal, window, cx)),
             )
             .child(div().flex_1())
             .child(
-                self.icon_button("split-terminal", Icon::SplitRight, self.split_terminal.is_some(), cx, |ws, _, window, cx| {
-                    ws.split_terminal(&SplitTerminal, window, cx)
+                self.icon_button("split-terminal", Icon::SplitRight, false, cx, move |ws, _, window, cx| {
+                    ws.active_group = g;
+                    ws.split_terminal(&SplitTerminal, window, cx);
                 })
-                .tooltip({
-                    let label = if self.split_terminal.is_some() { "Unsplit Terminal" } else { "Split Terminal" };
-                    move |window, cx| status_tooltip(label, &SplitTerminal, window, cx)
-                }),
+                .id(("split-terminal", g))
+                .flex_shrink_0()
+                .tooltip(|window, cx| status_tooltip("Split Terminal", &SplitTerminal, window, cx)),
             )
-            .child(self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
-                ws.show_terminal = false;
-                ws.focus_active(window, cx);
-                ws.save_state();
-                cx.notify();
-            }));
+            // The panel's own close button, on the group at its right end.
+            .when(g + 1 == count, |el| {
+                el.child(
+                    self.icon_button("hide-terminal", Icon::X, false, cx, |ws, _, window, cx| {
+                        ws.show_terminal = false;
+                        ws.focus_active(window, cx);
+                        ws.save_state();
+                        cx.notify();
+                    })
+                    .flex_shrink_0()
+                    .tooltip(|window, cx| status_tooltip("Hide Terminal", &ToggleTerminal, window, cx)),
+                )
+            });
         island(&theme)
-            .h(self.problems_height)
-            .flex_shrink_0()
+            .id(("terminal-group", g))
+            .flex_1()
+            .min_w_0()
+            // With splits, the group that has the keyboard is outlined, like a pane.
+            .when(count > 1 && current, |el| el.border_color(Hsla::from(theme.accent).alpha(0.35)))
+            // Clicking into a group makes it the current one.
+            .capture_any_mouse_down(cx.listener(move |ws, _, _, cx| {
+                if ws.active_group != g && g < ws.terminal_groups.len() {
+                    ws.active_group = g;
+                    cx.notify();
+                }
+            }))
             .child(header)
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .children(self.terminals.get(self.active_terminal).cloned().map(|t| div().flex_1().min_w_0().child(t)))
-                    .children(
-                        self.split_terminal
-                            .clone()
-                            .filter(|s| self.terminals.get(self.active_terminal) != Some(s))
-                            .map(|t| div().flex_1().min_w_0().border_l_1().border_color(theme.border).child(t)),
-                    ),
+                    .children(group.and_then(|group| group.tabs.get(group.active)).cloned().map(|t| div().flex_1().min_w_0().child(t))),
             )
-            .child(self.resize_handle(Edge::Problems, cx))
+            .into_any_element()
     }
 
     // ---- Search & navigation ---------------------------------------------------
