@@ -22,14 +22,14 @@ impl Workspace {
             self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
             // The project's own terminal panel, unless this window has shells already.
             if let Some(terminals) = session.terminals.take()
-                && self.terminal_groups.is_empty()
+                && self.terminals.read(cx).is_empty()
             {
                 if terminals.open {
                     self.bottom = Some(BottomPanel::Terminal);
                 } else {
                     self.hide_bottom(BottomPanel::Terminal);
                 }
-                self.saved_terminals = Some(terminals);
+                self.terminals.update(cx, |p, _| p.set_saved(Some(terminals)));
             }
         }
         // Before any tab's language server starts.
@@ -202,7 +202,7 @@ impl Workspace {
                     Some(MenuAction::Venv(choice)) => ws.set_venv(choice, cx),
                     Some(MenuAction::ChooseVenv) => ws.choose_venv_folder(window, cx),
                     Some(MenuAction::Terminal(terminal)) => {
-                        if let Some((g, ix)) = ws.terminal_position(&terminal) {
+                        if let Some((g, ix)) = ws.terminal_position(&terminal, cx) {
                             ws.activate_terminal(g, ix, window, cx);
                         }
                     }

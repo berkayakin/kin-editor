@@ -7,13 +7,13 @@ impl Workspace {
 
     /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
     pub(super) fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = self.all_terminals().any(|t| t.focus_handle(cx).contains_focused(window, cx));
+        let focused = self.all_terminals(cx).iter().any(|t| t.focus_handle(cx).contains_focused(window, cx));
         if self.shows(BottomPanel::Terminal) && focused {
             self.hide_bottom(BottomPanel::Terminal);
             self.focus_active(window, cx);
         } else {
             self.bottom = Some(BottomPanel::Terminal);
-            if self.terminal_groups.is_empty() && !self.restore_terminals(window, cx) {
+            if self.terminals.read(cx).is_empty() && !self.restore_terminals(window, cx) {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
                 self.focus_terminal(window, cx);
@@ -81,7 +81,7 @@ impl Workspace {
     /// Starts the shells of a terminal panel that shows without any (it was
     /// open last time): the project's saved ones, else a new one.
     pub(super) fn start_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.shows(BottomPanel::Terminal) || !self.terminal_groups.is_empty() {
+        if !self.shows(BottomPanel::Terminal) || !self.terminals.read(cx).is_empty() {
             return;
         }
         let focused = self.active_editor().cloned();
@@ -97,50 +97,46 @@ impl Workspace {
     /// Reopens the project's shells from last time, in their groups, folders
     /// and with their names. False when there were none to open.
     pub(super) fn restore_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.terminal_groups.is_empty() {
+        if !self.terminals.read(cx).is_empty() {
             return false;
         }
-        let Some(layout) = self.saved_terminals.take() else { return false };
+        let Some(layout) = self.terminals.update(cx, |p, _| p.take_saved()) else { return false };
         let fallback = self.terminal_cwd(cx);
-        for saved in layout.groups {
-            let group = self.terminal_groups.len();
+        for (group, saved) in layout.groups.into_iter().enumerate() {
             for tab in saved.tabs {
                 let cwd = tab.cwd.filter(|d| d.is_dir()).unwrap_or_else(|| fallback.clone());
                 // Into this group, which the first shell creates.
                 self.open_terminal(cwd, None, TerminalPlace::Tab { group, ix: None }, false, window, cx);
                 if let Some(name) = tab.name
-                    && let Some(terminal) = self.terminal_groups.get(group).and_then(|g| g.tabs.last()).cloned()
+                    && let Some(terminal) = self.terminals.read(cx).tabs(group).last().cloned()
                 {
                     terminal.update(cx, |t, cx| t.set_custom_title(Some(name), cx));
                 }
             }
-            if let Some(g) = self.terminal_groups.get_mut(group) {
-                g.active = saved.active.min(g.tabs.len() - 1);
-            }
+            self.terminals.update(cx, |p, _| p.set_group_active(group, saved.active));
         }
-        self.active_group = layout.active.min(self.terminal_groups.len().saturating_sub(1));
-        !self.terminal_groups.is_empty()
+        self.terminals.update(cx, |p, _| p.set_active_group(layout.active));
+        !self.terminals.read(cx).is_empty()
     }
 
     pub(super) fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.active_terminal() {
+        if let Some(terminal) = self.active_terminal(cx) {
             window.focus(&terminal.focus_handle(cx));
         }
     }
 
     /// The current tab of the current group.
-    pub(super) fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
-        let group = self.terminal_groups.get(self.active_group)?;
-        group.tabs.get(group.active)
+    pub(super) fn active_terminal(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        self.terminals.read(cx).active_terminal().cloned()
     }
 
-    pub(super) fn all_terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
-        self.terminal_groups.iter().flat_map(|g| g.tabs.iter())
+    pub(super) fn all_terminals(&self, cx: &App) -> Vec<Entity<TerminalView>> {
+        self.terminals.read(cx).all_terminals().cloned().collect()
     }
 
     /// (group, tab) of a terminal.
-    pub(super) fn terminal_position(&self, terminal: &Entity<TerminalView>) -> Option<(usize, usize)> {
-        self.terminal_groups.iter().enumerate().find_map(|(g, group)| group.tabs.iter().position(|t| t == terminal).map(|ix| (g, ix)))
+    pub(super) fn terminal_position(&self, terminal: &Entity<TerminalView>, cx: &App) -> Option<(usize, usize)> {
+        self.terminals.read(cx).position(terminal)
     }
 
     /// Where a new shell starts: the project folder (or the current file's).
@@ -157,16 +153,13 @@ impl Workspace {
         // The project's shells from last time come back first.
         self.restore_terminals(window, cx);
         let cwd = self.terminal_cwd(cx);
-        self.open_terminal(cwd, None, TerminalPlace::Tab { group: self.active_group, ix: None }, true, window, cx);
+        let group = self.terminals.read(cx).active_group();
+        self.open_terminal(cwd, None, TerminalPlace::Tab { group, ix: None }, true, window, cx);
     }
 
     /// Makes a tab current, and its group the one with the keyboard.
     pub(super) fn activate_terminal(&mut self, group: usize, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(g) = self.terminal_groups.get_mut(group) else { return };
-        g.active = ix.min(g.tabs.len().saturating_sub(1));
-        self.active_group = group;
-        self.focus_terminal(window, cx);
-        self.schedule_session_save(cx);
+        self.terminals.update(cx, |p, cx| p.activate(group, ix, window, cx));
         cx.notify();
     }
 
@@ -300,31 +293,7 @@ impl Workspace {
     ) {
         match TerminalView::create(cwd, run, cx) {
             Ok(terminal) => {
-                self._subscriptions.push(cx.subscribe_in(&terminal, window, |ws, terminal, event: &TerminalEvent, window, cx| match event {
-                    TerminalEvent::TitleChanged => cx.notify(),
-                    TerminalEvent::Exited if terminal.read(cx).run().is_some() => ws.collect_run_problems(terminal, cx),
-                    TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
-                    TerminalEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
-                }));
-                let (group, ix) = match place {
-                    TerminalPlace::Tab { group, ix } if group < self.terminal_groups.len() => {
-                        let tabs = &mut self.terminal_groups[group].tabs;
-                        let ix = ix.unwrap_or(tabs.len()).min(tabs.len());
-                        tabs.insert(ix, terminal);
-                        (group, ix)
-                    }
-                    TerminalPlace::GroupAfter(group) if group < self.terminal_groups.len() => {
-                        self.terminal_groups.insert(group + 1, TerminalGroup::new(terminal));
-                        (group + 1, 0)
-                    }
-                    // No group to put it in yet.
-                    _ => {
-                        self.terminal_groups.push(TerminalGroup::new(terminal));
-                        (self.terminal_groups.len() - 1, 0)
-                    }
-                };
-                self.terminal_groups[group].active = ix;
-                self.active_group = group;
+                self.terminals.update(cx, |p, cx| p.add(terminal, place, cx));
                 self.bottom = Some(BottomPanel::Terminal);
                 if focus {
                     self.focus_terminal(window, cx);
@@ -333,16 +302,24 @@ impl Workspace {
                 self.schedule_session_save(cx);
             }
             Err(err) => {
-                // A Run tab being replaced may have left its group empty.
-                self.terminal_groups.retain(|g| !g.tabs.is_empty());
-                self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
                 // Don't retry on every frame.
-                if self.terminal_groups.is_empty() {
+                if self.terminals.read(cx).is_empty() {
                     self.hide_bottom(BottomPanel::Terminal);
                 }
                 self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
             }
         }
         cx.notify();
+    }
+
+    /// The terminal panel in the bottom area, as tall as it is, with its grab edge.
+    pub(super) fn render_terminal_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .flex()
+            .h(self.problems_height)
+            .flex_shrink_0()
+            .child(cached(&self.terminals))
+            .child(self.resize_handle(Edge::Problems, cx))
     }
 }

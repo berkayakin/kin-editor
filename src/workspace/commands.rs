@@ -123,9 +123,7 @@ impl Workspace {
         self.pane_sizes = vec![1.0];
         self.pinned.clear();
         self.session_task = None;
-        self.terminal_groups.clear();
-        self.active_group = 0;
-        self.saved_terminals = None;
+        self.terminals.update(cx, |p, cx| p.clear(cx));
         self.hide_bottom(BottomPanel::Terminal);
         if let Some((session, _)) = self.debug.take() {
             session.update(cx, |s, cx| s.stop(cx));

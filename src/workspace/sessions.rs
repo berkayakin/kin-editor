@@ -93,42 +93,9 @@ impl Workspace {
         Some(SessionSnapshot { session, unsaved })
     }
 
-    /// The terminal panel as the session keeps it: each shell's folder and
-    /// name, by group. Run tabs are left out (they'd run their program again).
+    /// The terminal panel as the session keeps it.
     pub(super) fn terminal_layout(&self, cx: &App) -> TerminalLayout {
-        if self.terminal_groups.is_empty()
-            && let Some(saved) = &self.saved_terminals
-        {
-            return TerminalLayout { open: self.shows(BottomPanel::Terminal), ..saved.clone() };
-        }
-        let mut groups = Vec::new();
-        let mut active = 0;
-        for (g, group) in self.terminal_groups.iter().enumerate() {
-            let mut tabs = Vec::new();
-            let mut current = 0;
-            for (ix, terminal) in group.tabs.iter().enumerate() {
-                let terminal = terminal.read(cx);
-                if terminal.run().is_some() {
-                    continue;
-                }
-                // The current tab, else the closest one before it.
-                if ix <= group.active {
-                    current = tabs.len();
-                }
-                tabs.push(TerminalTabSession {
-                    name: terminal.custom_title().map(|t| t.to_string()),
-                    cwd: Some(terminal.current_dir()),
-                });
-            }
-            if tabs.is_empty() {
-                continue;
-            }
-            if g <= self.active_group {
-                active = groups.len();
-            }
-            groups.push(TerminalGroupSession { tabs, active: current });
-        }
-        TerminalLayout { open: self.shows(BottomPanel::Terminal), groups, active }
+        self.terminals.read(cx).layout(self.shows(BottomPanel::Terminal), cx)
     }
 
     pub(super) fn schedule_session_save(&mut self, cx: &mut Context<Self>) {

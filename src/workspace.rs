@@ -87,12 +87,20 @@ mod sessions;
 mod sidebar;
 mod status_bar;
 mod tab_bar;
+mod terminal_panel;
 mod terminals;
 mod title_bar;
 mod watching;
 mod welcome;
 mod windows;
-use self::{file_tree::*, tab_bar::*, title_bar::*, welcome::*, windows::*};
+use self::{
+    file_tree::*,
+    tab_bar::*,
+    terminal_panel::{TerminalPanel, TerminalPanelEvent},
+    title_bar::*,
+    welcome::*,
+    windows::*,
+};
 pub use self::windows::{modal_max_height, open_window, quit};
 
 actions!(
@@ -529,16 +537,6 @@ pub struct Workspace {
     bottom: Option<BottomPanel>,
     /// Height of the bottom panel (Problems or Terminal; one shows at a time).
     problems_height: Pixels,
-    /// Terminal tabs in groups side by side, each with its own tab strip
-    /// (one group unless the terminal is split). Groups are never empty.
-    terminal_groups: Vec<TerminalGroup>,
-    /// The group that has (or last had) the keyboard.
-    active_group: usize,
-    /// The project's terminals from last time, not started yet: they open
-    /// with the panel.
-    saved_terminals: Option<TerminalLayout>,
-    /// The terminal panel's bounds in the last frame, to fit its groups' tabs.
-    terminal_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
 
     /// For Rerun.
     last_run: Option<RunTarget>,
@@ -571,6 +569,8 @@ pub struct Workspace {
     git_panel: Entity<GitPanel>,
     /// The Files view.
     tree: Entity<ProjectTree>,
+    /// The shells in the bottom area.
+    terminals: Entity<TerminalPanel>,
     /// The active file's problems and the last Run's.
     problems: Entity<ProblemsPanel>,
     git_log: Entity<GitLog>,
@@ -667,6 +667,34 @@ impl Workspace {
             TreeEvent::CopyIn { paths, into } => ws.drop_into_tree(paths.clone(), into.clone(), window, cx),
             TreeEvent::History { redo } => ws.step_file_history(*redo, window, cx),
             TreeEvent::Toggled => ws.schedule_session_save(cx),
+        });
+        let terminals = cx.new(|_| TerminalPanel::new());
+        let terminals_subscription = cx.subscribe_in(&terminals, window, |ws, _, event: &TerminalPanelEvent, window, cx| match event {
+            TerminalPanelEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
+            TerminalPanelEvent::RunExited(terminal) => ws.collect_run_problems(terminal, cx),
+            TerminalPanelEvent::Close(terminal) => ws.remove_terminal(terminal, window, cx),
+            TerminalPanelEvent::TabMenu { terminal, position } => ws.open_terminal_tab_menu(terminal.clone(), *position, window, cx),
+            TerminalPanelEvent::Overflow { terminals, position } => {
+                let entries = terminals.iter().map(|(_, name)| MenuEntry::item(name.clone(), Icon::Terminal)).collect();
+                let actions = terminals.iter().map(|(t, _)| Some(MenuAction::Terminal(t.clone()))).collect();
+                ws.show_context_menu(entries, actions, *position, None, window, cx);
+            }
+            TerminalPanelEvent::New(group) => {
+                ws.terminals.update(cx, |p, _| p.set_active_group(*group));
+                ws.new_terminal(&NewTerminal, window, cx);
+            }
+            TerminalPanelEvent::Split(group) => {
+                ws.terminals.update(cx, |p, _| p.set_active_group(*group));
+                ws.split_terminal(&SplitTerminal, window, cx);
+            }
+            TerminalPanelEvent::Hide => {
+                ws.hide_bottom(BottomPanel::Terminal);
+                ws.focus_active(window, cx);
+                ws.save_state();
+                ws.schedule_session_save(cx);
+                cx.notify();
+            }
+            TerminalPanelEvent::Activated => ws.schedule_session_save(cx),
         });
         let problems = cx.new(|_| ProblemsPanel::new());
         let problems_subscription = cx.subscribe_in(&problems, window, |ws, _, event: &ProblemsEvent, window, cx| match event {
@@ -810,10 +838,6 @@ impl Workspace {
                 None
             },
             // Closed unless it was open when the window last closed.
-            terminal_groups: Vec::new(),
-            active_group: 0,
-            saved_terminals: None,
-            terminal_bounds: Default::default(),
 
             last_run: None,
             debug: None,
@@ -838,6 +862,7 @@ impl Workspace {
             sidebar_mode: if state.sidebar_mode.as_deref() == Some("commit") { SidebarMode::Commit } else { SidebarMode::Files },
             git_panel,
             tree,
+            terminals,
             problems,
             git_log,
             diff_return: None,
@@ -876,6 +901,7 @@ impl Workspace {
                 log_subscription,
                 problems_subscription,
                 tree_subscription,
+                terminals_subscription,
                 activation,
                 quit,
                 settings_observer,

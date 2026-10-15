@@ -237,7 +237,7 @@ impl Render for Workspace {
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);
-        let terminal_panel = self.shows(BottomPanel::Terminal).then(|| self.render_terminal_panel(window, cx).into_any_element());
+        let terminal_panel = self.shows(BottomPanel::Terminal).then(|| self.render_terminal_panel(cx).into_any_element());
         let panes = self.render_panes(window, cx).into_any_element();
 
         div()
