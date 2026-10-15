@@ -69,11 +69,11 @@ impl CloneDialog {
     }
 
     fn url_text(&self, cx: &App) -> String {
-        self.url.read(cx).text().trim().to_string()
+        self.url.read(cx).text(cx).trim().to_string()
     }
 
     fn parent_dir(&self, cx: &App) -> PathBuf {
-        expand_home(self.folder.read(cx).text().trim())
+        expand_home(self.folder.read(cx).text(cx).trim())
     }
 
     /// Where the clone will land, or why it can't start.

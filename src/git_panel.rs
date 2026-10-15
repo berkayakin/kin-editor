@@ -176,7 +176,7 @@ impl GitPanel {
     }
 
     fn message_text(&self, cx: &App) -> String {
-        self.message.read(cx).text().trim().to_string()
+        self.message.read(cx).text(cx).trim().to_string()
     }
 
     fn can_commit(&self, cx: &App) -> bool {

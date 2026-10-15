@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Context, Task, Window};
+use gpui::{App, Context, Task, Window};
 use serde_json::{Value, json};
 
 use super::{Editor, EditorLspEvent};
@@ -31,8 +31,8 @@ impl Editor {
 
     /// Not in Restricted Mode, where formatters don't run (saving shouldn't
     /// complain about it every time).
-    pub fn format_on_save(&self) -> bool {
-        self.file_settings.format_on_save && self.doc.path.as_deref().is_some_and(crate::trust::is_trusted)
+    pub fn format_on_save(&self, cx: &App) -> bool {
+        self.file_settings.format_on_save && self.doc.read(cx).path.as_deref().is_some_and(crate::trust::is_trusted)
     }
 
     /// Formats the document, or just the selection when `use_selection` and
@@ -40,14 +40,14 @@ impl Editor {
     /// then the language server, then one on PATH. Resolves to whether the
     /// text changed.
     pub fn format(&mut self, use_selection: bool, cx: &mut Context<Self>) -> Task<Result<bool, String>> {
-        let Some(path) = self.doc.path.clone() else {
+        let Some(path) = self.doc.read(cx).path.clone() else {
             return Task::ready(Err("Save the file to format it".into()));
         };
         // Formatters and servers may run the project's code (Prettier plugins, say).
         if !crate::trust::is_trusted(&path) {
             return Task::ready(Err("Formatting is off in Restricted Mode. Trust the project to use it.".into()));
         }
-        let language = self.doc.language;
+        let language = self.doc.read(cx).language;
         let configured = Settings::get(cx).formatters.get(language.name()).cloned();
         let command: Option<Vec<String>> = match &configured {
             Some(Value::Bool(false)) => return Task::ready(Err(format!("Formatting is off for {}", language.name()))),
@@ -64,8 +64,8 @@ impl Editor {
                 s.capability("documentFormattingProvider")
             }
         });
-        let version = self.doc.version();
-        let text = self.doc.rope().to_string();
+        let version = self.doc.read(cx).version();
+        let text = self.doc.read(cx).rope().to_string();
         let options = json!({
             "tabSize": self.tab_size,
             "insertSpaces": self.indent_unit != "\t",
@@ -73,7 +73,7 @@ impl Editor {
             "insertFinalNewline": self.file_settings.insert_final_newline,
         });
         let range = (use_selection && !selection.is_empty())
-            .then(|| protocol::offsets_to_range(self.doc.rope(), selection, server.as_ref().map_or(protocol::Encoding::Utf16, |s| s.encoding)));
+            .then(|| protocol::offsets_to_range(self.doc.read(cx).rope(), selection, server.as_ref().map_or(protocol::Encoding::Utf16, |s| s.encoding)));
         cx.spawn(async move |this, cx| {
             // Finding a formatter checks the disk (and the login shell's PATH).
             let cli = if server_only {
@@ -100,7 +100,7 @@ impl Editor {
                 ));
             };
             this.update(cx, |e, cx| {
-                if e.doc.version() != version {
+                if e.doc.read(cx).version() != version {
                     return Err("The file changed while formatting".to_string());
                 }
                 let edits = format::line_edits(&text, &formatted);

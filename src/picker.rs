@@ -186,7 +186,7 @@ impl Picker {
             if this.mode == PickerMode::Symbols {
                 // The current results stay put until the server answers the
                 // new query, so the list doesn't jump on every key.
-                cx.emit(PickerEvent::SymbolQuery(query.read(cx).text()));
+                cx.emit(PickerEvent::SymbolQuery(query.read(cx).text(cx)));
                 return;
             }
             this.update_items(cx)
@@ -346,7 +346,7 @@ impl Picker {
     }
 
     fn update_items(&mut self, cx: &mut Context<Self>) {
-        let text = self.query.read(cx).text();
+        let text = self.query.read(cx).text(cx);
         let pattern = (!text.trim().is_empty()).then(|| Pattern::parse(&text, CaseMatching::Smart, Normalization::Smart));
         let mut items = Vec::new();
 
@@ -909,7 +909,7 @@ impl GoToLine {
     }
 
     fn parse(&self, cx: &gpui::App) -> Option<(usize, usize)> {
-        let text = self.input.read(cx).text();
+        let text = self.input.read(cx).text(cx);
         let text = text.trim();
         if text.is_empty() {
             return None;
@@ -943,7 +943,7 @@ impl Focusable for GoToLine {
 impl Render for GoToLine {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let valid = self.input.read(cx).doc.len() == 0 || self.parse(cx).is_some();
+        let valid = self.input.read(cx).doc.read(cx).len() == 0 || self.parse(cx).is_some();
         modal_panel(cx)
             .key_context("GoToLine")
             .on_action(cx.listener(Self::on_enter))

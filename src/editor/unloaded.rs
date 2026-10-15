@@ -39,7 +39,7 @@ impl Editor {
     pub fn new_unloaded(path: Option<PathBuf>, unloaded: Unloaded, cx: &mut Context<Self>) -> Self {
         // The path is set afterwards: settings for it would read `.editorconfig`.
         let mut this = Self::blank(Document::unloaded(None, unloaded.unsaved.is_some()), cx);
-        this.doc.path = path;
+        this.doc.as_mut(cx).path = path;
         this.unloaded = Some(unloaded);
         this
     }
@@ -58,7 +58,7 @@ impl Editor {
     /// read and there's no unsaved text.
     pub fn load(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
         let Some(unloaded) = self.unloaded.take() else { return Ok(()) };
-        let doc = match self.doc.path.as_deref().map(Document::open) {
+        let doc = match self.doc.read(cx).path.as_deref().map(Document::open) {
             Some(Ok(mut doc)) => {
                 if let Some(encoding) = unloaded.encoding
                     && encoding != doc.encoding
@@ -81,11 +81,11 @@ impl Editor {
         self.focus_handle = focus_handle;
         if let Some(text) = unloaded.unsaved {
             // An edit on top of the file, so undo gets back to the saved text.
-            let len = self.doc.len();
+            let len = self.doc.read(cx).len();
             self.replace_ranges(vec![(0..len, text.to_string())], cx);
         }
         self.restore_folds(&unloaded.folds, cx);
-        let cursor = self.doc.clip(unloaded.cursor.min(self.doc.len()));
+        let cursor = self.doc.read(cx).clip(unloaded.cursor.min(self.doc.read(cx).len()));
         self.set_selections(vec![Selection::cursor(cursor)], 0, cx);
         self.center_on_next_frame = true;
         cx.emit(EditorLoaded { error: None });
@@ -116,17 +116,17 @@ mod tests {
     fn reads_the_file_on_load(cx: &mut TestAppContext) {
         let path = temp_file("clean.txt", b"one\ntwo\nthree\n");
         let editor = cx.new(|cx| Editor::new_unloaded(Some(path.clone()), unloaded(5, None), cx));
-        editor.read_with(cx, |e, _| {
+        editor.read_with(cx, |e, cx| {
             assert!(!e.is_loaded());
-            assert_eq!(e.text(), "");
-            assert!(!e.doc.is_dirty());
-            assert_eq!(e.doc.path.as_deref(), Some(path.as_path()));
+            assert_eq!(e.text(cx), "");
+            assert!(!e.doc.read(cx).is_dirty());
+            assert_eq!(e.doc.read(cx).path.as_deref(), Some(path.as_path()));
         });
         editor.update(cx, |e, cx| e.load(cx)).unwrap();
-        editor.read_with(cx, |e, _| {
+        editor.read_with(cx, |e, cx| {
             assert!(e.is_loaded());
-            assert_eq!(e.text(), "one\ntwo\nthree\n");
-            assert!(!e.doc.is_dirty());
+            assert_eq!(e.text(cx), "one\ntwo\nthree\n");
+            assert!(!e.doc.read(cx).is_dirty());
             assert_eq!(e.primary_selection().head, 5);
         });
     }
@@ -136,15 +136,15 @@ mod tests {
         let path = temp_file("dirty.txt", b"saved\n");
         let editor = cx.new(|cx| Editor::new_unloaded(Some(path), unloaded(99, Some("edited text\n")), cx));
         // Dirty before it's read, so closing asks and the tab shows it.
-        editor.read_with(cx, |e, _| assert!(e.doc.is_dirty()));
+        editor.read_with(cx, |e, cx| assert!(e.doc.read(cx).is_dirty()));
         editor.update(cx, |e, cx| e.load(cx)).unwrap();
-        editor.update(cx, |e, _| {
-            assert_eq!(e.text(), "edited text\n");
-            assert!(e.doc.is_dirty());
+        editor.update(cx, |e, cx| {
+            assert_eq!(e.text(cx), "edited text\n");
+            assert!(e.doc.read(cx).is_dirty());
             // The caret is kept inside the text.
-            assert_eq!(e.primary_selection().head, e.doc.len());
-            e.doc.undo();
-            assert_eq!(e.text(), "saved\n");
+            assert_eq!(e.primary_selection().head, e.doc.read(cx).len());
+            e.doc.as_mut(cx).undo();
+            assert_eq!(e.text(cx), "saved\n");
         });
     }
 
@@ -157,9 +157,9 @@ mod tests {
         state.encoding = encoding;
         let editor = cx.new(|cx| Editor::new_unloaded(Some(path), state, cx));
         editor.update(cx, |e, cx| e.load(cx)).unwrap();
-        editor.read_with(cx, |e, _| {
-            assert_eq!(Some(e.doc.encoding), encoding);
-            assert!(!e.doc.is_dirty());
+        editor.read_with(cx, |e, cx| {
+            assert_eq!(Some(e.doc.read(cx).encoding), encoding);
+            assert!(!e.doc.read(cx).is_dirty());
         });
     }
 
@@ -171,6 +171,6 @@ mod tests {
         editor.read_with(cx, |e, _| assert!(!e.is_loaded()));
         let editor = cx.new(|cx| Editor::new_unloaded(Some(gone), unloaded(0, Some("kept")), cx));
         editor.update(cx, |e, cx| e.load(cx)).unwrap();
-        editor.read_with(cx, |e, _| assert_eq!(e.text(), "kept"));
+        editor.read_with(cx, |e, cx| assert_eq!(e.text(cx), "kept"));
     }
 }

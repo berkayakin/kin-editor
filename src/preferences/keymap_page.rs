@@ -189,7 +189,7 @@ impl Render for KeymapPage {
             self.load_defaults(base);
         }
         let theme = Theme::get(cx).clone();
-        let query = self.filter.read(cx).text();
+        let query = self.filter.read(cx).text(cx);
         let filter_words = words(&query);
         let mut rows = Vec::new();
         for (ix, row) in self.rows.iter().enumerate() {

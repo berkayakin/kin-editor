@@ -462,7 +462,7 @@ impl TerminalView {
     /// stepping through matches, which mustn't use old ones).
     fn find_matches(&mut self, cx: &App) {
         let Some(search) = self.search.as_mut() else { return };
-        let query = search.input.read(cx).text();
+        let query = search.input.read(cx).text(cx);
         search.task = None;
         search.stale = false;
         let (matches, history) = find_in(&self.term.lock(), &query);
@@ -483,7 +483,7 @@ impl TerminalView {
                 if let Some(search) = this.search.as_mut() {
                     search.stale = false;
                 }
-                input.read(cx).text()
+                input.read(cx).text(cx)
             }) else {
                 return;
             };
@@ -573,7 +573,7 @@ impl TerminalView {
     fn render_search(&self, search: &Search, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let count = match (search.current, search.matches.len()) {
-            (_, 0) if search.input.read(cx).text().is_empty() => String::new(),
+            (_, 0) if search.input.read(cx).text(cx).is_empty() => String::new(),
             (_, 0) => "No results".into(),
             (Some(i), n) => format!("{}/{n}{}", i + 1, if n == MAX_MATCHES { "+" } else { "" }),
             (None, n) => n.to_string(),

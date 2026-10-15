@@ -66,7 +66,7 @@ impl ThemePicker {
     }
 
     fn update_rows(&mut self, cx: &mut Context<Self>) {
-        let query = self.query.read(cx).text().to_lowercase();
+        let query = self.query.read(cx).text(cx).to_lowercase();
         let registry = cx.global::<ThemeRegistry>();
         let mut rows: Vec<Row> = registry
             .entries

@@ -234,9 +234,9 @@ impl LspStore {
     pub fn register(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let (path, language) = {
             let e = editor.read(cx);
-            match e.doc.path.clone() {
+            match e.doc.read(cx).path.clone() {
                 // An unloaded tab registers once its file is read.
-                Some(path) if e.is_loaded() => (path, e.doc.language),
+                Some(path) if e.is_loaded() => (path, e.doc.read(cx).language),
                 _ => return,
             }
         };
@@ -609,11 +609,11 @@ impl LspStore {
         // The server gets the current text, so earlier edits don't matter
         // (unless another server still has to hear about them).
         let first = !doc.servers.iter().any(|(_, opened)| *opened);
-        let (text, version) = editor.update(cx, |e, _| {
+        let (text, version) = editor.update(cx, |e, cx| {
             if first {
-                e.doc.take_lsp_changes();
+                e.doc.as_mut(cx).take_lsp_changes();
             }
-            (e.doc.rope().to_string(), e.doc.version())
+            (e.doc.read(cx).rope().to_string(), e.doc.read(cx).version())
         });
         server.client.notify(
             "textDocument/didOpen",
@@ -721,7 +721,7 @@ impl LspStore {
     /// closes the old URI and opens the new one (a new name can also mean
     /// another language and server).
     pub fn moved(&mut self, old: &Path, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        if editor.read(cx).doc.path.as_deref() != Some(old) {
+        if editor.read(cx).doc.read(cx).path.as_deref() != Some(old) {
             self.did_close(old);
         }
         self.register(editor, cx);

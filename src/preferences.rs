@@ -571,14 +571,14 @@ impl Preferences {
     }
 
     fn query_words(&self, cx: &App) -> Vec<String> {
-        self.search.read(cx).text().to_lowercase().split_whitespace().map(str::to_string).collect()
+        self.search.read(cx).text(cx).to_lowercase().split_whitespace().map(str::to_string).collect()
     }
 
     fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
         self.menu = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
-        if !self.search.read(cx).text().is_empty() {
+        if !self.search.read(cx).text(cx).is_empty() {
             self.search.update(cx, |e, cx| e.set_text("", cx));
         }
         if page == Page::Keymap {
@@ -597,7 +597,7 @@ impl Preferences {
     }
 
     fn step_page(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.search.focus_handle(cx).is_focused(window) || !self.search.read(cx).text().is_empty() {
+        if !self.search.focus_handle(cx).is_focused(window) || !self.search.read(cx).text(cx).is_empty() {
             cx.propagate();
             return;
         }
@@ -695,7 +695,7 @@ impl Preferences {
         let settings = Settings::get(cx).clone();
         let mut results = Vec::new();
 
-        let rulers: Vec<usize> = self.rulers.read(cx).text().split([',', ' ']).filter_map(|c| c.trim().parse().ok()).collect();
+        let rulers: Vec<usize> = self.rulers.read(cx).text(cx).split([',', ' ']).filter_map(|c| c.trim().parse().ok()).collect();
         let rulers = (!rulers.is_empty()).then_some(rulers);
         if rulers != settings.editor.rulers {
             results.push(match &rulers {
@@ -704,7 +704,7 @@ impl Preferences {
             });
         }
 
-        let shell = split_command(&self.shell.read(cx).text());
+        let shell = split_command(&self.shell.read(cx).text(cx));
         let shell = (!shell.is_empty()).then_some(shell);
         if shell != settings.terminal_shell {
             results.push(match shell {
@@ -717,7 +717,7 @@ impl Preferences {
         for (tool, field) in [(Tool::Server, &self.server_command), (Tool::Formatter, &self.formatter_command)] {
             let configured = tool_value(&settings, tool, language);
             let custom = ToolMode::of(configured.as_ref()) == ToolMode::Custom || self.pending_custom == Some(tool);
-            let command = split_command(&field.read(cx).text());
+            let command = split_command(&field.read(cx).text(cx));
             if custom && !command.is_empty() && configured != Some(json!(command)) {
                 results.push(Settings::update_language_entry(tool.key(), language, |_| Some(json!(command))));
                 if self.pending_custom == Some(tool) {
@@ -730,9 +730,9 @@ impl Preferences {
             .runs
             .iter()
             .filter_map(|row| {
-                let command = row.command.read(cx).text().trim().to_string();
-                let name = row.name.read(cx).text().trim().to_string();
-                let cwd = row.cwd.read(cx).text().trim().to_string();
+                let command = row.command.read(cx).text(cx).trim().to_string();
+                let name = row.name.read(cx).text(cx).trim().to_string();
+                let cwd = row.cwd.read(cx).text(cx).trim().to_string();
                 (!command.is_empty()).then(|| RunConfiguration {
                     name: if name.is_empty() { command.clone() } else { name },
                     command,
@@ -840,7 +840,7 @@ impl Preferences {
             ToolMode::LanguageServer => Some("language_server".into()),
             ToolMode::Custom => {
                 // Start from the command Kin would use, or an empty field to type into.
-                let typed = split_command(&field.read(cx).text());
+                let typed = split_command(&field.read(cx).text(cx));
                 let command = if typed.is_empty() { default_command(tool, language) } else { typed };
                 if command.is_empty() {
                     self.pending_custom = Some(tool);
@@ -1541,7 +1541,7 @@ impl Preferences {
         let open = self.menu == Some(Menu::FontFamily);
         let width = px(240.);
         let list = open.then(|| {
-            let filter = self.font_filter.read(cx).text().to_lowercase();
+            let filter = self.font_filter.read(cx).text(cx).to_lowercase();
             let mut rows: Vec<Option<SharedString>> = vec![None];
             if let Some(fonts) = &self.fonts {
                 rows.extend(fonts.iter().filter(|f| f.to_lowercase().contains(&filter)).cloned().map(Some));
@@ -1763,7 +1763,7 @@ impl Preferences {
     // ---- Extensions ----------------------------------------------------------------
 
     fn install_from_git(&mut self, cx: &mut Context<Self>) {
-        let url = self.extension_url.read(cx).text().trim().to_string();
+        let url = self.extension_url.read(cx).text(cx).trim().to_string();
         if url.is_empty() {
             self.extension_status = Some((true, "Enter the URL of the extension's Git repository".into()));
             cx.notify();

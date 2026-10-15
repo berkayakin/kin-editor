@@ -3,43 +3,43 @@
 
 use std::sync::Arc;
 
-use gpui::{Context, Window};
+use gpui::{App, Context, Window};
 
 use super::{AcceptBoth, AcceptCurrent, AcceptIncoming, EditKind, Editor, EditorLspEvent};
 use crate::conflict::{self, Conflict, Resolution};
 
 impl Editor {
     /// The file's conflicts (cached per version).
-    pub(super) fn conflicts(&mut self) -> Arc<Vec<Conflict>> {
-        let rope = self.doc.rope().clone();
-        self.conflicts.now(self.doc.version(), move || conflict::parse(&rope.to_string()))
+    pub(super) fn conflicts(&mut self, cx: &App) -> Arc<Vec<Conflict>> {
+        let rope = self.doc.read(cx).rope().clone();
+        self.conflicts.now(self.doc.read(cx).version(), move || conflict::parse(&rope.to_string()))
     }
 
     /// The conflicts to draw: the last ones found (see `Derived`).
     pub(super) fn shown_conflicts(&mut self, cx: &mut Context<Self>) -> Arc<Vec<Conflict>> {
-        let rope = self.doc.rope().clone();
-        self.conflicts.schedule(self.doc.version(), move || conflict::parse(&rope.to_string()), |e| &mut e.conflicts, cx);
+        let rope = self.doc.read(cx).rope().clone();
+        self.conflicts.schedule(self.doc.read(cx).version(), move || conflict::parse(&rope.to_string()), |e| &mut e.conflicts, cx);
         self.conflicts.last()
     }
 
     /// Replaces the conflict starting at `start` with the side(s) kept.
     pub(super) fn resolve_conflict(&mut self, start: usize, resolution: Resolution, cx: &mut Context<Self>) {
-        let Some(c) = self.conflicts().iter().find(|c| c.start == start).cloned() else {
+        let Some(c) = self.conflicts(cx).iter().find(|c| c.start == start).cloned() else {
             return;
         };
-        let line = |row: usize| self.doc.line_start(row);
-        let mut text: String = resolution.kept(&c).into_iter().map(|rows| self.doc.slice(line(rows.start)..line(rows.end))).collect();
+        let line = |row: usize| self.doc.read(cx).line_start(row);
+        let mut text: String = resolution.kept(&c).into_iter().map(|rows| self.doc.read(cx).slice(line(rows.start)..line(rows.end))).collect();
         let end = line(c.end + 1);
         // At the end of a file without a final newline, keep it that way.
-        if end == self.doc.len() && !self.doc.rope().to_string().ends_with('\n') && text.ends_with('\n') {
+        if end == self.doc.read(cx).len() && !self.doc.read(cx).rope().to_string().ends_with('\n') && text.ends_with('\n') {
             text.pop();
         }
         self.edit_and_remap(vec![(line(c.start)..end, text)], EditKind::Other, cx);
     }
 
     fn resolve_at_caret(&mut self, resolution: Resolution, cx: &mut Context<Self>) {
-        let row = self.doc.row_of(self.primary_selection().head);
-        match self.conflicts().iter().find(|c| c.rows().contains(&row)) {
+        let row = self.doc.read(cx).row_of(self.primary_selection().head);
+        match self.conflicts(cx).iter().find(|c| c.rows().contains(&row)) {
             Some(c) => {
                 let start = c.start;
                 self.resolve_conflict(start, resolution, cx);

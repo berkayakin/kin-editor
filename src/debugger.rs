@@ -732,13 +732,13 @@ impl DebugSession {
 
     fn on_enter(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         if self.input.focus_handle(cx).is_focused(window) {
-            let expression = self.input.read(cx).text().trim().to_string();
+            let expression = self.input.read(cx).text(cx).trim().to_string();
             if !expression.is_empty() {
                 self.input.update(cx, |e, cx| e.set_text("", cx));
                 self.evaluate(expression, cx);
             }
         } else if self.watch_input.focus_handle(cx).is_focused(window) {
-            let expression = self.watch_input.read(cx).text().trim().to_string();
+            let expression = self.watch_input.read(cx).text(cx).trim().to_string();
             if !expression.is_empty() {
                 self.watch_input.update(cx, |e, cx| e.set_text("", cx));
                 self.watches.push((expression, None));

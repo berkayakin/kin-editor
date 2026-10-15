@@ -72,7 +72,7 @@ impl InputDialog {
     }
 
     fn on_enter(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).text().trim().to_string();
+        let text = self.input.read(cx).text(cx).trim().to_string();
         if text.is_empty() && !self.allow_empty {
             self.set_error("Enter a name".into(), cx);
         } else {

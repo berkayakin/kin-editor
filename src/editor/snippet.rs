@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use gpui::Context;
+use gpui::{App, Context};
 use serde_json::json;
 
 use super::{Editor, Selection};
@@ -17,8 +17,8 @@ use crate::{
 impl Editor {
     /// A snippet body indented for insertion at `at`: later lines start at
     /// that line's indentation, tabs become the file's indent unit.
-    pub(super) fn indented_snippet(&self, body: &str, at: usize) -> String {
-        let line = self.doc.line_text(self.doc.row_of(at));
+    pub(super) fn indented_snippet(&self, body: &str, at: usize, cx: &App) -> String {
+        let line = self.doc.read(cx).line_text(self.doc.read(cx).row_of(at));
         let indent: String = line.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
         snippets::indent_body(body, &indent, &self.indent_unit)
     }
@@ -32,7 +32,7 @@ impl Editor {
             self.set_selections(vec![Selection::cursor(base + len)], 0, cx);
             return;
         };
-        self.doc.snippet = (stops.len() > 1).then_some(SnippetStops { stops, current: 0 });
+        self.doc.as_mut(cx).snippet = (stops.len() > 1).then_some(SnippetStops { stops, current: 0 });
         self.select_stop(&first, cx);
     }
 
@@ -45,7 +45,7 @@ impl Editor {
     /// reaching the last ends it. False when no snippet is being filled in
     /// here, so the key does its usual thing.
     pub(super) fn snippet_tab(&mut self, step: isize, cx: &mut Context<Self>) -> bool {
-        let Some(mut snippet) = self.doc.snippet.take() else { return false };
+        let Some(mut snippet) = self.doc.as_mut(cx).snippet.take() else { return false };
         let head = self.primary_selection().head;
         // The caret left the snippet: it's done.
         if !snippet.stops[snippet.current].iter().any(|r| r.start <= head && head <= r.end) {
@@ -55,7 +55,7 @@ impl Editor {
         snippet.current = (snippet.current as isize + step).clamp(0, last as isize) as usize;
         let ranges = snippet.stops[snippet.current].clone();
         if snippet.current < last {
-            self.doc.snippet = Some(snippet);
+            self.doc.as_mut(cx).snippet = Some(snippet);
         }
         self.select_stop(&ranges, cx);
         true
@@ -68,10 +68,10 @@ impl Editor {
             return false;
         }
         let head = sel.head;
-        let line_start = self.doc.line_start(self.doc.row_of(head));
-        let before = self.doc.slice(line_start..head);
+        let line_start = self.doc.read(cx).line_start(self.doc.read(cx).row_of(head));
+        let before = self.doc.read(cx).slice(line_start..head);
         // The longest prefix that ends at the caret and starts a word.
-        let Some(snippet) = snippets::user_snippets(self.doc.language)
+        let Some(snippet) = snippets::user_snippets(self.doc.read(cx).language)
             .into_iter()
             .filter(|s| !s.prefix.is_empty() && before.ends_with(&s.prefix))
             .filter(|s| {
@@ -83,7 +83,7 @@ impl Editor {
             return false;
         };
         let start = head - snippet.prefix.len();
-        let (text, stops) = expand_snippet(&self.indented_snippet(&snippet.body, start));
+        let (text, stops) = expand_snippet(&self.indented_snippet(&snippet.body, start, cx));
         let len = text.len();
         self.edit_and_remap(vec![(start..head, text)], EditKind::Other, cx);
         self.select_snippet(start, len, stops, cx);

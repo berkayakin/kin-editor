@@ -62,7 +62,7 @@ impl FindBar {
     }
 
     pub fn has_query(&self, cx: &gpui::App) -> bool {
-        self.query.read(cx).doc.len() > 0
+        self.query.read(cx).doc.read(cx).len() > 0
     }
 
     /// Opens the bar for `target`, prefilled with the editor's selection.
@@ -72,7 +72,7 @@ impl FindBar {
         let selected = {
             let editor = target.read(cx);
             let s = editor.primary_selection();
-            let text = editor.doc.slice(s.range());
+            let text = editor.doc.read(cx).slice(s.range());
             (!s.is_empty() && !text.contains('\n')).then_some(text)
         };
         if let Some(text) = selected {
@@ -108,7 +108,7 @@ impl FindBar {
     }
 
     fn query(&self, cx: &gpui::App) -> Result<Option<SearchQuery>, String> {
-        SearchQuery::new(&self.query.read(cx).text(), self.options)
+        SearchQuery::new(&self.query.read(cx).text(cx), self.options)
     }
 
     /// Recomputes matches, in the background (the whole text is scanned),
@@ -116,8 +116,8 @@ impl FindBar {
     /// nearest match.
     fn update_matches(&mut self, jump: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
-        let text = self.query.read(cx).text();
-        let key = (target.entity_id(), target.read(cx).doc.version(), text, self.options);
+        let text = self.query.read(cx).text(cx);
+        let key = (target.entity_id(), target.read(cx).doc.read(cx).version(), text, self.options);
         if self.searched.as_ref() == Some(&key) {
             self.search_task = None;
             self.show_matches(jump, cx);
@@ -135,14 +135,14 @@ impl FindBar {
             }
         };
         self.error = None;
-        let rope = target.read(cx).doc.rope().clone();
+        let rope = target.read(cx).doc.read(cx).rope().clone();
         // Typing a query waits less than editing the text with the bar open.
         let delay = Duration::from_millis(if jump { 30 } else { 100 });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let matches = cx.background_executor().spawn(async move { query.find_all(&rope.to_string()) }).await;
             this.update(cx, |this, cx| {
-                let current = this.target.as_ref().map(|t| (t.entity_id(), t.read(cx).doc.version()));
+                let current = this.target.as_ref().map(|t| (t.entity_id(), t.read(cx).doc.read(cx).version()));
                 if current != Some((key.0, key.1)) {
                     return;
                 }
@@ -162,14 +162,14 @@ impl FindBar {
     /// (next, replace), which mustn't wait for the search or use old ones.
     fn search_now(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
-        let text = self.query.read(cx).text();
-        let key = (target.entity_id(), target.read(cx).doc.version(), text, self.options);
+        let text = self.query.read(cx).text(cx);
+        let key = (target.entity_id(), target.read(cx).doc.read(cx).version(), text, self.options);
         if self.searched.as_ref() == Some(&key) {
             return;
         }
         self.search_task = None;
         self.matches = match SearchQuery::new(&key.2, self.options) {
-            Ok(Some(query)) => query.find_all(&target.read(cx).doc.rope().to_string()),
+            Ok(Some(query)) => query.find_all(&target.read(cx).doc.read(cx).rope().to_string()),
             _ => Vec::new(),
         };
         self.searched = Some(key);
@@ -236,8 +236,8 @@ impl FindBar {
             self.select_next(cx);
             return;
         }
-        let text = target.read(cx).doc.rope().to_string();
-        let replacement = query.replacement_for(&text, range.clone(), &self.replacement.read(cx).text());
+        let text = target.read(cx).doc.read(cx).rope().to_string();
+        let replacement = query.replacement_for(&text, range.clone(), &self.replacement.read(cx).text(cx));
         let after = range.start + replacement.len();
         target.update(cx, |e, cx| {
             e.replace_ranges(vec![(range, replacement)], cx);
@@ -252,8 +252,8 @@ impl FindBar {
         let (Some(target), Ok(Some(query))) = (self.target.clone(), self.query(cx)) else {
             return;
         };
-        let text = target.read(cx).doc.rope().to_string();
-        let replacement = self.replacement.read(cx).text();
+        let text = target.read(cx).doc.read(cx).rope().to_string();
+        let replacement = self.replacement.read(cx).text(cx);
         let edits: Vec<_> = self
             .matches
             .iter()

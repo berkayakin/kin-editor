@@ -86,7 +86,7 @@ impl ProjectSearch {
     }
 
     fn search(&mut self, cx: &mut Context<Self>) {
-        let query = match SearchQuery::new(&self.query.read(cx).text(), self.options) {
+        let query = match SearchQuery::new(&self.query.read(cx).text(cx), self.options) {
             Ok(Some(q)) => q,
             Ok(None) => {
                 self.matches = Arc::new(Vec::new());
@@ -149,14 +149,14 @@ impl ProjectSearch {
     }
 
     fn replace_all(&mut self, cx: &mut Context<Self>) {
-        let Ok(Some(query)) = SearchQuery::new(&self.query.read(cx).text(), self.options) else {
+        let Ok(Some(query)) = SearchQuery::new(&self.query.read(cx).text(cx), self.options) else {
             return;
         };
         let mut files: Vec<PathBuf> = self.matches.iter().map(|m| m.path.clone()).collect();
         files.dedup();
         cx.emit(ProjectSearchEvent::ReplaceAll {
             query,
-            replacement: self.replacement.read(cx).text(),
+            replacement: self.replacement.read(cx).text(cx),
             files,
         });
     }
@@ -287,7 +287,7 @@ impl Render for ProjectSearch {
         } else if self.searching {
             "Searching…".into()
         } else if self.matches.is_empty() {
-            if self.query.read(cx).doc.len() > 0 { "No matches".into() } else { String::new() }
+            if self.query.read(cx).doc.read(cx).len() > 0 { "No matches".into() } else { String::new() }
         } else {
             format!(
                 "{}{} matches in {} file{}",

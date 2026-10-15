@@ -877,7 +877,7 @@ impl Workspace {
             self.set_root(path, window, cx);
             return;
         }
-        if let Some(editor) = self.tabs.iter().find(|t| t.read(cx).doc.path.as_deref() == Some(path.as_path())).cloned() {
+        if let Some(editor) = self.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())).cloned() {
             self.activate_editor(&editor, window, cx);
             return;
         }
@@ -904,9 +904,9 @@ impl Workspace {
         self.open_path(path.clone(), window, cx);
         let (Some(line), Some(editor)) = (line, self.tab_for(&path, cx)) else { return };
         editor.update(cx, |e, cx| {
-            let row = (line as usize).saturating_sub(1).min(e.doc.line_count().saturating_sub(1));
-            let start = e.doc.line_start(row);
-            let text = e.doc.line_text(row);
+            let row = (line as usize).saturating_sub(1).min(e.doc.read(cx).line_count().saturating_sub(1));
+            let start = e.doc.read(cx).line_start(row);
+            let text = e.doc.read(cx).line_text(row);
             let col = column.map_or(0, |c| c as usize).saturating_sub(1);
             let offset = start + text.char_indices().nth(col).map_or(text.len(), |(i, _)| i);
             e.go_to(offset, window, cx);
@@ -965,7 +965,7 @@ impl Workspace {
     /// restored tab is first shown): breakpoints, language server, Git changes.
     fn file_opened(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         // Breakpoints it had while closed, and the paused line if it's here.
-        let path = editor.read(cx).doc.path.clone();
+        let path = editor.read(cx).doc.read(cx).path.clone();
         if let Some(path) = path {
             if let Some(breakpoints) = self.breakpoints.remove(&path) {
                 editor.update(cx, |e, cx| e.set_breakpoints(&breakpoints, cx));
@@ -978,7 +978,7 @@ impl Workspace {
         self.lsp.update(cx, |s, cx| s.register(editor, cx));
         if self.repo.is_none() && self.root.is_none() {
             // A lone file: use the repository it lives in, if any.
-            if let Some(dir) = editor.read(cx).doc.path.as_deref().and_then(Path::parent) {
+            if let Some(dir) = editor.read(cx).doc.read(cx).path.as_deref().and_then(Path::parent) {
                 self.detect_repo(dir.to_path_buf(), cx);
             }
         } else {
@@ -991,7 +991,7 @@ impl Workspace {
         match &event.error {
             None => self.file_opened(editor, cx),
             Some(err) => {
-                let name = editor.read(cx).doc.file_name();
+                let name = editor.read(cx).doc.read(cx).file_name();
                 self.toast(ToastKind::Error, format!("Couldn't open {name}"), Some(err.clone()), cx);
                 self.remove_tab(editor, window, cx);
             }
@@ -1044,7 +1044,7 @@ impl Workspace {
             // A restored tab reads its file when first shown.
             let _ = editor.update(cx, |e, cx| e.load(cx));
             window.focus(&editor.focus_handle(cx));
-            if let Some(path) = editor.read(cx).doc.path.clone() {
+            if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
                 self.recent.retain(|p| p != &path);
                 self.recent.insert(0, path);
                 self.recent.truncate(50);
@@ -1143,7 +1143,7 @@ impl Workspace {
             let mut count = 0;
             for (ix, tab) in pane.tabs.iter().enumerate() {
                 let e = tab.read(cx);
-                let dirty = e.doc.is_dirty();
+                let dirty = e.doc.read(cx).is_dirty();
                 // A tab not read yet goes back as it was restored.
                 if let Some(u) = e.unloaded() {
                     if ix == pane.active {
@@ -1157,7 +1157,7 @@ impl Workspace {
                         unsaved.push((tabs.len(), text.clone()));
                     }
                     tabs.push(TabSession {
-                        path: e.doc.path.clone(),
+                        path: e.doc.read(cx).path.clone(),
                         cursor: u.cursor,
                         unsaved: None,
                         pane: pane_ix,
@@ -1168,7 +1168,7 @@ impl Workspace {
                     continue;
                 }
                 // An untitled buffer without edits has nothing to bring back.
-                if e.doc.path.is_none() && !dirty {
+                if e.doc.read(cx).path.is_none() && !dirty {
                     continue;
                 }
                 if ix == pane.active {
@@ -1179,16 +1179,16 @@ impl Workspace {
                 }
                 count += 1;
                 if dirty {
-                    unsaved.push((tabs.len(), e.doc.rope().clone()));
+                    unsaved.push((tabs.len(), e.doc.read(cx).rope().clone()));
                 }
                 tabs.push(TabSession {
-                    path: e.doc.path.clone(),
+                    path: e.doc.read(cx).path.clone(),
                     cursor: e.primary_selection().head,
                     unsaved: None,
                     pane: pane_ix,
                     pinned: self.pinned.contains(&tab.entity_id()),
-                    folds: e.folded_rows(),
-                    encoding: (e.doc.encoding != TextEncoding::UTF8).then(|| e.doc.encoding.key()),
+                    folds: e.folded_rows(cx),
+                    encoding: (e.doc.read(cx).encoding != TextEncoding::UTF8).then(|| e.doc.read(cx).encoding.key()),
                 });
             }
             pane_active.push(active_in_pane);
@@ -1524,7 +1524,7 @@ impl Workspace {
             self.refresh_git(cx);
         }
         for editor in self.tabs.clone() {
-            if editor.read(cx).doc.path.as_ref().is_some_and(|p| paths.contains(p)) {
+            if editor.read(cx).doc.read(cx).path.as_ref().is_some_and(|p| paths.contains(p)) {
                 editor.update(cx, |e, cx| e.reload_if_changed(cx));
             }
         }
@@ -1739,13 +1739,13 @@ impl Workspace {
 
     fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
-        if editor.read(cx).doc.path.is_none() {
+        if editor.read(cx).doc.read(cx).path.is_none() {
             self.save_as(&SaveAs, window, cx);
             return;
         }
         // Format on save: only for an explicit Save, like VS Code, so
         // auto-save never reformats mid-typing.
-        if editor.read(cx).format_on_save() {
+        if editor.read(cx).format_on_save(cx) {
             let task = editor.update(cx, |e, cx| e.format(false, cx));
             let timeout = cx.background_executor().timer(FORMAT_ON_SAVE_TIMEOUT);
             cx.spawn_in(window, async move |this, cx| {
@@ -1850,7 +1850,7 @@ impl Workspace {
         self.tabs
             .iter()
             .find(|t| {
-                t.read(cx).doc.path.as_deref().is_some_and(|p| p == path || p.canonicalize().is_ok_and(|p| p == wanted))
+                t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p == path || p.canonicalize().is_ok_and(|p| p == wanted))
             })
             .cloned()
     }
@@ -1859,7 +1859,7 @@ impl Workspace {
         self.open_path(location.path.clone(), window, cx);
         if let Some(editor) = self.tab_for(&location.path, cx) {
             editor.update(cx, |e, cx| {
-                let offset = protocol::position_to_offset(e.doc.rope(), location.range.start, encoding);
+                let offset = protocol::position_to_offset(e.doc.read(cx).rope(), location.range.start, encoding);
                 e.go_to(offset, window, cx);
             });
         }
@@ -1872,7 +1872,7 @@ impl Workspace {
         for location in locations {
             let line = location.range.start.line as usize;
             let lines = files.entry(location.path.clone()).or_insert_with(|| match self.tab_for(&location.path, cx) {
-                Some(editor) => editor.read(cx).doc.rope().to_string().lines().map(str::to_string).collect(),
+                Some(editor) => editor.read(cx).doc.read(cx).rope().to_string().lines().map(str::to_string).collect(),
                 None => std::fs::read_to_string(&location.path).unwrap_or_default().lines().map(str::to_string).collect(),
             });
             let preview = lines.get(line).map(|l| l.trim().to_string()).unwrap_or_default();
@@ -1899,7 +1899,7 @@ impl Workspace {
                 continue;
             };
             editor.update(cx, |e, cx| {
-                let resolved = protocol::resolve_edits(e.doc.rope(), &file_edits, encoding);
+                let resolved = protocol::resolve_edits(e.doc.read(cx).rope(), &file_edits, encoding);
                 e.replace_ranges(resolved, cx);
             });
         }
@@ -1987,7 +1987,7 @@ impl Workspace {
     }
 
     fn restart_language_server(&mut self, _: &RestartLanguageServer, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) else { return };
+        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone()) else { return };
         self.lsp.update(cx, |s, cx| s.restart(&path, cx));
     }
 
@@ -2038,7 +2038,7 @@ impl Workspace {
 
     /// Restarts the idle timer for an edited tab in `after_delay` mode.
     fn schedule_auto_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        if self.auto_save != AutoSave::AfterDelay || !editor.read(cx).doc.is_dirty() {
+        if self.auto_save != AutoSave::AfterDelay || !editor.read(cx).doc.read(cx).is_dirty() {
             return;
         }
         let delay = self.auto_save_delay;
@@ -2062,7 +2062,7 @@ impl Workspace {
     fn auto_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
         let id = editor.entity_id();
         self.auto_save_tasks.remove(&id);
-        let doc = &editor.read(cx).doc;
+        let doc = editor.read(cx).doc.read(cx);
         if !doc.is_dirty() {
             return true;
         }
@@ -2089,7 +2089,7 @@ impl Workspace {
                 true
             }
             Err(err) => {
-                let name = editor.read(cx).doc.file_name();
+                let name = editor.read(cx).doc.read(cx).file_name();
                 if self.auto_save_warned.insert(id) {
                     self.toast(ToastKind::Error, format!("Couldn't auto-save {name}"), Some(err.to_string()), cx);
                 }
@@ -2207,7 +2207,7 @@ impl Workspace {
         let unsaved: Vec<String> = self
             .tabs
             .iter()
-            .map(|t| &t.read(cx).doc)
+            .map(|t| t.read(cx).doc.read(cx))
             .filter(|d| d.is_dirty())
             .map(|d| d.file_name())
             .collect();
@@ -2230,18 +2230,18 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| match answer {
                 0 => {
                     for editor in ws.tabs.clone() {
-                        if editor.read(cx).doc.is_dirty()
-                            && editor.read(cx).doc.path.is_some()
+                        if editor.read(cx).doc.read(cx).is_dirty()
+                            && editor.read(cx).doc.read(cx).path.is_some()
                             && let Err(err) = editor.update(cx, |e, cx| e.save(cx))
                         {
-                            let name = editor.read(cx).doc.file_name();
+                            let name = editor.read(cx).doc.read(cx).file_name();
                             ws.toast(ToastKind::Error, format!("Couldn't save {name}"), Some(err.to_string()), cx);
                         }
                     }
                     // Untitled files need a name first; show the first one.
-                    if let Some(dirty) = ws.tabs.iter().find(|t| t.read(cx).doc.is_dirty()).cloned() {
+                    if let Some(dirty) = ws.tabs.iter().find(|t| t.read(cx).doc.read(cx).is_dirty()).cloned() {
                         ws.activate_editor(&dirty, window, cx);
-                        if dirty.read(cx).doc.path.is_none() {
+                        if dirty.read(cx).doc.read(cx).path.is_none() {
                             ws.save_as(&SaveAs, window, cx);
                         }
                     } else {
@@ -2279,7 +2279,7 @@ impl Workspace {
 
     fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
-        let current = editor.read(cx).doc.path.clone();
+        let current = editor.read(cx).doc.read(cx).path.clone();
         let dir = current
             .as_deref()
             .and_then(Path::parent)
@@ -2287,7 +2287,7 @@ impl Workspace {
             .or_else(|| self.root.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let name = editor.read(cx).doc.file_name();
+        let name = editor.read(cx).doc.read(cx).file_name();
         let rx = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
@@ -2323,8 +2323,8 @@ impl Workspace {
         if self.auto_save != AutoSave::Off {
             self.auto_save(&editor, cx);
         }
-        if editor.read(cx).doc.is_dirty() {
-            let name = editor.read(cx).doc.file_name();
+        if editor.read(cx).doc.read(cx).is_dirty() {
+            let name = editor.read(cx).doc.read(cx).file_name();
             let rx = window.prompt(
                 PromptLevel::Warning,
                 &format!("Do you want to save the changes you made to {name}?"),
@@ -2336,7 +2336,7 @@ impl Workspace {
                 let Ok(answer) = rx.await else { return };
                 this.update_in(cx, |ws, window, cx| match answer {
                     0 => {
-                        if editor.read(cx).doc.path.is_some() && editor.update(cx, |e, cx| e.save(cx)).is_ok() {
+                        if editor.read(cx).doc.read(cx).path.is_some() && editor.update(cx, |e, cx| e.save(cx)).is_ok() {
                             ws.remove_tab(&editor, window, cx);
                         } else {
                             ws.activate_editor(&editor, window, cx);
@@ -2359,9 +2359,9 @@ impl Workspace {
         self.tabs.remove(ix);
         self.pinned.remove(&editor.entity_id());
         let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
-        if let Some(path) = editor.read(cx).doc.path.clone() {
+        if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
             self.lsp.update(cx, |s, _| s.did_close(&path));
-            let breakpoints = editor.read(cx).breakpoints();
+            let breakpoints = editor.read(cx).breakpoints(cx);
             if !breakpoints.is_empty() {
                 self.breakpoints.insert(path, breakpoints);
             }
@@ -2562,7 +2562,7 @@ impl Workspace {
 
     fn open_tab_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let pinned = self.pinned.contains(&editor.entity_id());
-        let path = editor.read(cx).doc.path.clone();
+        let path = editor.read(cx).doc.read(cx).path.clone();
         let mut entries = Vec::new();
         let mut actions = Vec::new();
         let mut add = |entry: MenuEntry, action: Option<MenuAction>| {
@@ -2761,9 +2761,9 @@ impl Workspace {
     fn load_diff_base(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
         // A tab not read yet gets it when it is (`file_opened`).
-        let Some(path) = editor.read(cx).doc.path.clone().filter(|_| editor.read(cx).is_loaded()) else { return };
+        let Some(path) = editor.read(cx).doc.read(cx).path.clone().filter(|_| editor.read(cx).is_loaded()) else { return };
         // Images have no lines to mark.
-        if editor.read(cx).doc.image.is_some() {
+        if editor.read(cx).doc.read(cx).image.is_some() {
             return;
         }
         let Ok(rel) = path.strip_prefix(&repo) else {
@@ -2773,7 +2773,7 @@ impl Workspace {
         let rel = rel.to_string_lossy().replace('\\', "/");
         let git_file = GitFile { root: repo.clone(), rel: rel.clone(), user_name: self.git_user.clone() };
         // Compared as the editor holds the file: decoded like it, LF line ends.
-        let encoding = editor.read(cx).doc.encoding;
+        let encoding = editor.read(cx).doc.read(cx).encoding;
         let editor = editor.downgrade();
         cx.spawn(async move |_, cx| {
             let (base, index) = cx
@@ -3046,8 +3046,8 @@ impl Workspace {
         let buffer = self
             .tabs
             .iter()
-            .find(|t| t.read(cx).doc.path.as_deref() == Some(file.path.as_path()))
-            .map(|t| t.read(cx).text());
+            .find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(file.path.as_path()))
+            .map(|t| t.read(cx).text(cx));
         self.show_diff(DiffSource::Working { file, staged, buffer }, window, cx);
     }
 
@@ -3170,7 +3170,7 @@ impl Workspace {
     /// The active file's commits (Git → Show History).
     fn show_file_history(&mut self, _: &ShowFileHistory, window: &mut Window, cx: &mut Context<Self>) {
         let rel = self.active_editor().and_then(|e| {
-            let path = e.read(cx).doc.path.clone()?;
+            let path = e.read(cx).doc.read(cx).path.clone()?;
             Some(path.strip_prefix(self.repo.as_ref()?).ok()?.to_string_lossy().replace('\\', "/"))
         });
         let Some(rel) = rel else {
@@ -3280,7 +3280,7 @@ impl Workspace {
     fn terminal_cwd(&self, cx: &App) -> PathBuf {
         self.root
             .clone()
-            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)))
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.as_deref()?.parent().map(Path::to_path_buf)))
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/"))
     }
@@ -3324,7 +3324,7 @@ impl Workspace {
     /// Open files may have a language now, or one with a grammar.
     /// The folder trust decides about: the project, else the active file's.
     fn trust_folder(&self, cx: &App) -> Option<PathBuf> {
-        self.root.clone().or_else(|| self.active_editor()?.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf))
+        self.root.clone().or_else(|| self.active_editor()?.read(cx).doc.read(cx).path.as_deref()?.parent().map(Path::to_path_buf))
     }
 
     fn restricted(&self, cx: &App) -> bool {
@@ -3423,7 +3423,7 @@ impl Workspace {
     /// already (its language server reports the same compiler errors).
     fn run_problems_shown(&self, cx: &App) -> Vec<&run::OutputProblem> {
         let Some((_, problems)) = &self.run_problems else { return Vec::new() };
-        let doc = self.active_editor().map(|e| &e.read(cx).doc);
+        let doc = self.active_editor().map(|e| e.read(cx).doc.read(cx));
         let known = |p: &run::OutputProblem| {
             doc.is_some_and(|doc| {
                 doc.path.as_deref() == Some(p.path.as_path())
@@ -3500,7 +3500,7 @@ impl Workspace {
     fn run_target(&mut self, target: RunTarget, window: &mut Window, cx: &mut Context<Self>) {
         // Unsaved edits would make the run disagree with what's on screen.
         for editor in self.tabs.clone() {
-            if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+            if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
         }
@@ -3575,7 +3575,7 @@ impl Workspace {
         }
         // What's debugged is what's on screen.
         for editor in self.tabs.clone() {
-            if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+            if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
         }
@@ -3633,8 +3633,8 @@ impl Workspace {
         for editor in &self.tabs {
             let e = editor.read(cx);
             // A tab not read yet has its file's breakpoints in `self.breakpoints`.
-            if let Some(path) = e.doc.path.clone().filter(|_| e.is_loaded()) {
-                let breakpoints = e.breakpoints();
+            if let Some(path) = e.doc.read(cx).path.clone().filter(|_| e.is_loaded()) {
+                let breakpoints = e.breakpoints(cx);
                 if breakpoints.is_empty() {
                     all.remove(&path);
                 } else {
@@ -3648,7 +3648,7 @@ impl Workspace {
     fn breakpoints_changed(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let (path, breakpoints) = {
             let e = editor.read(cx);
-            (e.doc.path.clone(), e.breakpoints())
+            (e.doc.read(cx).path.clone(), e.breakpoints(cx))
         };
         if let (Some(path), Some((session, _))) = (path, &self.debug) {
             session.update(cx, |s, _| s.set_breakpoints(path, breakpoints));
@@ -3659,7 +3659,7 @@ impl Workspace {
     /// Right-click on a line number: add or remove its breakpoint, or give it
     /// a condition or a log message.
     fn open_breakpoint_menu(&mut self, editor: Entity<Editor>, row: usize, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = editor.read(cx).breakpoint(row).is_some();
+        let existing = editor.read(cx).breakpoint(row, cx).is_some();
         let toggle = binding_label(&editor::ToggleBreakpoint, window);
         let entries = if existing {
             vec![
@@ -3693,18 +3693,18 @@ impl Workspace {
 
     fn edit_breakpoint_at_caret(&mut self, edit: BreakpointEdit, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
-        if !editor.read(cx).can_break() {
+        if !editor.read(cx).can_break(cx) {
             self.toast(ToastKind::Info, "Breakpoints work in Rust, Go, Python, JavaScript and TypeScript files", None, cx);
             return;
         }
-        let row = editor.read(cx).caret_row();
+        let row = editor.read(cx).caret_row(cx);
         self.edit_breakpoint(edit, editor, row, window, cx);
     }
 
     /// Asks for a breakpoint's condition or log message; confirming adds the
     /// breakpoint if the line has none, and an empty text clears the option.
     fn edit_breakpoint(&mut self, edit: BreakpointEdit, editor: Entity<Editor>, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let current = editor.read(cx).breakpoint(row).unwrap_or(Breakpoint::at(row));
+        let current = editor.read(cx).breakpoint(row, cx).unwrap_or(Breakpoint::at(row));
         let line = row + 1;
         let (title, hint, initial) = match edit {
             BreakpointEdit::Condition => (
@@ -3724,7 +3724,7 @@ impl Workspace {
         self.modal_subscription = Some(cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
             if let InputDialogEvent::Confirm(text) = event {
                 let text = Some(text.trim().to_string()).filter(|t| !t.is_empty());
-                let mut breakpoint = editor.read(cx).breakpoint(row).unwrap_or(Breakpoint::at(row));
+                let mut breakpoint = editor.read(cx).breakpoint(row, cx).unwrap_or(Breakpoint::at(row));
                 match edit {
                     BreakpointEdit::Condition => breakpoint.condition = text,
                     _ => breakpoint.log_message = text,
@@ -3876,13 +3876,13 @@ impl Workspace {
         let root = self
             .root
             .clone()
-            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().map(Path::to_path_buf)));
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.as_deref()?.parent().map(Path::to_path_buf)));
         let Some(root) = root else {
             self.toast(ToastKind::Info, "Open a folder or a file to run something", None, cx);
             return None;
         };
         let current = self.active_editor().and_then(|e| {
-            let doc = &e.read(cx).doc;
+            let doc = e.read(cx).doc.read(cx);
             doc.path.clone().map(|p| (p, doc.language))
         });
         let mut targets: Vec<RunTarget> = Settings::get(cx)
@@ -3903,7 +3903,7 @@ impl Workspace {
         targets.extend(run::project_targets(&root, current.as_ref().map(|(p, l)| (p.as_path(), *l))));
         // Then the current file's tests and mains, by name.
         if let Some(editor) = self.active_editor() {
-            let file = editor.update(cx, |e, _| e.run_targets());
+            let file = editor.update(cx, |e, cx| e.run_targets(cx));
             targets.extend(file.iter().filter(|t| !targets.iter().any(|o| o.command == t.command)).cloned().collect::<Vec<_>>());
         }
         // The last one comes first, so Enter repeats it.
@@ -4404,7 +4404,7 @@ impl Workspace {
         let files = if self.root.is_some() {
             self.file_index.clone()
         } else {
-            Arc::new(self.tabs.iter().filter_map(|t| t.read(cx).doc.path.clone()).collect())
+            Arc::new(self.tabs.iter().filter_map(|t| t.read(cx).doc.read(cx).path.clone()).collect())
         };
         let recent = if mode == PickerMode::Projects { self.recent_projects.clone() } else { self.recent.clone() };
         let (root, actions) = (self.root.clone(), self.actions.clone());
@@ -4562,11 +4562,12 @@ impl Workspace {
             let e = editor.read(cx);
             let symbols: Vec<_> = e
                 .doc
+                .read(cx)
                 .syntax()
-                .symbols(e.doc.rope())
+                .symbols(e.doc.read(cx).rope())
                 .into_iter()
                 .map(|s| {
-                    let line = e.doc.row_of(s.offset) + 1;
+                    let line = e.doc.read(cx).row_of(s.offset) + 1;
                     (s, line)
                 })
                 .collect();
@@ -4584,7 +4585,7 @@ impl Workspace {
         let Some(editor) = self.active_editor().cloned() else { return };
         let (line_count, current) = {
             let e = editor.read(cx);
-            (e.doc.line_count(), e.cursor_position())
+            (e.doc.read(cx).line_count(), e.cursor_position(cx))
         };
         let modal = cx.new(|cx| GoToLineModal::new(line_count, current, window, cx));
         self.modal_subscription = Some(cx.subscribe_in(&modal, window, move |ws, _, event: &GoToLineEvent, window, cx| match event {
@@ -4593,8 +4594,8 @@ impl Workspace {
                 let (line, column) = (*line, *column);
                 editor.update(cx, |e, cx| {
                     let row = line - 1;
-                    let start = e.doc.line_start(row);
-                    let text = e.doc.line_text(row);
+                    let start = e.doc.read(cx).line_start(row);
+                    let text = e.doc.read(cx).line_text(row);
                     let col = text.char_indices().nth(column - 1).map_or(text.len(), |(b, _)| b);
                     e.go_to(start + col, window, cx);
                 });
@@ -4614,9 +4615,9 @@ impl Workspace {
                 let text = match e.unloaded() {
                     // Not read yet: its unsaved text, else the file on disk.
                     Some(u) => u.unsaved.as_ref()?.to_string(),
-                    None => e.doc.rope().to_string(),
+                    None => e.doc.read(cx).rope().to_string(),
                 };
-                Some((e.doc.path.clone()?, Arc::from(text)))
+                Some((e.doc.read(cx).path.clone()?, Arc::from(text)))
             })
             .collect()
     }
@@ -4638,7 +4639,7 @@ impl Workspace {
         let root = scope
             .or_else(|| self.root.clone())
             .or_else(|| {
-                let path = self.active_editor()?.read(cx).doc.path.clone()?;
+                let path = self.active_editor()?.read(cx).doc.read(cx).path.clone()?;
                 path.parent().map(Path::to_path_buf)
             })
             .or_else(|| std::env::current_dir().ok());
@@ -4646,7 +4647,7 @@ impl Workspace {
         let initial = self.active_editor().and_then(|e| {
             let e = e.read(cx);
             let s = e.primary_selection();
-            let text = e.doc.slice(s.range());
+            let text = e.doc.read(cx).slice(s.range());
             (!s.is_empty() && !text.contains('\n')).then_some(text)
         });
         let overrides = self.open_buffers(cx);
@@ -4699,13 +4700,13 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| {
                 let mut failures = Vec::new();
                 for path in &files {
-                    if let Some(editor) = ws.tabs.iter().find(|t| t.read(cx).doc.path.as_deref() == Some(path.as_path())) {
+                    if let Some(editor) = ws.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())) {
                         editor.update(cx, |e, cx| {
                             // A restored tab not shown yet is read first, like any open file.
                             if e.load(cx).is_err() {
                                 return;
                             }
-                            let text = e.text();
+                            let text = e.text(cx);
                             let edits = query
                                 .find_all(&text)
                                 .into_iter()
@@ -4886,7 +4887,7 @@ impl Workspace {
                     Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
                     Some(MenuAction::Tab(action, editor)) => ws.run_tab_action(action, &editor, window, cx),
                     Some(MenuAction::LineEndings(crlf, editor)) => editor.update(cx, |e, cx| {
-                        e.doc.set_crlf(crlf);
+                        e.doc.as_mut(cx).set_crlf(crlf);
                         cx.emit(EditorEvent::Edited);
                         cx.notify();
                     }),
@@ -4915,7 +4916,7 @@ impl Workspace {
     // ---- Line endings and encoding (status bar) ------------------------------------
 
     fn open_line_endings_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let crlf = editor.read(cx).doc.uses_crlf;
+        let crlf = editor.read(cx).doc.read(cx).uses_crlf;
         let choice = |label: &'static str, on: bool| if on { MenuEntry::item(label, Icon::Check) } else { MenuEntry::text(label) };
         let entries = vec![
             MenuEntry::Header("Line endings".into()),
@@ -4927,7 +4928,7 @@ impl Workspace {
     }
 
     fn open_encoding_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let current = editor.read(cx).doc.encoding;
+        let current = editor.read(cx).doc.read(cx).encoding;
         let mut entries = vec![MenuEntry::Header("Encoding".into())];
         let mut actions = vec![None];
         for encoding in crate::encoding::choices() {
@@ -4957,7 +4958,7 @@ impl Workspace {
         let Some(root) = self.root.clone() else { return };
         let current = python::choice(&root);
         let check = |on: bool, label: String| if on { MenuEntry::item(label, Icon::Check) } else { MenuEntry::text(label) };
-        let detected = self.active_editor().and_then(|e| e.read(cx).doc.path.as_deref()?.parent().and_then(python::detect));
+        let detected = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.as_deref()?.parent().and_then(python::detect));
         let auto = match &detected {
             Some(venv) => format!("Auto-detect ({})", python::label(venv, Some(&root))),
             None => "Auto-detect (none found)".into(),
@@ -4992,7 +4993,7 @@ impl Workspace {
         crate::python::set_choice(&root, choice);
         self.venv_shown.take();
         self.schedule_session_save(cx);
-        if let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) {
+        if let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone()) {
             self.lsp.update(cx, |s, cx| s.restart(&path, cx));
         }
         cx.notify();
@@ -5020,7 +5021,7 @@ impl Workspace {
     /// wrong) or convert it (the next save writes the new encoding).
     fn choose_encoding(&mut self, encoding: TextEncoding, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let (current, dirty, saved) = {
-            let doc = &editor.read(cx).doc;
+            let doc = editor.read(cx).doc.read(cx);
             (doc.encoding, doc.is_dirty(), doc.path.is_some())
         };
         if encoding == current {
@@ -5028,7 +5029,7 @@ impl Workspace {
         }
         let convert = move |editor: &Entity<Editor>, cx: &mut Context<Self>| {
             editor.update(cx, |e, cx| {
-                e.doc.convert_to(encoding);
+                e.doc.as_mut(cx).convert_to(encoding);
                 cx.emit(EditorEvent::Edited);
                 cx.notify();
             })
@@ -5069,10 +5070,10 @@ impl Workspace {
     fn open_editor_menu(&mut self, editor: Entity<Editor>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_modal(window, cx);
         let e = editor.read(cx);
-        let path = e.doc.path.clone();
-        let has_change = e.has_change_at_cursor();
-        let change_staged = e.change_at_cursor_staged();
-        let in_conflict = e.has_conflict_at_cursor();
+        let path = e.doc.read(cx).path.clone();
+        let has_change = e.has_change_at_cursor(cx);
+        let change_staged = e.change_at_cursor_staged(cx);
+        let in_conflict = e.has_conflict_at_cursor(cx);
         let soft_wrap = e.soft_wrap();
         let mut entries: Vec<MenuEntry> = Vec::new();
         let mut actions: Vec<Option<MenuAction>> = Vec::new();
@@ -5310,9 +5311,9 @@ impl Workspace {
         if let Ok(line) = command.parse::<usize>() {
             let editor = self.active_editor().cloned().ok_or("No file is open")?;
             editor.update(cx, |e, cx| {
-                let row = line.saturating_sub(1).min(e.doc.line_count().saturating_sub(1));
-                let text = e.doc.line_text(row);
-                let offset = e.doc.line_start(row) + (text.len() - text.trim_start().len());
+                let row = line.saturating_sub(1).min(e.doc.read(cx).line_count().saturating_sub(1));
+                let text = e.doc.read(cx).line_text(row);
+                let offset = e.doc.read(cx).line_start(row) + (text.len() - text.trim_start().len());
                 e.go_to(offset, window, cx);
             });
             return Ok(());
@@ -5326,7 +5327,7 @@ impl Workspace {
             }
             "wa" | "wall" => {
                 for editor in self.tabs.clone() {
-                    if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
+                    if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                         editor.update(cx, |e, cx| e.save(cx)).ok();
                     }
                 }
@@ -5437,7 +5438,7 @@ impl Workspace {
             });
         }
         let dirty = self.tabs.iter().any(|t| {
-            let doc = &t.read(cx).doc;
+            let doc = t.read(cx).doc.read(cx);
             doc.is_dirty() && doc.path.as_deref().is_some_and(|p| trashes.iter().any(|t| p.starts_with(t)))
         });
         if !dirty {
@@ -5468,7 +5469,7 @@ impl Workspace {
                 Change::Trashed(trashed) => {
                     let path = &trashed.original;
                     for editor in self.tabs.clone() {
-                        if editor.read(cx).doc.path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                        if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(path)) {
                             self.remove_tab(&editor, window, cx);
                         }
                     }
@@ -5492,7 +5493,7 @@ impl Workspace {
     fn moved(&mut self, old: &Path, new: &Path, cx: &mut Context<Self>) {
         let remap = |p: &Path| p.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) });
         for editor in self.tabs.clone() {
-            let path = editor.read(cx).doc.path.clone();
+            let path = editor.read(cx).doc.read(cx).path.clone();
             if let Some((path, moved)) = path.as_deref().and_then(|p| Some((p, remap(p)?))) {
                 editor.update(cx, |e, cx| e.set_path(moved, cx));
                 self.lsp.update(cx, |s, cx| s.moved(path, &editor, cx));
@@ -5645,7 +5646,7 @@ impl Workspace {
 
     /// Shows the active file in the tree: opens its folders and scrolls to it.
     fn select_opened_file(&mut self, _: &SelectOpenedFile, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.path.clone()) else { return };
+        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone()) else { return };
         if !self.root.as_deref().is_some_and(|r| path.starts_with(r)) {
             return;
         }
@@ -5702,7 +5703,7 @@ impl Workspace {
     fn confirm_trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let dirty = self.tabs.iter().any(|t| {
-            let doc = &t.read(cx).doc;
+            let doc = t.read(cx).doc.read(cx);
             doc.is_dirty() && doc.path.as_deref().is_some_and(|p| p.starts_with(&path))
         });
         let mut detail = if path.is_dir() {
@@ -5732,7 +5733,7 @@ impl Workspace {
                     ws.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
                     window.focus(&ws.tree_focus);
                     for editor in ws.tabs.clone() {
-                        if editor.read(cx).doc.path.as_deref().is_some_and(|p| p.starts_with(&path)) {
+                        if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(&path)) {
                             ws.remove_tab(&editor, window, cx);
                         }
                     }
@@ -5945,7 +5946,7 @@ impl Workspace {
         };
         let full = matches!(capsule, Capsule::Full(_));
         let file = self.active_editor().map(|e| {
-            let doc = &e.read(cx).doc;
+            let doc = e.read(cx).doc.read(cx);
             (doc.path.clone(), doc.file_name(), doc.is_dirty())
         });
         // The folder only when there's room for it.
@@ -6293,7 +6294,7 @@ impl Workspace {
         let body: AnyElement = if self.sidebar_mode == SidebarMode::Commit {
             div().flex_1().min_h_0().child(cached(&self.git_panel)).into_any_element()
         } else if self.root.is_some() {
-            let active_path = self.active_editor().and_then(|e| e.read(cx).doc.path.clone());
+            let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
             let entries = self.entries.clone();
             let expanded = self.expanded.clone();
             let git_paths = self.git_paths.clone();
@@ -6644,14 +6645,14 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
-        let names: Vec<String> = pane.tabs.iter().map(|e| e.read(cx).doc.file_name()).collect();
+        let names: Vec<String> = pane.tabs.iter().map(|e| e.read(cx).doc.read(cx).file_name()).collect();
         let name_widths = measure_tab_names(&names, window, &theme);
         let naturals: Vec<f32> = pane
             .tabs
             .iter()
             .zip(&name_widths)
             .map(|(e, (w, _))| {
-                let errors = e.read(cx).doc.diagnostics.iter().any(|d| d.severity == Severity::Error);
+                let errors = e.read(cx).doc.read(cx).diagnostics.iter().any(|d| d.severity == Severity::Error);
                 (TAB_CHROME + w + if errors { TAB_ERROR_DOT } else { 0. }).ceil()
             })
             .collect();
@@ -6693,10 +6694,10 @@ impl Workspace {
                 let icon_only = matches!(slot, TabSlot::Icon(_));
                 let compact = matches!(slot, TabSlot::Compact(_));
                 let pinned = self.pinned.contains(&editor.entity_id());
-                let dirty = e.doc.is_dirty();
-                let errors = e.doc.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-                let icon = file_icon(e.doc.path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
-                let name = e.doc.file_name();
+                let dirty = e.doc.read(cx).is_dirty();
+                let errors = e.doc.read(cx).diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+                let icon = file_icon(e.doc.read(cx).path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
+                let name = e.doc.read(cx).file_name();
                 let shown_name = tab_label(&name, slot, naturals[ix], name_widths[ix]);
                 let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
                 let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
@@ -6821,7 +6822,7 @@ impl Workspace {
                         .hover(|s| s.text_color(theme.text))
                         .tooltip(move |_, cx| tooltip_view(format!("{count} more tab{}", plural(count)), cx))
                         .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
-                            let entries = hidden.iter().map(|e| MenuEntry::item(e.read(cx).doc.file_name(), Icon::File)).collect();
+                            let entries = hidden.iter().map(|e| MenuEntry::item(e.read(cx).doc.read(cx).file_name(), Icon::File)).collect();
                             let actions = hidden.iter().map(|e| Some(MenuAction::Tab(TabAction::Activate, e.clone()))).collect();
                             ws.show_context_menu(entries, actions, event.position(), None, window, cx);
                         }))
@@ -7076,7 +7077,7 @@ impl Workspace {
     /// Under the tabs: the file's folders and name, then the definitions
     /// around the caret; clicking one goes to it.
     fn render_breadcrumbs(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (path, symbols) = editor.update(cx, |e, cx| (e.doc.path.clone(), e.doc.image.is_none().then(|| e.breadcrumbs(cx))));
+        let (path, symbols) = editor.update(cx, |e, cx| (e.doc.read(cx).path.clone(), e.doc.read(cx).image.is_none().then(|| e.breadcrumbs(cx))));
         let path = path?;
         let theme = Theme::get(cx).clone();
         let inside = self.root.as_deref().is_some_and(|r| path.starts_with(r));
@@ -7675,7 +7676,7 @@ impl Workspace {
         let theme = Theme::get(cx).clone();
         let run_count = self.run_problems_shown(cx).len();
         let editor = self.active_editor().cloned();
-        let diag_count = editor.as_ref().map_or(0, |e| e.read(cx).doc.diagnostics.len());
+        let diag_count = editor.as_ref().map_or(0, |e| e.read(cx).doc.read(cx).diagnostics.len());
 
         let header = div()
             .flex()
@@ -7736,14 +7737,14 @@ impl Workspace {
                         let mut ix = ix;
                         if file_title {
                             if ix == 0 {
-                                let name = editor.as_ref().and_then(|e| e.read(cx).doc.path.as_deref().map(folder_name)).unwrap_or_default();
+                                let name = editor.as_ref().and_then(|e| e.read(cx).doc.read(cx).path.as_deref().map(folder_name)).unwrap_or_default();
                                 rows.push(problem_section("file-problems".into(), Icon::File, name, &theme).into_any_element());
                                 continue;
                             }
                             ix -= 1;
                         }
                         let diagnostic = editor.as_ref().and_then(|e| {
-                            let doc = &e.read(cx).doc;
+                            let doc = e.read(cx).doc.read(cx);
                             let d = doc.diagnostics.get(ix)?;
                             let row = doc.row_of(d.range.start);
                             let col = doc.slice(doc.line_start(row)..d.range.start).chars().count();
@@ -7869,7 +7870,7 @@ impl Workspace {
     /// The active file's language server: its name, what it's busy with, or
     /// what's wrong (click to copy the install command or to restart).
     fn render_lsp_status(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let path = self.active_editor()?.read(cx).doc.path.clone()?;
+        let path = self.active_editor()?.read(cx).doc.read(cx).path.clone()?;
         let status = self.lsp.read(cx).status(&path)?;
         let dim: Hsla = theme.text_dim.into();
         let (label, color, tip): (String, Hsla, Option<String>) = match &status {
@@ -7915,7 +7916,7 @@ impl Workspace {
                 .when_some(tip, |el, tip| el.tooltip(move |_, cx| tooltip_view(tip.clone(), cx)))
                 .on_click(cx.listener(move |ws, _, window, cx| match &status {
                     LspStatus::Missing { installer: Some(_), .. } => {
-                        if let Some(path) = ws.active_editor().and_then(|e| e.read(cx).doc.path.clone()) {
+                        if let Some(path) = ws.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone()) {
                             ws.lsp.update(cx, |s, cx| s.install_server(&path, cx));
                         }
                     }
@@ -7943,7 +7944,7 @@ impl Workspace {
         // The file's problems and the last Run's.
         let run_problems = self.run_problems_shown(cx);
         let count = |sev: Severity| {
-            editor.map_or(0, |e| e.doc.diagnostics.iter().filter(|d| d.severity == sev).count())
+            editor.map_or(0, |e| e.doc.read(cx).diagnostics.iter().filter(|d| d.severity == sev).count())
                 + run_problems.iter().filter(|p| p.severity == sev).count()
         };
         let (errors, warnings, infos) = (count(Severity::Error), count(Severity::Warning), count(Severity::Info));
@@ -7969,15 +7970,15 @@ impl Workspace {
 
         let mut right: Vec<AnyElement> = Vec::new();
         // An image tab has no caret, indentation or line endings.
-        if let Some(e) = editor.filter(|e| e.doc.image.is_none()) {
+        if let Some(e) = editor.filter(|e| e.doc.read(cx).image.is_none()) {
             if let Some(mode) = e.vim_status() {
                 right.push(
                     item(div().font_family(theme.mono_font.clone()).text_size(px(11.)).text_color(theme.text).child(mode).into_any_element())
                         .into_any_element(),
                 );
             }
-            let (line, col) = e.cursor_position();
-            let selected = e.selected_chars();
+            let (line, col) = e.cursor_position(cx);
+            let selected = e.selected_chars(cx);
             let cursors = e.selections().len();
             let mut pos = format!("Ln {line}, Col {col}");
             if cursors > 1 {
@@ -8033,7 +8034,7 @@ impl Workspace {
             };
             let tab = active_editor.clone();
             right.push(
-                menu_item("line-endings", if e.doc.uses_crlf { "CRLF".into() } else { "LF".into() }, "Line Endings")
+                menu_item("line-endings", if e.doc.read(cx).uses_crlf { "CRLF".into() } else { "LF".into() }, "Line Endings")
                     .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
                         if let Some(editor) = tab.clone() {
                             ws.open_line_endings_menu(editor, event.position(), window, cx);
@@ -8043,7 +8044,7 @@ impl Workspace {
             );
             let tab = active_editor.clone();
             right.push(
-                menu_item("encoding", e.doc.encoding.label(), "File Encoding")
+                menu_item("encoding", e.doc.read(cx).encoding.label(), "File Encoding")
                     .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
                         if let Some(editor) = tab.clone() {
                             ws.open_encoding_menu(editor, event.position(), window, cx);
@@ -8051,9 +8052,9 @@ impl Workspace {
                     }))
                     .into_any_element(),
             );
-            if e.doc.language == Language::Python
+            if e.doc.read(cx).language == Language::Python
                 && self.root.is_some()
-                && let Some(dir) = e.doc.path.as_deref().and_then(Path::parent)
+                && let Some(dir) = e.doc.read(cx).path.as_deref().and_then(Path::parent)
             {
                 let label = match self.shown_venv(dir) {
                     Some(venv) => crate::python::label(&venv, self.root.as_deref()),
@@ -8065,7 +8066,7 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
-            let (icon, color) = match e.doc.language {
+            let (icon, color) = match e.doc.read(cx).language {
                 Language::Html => (Icon::CodeXml, Hsla::from(theme.text_muted)),
                 Language::Markdown => (Icon::FileText, Hsla::from(theme.text_muted)),
                 Language::PlainText => (Icon::FileText, theme.text_dim.into()),
@@ -8078,7 +8079,7 @@ impl Workspace {
                         .items_center()
                         .gap_1()
                         .child(icon_el(icon, px(13.), color))
-                        .child(e.doc.language.name())
+                        .child(e.doc.read(cx).language.name())
                         .into_any_element(),
                 )
                 .into_any_element(),
@@ -8222,7 +8223,7 @@ impl Workspace {
     fn update_window_title(&mut self, window: &mut Window, cx: &App) {
         let mut title = match self.active_editor() {
             Some(e) => {
-                let doc = &e.read(cx).doc;
+                let doc = e.read(cx).doc.read(cx);
                 format!("{}{}", doc.file_name(), if doc.is_dirty() { " •" } else { "" })
             }
             None => "Kin".into(),

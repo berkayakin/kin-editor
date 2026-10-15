@@ -17,9 +17,9 @@ impl Editor {
     /// The file's symbols with their ranges, recomputed when the text changes.
     /// The outline to draw: the last one computed (see `Derived`).
     fn shown_outline(&mut self, cx: &mut Context<Self>) -> Arc<Vec<Symbol>> {
-        let (language, tree, rope) = (self.doc.language, self.doc.syntax().tree().cloned(), self.doc.rope().clone());
+        let (language, tree, rope) = (self.doc.read(cx).language, self.doc.read(cx).syntax().tree().cloned(), self.doc.read(cx).rope().clone());
         let job = move || tree.map(|tree| crate::syntax::symbols(language, &tree, &rope)).unwrap_or_default();
-        self.outline.schedule((self.doc.tree_version(), language), job, |e| &mut e.outline, cx);
+        self.outline.schedule((self.doc.read(cx).tree_version(), language), job, |e| &mut e.outline, cx);
         self.outline.last()
     }
 
@@ -43,8 +43,8 @@ impl Editor {
             let top = top_row + rows.len();
             let mut next: Vec<(usize, usize)> = outline
                 .iter()
-                .map(|s| (self.doc.row_of(s.offset), s))
-                .filter(|(row, s)| *row < top && self.doc.row_of(s.range.end) > top)
+                .map(|s| (self.doc.read(cx).row_of(s.offset), s))
+                .filter(|(row, s)| *row < top && self.doc.read(cx).row_of(s.range.end) > top)
                 .map(|(row, s)| (row, s.offset))
                 .collect();
             next.dedup_by_key(|(row, _)| *row);
@@ -93,10 +93,10 @@ impl Editor {
             frame.sticky_bgs.push(fill(row_bounds, theme.background));
             self.sticky_rows.push((row_bounds, offset));
 
-            let line_start = self.doc.line_start(row);
-            let text = self.doc.line_text(row);
+            let line_start = self.doc.read(cx).line_start(row);
+            let text = self.doc.read(cx).line_text(row);
             let dl = DisplayLine::new(&text, self.tab_size);
-            let highlights = self.doc.syntax().highlights(self.doc.rope(), line_start..line_start + text.len());
+            let highlights = self.doc.read(cx).syntax().highlights(self.doc.read(cx).rope(), line_start..line_start + text.len());
             // Highlighted like the line itself (without diagnostics).
             let mut runs = Vec::new();
             let mut at = 0;

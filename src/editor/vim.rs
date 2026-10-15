@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use gpui::{ClipboardItem, Context, Keystroke, Subscription, Window};
+use gpui::{App, ClipboardItem, Context, Keystroke, Subscription, Window};
 
 use super::{Backspace, Editor, EditorMode, Indent, JoinLines, Newline, NewlineAbove, NewlineBelow, Outdent, Redo, Selection, Undo};
 use crate::{document::EditKind, settings::Settings};
@@ -257,8 +257,8 @@ impl Editor {
         let Some(vim) = self.vim.as_ref() else { return };
         let sel = self.primary_selection();
         if vim.mode == VimMode::Normal && !sel.is_empty() {
-            let cursor = if sel.head > sel.anchor { self.prev(sel.head) } else { sel.head };
-            let anchor = if sel.anchor > sel.head { self.prev(sel.anchor) } else { sel.anchor };
+            let cursor = if sel.head > sel.anchor { self.prev(sel.head, cx) } else { sel.head };
+            let anchor = if sel.anchor > sel.head { self.prev(sel.anchor, cx) } else { sel.anchor };
             if let Some(vim) = self.vim.as_mut() {
                 vim.mode = VimMode::Visual;
                 vim.visual_anchor = anchor;
@@ -326,7 +326,7 @@ impl Editor {
             return;
         }
         if vim.pending.is_empty() && !vim.replaying {
-            vim.command_mark = self.doc.undo_mark();
+            vim.command_mark = self.doc.read(cx).undo_mark();
             vim.recording = Some(Vec::new());
         }
         if let Some(recording) = vim.recording.as_mut().filter(|_| !vim.replaying) {
@@ -392,7 +392,7 @@ impl Editor {
             Command::Motion(count, motion) => {
                 if visual {
                     let cursor = self.vim.as_ref().map_or(0, |v| v.visual_cursor);
-                    if let Some((to, _)) = self.vim_motion(cursor, &motion, count, false) {
+                    if let Some((to, _)) = self.vim_motion(cursor, &motion, count, false, cx) {
                         if let Some(vim) = self.vim.as_mut() {
                             vim.visual_cursor = to;
                         }
@@ -403,7 +403,7 @@ impl Editor {
                     let heads: Vec<usize> = self.selections.iter().map(|s| s.head).collect();
                     let mut selections = Vec::new();
                     for head in heads {
-                        let to = self.vim_motion(head, &motion, count, false).map_or(head, |(to, _)| to);
+                        let to = self.vim_motion(head, &motion, count, false, cx).map_or(head, |(to, _)| to);
                         selections.push(Selection::cursor(to));
                     }
                     let primary = self.primary;
@@ -421,19 +421,19 @@ impl Editor {
                     let head = sel.head;
                     let range = match &target {
                         Target::Lines => {
-                            let row = self.doc.row_of(head);
-                            let last = (row + count - 1).min(self.doc.line_count() - 1);
-                            Some((self.doc.line_start(row)..self.doc.line_start(last), Kind::Linewise))
+                            let row = self.doc.read(cx).row_of(head);
+                            let last = (row + count - 1).min(self.doc.read(cx).line_count() - 1);
+                            Some((self.doc.read(cx).line_start(row)..self.doc.read(cx).line_start(last), Kind::Linewise))
                         }
-                        Target::Object(around, object) => self.vim_object(head, *around == 'a', *object).map(|r| (r, Kind::Exclusive)),
+                        Target::Object(around, object) => self.vim_object(head, *around == 'a', *object, cx).map(|r| (r, Kind::Exclusive)),
                         Target::Motion(motion) => {
                             // `cw` changes to the end of the word (Vim's exception).
-                            let motion = if op == 'c' && (motion == "w" || motion == "W") && self.doc.char_at(head).is_some_and(|c| !c.is_whitespace()) {
+                            let motion = if op == 'c' && (motion == "w" || motion == "W") && self.doc.read(cx).char_at(head).is_some_and(|c| !c.is_whitespace()) {
                                 if motion == "w" { "e".to_string() } else { "E".to_string() }
                             } else {
                                 motion.clone()
                             };
-                            self.vim_motion(head, &motion, count, true).map(|(to, kind)| (head.min(to)..head.max(to), kind))
+                            self.vim_motion(head, &motion, count, true, cx).map(|(to, kind)| (head.min(to)..head.max(to), kind))
                         }
                     };
                     if let Some(range) = range {
@@ -462,14 +462,14 @@ impl Editor {
             .into_iter()
             .map(|(r, kind)| match kind {
                 Kind::Exclusive => (r, kind),
-                Kind::Inclusive => (r.start..self.next(r.end), kind),
+                Kind::Inclusive => (r.start..self.next(r.end, cx), kind),
                 Kind::Linewise => {
-                    let last = self.doc.row_of(r.end);
-                    (self.doc.line_start(self.doc.row_of(r.start))..self.doc.line_end(last), kind)
+                    let last = self.doc.read(cx).row_of(r.end);
+                    (self.doc.read(cx).line_start(self.doc.read(cx).row_of(r.start))..self.doc.read(cx).line_end(last), kind)
                 }
             })
             .collect();
-        let text: Vec<String> = spans.iter().map(|(r, _)| self.doc.slice(r.clone())).collect();
+        let text: Vec<String> = spans.iter().map(|(r, _)| self.doc.read(cx).slice(r.clone())).collect();
         let mut yanked = text.join("\n");
         if linewise {
             yanked.push('\n');
@@ -485,7 +485,7 @@ impl Editor {
                 self.vim_enter_normal(cx);
             }
             '>' | '<' => {
-                let selections: Vec<Selection> = spans.iter().map(|(r, _)| Selection { anchor: r.start, head: r.end.max(r.start + 1).min(self.doc.len()) }).collect();
+                let selections: Vec<Selection> = spans.iter().map(|(r, _)| Selection { anchor: r.start, head: r.end.max(r.start + 1).min(self.doc.read(cx).len()) }).collect();
                 self.set_selections(selections, 0, cx);
                 if op == '>' {
                     self.indent(&Indent, window, cx);
@@ -493,7 +493,7 @@ impl Editor {
                     self.outdent(&Outdent, window, cx);
                 }
                 let start = self.primary_selection().range().start;
-                self.set_selections(vec![Selection::cursor(self.first_non_blank(self.doc.row_of(start)))], 0, cx);
+                self.set_selections(vec![Selection::cursor(self.first_non_blank(self.doc.read(cx).row_of(start), cx))], 0, cx);
                 self.vim_enter_normal(cx);
             }
             'd' => {
@@ -504,7 +504,7 @@ impl Editor {
                             return (r.clone(), String::new());
                         }
                         // The line break goes too: after the lines, or before them at the end.
-                        if r.end < self.doc.len() {
+                        if r.end < self.doc.read(cx).len() {
                             (r.start..r.end + 1, String::new())
                         } else if r.start > 0 {
                             (r.start - 1..r.end, String::new())
@@ -517,8 +517,8 @@ impl Editor {
                 self.set_selections(cursors, 0, cx);
                 self.edit_and_remap(edits, EditKind::Other, cx);
                 if linewise {
-                    let row = self.doc.row_of(self.primary_selection().head);
-                    self.set_selections(vec![Selection::cursor(self.first_non_blank(row))], 0, cx);
+                    let row = self.doc.read(cx).row_of(self.primary_selection().head);
+                    self.set_selections(vec![Selection::cursor(self.first_non_blank(row, cx))], 0, cx);
                 }
                 self.vim_enter_normal(cx);
             }
@@ -526,7 +526,7 @@ impl Editor {
                 // Changing lines keeps the first one's indentation.
                 let edits: Vec<(Range<usize>, String)> = spans
                     .iter()
-                    .map(|(r, k)| if *k == Kind::Linewise { (self.first_non_blank(self.doc.row_of(r.start)).min(r.end)..r.end, String::new()) } else { (r.clone(), String::new()) })
+                    .map(|(r, k)| if *k == Kind::Linewise { (self.first_non_blank(self.doc.read(cx).row_of(r.start), cx).min(r.end)..r.end, String::new()) } else { (r.clone(), String::new()) })
                     .collect();
                 let cursors: Vec<Selection> = edits.iter().map(|(r, _)| Selection::cursor(r.start)).collect();
                 self.set_selections(cursors, 0, cx);
@@ -544,7 +544,7 @@ impl Editor {
             return self.vim_visual_command(count, key, window, cx);
         }
         let head = self.primary_selection().head;
-        let row = self.doc.row_of(head);
+        let row = self.doc.read(cx).row_of(head);
         match key {
             "x" => self.vim_run(Command::Operator { op: 'd', count, target: Target::Motion("l".into()) }, window, cx),
             "X" => self.vim_run(Command::Operator { op: 'd', count, target: Target::Motion("h".into()) }, window, cx),
@@ -558,16 +558,16 @@ impl Editor {
             }
             "p" | "P" => self.vim_paste(key == "P", count, cx),
             "~" => {
-                let end = (0..count).fold(head, |at, _| if at < self.doc.line_end(row) { self.next(at) } else { at });
-                let text: String = self.doc.slice(head..end).chars().map(|c| if c.is_uppercase() { c.to_lowercase().collect::<String>() } else { c.to_uppercase().collect() }).collect();
+                let end = (0..count).fold(head, |at, _| if at < self.doc.read(cx).line_end(row) { self.next(at, cx) } else { at });
+                let text: String = self.doc.read(cx).slice(head..end).chars().map(|c| if c.is_uppercase() { c.to_lowercase().collect::<String>() } else { c.to_uppercase().collect() }).collect();
                 self.edit_and_remap(vec![(head..end, text)], EditKind::Other, cx);
                 self.set_selections(vec![Selection::cursor(end)], 0, cx);
                 self.vim_clamp(cx);
             }
             "J" | "gJ" => {
-                let last = (row + count.max(2) - 1).min(self.doc.line_count() - 1);
+                let last = (row + count.max(2) - 1).min(self.doc.read(cx).line_count() - 1);
                 if last > row {
-                    self.set_selections(vec![Selection { anchor: self.doc.line_start(row), head: self.doc.line_start(last) }], 0, cx);
+                    self.set_selections(vec![Selection { anchor: self.doc.read(cx).line_start(row), head: self.doc.read(cx).line_start(last) }], 0, cx);
                     self.join_lines(&JoinLines, window, cx);
                     let at = self.primary_selection().range().start;
                     self.set_selections(vec![Selection::cursor(at)], 0, cx);
@@ -583,16 +583,16 @@ impl Editor {
             }
             "i" => self.vim_enter_insert(cx),
             "a" => {
-                let at = if head < self.doc.line_end(row) { self.next(head) } else { head };
+                let at = if head < self.doc.read(cx).line_end(row) { self.next(head, cx) } else { head };
                 self.set_selections(vec![Selection::cursor(at)], 0, cx);
                 self.vim_enter_insert(cx);
             }
             "I" => {
-                self.set_selections(vec![Selection::cursor(self.first_non_blank(row))], 0, cx);
+                self.set_selections(vec![Selection::cursor(self.first_non_blank(row, cx))], 0, cx);
                 self.vim_enter_insert(cx);
             }
             "A" => {
-                self.set_selections(vec![Selection::cursor(self.doc.line_end(row))], 0, cx);
+                self.set_selections(vec![Selection::cursor(self.doc.read(cx).line_end(row))], 0, cx);
                 self.vim_enter_insert(cx);
             }
             "o" => {
@@ -632,14 +632,14 @@ impl Editor {
                 let Some(c) = key[1..].chars().next() else { return false };
                 let mut end = head;
                 for _ in 0..count {
-                    if end >= self.doc.line_end(row) {
+                    if end >= self.doc.read(cx).line_end(row) {
                         return false;
                     }
-                    end = self.next(end);
+                    end = self.next(end, cx);
                 }
-                let replaced = c.to_string().repeat(self.doc.slice(head..end).chars().count());
+                let replaced = c.to_string().repeat(self.doc.read(cx).slice(head..end).chars().count());
                 self.edit_and_remap(vec![(head..end, replaced)], EditKind::Other, cx);
-                self.set_selections(vec![Selection::cursor(self.prev(end))], 0, cx);
+                self.set_selections(vec![Selection::cursor(self.prev(end, cx))], 0, cx);
             }
             _ => return false,
         }
@@ -651,8 +651,8 @@ impl Editor {
         let linewise = vim.mode == VimMode::VisualLine;
         let (anchor, cursor) = (vim.visual_anchor, vim.visual_cursor);
         let range = if linewise {
-            let (a, b) = (self.doc.row_of(anchor.min(cursor)), self.doc.row_of(anchor.max(cursor)));
-            (self.doc.line_start(a)..self.doc.line_start(b), Kind::Linewise)
+            let (a, b) = (self.doc.read(cx).row_of(anchor.min(cursor)), self.doc.read(cx).row_of(anchor.max(cursor)));
+            (self.doc.read(cx).line_start(a)..self.doc.read(cx).line_start(b), Kind::Linewise)
         } else {
             (anchor.min(cursor)..anchor.max(cursor), Kind::Inclusive)
         };
@@ -666,7 +666,7 @@ impl Editor {
             ">" | "<" => self.vim_operate(key.chars().next().unwrap_or('>'), vec![range], window, cx),
             "~" | "u" | "U" => {
                 let span = self.primary_selection().range();
-                let text = self.doc.slice(span.clone());
+                let text = self.doc.read(cx).slice(span.clone());
                 let new: String = match key {
                     "u" => text.to_lowercase(),
                     "U" => text.to_uppercase(),
@@ -709,8 +709,8 @@ impl Editor {
             _ if key.len() == 2 && (key.starts_with('i') || key.starts_with('a')) => {
                 let mut chars = key.chars();
                 let (around, object) = (chars.next() == Some('a'), chars.next().unwrap_or('w'));
-                if let Some(r) = self.vim_object(cursor, around, object).filter(|r| !r.is_empty()) {
-                    let last = self.prev(r.end);
+                if let Some(r) = self.vim_object(cursor, around, object, cx).filter(|r| !r.is_empty()) {
+                    let last = self.prev(r.end, cx);
                     if let Some(vim) = self.vim.as_mut() {
                         vim.visual_anchor = r.start;
                         vim.visual_cursor = last;
@@ -737,23 +737,23 @@ impl Editor {
             return;
         }
         let head = self.primary_selection().head;
-        let row = self.doc.row_of(head);
+        let row = self.doc.read(cx).row_of(head);
         let text = text.repeat(count.max(1));
         if linewise {
             let body = text.trim_end_matches('\n');
             let (at, insert) = if before {
-                (self.doc.line_start(row), format!("{body}\n"))
+                (self.doc.read(cx).line_start(row), format!("{body}\n"))
             } else {
-                (self.doc.line_end(row), format!("\n{body}"))
+                (self.doc.read(cx).line_end(row), format!("\n{body}"))
             };
             self.edit_and_remap(vec![(at..at, insert)], EditKind::Other, cx);
             let first = if before { row } else { row + 1 };
-            self.set_selections(vec![Selection::cursor(self.first_non_blank(first))], 0, cx);
+            self.set_selections(vec![Selection::cursor(self.first_non_blank(first, cx))], 0, cx);
         } else {
-            let at = if before || head >= self.doc.line_end(row) { head } else { self.next(head) };
+            let at = if before || head >= self.doc.read(cx).line_end(row) { head } else { self.next(head, cx) };
             self.set_selections(vec![Selection::cursor(at)], 0, cx);
             self.edit_and_remap(vec![(at..at, text.clone())], EditKind::Other, cx);
-            self.set_selections(vec![Selection::cursor(self.prev(at + text.len()))], 0, cx);
+            self.set_selections(vec![Selection::cursor(self.prev(at + text.len(), cx))], 0, cx);
         }
         self.vim_clamp(cx);
     }
@@ -789,7 +789,7 @@ impl Editor {
             "*" | "#" => {
                 // Selecting the word makes it the find bar's query.
                 let head = self.primary_selection().head;
-                let word = super::word_range(&self.doc, head);
+                let word = super::word_range(self.doc.read(cx), head);
                 self.set_selections(vec![Selection { anchor: word.start, head: word.end }], 0, cx);
                 window.dispatch_action(Box::new(Find), cx);
             }
@@ -804,7 +804,7 @@ impl Editor {
             return;
         }
         vim.replaying = true;
-        vim.command_mark = self.doc.undo_mark();
+        vim.command_mark = self.doc.read(cx).undo_mark();
         for key in keys {
             if self.vim_mode() == VimMode::Insert {
                 match key.as_str() {
@@ -840,7 +840,7 @@ impl Editor {
         let Some(vim) = self.vim.as_mut() else { return };
         vim.mode = VimMode::Normal;
         if let Some(mark) = vim.insert_mark.take() {
-            self.doc.merge_undo_since(mark);
+            self.doc.as_mut(cx).merge_undo_since(mark);
         }
         let Some(vim) = self.vim.as_mut() else { return };
         if !vim.replaying
@@ -854,8 +854,8 @@ impl Editor {
             .selections
             .iter()
             .map(|s| {
-                let start = self.doc.line_start(self.doc.row_of(s.head));
-                Selection::cursor(if s.head > start { self.prev(s.head) } else { s.head })
+                let start = self.doc.read(cx).line_start(self.doc.read(cx).row_of(s.head));
+                Selection::cursor(if s.head > start { self.prev(s.head, cx) } else { s.head })
             })
             .collect();
         self.set_selections(heads, self.primary, cx);
@@ -886,9 +886,9 @@ impl Editor {
             .selections
             .iter()
             .map(|s| {
-                let row = self.doc.row_of(s.head);
-                let (start, end) = (self.doc.line_start(row), self.doc.line_end(row));
-                Selection::cursor(if s.head >= end && end > start { self.prev(end) } else { s.head })
+                let row = self.doc.read(cx).row_of(s.head);
+                let (start, end) = (self.doc.read(cx).line_start(row), self.doc.read(cx).line_end(row));
+                Selection::cursor(if s.head >= end && end > start { self.prev(end, cx) } else { s.head })
             })
             .collect();
         if clamped != self.selections {
@@ -901,48 +901,48 @@ impl Editor {
         let Some(vim) = self.vim.as_ref() else { return };
         let (anchor, cursor) = (vim.visual_anchor, vim.visual_cursor);
         let sel = if vim.mode == VimMode::VisualLine {
-            let (a, b) = (self.doc.row_of(anchor), self.doc.row_of(cursor));
+            let (a, b) = (self.doc.read(cx).row_of(anchor), self.doc.read(cx).row_of(cursor));
             let (first, last) = (a.min(b), a.max(b));
-            let start = self.doc.line_start(first);
-            let end = if last + 1 < self.doc.line_count() { self.doc.line_start(last + 1) } else { self.doc.len() };
+            let start = self.doc.read(cx).line_start(first);
+            let end = if last + 1 < self.doc.read(cx).line_count() { self.doc.read(cx).line_start(last + 1) } else { self.doc.read(cx).len() };
             if b >= a { Selection { anchor: start, head: end } } else { Selection { anchor: end, head: start } }
         } else if cursor >= anchor {
-            Selection { anchor, head: self.next(cursor) }
+            Selection { anchor, head: self.next(cursor, cx) }
         } else {
-            Selection { anchor: self.next(anchor), head: cursor }
+            Selection { anchor: self.next(anchor, cx), head: cursor }
         };
         self.set_selections(vec![sel], 0, cx);
     }
 
     // ---- Motions and text objects -------------------------------------------------------
 
-    fn next(&self, at: usize) -> usize {
-        self.doc.char_at(at).map_or(at, |c| at + c.len_utf8())
+    fn next(&self, at: usize, cx: &App) -> usize {
+        self.doc.read(cx).char_at(at).map_or(at, |c| at + c.len_utf8())
     }
 
-    fn prev(&self, at: usize) -> usize {
-        self.doc.char_before(at).map_or(at, |c| at - c.len_utf8())
+    fn prev(&self, at: usize, cx: &App) -> usize {
+        self.doc.read(cx).char_before(at).map_or(at, |c| at - c.len_utf8())
     }
 
     /// The last line as Vim counts them: a file's final line break doesn't
     /// start another line.
-    fn vim_last_row(&self) -> usize {
-        let last = self.doc.line_count() - 1;
-        if last > 0 && self.doc.line_text(last).is_empty() { last - 1 } else { last }
+    fn vim_last_row(&self, cx: &App) -> usize {
+        let last = self.doc.read(cx).line_count() - 1;
+        if last > 0 && self.doc.read(cx).line_text(last).is_empty() { last - 1 } else { last }
     }
 
-    fn first_non_blank(&self, row: usize) -> usize {
-        let start = self.doc.line_start(row);
-        let text = self.doc.line_text(row);
+    fn first_non_blank(&self, row: usize, cx: &App) -> usize {
+        let start = self.doc.read(cx).line_start(row);
+        let text = self.doc.read(cx).line_text(row);
         start + (text.len() - text.trim_start().len())
     }
 
     /// Where a motion goes from `from`, and how an operator treats it.
     /// `for_op`: the target may be a line's end (deleting to it).
-    fn vim_motion(&mut self, from: usize, motion: &str, count: usize, for_op: bool) -> Option<(usize, Kind)> {
-        let row = self.doc.row_of(from);
-        let (line_start, line_end) = (self.doc.line_start(row), self.doc.line_end(row));
-        let last_row = self.vim_last_row();
+    fn vim_motion(&mut self, from: usize, motion: &str, count: usize, for_op: bool, cx: &App) -> Option<(usize, Kind)> {
+        let row = self.doc.read(cx).row_of(from);
+        let (line_start, line_end) = (self.doc.read(cx).line_start(row), self.doc.read(cx).line_end(row));
+        let last_row = self.vim_last_row(cx);
         let mut chars = motion.chars();
         let key = chars.next()?;
         let arg = chars.next();
@@ -951,7 +951,7 @@ impl Editor {
                 let mut at = from;
                 for _ in 0..count {
                     if at > line_start {
-                        at = self.prev(at);
+                        at = self.prev(at, cx);
                     }
                 }
                 (at, Kind::Exclusive)
@@ -960,12 +960,12 @@ impl Editor {
                 let mut at = from;
                 for _ in 0..count {
                     if at < line_end {
-                        at = self.next(at);
+                        at = self.next(at, cx);
                     }
                 }
                 // Normal mode stops on the last character.
                 if !for_op && at >= line_end && line_end > line_start {
-                    at = self.prev(line_end);
+                    at = self.prev(line_end, cx);
                 }
                 (at, Kind::Exclusive)
             }
@@ -976,37 +976,37 @@ impl Editor {
                     _ => row.saturating_sub(count),
                 };
                 let at = if key == 'j' || key == 'k' {
-                    let current = self.doc.slice(line_start..from).chars().count();
+                    let current = self.doc.read(cx).slice(line_start..from).chars().count();
                     let col = *self.vim.as_mut()?.want_col.get_or_insert(current);
-                    let text = self.doc.line_text(target);
+                    let text = self.doc.read(cx).line_text(target);
                     let max = text.chars().count().saturating_sub(1);
                     let byte = text.char_indices().nth(col.min(max)).map_or(0, |(i, _)| i);
-                    self.doc.line_start(target) + byte
+                    self.doc.read(cx).line_start(target) + byte
                 } else {
-                    self.first_non_blank(target)
+                    self.first_non_blank(target, cx)
                 };
                 (at, Kind::Linewise)
             }
             '0' => (line_start, Kind::Exclusive),
-            '^' => (self.first_non_blank(row), Kind::Exclusive),
+            '^' => (self.first_non_blank(row, cx), Kind::Exclusive),
             '$' => {
                 let target = (row + count - 1).min(last_row);
-                let (s, e) = (self.doc.line_start(target), self.doc.line_end(target));
-                (if e > s { self.prev(e) } else { s }, Kind::Inclusive)
+                let (s, e) = (self.doc.read(cx).line_start(target), self.doc.read(cx).line_end(target));
+                (if e > s { self.prev(e, cx) } else { s }, Kind::Inclusive)
             }
             'G' => {
                 let target = if count > 1 || motion.len() > 1 { count.saturating_sub(1).min(last_row) } else { last_row };
-                (self.first_non_blank(target), Kind::Linewise)
+                (self.first_non_blank(target, cx), Kind::Linewise)
             }
-            'g' if arg == Some('g') => (self.first_non_blank(count.saturating_sub(1).min(last_row)), Kind::Linewise),
+            'g' if arg == Some('g') => (self.first_non_blank(count.saturating_sub(1).min(last_row), cx), Kind::Linewise),
             'w' | 'W' => {
                 let big = key == 'W';
                 let mut at = from;
                 for _ in 0..count {
-                    at = self.word_forward(at, big);
+                    at = self.word_forward(at, big, cx);
                 }
                 // `dw` on a line's last word stops at its end.
-                if for_op && self.doc.row_of(at) > row {
+                if for_op && self.doc.read(cx).row_of(at) > row {
                     at = line_end.max(from);
                 }
                 (at, Kind::Exclusive)
@@ -1015,7 +1015,7 @@ impl Editor {
                 let big = key == 'E';
                 let mut at = from;
                 for _ in 0..count {
-                    at = self.word_end(at, big);
+                    at = self.word_end(at, big, cx);
                 }
                 (at, Kind::Inclusive)
             }
@@ -1023,7 +1023,7 @@ impl Editor {
                 let big = key == 'B';
                 let mut at = from;
                 for _ in 0..count {
-                    at = self.word_backward(at, big);
+                    at = self.word_backward(at, big, cx);
                 }
                 (at, Kind::Exclusive)
             }
@@ -1031,18 +1031,18 @@ impl Editor {
                 let mut r = row;
                 for _ in 0..count {
                     if key == '}' {
-                        r = (r + 1..=last_row).find(|&r| self.doc.line_text(r).trim().is_empty()).unwrap_or(last_row);
+                        r = (r + 1..=last_row).find(|&r| self.doc.read(cx).line_text(r).trim().is_empty()).unwrap_or(last_row);
                     } else {
-                        r = (0..r).rev().find(|&r| self.doc.line_text(r).trim().is_empty()).unwrap_or(0);
+                        r = (0..r).rev().find(|&r| self.doc.read(cx).line_text(r).trim().is_empty()).unwrap_or(0);
                     }
                 }
-                let at = if key == '}' && r == last_row && !self.doc.line_text(r).trim().is_empty() { self.doc.line_end(r) } else { self.doc.line_start(r) };
+                let at = if key == '}' && r == last_row && !self.doc.read(cx).line_text(r).trim().is_empty() { self.doc.read(cx).line_end(r) } else { self.doc.read(cx).line_start(r) };
                 (at, Kind::Exclusive)
             }
             '%' => {
-                let text = self.doc.slice(from..line_end);
+                let text = self.doc.read(cx).slice(from..line_end);
                 let offset = text.char_indices().find(|(_, c)| "()[]{}".contains(*c)).map(|(i, _)| from + i)?;
-                let (_, partner) = self.doc.syntax().matching_bracket(self.doc.rope(), offset).filter(|(at, _)| *at == offset).or_else(|| self.bracket_partner(offset).map(|p| (offset, p)))?;
+                let (_, partner) = self.doc.read(cx).syntax().matching_bracket(self.doc.read(cx).rope(), offset).filter(|(at, _)| *at == offset).or_else(|| self.bracket_partner(offset, cx).map(|p| (offset, p)))?;
                 (partner, Kind::Inclusive)
             }
             'f' | 'F' | 't' | 'T' | ';' | ',' => {
@@ -1063,7 +1063,7 @@ impl Editor {
                         (key, c)
                     }
                 };
-                let at = self.find_in_line(from, kind, target, count, matches!(key, ';' | ','))?;
+                let at = self.find_in_line(from, kind, target, count, matches!(key, ';' | ','), cx)?;
                 (at, if kind == 'f' || kind == 't' { Kind::Inclusive } else { Kind::Exclusive })
             }
             _ => return None,
@@ -1071,19 +1071,19 @@ impl Editor {
         Some(result)
     }
 
-    fn word_forward(&self, from: usize, big: bool) -> usize {
-        let len = self.doc.len();
+    fn word_forward(&self, from: usize, big: bool, cx: &App) -> usize {
+        let len = self.doc.read(cx).len();
         let mut at = from;
-        let Some(c) = self.doc.char_at(at) else { return at };
+        let Some(c) = self.doc.read(cx).char_at(at) else { return at };
         let start_class = class(c, big);
         if start_class != 0 {
-            while let Some(c) = self.doc.char_at(at).filter(|c| class(*c, big) == start_class && *c != '\n') {
+            while let Some(c) = self.doc.read(cx).char_at(at).filter(|c| class(*c, big) == start_class && *c != '\n') {
                 at += c.len_utf8();
             }
         }
         // Then past whitespace, stopping at an empty line.
-        while let Some(c) = self.doc.char_at(at).filter(|c| c.is_whitespace()) {
-            if c == '\n' && self.doc.char_at(at + 1) == Some('\n') && at + 1 > from {
+        while let Some(c) = self.doc.read(cx).char_at(at).filter(|c| c.is_whitespace()) {
+            if c == '\n' && self.doc.read(cx).char_at(at + 1) == Some('\n') && at + 1 > from {
                 return at + 1;
             }
             at += c.len_utf8();
@@ -1091,59 +1091,59 @@ impl Editor {
         at.min(len)
     }
 
-    fn word_end(&self, from: usize, big: bool) -> usize {
-        let mut at = self.next(from);
-        while let Some(c) = self.doc.char_at(at).filter(|c| c.is_whitespace()) {
+    fn word_end(&self, from: usize, big: bool, cx: &App) -> usize {
+        let mut at = self.next(from, cx);
+        while let Some(c) = self.doc.read(cx).char_at(at).filter(|c| c.is_whitespace()) {
             at += c.len_utf8();
         }
-        let Some(c) = self.doc.char_at(at) else { return from };
+        let Some(c) = self.doc.read(cx).char_at(at) else { return from };
         let cls = class(c, big);
-        while let Some(n) = self.doc.char_at(self.next(at)).filter(|n| class(*n, big) == cls) {
+        while let Some(n) = self.doc.read(cx).char_at(self.next(at, cx)).filter(|n| class(*n, big) == cls) {
             let _ = n;
-            at = self.next(at);
+            at = self.next(at, cx);
         }
         at
     }
 
-    fn word_backward(&self, from: usize, big: bool) -> usize {
-        let mut at = self.prev(from);
-        while at > 0 && self.doc.char_at(at).is_some_and(char::is_whitespace) {
-            at = self.prev(at);
+    fn word_backward(&self, from: usize, big: bool, cx: &App) -> usize {
+        let mut at = self.prev(from, cx);
+        while at > 0 && self.doc.read(cx).char_at(at).is_some_and(char::is_whitespace) {
+            at = self.prev(at, cx);
         }
-        let Some(c) = self.doc.char_at(at) else { return at };
+        let Some(c) = self.doc.read(cx).char_at(at) else { return at };
         let cls = class(c, big);
-        while let Some(p) = self.doc.char_before(at).filter(|p| class(*p, big) == cls && cls != 0) {
+        while let Some(p) = self.doc.read(cx).char_before(at).filter(|p| class(*p, big) == cls && cls != 0) {
             at -= p.len_utf8();
         }
         at
     }
 
-    fn find_in_line(&self, from: usize, kind: char, target: char, count: usize, repeat: bool) -> Option<usize> {
-        let row = self.doc.row_of(from);
-        let (start, end) = (self.doc.line_start(row), self.doc.line_end(row));
+    fn find_in_line(&self, from: usize, kind: char, target: char, count: usize, repeat: bool, cx: &App) -> Option<usize> {
+        let row = self.doc.read(cx).row_of(from);
+        let (start, end) = (self.doc.read(cx).line_start(row), self.doc.read(cx).line_end(row));
         let mut at = from;
         let mut found = 0;
         if kind == 'f' || kind == 't' {
             // `;` after `t` would find the same spot again; step past it.
-            let mut pos = if repeat && kind == 't' { self.next(at) } else { at };
+            let mut pos = if repeat && kind == 't' { self.next(at, cx) } else { at };
             while pos < end {
-                pos = self.next(pos);
-                if self.doc.char_at(pos) == Some(target) {
+                pos = self.next(pos, cx);
+                if self.doc.read(cx).char_at(pos) == Some(target) {
                     found += 1;
                     if found == count {
-                        at = if kind == 't' { self.prev(pos) } else { pos };
+                        at = if kind == 't' { self.prev(pos, cx) } else { pos };
                         return Some(at);
                     }
                 }
             }
         } else {
-            let mut pos = if repeat && kind == 'T' { self.prev(at) } else { at };
+            let mut pos = if repeat && kind == 'T' { self.prev(at, cx) } else { at };
             while pos > start {
-                pos = self.prev(pos);
-                if self.doc.char_at(pos) == Some(target) {
+                pos = self.prev(pos, cx);
+                if self.doc.read(cx).char_at(pos) == Some(target) {
                     found += 1;
                     if found == count {
-                        at = if kind == 'T' { self.next(pos) } else { pos };
+                        at = if kind == 'T' { self.next(pos, cx) } else { pos };
                         return Some(at);
                     }
                 }
@@ -1154,8 +1154,8 @@ impl Editor {
 
     /// The bracket matching the one at `at`, by counting (when the syntax
     /// tree has no answer).
-    fn bracket_partner(&self, at: usize) -> Option<usize> {
-        let c = self.doc.char_at(at)?;
+    fn bracket_partner(&self, at: usize, cx: &App) -> Option<usize> {
+        let c = self.doc.read(cx).char_at(at)?;
         let (open, close, forward) = match c {
             '(' => ('(', ')', true),
             '[' => ('[', ']', true),
@@ -1168,7 +1168,7 @@ impl Editor {
         let mut depth = 0i32;
         let mut pos = at;
         loop {
-            let ch = self.doc.char_at(pos)?;
+            let ch = self.doc.read(cx).char_at(pos)?;
             if ch == open {
                 depth += if forward { 1 } else { -1 };
             } else if ch == close {
@@ -1178,57 +1178,57 @@ impl Editor {
                 return Some(pos);
             }
             if forward {
-                pos = self.next(pos);
-                if pos >= self.doc.len() {
+                pos = self.next(pos, cx);
+                if pos >= self.doc.read(cx).len() {
                     return None;
                 }
             } else {
                 if pos == 0 {
                     return None;
                 }
-                pos = self.prev(pos);
+                pos = self.prev(pos, cx);
             }
         }
     }
 
     /// A text object around `at`: a word, a quoted string or a bracketed
     /// block, inner (`i`) or with its delimiters (`a`).
-    fn vim_object(&self, at: usize, around: bool, object: char) -> Option<Range<usize>> {
+    fn vim_object(&self, at: usize, around: bool, object: char, cx: &App) -> Option<Range<usize>> {
         match object {
             // A function or class: the language's textobjects.scm, else
             // the outline's definitions.
             'f' | 'c' => {
                 let name = if object == 'f' { "function" } else { "class" };
-                if let Some(range) = self.doc.syntax().text_object(self.doc.rope(), at, name, around) {
+                if let Some(range) = self.doc.read(cx).syntax().text_object(self.doc.read(cx).rope(), at, name, around) {
                     return Some(range);
                 }
                 let kinds: &[&str] = if object == 'f' { &["function", "method"] } else { &["class", "struct", "enum", "interface", "trait", "impl", "module", "type"] };
-                let symbol = self.doc.syntax().symbols(self.doc.rope()).into_iter().filter(|s| kinds.contains(&s.kind) && s.range.start <= at && at < s.range.end).min_by_key(|s| s.range.len())?;
+                let symbol = self.doc.read(cx).syntax().symbols(self.doc.read(cx).rope()).into_iter().filter(|s| kinds.contains(&s.kind) && s.range.start <= at && at < s.range.end).min_by_key(|s| s.range.len())?;
                 let range = symbol.range;
-                let (first, last) = (self.doc.row_of(range.start), self.doc.row_of(range.end.saturating_sub(1)));
+                let (first, last) = (self.doc.read(cx).row_of(range.start), self.doc.read(cx).row_of(range.end.saturating_sub(1)));
                 // Inside: the lines between its first and last.
-                Some(if around || last <= first + 1 { range } else { self.doc.line_start(first + 1)..self.doc.line_start(last) })
+                Some(if around || last <= first + 1 { range } else { self.doc.read(cx).line_start(first + 1)..self.doc.read(cx).line_start(last) })
             }
             'w' | 'W' => {
                 let big = object == 'W';
-                let cls = class(self.doc.char_at(at)?, big);
+                let cls = class(self.doc.read(cx).char_at(at)?, big);
                 let mut start = at;
-                while let Some(p) = self.doc.char_before(start).filter(|p| class(*p, big) == cls && *p != '\n') {
+                while let Some(p) = self.doc.read(cx).char_before(start).filter(|p| class(*p, big) == cls && *p != '\n') {
                     start -= p.len_utf8();
                 }
                 let mut end = at;
-                while let Some(c) = self.doc.char_at(end).filter(|c| class(*c, big) == cls && *c != '\n') {
+                while let Some(c) = self.doc.read(cx).char_at(end).filter(|c| class(*c, big) == cls && *c != '\n') {
                     end += c.len_utf8();
                 }
                 if around {
                     let mut after = end;
-                    while let Some(c) = self.doc.char_at(after).filter(|c| *c == ' ' || *c == '\t') {
+                    while let Some(c) = self.doc.read(cx).char_at(after).filter(|c| *c == ' ' || *c == '\t') {
                         after += c.len_utf8();
                     }
                     if after > end {
                         end = after;
                     } else {
-                        while let Some(p) = self.doc.char_before(start).filter(|p| *p == ' ' || *p == '\t') {
+                        while let Some(p) = self.doc.read(cx).char_before(start).filter(|p| *p == ' ' || *p == '\t') {
                             start -= p.len_utf8();
                         }
                     }
@@ -1236,9 +1236,9 @@ impl Editor {
                 Some(start..end)
             }
             '"' | '\'' | '`' => {
-                let row = self.doc.row_of(at);
-                let line_start = self.doc.line_start(row);
-                let text = self.doc.line_text(row);
+                let row = self.doc.read(cx).row_of(at);
+                let line_start = self.doc.read(cx).line_start(row);
+                let text = self.doc.read(cx).line_text(row);
                 let col = at - line_start;
                 let quotes: Vec<usize> = text.char_indices().filter(|(i, c)| *c == object && !text[..*i].ends_with('\\')).map(|(i, _)| i).collect();
                 let pair = quotes.chunks(2).filter(|p| p.len() == 2).find(|p| p[0] <= col && col <= p[1]).or_else(|| quotes.chunks(2).filter(|p| p.len() == 2).find(|p| p[0] > col))?;
@@ -1257,7 +1257,7 @@ impl Editor {
                 let mut depth = 0;
                 let mut pos = at;
                 let open_at = loop {
-                    match self.doc.char_at(pos) {
+                    match self.doc.read(cx).char_at(pos) {
                         Some(c) if c == open && depth == 0 => break pos,
                         Some(c) if c == open => depth -= 1,
                         Some(c) if c == close && pos != at => depth += 1,
@@ -1266,12 +1266,12 @@ impl Editor {
                     if pos == 0 {
                         return None;
                     }
-                    pos = self.prev(pos);
+                    pos = self.prev(pos, cx);
                 };
                 let mut depth = 0;
                 let mut pos = open_at;
                 let close_at = loop {
-                    match self.doc.char_at(pos)? {
+                    match self.doc.read(cx).char_at(pos)? {
                         c if c == open => depth += 1,
                         c if c == close => {
                             depth -= 1;
@@ -1281,7 +1281,7 @@ impl Editor {
                         }
                         _ => {}
                     }
-                    pos = self.next(pos);
+                    pos = self.next(pos, cx);
                 };
                 if around {
                     return Some(open_at..close_at + 1);
@@ -1289,11 +1289,11 @@ impl Editor {
                 // A block on its own lines: the lines between the brackets.
                 let mut start = open_at + 1;
                 let mut end = close_at;
-                if self.doc.char_at(start) == Some('\n') {
+                if self.doc.read(cx).char_at(start) == Some('\n') {
                     start += 1;
-                    let close_row = self.doc.row_of(close_at);
-                    if self.doc.slice(self.doc.line_start(close_row)..close_at).trim().is_empty() {
-                        end = self.doc.line_start(close_row);
+                    let close_row = self.doc.read(cx).row_of(close_at);
+                    if self.doc.read(cx).slice(self.doc.read(cx).line_start(close_row)..close_at).trim().is_empty() {
+                        end = self.doc.read(cx).line_start(close_row);
                     }
                 }
                 Some(start..end.max(start))

@@ -5,7 +5,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use gpui::{
+use gpui::{App, 
     AnyElement, Context, FontWeight, HighlightStyle, MouseButton, Pixels, Point, SharedString, StyledText, Task,
     WeakEntity, Window, div, font, prelude::*, px,
 };
@@ -134,7 +134,7 @@ impl Editor {
 
     /// The document's servers that are up, the main one first.
     pub(super) fn lsp_servers(&self, cx: &gpui::App) -> Vec<Arc<Server>> {
-        let (Some(path), Some(store)) = (self.doc.path.as_deref(), self.lsp.store.as_ref().and_then(|s| s.upgrade())) else {
+        let (Some(path), Some(store)) = (self.doc.read(cx).path.as_deref(), self.lsp.store.as_ref().and_then(|s| s.upgrade())) else {
             return Vec::new();
         };
         store.read(cx).servers_for(path)
@@ -154,9 +154,9 @@ impl Editor {
     /// popovers that no longer apply.
     pub(super) fn edited(&mut self, cx: &mut Context<Self>) {
         self.schedule_parse(cx);
-        if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.path.clone()) {
-            let changes = self.doc.take_lsp_changes();
-            store.read(cx).did_change(&path, self.doc.version(), changes, self.doc.rope());
+        if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.read(cx).path.clone()) {
+            let changes = self.doc.as_mut(cx).take_lsp_changes();
+            store.read(cx).did_change(&path, self.doc.read(cx).version(), changes, self.doc.read(cx).rope());
         }
         self.lsp.hover = None;
         self.lsp.hover_task = None;
@@ -165,8 +165,8 @@ impl Editor {
     }
 
     pub(super) fn lsp_did_save(&self, cx: &gpui::App) {
-        if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.path.as_deref()) {
-            store.read(cx).did_save(path, self.doc.rope());
+        if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.read(cx).path.as_deref()) {
+            store.read(cx).did_save(path, self.doc.read(cx).rope());
         }
     }
 
@@ -176,12 +176,12 @@ impl Editor {
         self.lsp.raw_diagnostics.clear();
         for source in sources {
             let name = diagnostic_source(&source.server);
-            diagnostics.extend(protocol::diagnostics(&source.params, self.doc.rope(), source.encoding, name));
+            diagnostics.extend(protocol::diagnostics(&source.params, self.doc.read(cx).rope(), source.encoding, name));
             let raw = source.params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
             self.lsp.raw_diagnostics.push((source.id, raw));
         }
         diagnostics.sort_by_key(|d| d.range.start);
-        self.doc.set_lsp_diagnostics(diagnostics);
+        self.doc.as_mut(cx).set_lsp_diagnostics(diagnostics);
         // The server has (re)analysed the file: its hints may have changed too.
         self.schedule_inlay_hints(cx);
         if !self.lsp.active {
@@ -193,14 +193,14 @@ impl Editor {
         cx.notify();
     }
 
-    fn text_document(&self) -> Option<Value> {
-        Some(json!({ "uri": path_to_uri(self.doc.path.as_deref()?) }))
+    fn text_document(&self, cx: &App) -> Option<Value> {
+        Some(json!({ "uri": path_to_uri(self.doc.read(cx).path.as_deref()?) }))
     }
 
-    fn position_params(&self, offset: usize, server: &Server) -> Option<Value> {
+    fn position_params(&self, offset: usize, server: &Server, cx: &App) -> Option<Value> {
         Some(json!({
-            "textDocument": self.text_document()?,
-            "position": offset_to_position(self.doc.rope(), offset, server.encoding).to_json(),
+            "textDocument": self.text_document(cx)?,
+            "position": offset_to_position(self.doc.read(cx).rope(), offset, server.encoding).to_json(),
         }))
     }
 
@@ -219,7 +219,7 @@ impl Editor {
             .iter()
             .filter(|s| s.capability("completionProvider"))
             .flat_map(|s| s.completion_triggers())
-            .find(|t| head >= t.len() && self.doc.slice(head - t.len()..head) == *t);
+            .find(|t| head >= t.len() && self.doc.read(cx).slice(head - t.len()..head) == *t);
         if servers.iter().any(|s| s.capability("completionProvider")) {
             match (&self.lsp.completion, trigger) {
                 (_, Some(trigger)) => self.request_completion(Some(trigger), cx),
@@ -246,14 +246,14 @@ impl Editor {
     /// triggers) and shows their items together.
     fn request_completion(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let start = self.word_start(head);
+        let start = self.word_start(head, cx);
         let requests: Vec<(Arc<Server>, Value)> = self
             .lsp_servers(cx)
             .into_iter()
             .filter(|s| s.capability("completionProvider"))
             .filter(|s| trigger.as_ref().is_none_or(|t| s.completion_triggers().contains(t)))
             .filter_map(|server| {
-                let mut params = self.position_params(head, &server)?;
+                let mut params = self.position_params(head, &server, cx)?;
                 params["context"] = match &trigger {
                     Some(t) => json!({ "triggerKind": 2, "triggerCharacter": t }),
                     None => json!({ "triggerKind": 1 }),
@@ -279,7 +279,7 @@ impl Editor {
                 items.extend(found);
             }
             this.update(cx, |e, cx| {
-                let snippets = super::snippet::user_snippet_items(e.doc.language);
+                let snippets = super::snippet::user_snippet_items(e.doc.read(cx).language);
                 sources.extend(std::iter::repeat_n(0, snippets.len()));
                 items.extend(snippets);
                 e.lsp.completion = Some(CompletionMenu {
@@ -299,9 +299,9 @@ impl Editor {
     }
 
     /// Start of the identifier the caret is in or after.
-    fn word_start(&self, offset: usize) -> usize {
+    fn word_start(&self, offset: usize, cx: &App) -> usize {
         let mut start = offset;
-        while let Some(c) = self.doc.char_before(start) {
+        while let Some(c) = self.doc.read(cx).char_before(start) {
             if !is_word_char(c) {
                 break;
             }
@@ -317,14 +317,14 @@ impl Editor {
         let head = self.selections.get(self.primary).map_or(0, |s| s.head);
         let valid = self.selections.len() == 1
             && head >= menu.start
-            && self.doc.row_of(head) == self.doc.row_of(menu.start)
-            && self.doc.slice(menu.start..head).chars().all(is_word_char);
+            && self.doc.read(cx).row_of(head) == self.doc.read(cx).row_of(menu.start)
+            && self.doc.read(cx).slice(menu.start..head).chars().all(is_word_char);
         if !valid {
             self.lsp.completion = None;
             cx.notify();
             return;
         }
-        let prefix = self.doc.slice(menu.start..head);
+        let prefix = self.doc.read(cx).slice(menu.start..head);
         if prefix.is_empty() {
             let mut order: Vec<usize> = (0..menu.items.len()).collect();
             order.sort_by(|&a, &b| menu.items[a].sort_text.cmp(&menu.items[b].sort_text));
@@ -400,16 +400,16 @@ impl Editor {
     /// the rest of the word after the caret (as in JetBrains).
     fn apply_completion(&mut self, item: &CompletionItem, start: usize, encoding: Encoding, replace: bool, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let rope = self.doc.rope().clone();
+        let rope = self.doc.read(cx).rope().clone();
         let from = item.edit.as_ref().map(|e| position_to_offset(&rope, e.range.start, encoding)).unwrap_or(start).min(head);
         let mut to = head;
         if replace {
-            while let Some(c) = self.doc.char_at(to).filter(|c| is_word_char(*c)) {
+            while let Some(c) = self.doc.read(cx).char_at(to).filter(|c| is_word_char(*c)) {
                 to += c.len_utf8();
             }
         }
         let (text, stops) = match item.is_snippet {
-            true => protocol::expand_snippet(&self.indented_snippet(item.raw_text(), from)),
+            true => protocol::expand_snippet(&self.indented_snippet(item.raw_text(), from, cx)),
             false => (item.raw_text().to_string(), Vec::new()),
         };
         let mut edits = vec![(from..to, text.clone())];
@@ -441,8 +441,8 @@ impl Editor {
     fn request_signature_help(&mut self, cx: &mut Context<Self>) {
         let Some(server) = self.lsp_server_with("signatureHelpProvider", cx) else { return };
         let head = self.primary_selection().head;
-        let row = self.doc.row_of(head);
-        let Some(params) = self.position_params(head, &server) else { return };
+        let row = self.doc.read(cx).row_of(head);
+        let Some(params) = self.position_params(head, &server, cx) else { return };
         self.lsp.signature_task = Some(cx.spawn(async move |this, cx| {
             let result = server.request("textDocument/signatureHelp", params).await;
             this.update(cx, |e, cx| {
@@ -463,7 +463,7 @@ impl Editor {
             self.refilter_completion(cx);
         }
         let head = self.selections.get(self.primary).map_or(0, |s| s.head);
-        if self.lsp.signature.as_ref().is_some_and(|s| s.row != self.doc.row_of(head)) {
+        if self.lsp.signature.as_ref().is_some_and(|s| s.row != self.doc.read(cx).row_of(head)) {
             self.lsp.signature = None;
             self.lsp.signature_task = None;
         }
@@ -495,8 +495,8 @@ impl Editor {
             return;
         }
         let offset = self.offset_for_position(position, window, cx);
-        let range = super::word_range(&self.doc, offset);
-        let range = if range.is_empty() { offset..self.doc.next_char_boundary(offset) } else { range };
+        let range = super::word_range(self.doc.read(cx), offset);
+        let range = if range.is_empty() { offset..self.doc.read(cx).next_char_boundary(offset) } else { range };
         if self.lsp.hover.as_ref().is_some_and(|h| h.range == range) {
             // Back on the word: keep its popover.
             self.lsp.hover_hide = None;
@@ -545,7 +545,7 @@ impl Editor {
 
     pub(super) fn quick_documentation(&mut self, _: &super::QuickDocumentation, window: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let range = super::word_range(&self.doc, head);
+        let range = super::word_range(self.doc.read(cx), head);
         self.show_hover(range, window, cx);
     }
 
@@ -554,6 +554,7 @@ impl Editor {
         let Some(anchor) = self.local_position(range.start, window, cx) else { return };
         let diagnostics: Vec<(Severity, String)> = self
             .doc
+            .read(cx)
             .diagnostics
             .iter()
             .filter(|d| d.range.start <= range.end && d.range.end >= range.start)
@@ -564,7 +565,7 @@ impl Editor {
             cx.notify();
         }
         let server = self.lsp_server_with("hoverProvider", cx);
-        let params = server.as_ref().and_then(|s| self.position_params(range.start, s));
+        let params = server.as_ref().and_then(|s| self.position_params(range.start, s, cx));
         let (Some(server), Some(params)) = (server, params) else {
             self.lsp.hover_pending = None;
             return;
@@ -590,7 +591,7 @@ impl Editor {
         self.sync_wrap(window, cx);
         let layout = self.layout.clone()?;
         let x = self.x_for_offset(offset, window, cx);
-        let drow = self.display_row_of(offset);
+        let drow = self.display_row_of(offset, cx);
         Some(gpui::point(
             layout.text_left - layout.bounds.left() + x - self.scroll.x,
             layout.line_height * drow as f32 - self.scroll.y,
@@ -602,10 +603,10 @@ impl Editor {
     /// Asks for the file's inlay hints once typing pauses (they follow edits
     /// in the meantime).
     pub(super) fn schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
-        if self.mode != EditorMode::Full || self.doc.large || !self.file_settings.inlay_hints {
+        if self.mode != EditorMode::Full || self.doc.read(cx).large || !self.file_settings.inlay_hints {
             self.lsp.inlay_task = None;
-            if !self.doc.inlay_hints().is_empty() {
-                self.doc.set_inlay_hints(Vec::new());
+            if !self.doc.read(cx).inlay_hints().is_empty() {
+                self.doc.as_mut(cx).set_inlay_hints(Vec::new());
                 cx.notify();
             }
             return;
@@ -614,23 +615,23 @@ impl Editor {
             cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
             let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
                 let server = e.lsp_server_with("inlayHintProvider", cx)?;
-                let rope = e.doc.rope();
+                let rope = e.doc.read(cx).rope();
                 let end = offset_to_position(rope, rope.len_bytes(), server.encoding);
                 let params = json!({
-                    "textDocument": e.text_document()?,
+                    "textDocument": e.text_document(cx)?,
                     "range": { "start": { "line": 0, "character": 0 }, "end": end.to_json() },
                 });
-                Some((server, params, e.doc.version()))
+                Some((server, params, e.doc.read(cx).version()))
             }) else {
                 return;
             };
             let result = server.request("textDocument/inlayHint", params).await;
             this.update(cx, |e, cx| {
                 // Edited meanwhile: the next request answers for the new text.
-                if e.doc.version() != version {
+                if e.doc.read(cx).version() != version {
                     return;
                 }
-                let rope = e.doc.rope();
+                let rope = e.doc.read(cx).rope();
                 let hints = result
                     .ok()
                     .and_then(|v| v.as_array().cloned())
@@ -654,7 +655,7 @@ impl Editor {
                     })
                     .filter(|h| !h.label.is_empty())
                     .collect();
-                e.doc.set_inlay_hints(hints);
+                e.doc.as_mut(cx).set_inlay_hints(hints);
                 cx.notify();
             })
             .ok();
@@ -671,24 +672,24 @@ impl Editor {
         let head = self.primary_selection().head;
         // Leaving the highlighted symbol drops them now rather than after the request.
         let (version, ranges) = &self.lsp.symbol_highlights;
-        if *version != self.doc.version() || !ranges.iter().any(|r| r.start <= head && head <= r.end) {
+        if *version != self.doc.read(cx).version() || !ranges.iter().any(|r| r.start <= head && head <= r.end) {
             self.lsp.symbol_highlights.1.clear();
         }
         self.lsp.symbol_highlight_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
             let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
                 let server = e.lsp_server_with("documentHighlightProvider", cx)?;
-                let params = e.position_params(e.primary_selection().head, &server)?;
-                Some((server, params, e.doc.version()))
+                let params = e.position_params(e.primary_selection().head, &server, cx)?;
+                Some((server, params, e.doc.read(cx).version()))
             }) else {
                 return;
             };
             let result = server.request("textDocument/documentHighlight", params).await;
             this.update(cx, |e, cx| {
-                if e.doc.version() != version {
+                if e.doc.read(cx).version() != version {
                     return;
                 }
-                let rope = e.doc.rope();
+                let rope = e.doc.read(cx).rope();
                 let mut ranges: Vec<std::ops::Range<usize>> = result
                     .ok()
                     .and_then(|v| v.as_array().cloned())
@@ -710,9 +711,9 @@ impl Editor {
     }
 
     /// The highlights that still match the text.
-    pub(super) fn current_symbol_highlights(&self) -> &[std::ops::Range<usize>] {
+    pub(super) fn current_symbol_highlights(&self, cx: &App) -> &[std::ops::Range<usize>] {
         let (version, ranges) = &self.lsp.symbol_highlights;
-        if *version == self.doc.version() { ranges } else { &[] }
+        if *version == self.doc.read(cx).version() { ranges } else { &[] }
     }
 
     // ---- Navigation, rename and code actions ------------------------------------------------
@@ -729,7 +730,7 @@ impl Editor {
 
     pub(super) fn go_to_implementation(&mut self, _: &super::GoToImplementation, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let name = self.doc.slice(super::word_range(&self.doc, head));
+        let name = self.doc.read(cx).slice(super::word_range(self.doc.read(cx), head));
         let title = format!("Implementations of {name}");
         self.locations_request("textDocument/implementation", head, &title, "No implementations found", Value::Null, cx);
     }
@@ -741,7 +742,7 @@ impl Editor {
 
     pub(super) fn find_usages(&mut self, _: &super::FindUsages, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let name = self.doc.slice(super::word_range(&self.doc, head));
+        let name = self.doc.read(cx).slice(super::word_range(self.doc.read(cx), head));
         let context = json!({ "includeDeclaration": true });
         self.locations_request("textDocument/references", head, &format!("Usages of {name}"), "No usages found", context, cx);
     }
@@ -761,7 +762,7 @@ impl Editor {
             cx.emit(EditorLspEvent::Message("No language server for this file".into()));
             return;
         };
-        let Some(mut params) = self.position_params(offset, &server) else { return };
+        let Some(mut params) = self.position_params(offset, &server, cx) else { return };
         if !context.is_null() {
             params["context"] = context;
         }
@@ -790,10 +791,10 @@ impl Editor {
             return;
         };
         let head = self.primary_selection().head;
-        let word = super::word_range(&self.doc, head);
-        let (Some(path), false) = (self.doc.path.clone(), word.is_empty()) else { return };
-        let position = offset_to_position(self.doc.rope(), word.start, server.encoding);
-        let current = self.doc.slice(word);
+        let word = super::word_range(self.doc.read(cx), head);
+        let (Some(path), false) = (self.doc.read(cx).path.clone(), word.is_empty()) else { return };
+        let position = offset_to_position(self.doc.read(cx).rope(), word.start, server.encoding);
+        let current = self.doc.read(cx).slice(word);
         cx.emit(EditorLspEvent::Rename { server, path, position, current });
     }
 
@@ -804,8 +805,8 @@ impl Editor {
             return;
         }
         let range = self.primary_selection().range();
-        let rope = self.doc.rope().clone();
-        let Some(document) = self.text_document() else { return };
+        let rope = self.doc.read(cx).rope().clone();
+        let Some(document) = self.text_document(cx) else { return };
         // Each server is asked for fixes for its own problems under the caret.
         let requests: Vec<(Arc<Server>, Value)> = servers
             .into_iter()
@@ -1094,16 +1095,16 @@ mod tests {
 
         // Both get the text; their diagnostics are shown together, each
         // server's kept apart for code actions.
-        let from_servers = |e: &Editor| e.doc.diagnostics.iter().filter(|d| d.message.ends_with(" problem")).count();
+        let from_servers = |e: &Editor, cx: &gpui::App| e.doc.read(cx).diagnostics.iter().filter(|d| d.message.ends_with(" problem")).count();
         wait_for(cx, "diagnostics", |cx| {
-            let found = editor.read_with(cx, |e, _| from_servers(e));
+            let found = editor.read_with(cx, |e, cx| from_servers(e, cx));
             if found < 2 {
                 eprintln!("status: {:?}, diagnostics: {found}", store.read_with(cx, |s, _| s.status(&path)));
             }
             found == 2
         });
-        editor.read_with(cx, |e, _| {
-            let mut messages: Vec<&str> = e.doc.diagnostics.iter().map(|d| &*d.message).filter(|m| m.ends_with(" problem")).collect();
+        editor.read_with(cx, |e, cx| {
+            let mut messages: Vec<&str> = e.doc.read(cx).diagnostics.iter().map(|d| &*d.message).filter(|m| m.ends_with(" problem")).collect();
             messages.sort();
             assert_eq!(messages, ["extra problem", "main problem"]);
             let ids: Vec<&str> = e.lsp.raw_diagnostics.iter().map(|(id, raw)| (id.as_str(), raw.len())).map(|(id, _)| id).collect();
@@ -1200,7 +1201,7 @@ mod tests {
         store.update(cx, |s, cx| s.register(&editor, cx));
         // The server echoes its initialization options and the setting it asked for.
         wait_for(cx, "diagnostics", |cx| {
-            editor.read_with(cx, |e, _| e.doc.diagnostics.iter().any(|d| &*d.message == "configured problem hello strict"))
+            editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().any(|d| &*d.message == "configured problem hello strict"))
         });
         store.update(cx, |s, _| s.shutdown_all());
         let _ = std::fs::remove_dir_all(&dir);

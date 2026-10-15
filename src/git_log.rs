@@ -227,7 +227,7 @@ impl GitLog {
     }
 
     fn apply_filter(&mut self, cx: &mut Context<Self>) {
-        let needle = self.filter.read(cx).text().trim().to_lowercase();
+        let needle = self.filter.read(cx).text(cx).trim().to_lowercase();
         let visible: Vec<usize> = self
             .entries
             .iter()

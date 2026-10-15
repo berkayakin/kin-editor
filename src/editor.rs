@@ -225,7 +225,7 @@ struct LayoutSnapshot {
 }
 
 pub struct Editor {
-    pub doc: Document,
+    pub doc: Entity<Document>,
     mode: EditorMode,
     placeholder: SharedString,
     search_matches: Vec<Range<usize>>,
@@ -324,7 +324,7 @@ impl Editor {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
         let mut this = Self::blank(doc, cx);
         this.apply_settings(cx);
-        this.detect_external_linter();
+        this.detect_external_linter(cx);
         this.schedule_lint(Duration::ZERO, cx);
         this.run_external_linter(cx);
         this.schedule_parse(cx);
@@ -336,7 +336,7 @@ impl Editor {
     fn blank(doc: Document, cx: &mut Context<Self>) -> Self {
         let file_settings = Settings::get(cx).for_file(doc.language, doc.path.as_deref());
         Self {
-            doc,
+            doc: cx.new(|_| doc),
             mode: EditorMode::Full,
             placeholder: SharedString::default(),
             search_matches: Vec::new(),
@@ -410,7 +410,7 @@ impl Editor {
         if self.parse_task.is_some() {
             return;
         }
-        let Some((version, job)) = self.doc.parse_job() else { return };
+        let Some((version, job)) = self.doc.read(cx).parse_job() else { return };
         self.parse_task = Some(cx.spawn(async move |this, cx| {
             let syntax = cx.background_executor().spawn(async move { job() }).await;
             this.update(cx, |editor, cx| {
@@ -418,7 +418,7 @@ impl Editor {
                 if let Some(task) = editor.parse_task.take() {
                     task.detach();
                 }
-                if editor.doc.finish_parse(version, syntax) {
+                if editor.doc.as_mut(cx).finish_parse(version, syntax) {
                     editor.schedule_parse(cx);
                 }
                 cx.notify();
@@ -459,29 +459,29 @@ impl Editor {
         }
     }
 
-    pub fn text(&self) -> String {
-        self.doc.rope().to_string()
+    pub fn text(&self, cx: &App) -> String {
+        self.doc.read(cx).rope().to_string()
     }
 
     /// Replaces the whole text (as one undoable edit) and selects it.
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = if self.is_single_line() { text.replace('\n', " ") } else { text.to_string() };
         let before = self.selections.clone();
-        let len = self.doc.len();
-        self.doc.edit(vec![(0..len, text)], &before, EditKind::Other);
-        let len = self.doc.len();
+        let len = self.doc.read(cx).len();
+        self.doc.as_mut(cx).edit(vec![(0..len, text)], &before, EditKind::Other);
+        let len = self.doc.read(cx).len();
         self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
         self.after_edit(cx);
     }
 
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
-        let len = self.doc.len();
+        let len = self.doc.read(cx).len();
         self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
     }
 
     /// Selects a range and scrolls it to the middle of the view if needed.
     pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        let (s, e) = (self.doc.clip(range.start), self.doc.clip(range.end));
+        let (s, e) = (self.doc.read(cx).clip(range.start), self.doc.read(cx).clip(range.end));
         self.set_selections(vec![Selection { anchor: s, head: e }], 0, cx);
         self.reveal_primary = true;
     }
@@ -501,8 +501,8 @@ impl Editor {
 
     /// The project's ESLint, which runs its JavaScript config: only in a
     /// trusted project.
-    pub fn detect_external_linter(&mut self) {
-        self.external = match (&self.doc.path, self.doc.language) {
+    pub fn detect_external_linter(&mut self, cx: &App) {
+        self.external = match (&self.doc.read(cx).path, self.doc.read(cx).language) {
             (Some(path), _) if !crate::trust::is_trusted(path) => None,
             (
                 Some(path),
@@ -521,11 +521,11 @@ impl Editor {
     }
 
     fn run_external_linter(&mut self, cx: &mut Context<Self>) {
-        let (Some(linter), Some(path)) = (self.external.clone(), self.doc.path.clone()) else {
+        let (Some(linter), Some(path)) = (self.external.clone(), self.doc.read(cx).path.clone()) else {
             return;
         };
-        let rope = self.doc.rope().clone();
-        let version = self.doc.version();
+        let rope = self.doc.read(cx).rope().clone();
+        let version = self.doc.read(cx).version();
         self.external_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -536,13 +536,13 @@ impl Editor {
                 match result {
                     Ok(diagnostics) => {
                         editor.external_error = None;
-                        if editor.doc.version() == version {
-                            editor.doc.set_external_diagnostics(diagnostics);
+                        if editor.doc.read(cx).version() == version {
+                            editor.doc.as_mut(cx).set_external_diagnostics(diagnostics);
                         }
                     }
                     Err(err) => {
                         editor.external_error = Some(err);
-                        editor.doc.set_external_diagnostics(Vec::new());
+                        editor.doc.as_mut(cx).set_external_diagnostics(Vec::new());
                     }
                 }
                 // Built-in rules fill in whenever the external linter isn't working.
@@ -565,19 +565,19 @@ impl Editor {
     }
 
     /// 1-based (line, column) of the primary cursor, column in characters.
-    pub fn cursor_position(&self) -> (usize, usize) {
+    pub fn cursor_position(&self, cx: &App) -> (usize, usize) {
         let head = self.primary_selection().head;
-        let row = self.doc.row_of(head);
-        let start = self.doc.line_start(row);
-        let col = self.doc.slice(start..head).chars().count();
+        let row = self.doc.read(cx).row_of(head);
+        let start = self.doc.read(cx).line_start(row);
+        let col = self.doc.read(cx).slice(start..head).chars().count();
         (row + 1, col + 1)
     }
 
-    pub fn selected_chars(&self) -> usize {
+    pub fn selected_chars(&self, cx: &App) -> usize {
         self.selections
             .iter()
             .map(|s| {
-                let r = self.doc.rope();
+                let r = self.doc.read(cx).rope();
                 r.byte_to_char(s.range().end) - r.byte_to_char(s.range().start)
             })
             .sum()
@@ -593,7 +593,7 @@ impl Editor {
 
     /// Moves the cursor to a byte offset and scrolls it into view.
     pub fn go_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.doc.clip(offset);
+        let offset = self.doc.read(cx).clip(offset);
         self.set_selections(vec![Selection::cursor(offset)], 0, cx);
         self.center_on_next_frame = true;
         window.focus(&self.focus_handle);
@@ -621,8 +621,8 @@ impl Editor {
             }
             return;
         };
-        let rope = self.doc.rope().clone();
-        let version = self.doc.version();
+        let rope = self.doc.read(cx).rope().clone();
+        let version = self.doc.read(cx).version();
         let index = self.index_base.clone();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
@@ -643,7 +643,7 @@ impl Editor {
                 })
                 .await;
             this.update(cx, |editor, cx| {
-                if editor.doc.version() == version {
+                if editor.doc.read(cx).version() == version {
                     editor.hunks = Arc::new(hunks);
                     editor.hunk_staged = Arc::new(staged);
                     if editor.open_hunk.is_some_and(|i| i >= editor.hunks.len()) {
@@ -660,23 +660,24 @@ impl Editor {
     /// (e.g. after a checkout, pull or discard).
     pub fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
         // An unloaded tab reads the file as it is when it's shown.
-        if self.doc.is_dirty() || !self.is_loaded() {
+        if self.doc.read(cx).is_dirty() || !self.is_loaded() {
             return;
         }
-        if let Ok(true) = self.doc.reload_from_disk() {
+        let reloaded = self.doc.as_mut(cx).reload_from_disk();
+        if let Ok(true) = reloaded {
             self.after_reload(cx);
         }
     }
 
     /// Reads the file again as `encoding`; unsaved edits are dropped.
     pub fn reload_with_encoding(&mut self, encoding: crate::encoding::TextEncoding, cx: &mut Context<Self>) -> std::io::Result<()> {
-        self.doc.reload_with_encoding(encoding)?;
+        self.doc.as_mut(cx).reload_with_encoding(encoding)?;
         self.after_reload(cx);
         Ok(())
     }
 
     fn after_reload(&mut self, cx: &mut Context<Self>) {
-        let selections = self.clamp_selections(self.selections.clone());
+        let selections = self.clamp_selections(self.selections.clone(), cx);
         self.set_selections(selections, 0, cx);
         self.autoscroll = false;
         self.linted_version = None;
@@ -693,7 +694,7 @@ impl Editor {
         if !self.is_loaded() {
             return;
         }
-        let fs = Settings::get(cx).for_file(self.doc.language, self.doc.path.as_deref());
+        let fs = Settings::get(cx).for_file(self.doc.read(cx).language, self.doc.read(cx).path.as_deref());
         // Settings reloads come for every editor; most files resolve the same.
         self.sync_vim(cx);
         if self.applied_settings.as_ref() == Some(&fs) {
@@ -704,10 +705,10 @@ impl Editor {
         self.tab_size = fs.tab_size;
         let configured = if fs.hard_tabs { "\t".to_string() } else { " ".repeat(fs.tab_size) };
         // A file's own indentation wins over settings, but not over .editorconfig.
-        self.indent_unit = if fs.indent_is_explicit { configured } else { detect_indent(&self.doc).unwrap_or(configured) };
+        self.indent_unit = if fs.indent_is_explicit { configured } else { detect_indent(self.doc.read(cx)).unwrap_or(configured) };
         if self.mode == EditorMode::Full {
             // Wrapping a huge file means measuring every line.
-            self.soft_wrap = fs.soft_wrap && !self.doc.large;
+            self.soft_wrap = fs.soft_wrap && !self.doc.read(cx).large;
         }
         self.wrap = None;
         self.schedule_inlay_hints(cx);
@@ -722,25 +723,25 @@ impl Editor {
             return;
         }
         let FileSettings { trim_trailing_whitespace, insert_final_newline, .. } = self.file_settings;
-        let caret_rows: Vec<usize> = self.selections.iter().map(|s| self.doc.row_of(s.head)).collect();
+        let caret_rows: Vec<usize> = self.selections.iter().map(|s| self.doc.read(cx).row_of(s.head)).collect();
         let mut edits = Vec::new();
         if trim_trailing_whitespace {
-            for row in 0..self.doc.line_count() {
+            for row in 0..self.doc.read(cx).line_count() {
                 if caret_rows.contains(&row) {
                     continue;
                 }
-                let text = self.doc.line_text(row);
+                let text = self.doc.read(cx).line_text(row);
                 let kept = text.trim_end_matches([' ', '\t']).len();
                 if kept < text.len() {
-                    let start = self.doc.line_start(row);
+                    let start = self.doc.read(cx).line_start(row);
                     edits.push((start + kept..start + text.len(), String::new()));
                 }
             }
         }
-        let len = self.doc.len();
+        let len = self.doc.read(cx).len();
         if insert_final_newline
             && len > 0
-            && self.doc.rope().byte(len - 1) != b'\n'
+            && self.doc.read(cx).rope().byte(len - 1) != b'\n'
             && !self.selections.iter().any(|s| s.head == len)
         {
             edits.push((len..len, "\n".to_string()));
@@ -754,9 +755,9 @@ impl Editor {
         // A restored tab saved before it was shown (Save All).
         self.load(cx)?;
         self.apply_save_actions(cx);
-        self.doc.save()?;
+        self.doc.as_mut(cx).save()?;
         self.lsp_did_save(cx);
-        self.doc.finalize_transaction();
+        self.doc.as_mut(cx).finalize_transaction();
         self.schedule_lint(Duration::ZERO, cx);
         self.run_external_linter(cx);
         cx.notify();
@@ -766,12 +767,12 @@ impl Editor {
     /// Extensions changed: the file may have a language now, or a grammar
     /// for it. True when it was parsed again.
     pub fn refresh_language(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(path) = self.doc.path.clone().filter(|_| self.is_loaded()) else { return false };
+        let Some(path) = self.doc.read(cx).path.clone().filter(|_| self.is_loaded()) else { return false };
         let language = crate::syntax::Language::from_path(&path);
-        if language == self.doc.language && language.extension().is_none() {
+        if language == self.doc.read(cx).language && language.extension().is_none() {
             return false;
         }
-        self.doc.set_language(language);
+        self.doc.as_mut(cx).set_language(language);
         self.highlight_cache = None;
         self.apply_settings(cx);
         self.linted_version = None;
@@ -785,7 +786,7 @@ impl Editor {
         if !self.is_loaded() {
             return;
         }
-        self.detect_external_linter();
+        self.detect_external_linter(cx);
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
     }
@@ -793,12 +794,12 @@ impl Editor {
     pub fn set_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         // The language and settings come with the text.
         if !self.is_loaded() {
-            self.doc.path = Some(path);
+            self.doc.as_mut(cx).path = Some(path);
             return;
         }
-        self.doc.set_path(path);
+        self.doc.as_mut(cx).set_path(path);
         self.apply_settings(cx);
-        self.detect_external_linter();
+        self.detect_external_linter(cx);
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
     }
@@ -840,7 +841,7 @@ impl Editor {
         self.cursor_visible = true;
         self.blink_epoch += 1;
         self.blink_task = None;
-        self.unfold_at_carets();
+        self.unfold_at_carets(cx);
         self.schedule_symbol_highlights(cx);
         self.lsp_selection_changed(cx);
         cx.notify();
@@ -850,13 +851,13 @@ impl Editor {
         &mut self,
         extend: bool,
         cx: &mut Context<Self>,
-        mut f: impl FnMut(&Self, &Selection) -> usize,
+        mut f: impl FnMut(&Self, &Selection, &App) -> usize,
     ) {
         let selections = self
             .selections
             .iter()
             .map(|s| {
-                let head = f(self, s);
+                let head = f(self, s, cx);
                 if extend {
                     Selection { anchor: s.anchor, head }
                 } else {
@@ -883,11 +884,11 @@ impl Editor {
         let mut edits = Vec::with_capacity(before.len());
         let mut placements = Vec::with_capacity(before.len());
         for sel in &before {
-            let (range, text, cursor) = f(&self.doc, sel);
+            let (range, text, cursor) = f(self.doc.read(cx), sel);
             placements.push(cursor);
             edits.push((range, text));
         }
-        let new_ranges = self.doc.edit(edits, &before, kind);
+        let new_ranges = self.doc.as_mut(cx).edit(edits, &before, kind);
         let selections = new_ranges
             .into_iter()
             .zip(placements)
@@ -933,14 +934,14 @@ impl Editor {
             .iter()
             .map(|s| Selection { anchor: map(s.anchor, &edits), head: map(s.head, &edits) })
             .collect();
-        self.doc.edit(edits, &before, kind);
+        self.doc.as_mut(cx).edit(edits, &before, kind);
         self.goal_x = None;
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
     }
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
-        self.doc.set_selections_after(&self.selections);
+        self.doc.as_mut(cx).set_selections_after(&self.selections);
         self.schedule_inlay_hints(cx);
         self.schedule_lint(Duration::from_millis(150), cx);
         self.schedule_diff(Duration::from_millis(120), cx);
@@ -991,18 +992,18 @@ impl Editor {
     }
 
     fn schedule_lint(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if !self.doc.language.is_lintable() {
-            self.doc.set_builtin_diagnostics(Vec::new());
+        if !self.doc.read(cx).language.is_lintable() {
+            self.doc.as_mut(cx).set_builtin_diagnostics(Vec::new());
             return;
         }
         let syntax_only = self.external.is_some() && self.external_error.is_none();
-        let version = self.doc.version();
+        let version = self.doc.read(cx).version();
         if self.linted_version == Some(version) {
             return;
         }
-        let rope = self.doc.rope().clone();
-        let language = self.doc.language;
-        let path = self.doc.path.clone();
+        let rope = self.doc.read(cx).rope().clone();
+        let language = self.doc.read(cx).language;
+        let path = self.doc.read(cx).path.clone();
         self.lint_task = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
@@ -1012,13 +1013,13 @@ impl Editor {
                 .spawn(async move { lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only) })
                 .await;
             this.update(cx, |editor, cx| {
-                if editor.doc.version() == version {
+                if editor.doc.read(cx).version() == version {
                     let mut diagnostics = diagnostics;
                     // The language server reports syntax errors itself.
                     if editor.lsp.active {
                         diagnostics.retain(|d| d.rule != "syntax");
                     }
-                    editor.doc.set_builtin_diagnostics(diagnostics);
+                    editor.doc.as_mut(cx).set_builtin_diagnostics(diagnostics);
                     editor.linted_version = Some(version);
                     cx.notify();
                 }
@@ -1081,13 +1082,13 @@ impl Editor {
 
     /// `row` as displayed: tabs expanded, inlay hints in place. Wrapped lines
     /// get no hints (the wrap map is measured without them).
-    fn display_line(&self, row: usize) -> DisplayLine {
-        let text = self.doc.line_text(row);
-        let hints = self.doc.inlay_hints();
+    fn display_line(&self, row: usize, cx: &App) -> DisplayLine {
+        let text = self.doc.read(cx).line_text(row);
+        let hints = self.doc.read(cx).inlay_hints();
         if !self.file_settings.inlay_hints || hints.is_empty() || !self.line_breaks(row).is_empty() {
             return DisplayLine::new(&text, self.tab_size);
         }
-        let start = self.doc.line_start(row);
+        let start = self.doc.read(cx).line_start(row);
         let end = start + text.len();
         let first = hints.partition_point(|h| h.offset < start);
         let inlays: Vec<(usize, &str, bool, bool)> = hints[first..]
@@ -1101,7 +1102,7 @@ impl Editor {
     /// Shapes the part of `row` shown on display segment `seg`.
     fn shape_segment(&self, row: usize, seg: usize, window: &mut Window, cx: &App) -> RowShape {
         let theme = Theme::get(cx);
-        let dl = self.display_line(row);
+        let dl = self.display_line(row, cx);
         let breaks = self.line_breaks(row);
         let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.text.len());
         let last = seg >= breaks.len();
@@ -1128,22 +1129,22 @@ impl Editor {
 
     /// The x of `offset` within its display row (wrap indent included).
     fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
-        let row = self.doc.row_of(offset);
-        let col = self.display_line(row).to_display(offset - self.doc.line_start(row));
+        let row = self.doc.read(cx).row_of(offset);
+        let col = self.display_line(row, cx).to_display(offset - self.doc.read(cx).line_start(row));
         let seg = wrap::segment_of(self.line_breaks(row), col);
         let shape = self.shape_segment(row, seg, window, cx);
         shape.indent + shape.line.x_for_index(col - shape.range.start)
     }
 
     fn offset_for_display_row_x(&self, drow: usize, x: Pixels, window: &mut Window, cx: &App) -> usize {
-        let (row, seg) = self.line_of_display_row(drow);
+        let (row, seg) = self.line_of_display_row(drow, cx);
         let shape = self.shape_segment(row, seg, window, cx);
         let mut col = shape.range.start + shape.line.closest_index_for_x((x - shape.indent).max(px(0.)));
         // The end of a wrapped row is the start of the next one; stay on this row.
         if !shape.last && col >= shape.range.end && shape.range.end > shape.range.start {
             col = shape.dl.text[..shape.range.end].char_indices().last().map_or(col, |(i, _)| i);
         }
-        self.doc.line_start(row) + shape.dl.to_buffer(col)
+        self.doc.read(cx).line_start(row) + shape.dl.to_buffer(col)
     }
 
     fn offset_for_position(&self, position: Point<Pixels>, window: &mut Window, cx: &App) -> usize {
@@ -1155,19 +1156,19 @@ impl Editor {
             return 0;
         }
         let drow = (y / layout.line_height).floor() as usize;
-        if drow >= self.display_row_count() {
-            return self.doc.len();
+        if drow >= self.display_row_count(cx) {
+            return self.doc.read(cx).len();
         }
         let x = position.x - layout.text_left + self.scroll.x;
         self.offset_for_display_row_x(drow, x.max(px(0.)), window, cx)
     }
 
     fn vertical_target(&self, sel: &Selection, rows: isize, goal: Pixels, window: &mut Window, cx: &App) -> usize {
-        let drow = self.display_row_of(sel.head) as isize + rows;
+        let drow = self.display_row_of(sel.head, cx) as isize + rows;
         if drow < 0 {
             0
-        } else if drow as usize >= self.display_row_count() {
-            self.doc.len()
+        } else if drow as usize >= self.display_row_count(cx) {
+            self.doc.read(cx).len()
         } else {
             self.offset_for_display_row_x(drow as usize, goal, window, cx)
         }
@@ -1176,7 +1177,7 @@ impl Editor {
     // ---- Soft wrap -------------------------------------------------------------
 
     fn toggle_markdown_preview(&mut self, _: &ToggleMarkdownPreview, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == EditorMode::Full && self.doc.language == crate::syntax::Language::Markdown {
+        if self.mode == EditorMode::Full && self.doc.read(cx).language == crate::syntax::Language::Markdown {
             self.md_preview = !self.md_preview;
             cx.notify();
         }
@@ -1184,10 +1185,10 @@ impl Editor {
 
     /// The preview beside a Markdown file, parsed again when the text changes.
     fn render_markdown_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let path = self.doc.path.clone();
-        let rope = self.doc.rope().clone();
+        let path = self.doc.read(cx).path.clone();
+        let rope = self.doc.read(cx).rope().clone();
         let job = move || crate::markdown_preview::parse(&rope.to_string(), path.as_deref().and_then(std::path::Path::parent));
-        self.md_blocks.schedule((self.doc.version(), self.doc.path.clone()), job, |e| &mut e.md_blocks, cx);
+        self.md_blocks.schedule((self.doc.read(cx).version(), self.doc.read(cx).path.clone()), job, |e| &mut e.md_blocks, cx);
         let blocks = self.md_blocks.last();
         let theme = Theme::get(cx).clone();
         let zoom = self.md_zoom;
@@ -1295,7 +1296,7 @@ impl Editor {
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
         let wrap = self.soft_wrap && !self.is_single_line();
         // Without wrapping, folds or long lines, display rows are buffer lines.
-        if !wrap && self.doc.folds().is_empty() && !self.doc.has_long_lines() {
+        if !wrap && self.doc.read(cx).folds().is_empty() && !self.doc.read(cx).has_long_lines() {
             self.wrap = None;
             return;
         }
@@ -1308,11 +1309,11 @@ impl Editor {
             tab_size: self.tab_size,
             wrap,
         };
-        let (char_width, version, folds, rope) = (layout.char_width, self.doc.version(), self.doc.folds(), self.doc.rope());
+        let (char_width, version, folds, rope) = (layout.char_width, self.doc.read(cx).version(), self.doc.read(cx).folds(), self.doc.read(cx).rope());
         // Edits re-measure only their lines; a new width, font or tab size
         // measures them all.
         if let Some(map) = self.wrap.as_mut().filter(|map| map.key == key) {
-            let edits = self.doc.line_edits_since(map.version);
+            let edits = self.doc.read(cx).line_edits_since(map.version);
             let caught_up = match edits {
                 Some(edits) => map.update(edits, version, folds, rope, window.text_system(), font.clone(), char_width),
                 None => false,
@@ -1327,17 +1328,17 @@ impl Editor {
     /// Both brackets of the pairs around carets (a few, so many cursors stay
     /// cheap). Cached: in a big array or object finding a partner is a walk,
     /// and a caret blink draws again.
-    fn bracket_pairs(&mut self) -> Arc<Vec<Range<usize>>> {
+    fn bracket_pairs(&mut self, cx: &App) -> Arc<Vec<Range<usize>>> {
         let heads: Vec<usize> = self.selections.iter().filter(|s| s.is_empty()).take(8).map(|s| s.head).collect();
-        let key = (self.doc.tree_version(), heads);
+        let key = (self.doc.read(cx).tree_version(), heads);
         if let Some((k, pairs)) = &self.bracket_cache
             && *k == key
         {
             return pairs.clone();
         }
-        let syntax = self.doc.syntax();
+        let syntax = self.doc.read(cx).syntax();
         let pairs: Arc<Vec<_>> =
-            Arc::new(key.1.iter().filter_map(|&head| syntax.bracket_pair(self.doc.rope(), head)).flat_map(|(a, b)| [a, b]).collect());
+            Arc::new(key.1.iter().filter_map(|&head| syntax.bracket_pair(self.doc.read(cx).rope(), head)).flat_map(|(a, b)| [a, b]).collect());
         self.bracket_cache = Some((key, pairs.clone()));
         pairs
     }
@@ -1345,37 +1346,37 @@ impl Editor {
     /// Highlights for display rows `first_drow..last_drow` (buffer lines
     /// `first_row..last_row`): folded lines and a long line's rows off
     /// screen are left out. Cached, since a caret blink draws again.
-    fn visible_highlights(&mut self, first_drow: usize, last_drow: usize, first_row: usize, last_row: usize) -> Arc<Vec<(Range<usize>, crate::syntax::Highlight)>> {
+    fn visible_highlights(&mut self, first_drow: usize, last_drow: usize, first_row: usize, last_row: usize, cx: &App) -> Arc<Vec<(Range<usize>, crate::syntax::Highlight)>> {
         let mut ranges: Vec<Range<usize>> = Vec::new();
         for row in (first_row..last_row).filter(|&row| !self.row_hidden(row)) {
-            let (start, end) = (self.doc.line_start(row), self.doc.line_end(row));
+            let (start, end) = (self.doc.read(cx).line_start(row), self.doc.read(cx).line_end(row));
             match ranges.last_mut() {
                 Some(r) if r.end + 1 >= start => r.end = end,
                 _ => ranges.push(start..end),
             }
         }
-        let (row, seg) = self.line_of_display_row(first_drow);
+        let (row, seg) = self.line_of_display_row(first_drow, cx);
         if let (Some(r), Some(b)) = (ranges.first_mut(), seg.checked_sub(1).and_then(|s| self.line_breaks(row).get(s))) {
-            r.start = (self.doc.line_start(row) + b.byte as usize).min(r.end);
+            r.start = (self.doc.read(cx).line_start(row) + b.byte as usize).min(r.end);
         }
-        let (row, seg) = self.line_of_display_row(last_drow.saturating_sub(1));
+        let (row, seg) = self.line_of_display_row(last_drow.saturating_sub(1), cx);
         if let (Some(r), Some(b)) = (ranges.last_mut(), self.line_breaks(row).get(seg)) {
-            r.end = (self.doc.line_start(row) + b.byte as usize).max(r.start);
+            r.end = (self.doc.read(cx).line_start(row) + b.byte as usize).max(r.start);
         }
-        let key = (self.doc.tree_version(), self.doc.language, ranges);
+        let key = (self.doc.read(cx).tree_version(), self.doc.read(cx).language, ranges);
         if let Some((k, highlights)) = &self.highlight_cache
             && *k == key
         {
             return highlights.clone();
         }
-        let syntax = self.doc.syntax();
-        let highlights: Arc<Vec<_>> = Arc::new(key.2.iter().flat_map(|r| syntax.highlights(self.doc.rope(), r.clone())).collect());
+        let syntax = self.doc.read(cx).syntax();
+        let highlights: Arc<Vec<_>> = Arc::new(key.2.iter().flat_map(|r| syntax.highlights(self.doc.read(cx).rope(), r.clone())).collect());
         self.highlight_cache = Some((key, highlights.clone()));
         highlights
     }
 
-    fn display_row_count(&self) -> usize {
-        self.wrap.as_ref().map_or(self.doc.line_count(), WrapMap::row_count)
+    fn display_row_count(&self, cx: &App) -> usize {
+        self.wrap.as_ref().map_or(self.doc.read(cx).line_count(), WrapMap::row_count)
     }
 
     fn first_display_row(&self, row: usize) -> usize {
@@ -1383,10 +1384,10 @@ impl Editor {
     }
 
     /// The buffer line and its wrap segment on display row `drow`.
-    fn line_of_display_row(&self, drow: usize) -> (usize, usize) {
+    fn line_of_display_row(&self, drow: usize, cx: &App) -> (usize, usize) {
         match &self.wrap {
             Some(w) => w.line_of(drow),
-            None => (drow.min(self.doc.line_count().saturating_sub(1)), 0),
+            None => (drow.min(self.doc.read(cx).line_count().saturating_sub(1)), 0),
         }
     }
 
@@ -1395,13 +1396,13 @@ impl Editor {
     }
 
     /// The display row showing `offset` (on a wrap break, the later row).
-    fn display_row_of(&self, offset: usize) -> usize {
-        let row = self.doc.row_of(offset);
+    fn display_row_of(&self, offset: usize, cx: &App) -> usize {
+        let row = self.doc.read(cx).row_of(offset);
         let breaks = self.line_breaks(row);
         if breaks.is_empty() {
             return self.first_display_row(row);
         }
-        let col = DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - self.doc.line_start(row));
+        let col = DisplayLine::new(&self.doc.read(cx).line_text(row), self.tab_size).to_display(offset - self.doc.read(cx).line_start(row));
         self.first_display_row(row) + wrap::segment_of(breaks, col)
     }
 
@@ -1443,23 +1444,23 @@ impl Editor {
     // ---- Actions -------------------------------------------------------------
 
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| {
-            if s.is_empty() { this.doc.prev_char_boundary(s.head) } else { s.range().start }
+        self.move_selections(false, cx, |this, s, cx| {
+            if s.is_empty() { this.doc.read(cx).prev_char_boundary(s.head) } else { s.range().start }
         });
     }
 
     fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| {
-            if s.is_empty() { this.doc.next_char_boundary(s.head) } else { s.range().end }
+        self.move_selections(false, cx, |this, s, cx| {
+            if s.is_empty() { this.doc.read(cx).next_char_boundary(s.head) } else { s.range().end }
         });
     }
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| this.doc.prev_char_boundary(s.head));
+        self.move_selections(true, cx, |this, s, cx| this.doc.read(cx).prev_char_boundary(s.head));
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| this.doc.next_char_boundary(s.head));
+        self.move_selections(true, cx, |this, s, cx| this.doc.read(cx).next_char_boundary(s.head));
     }
 
     fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -1517,43 +1518,43 @@ impl Editor {
     }
 
     fn move_word_left(&mut self, _: &MoveWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| word_left(&this.doc, s.head));
+        self.move_selections(false, cx, |this, s, cx| word_left(this.doc.read(cx), s.head));
     }
 
     fn move_word_right(&mut self, _: &MoveWordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| word_right(&this.doc, s.head));
+        self.move_selections(false, cx, |this, s, cx| word_right(this.doc.read(cx), s.head));
     }
 
     fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| word_left(&this.doc, s.head));
+        self.move_selections(true, cx, |this, s, cx| word_left(this.doc.read(cx), s.head));
     }
 
     fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| word_right(&this.doc, s.head));
+        self.move_selections(true, cx, |this, s, cx| word_right(this.doc.read(cx), s.head));
     }
 
-    fn smart_home(&self, offset: usize) -> usize {
-        let row = self.doc.row_of(offset);
-        let start = self.doc.line_start(row);
-        let text = self.doc.line_text(row);
+    fn smart_home(&self, offset: usize, cx: &App) -> usize {
+        let row = self.doc.read(cx).row_of(offset);
+        let start = self.doc.read(cx).line_start(row);
+        let text = self.doc.read(cx).line_text(row);
         let indent = text.len() - text.trim_start().len();
         if offset == start + indent { start } else { start + indent }
     }
 
     fn move_line_start(&mut self, _: &MoveLineStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| this.smart_home(s.head));
+        self.move_selections(false, cx, |this, s, cx| this.smart_home(s.head, cx));
     }
 
     fn move_line_end(&mut self, _: &MoveLineEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(false, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+        self.move_selections(false, cx, |this, s, cx| this.doc.read(cx).line_end(this.doc.read(cx).row_of(s.head)));
     }
 
     fn select_line_start(&mut self, _: &SelectLineStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| this.smart_home(s.head));
+        self.move_selections(true, cx, |this, s, cx| this.smart_home(s.head, cx));
     }
 
     fn select_line_end(&mut self, _: &SelectLineEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_selections(true, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+        self.move_selections(true, cx, |this, s, cx| this.doc.read(cx).line_end(this.doc.read(cx).row_of(s.head)));
     }
 
     fn move_doc_start(&mut self, _: &MoveDocStart, _: &mut Window, cx: &mut Context<Self>) {
@@ -1561,7 +1562,7 @@ impl Editor {
     }
 
     fn move_doc_end(&mut self, _: &MoveDocEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_selections(vec![Selection::cursor(self.doc.len())], 0, cx);
+        self.set_selections(vec![Selection::cursor(self.doc.read(cx).len())], 0, cx);
     }
 
     fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
@@ -1571,12 +1572,12 @@ impl Editor {
 
     fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
         let anchor = self.primary_selection().anchor;
-        let head = self.doc.len();
+        let head = self.doc.read(cx).len();
         self.set_selections(vec![Selection { anchor, head }], 0, cx);
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        let len = self.doc.len();
+        let len = self.doc.read(cx).len();
         self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
         self.autoscroll = false;
     }
@@ -1587,9 +1588,9 @@ impl Editor {
             .iter()
             .map(|s| {
                 let r = s.range();
-                let start = self.doc.line_start(self.doc.row_of(r.start));
-                let end_row = self.doc.row_of(r.end);
-                let end = (self.doc.line_end(end_row) + 1).min(self.doc.len());
+                let start = self.doc.read(cx).line_start(self.doc.read(cx).row_of(r.start));
+                let end_row = self.doc.read(cx).row_of(r.end);
+                let end = (self.doc.read(cx).line_end(end_row) + 1).min(self.doc.read(cx).len());
                 Selection { anchor: start, head: end }
             })
             .collect();
@@ -1663,10 +1664,10 @@ impl Editor {
             return;
         }
         let unit = self.indent_unit.clone();
-        let is_html = self.doc.language == crate::syntax::Language::Html;
+        let is_html = self.doc.read(cx).language == crate::syntax::Language::Html;
         // Python blocks and YAML mappings open with a trailing `:`.
         let colon_opens = matches!(
-            self.doc.language,
+            self.doc.read(cx).language,
             crate::syntax::Language::Python | crate::syntax::Language::Yaml
         );
         self.edit_selections(EditKind::Other, cx, |doc, s| {
@@ -1719,19 +1720,19 @@ impl Editor {
             cx.propagate();
             return;
         }
-        self.move_selections(false, cx, |this, s| this.doc.line_end(this.doc.row_of(s.head)));
+        self.move_selections(false, cx, |this, s, cx| this.doc.read(cx).line_end(this.doc.read(cx).row_of(s.head)));
         self.newline(&Newline, window, cx);
     }
 
     /// Rows covered by selections, as merged row ranges.
-    fn selected_row_blocks(&self) -> Vec<Range<usize>> {
+    fn selected_row_blocks(&self, cx: &App) -> Vec<Range<usize>> {
         let mut blocks: Vec<Range<usize>> = Vec::new();
         for s in &self.selections {
             let r = s.range();
-            let start = self.doc.row_of(r.start);
-            let mut end = self.doc.row_of(r.end);
+            let start = self.doc.read(cx).row_of(r.start);
+            let mut end = self.doc.read(cx).row_of(r.end);
             // A selection ending at column 0 doesn't include that row.
-            if end > start && self.doc.line_start(end) == r.end {
+            if end > start && self.doc.read(cx).line_start(end) == r.end {
                 end -= 1;
             }
             match blocks.last_mut() {
@@ -1770,10 +1771,10 @@ impl Editor {
             return;
         }
         let mut edits = Vec::new();
-        for block in self.selected_row_blocks() {
+        for block in self.selected_row_blocks(cx) {
             for row in block {
-                if !self.doc.line_text(row).trim().is_empty() {
-                    let at = self.doc.line_start(row);
+                if !self.doc.read(cx).line_text(row).trim().is_empty() {
+                    let at = self.doc.read(cx).line_start(row);
                     edits.push((at..at, self.indent_unit.clone()));
                 }
             }
@@ -1791,10 +1792,10 @@ impl Editor {
         }
         let mut edits = Vec::new();
         let width = if self.indent_unit == "\t" { self.tab_size } else { self.indent_unit.len() };
-        for block in self.selected_row_blocks() {
+        for block in self.selected_row_blocks(cx) {
             for row in block {
-                let text = self.doc.line_text(row);
-                let at = self.doc.line_start(row);
+                let text = self.doc.read(cx).line_text(row);
+                let at = self.doc.read(cx).line_start(row);
                 let n = if text.starts_with('\t') {
                     1
                 } else {
@@ -1809,28 +1810,28 @@ impl Editor {
     }
 
     fn toggle_comment(&mut self, _: &ToggleComment, _: &mut Window, cx: &mut Context<Self>) {
-        let language = self.doc.language;
+        let language = self.doc.read(cx).language;
         let mut edits = Vec::new();
-        for block in self.selected_row_blocks() {
-            let rows: Vec<usize> = block.clone().filter(|&r| !self.doc.line_text(r).trim().is_empty()).collect();
+        for block in self.selected_row_blocks(cx) {
+            let rows: Vec<usize> = block.clone().filter(|&r| !self.doc.read(cx).line_text(r).trim().is_empty()).collect();
             if rows.is_empty() {
                 continue;
             }
             match language.line_comment() {
                 Some(prefix) => {
                     let token = prefix.trim_end();
-                    let all_commented = rows.iter().all(|&r| self.doc.line_text(r).trim_start().starts_with(token));
+                    let all_commented = rows.iter().all(|&r| self.doc.read(cx).line_text(r).trim_start().starts_with(token));
                     let min_indent = rows
                         .iter()
                         .map(|&r| {
-                            let t = self.doc.line_text(r);
+                            let t = self.doc.read(cx).line_text(r);
                             t.len() - t.trim_start().len()
                         })
                         .min()
                         .unwrap_or(0);
                     for &r in &rows {
-                        let t = self.doc.line_text(r);
-                        let start = self.doc.line_start(r);
+                        let t = self.doc.read(cx).line_text(r);
+                        let start = self.doc.read(cx).line_start(r);
                         if all_commented {
                             let indent = t.len() - t.trim_start().len();
                             let len = if t[indent..].starts_with(prefix) { prefix.len() } else { token.len() };
@@ -1847,15 +1848,15 @@ impl Editor {
                     };
                     let (open_token, close_token) = (open.trim_end(), close.trim_start());
                     let all_commented = rows.iter().all(|&r| {
-                        let t = self.doc.line_text(r);
+                        let t = self.doc.read(cx).line_text(r);
                         let t = t.trim();
                         t.len() >= open_token.len() + close_token.len()
                             && t.starts_with(open_token)
                             && t.ends_with(close_token)
                     });
                     for &r in &rows {
-                        let t = self.doc.line_text(r);
-                        let start = self.doc.line_start(r);
+                        let t = self.doc.read(cx).line_text(r);
+                        let start = self.doc.read(cx).line_start(r);
                         let indent = t.len() - t.trim_start().len();
                         let end = start + t.trim_end().len();
                         if all_commented {
@@ -1883,14 +1884,14 @@ impl Editor {
 
     fn duplicate_line(&mut self, _: &DuplicateLine, _: &mut Window, cx: &mut Context<Self>) {
         // Each block's text is inserted after it; cursors move onto the copy.
-        let blocks = self.selected_row_blocks();
+        let blocks = self.selected_row_blocks(cx);
         let mut edits = Vec::new();
         let mut shifts: Vec<(usize, usize)> = Vec::new(); // (block end, cumulative shift)
         let mut total = 0;
         for block in &blocks {
-            let start = self.doc.line_start(block.start);
-            let end = self.doc.line_end(block.end - 1);
-            let text = format!("\n{}", self.doc.slice(start..end));
+            let start = self.doc.read(cx).line_start(block.start);
+            let end = self.doc.read(cx).line_end(block.end - 1);
+            let text = format!("\n{}", self.doc.read(cx).slice(start..end));
             total += text.len();
             shifts.push((end, total));
             edits.push((end..end, text));
@@ -1906,31 +1907,31 @@ impl Editor {
                 Selection { anchor: s.anchor + shift, head: s.head + shift }
             })
             .collect();
-        self.doc.edit(edits, &before, EditKind::Other);
+        self.doc.as_mut(cx).edit(edits, &before, EditKind::Other);
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
     }
 
     fn move_lines(&mut self, up: bool, cx: &mut Context<Self>) {
-        let blocks = self.selected_row_blocks();
-        let last_row = self.doc.line_count() - 1;
+        let blocks = self.selected_row_blocks(cx);
+        let last_row = self.doc.read(cx).line_count() - 1;
         if (up && blocks.first().is_some_and(|b| b.start == 0)) || (!up && blocks.last().is_some_and(|b| b.end > last_row)) {
             return;
         }
         let mut edits = Vec::new();
         let mut shifts: Vec<(Range<usize>, isize)> = Vec::new();
         for block in &blocks {
-            let block_start = self.doc.line_start(block.start);
-            let block_end = self.doc.line_end(block.end - 1);
-            let block_text = self.doc.slice(block_start..block_end);
+            let block_start = self.doc.read(cx).line_start(block.start);
+            let block_end = self.doc.read(cx).line_end(block.end - 1);
+            let block_text = self.doc.read(cx).slice(block_start..block_end);
             if up {
-                let prev_start = self.doc.line_start(block.start - 1);
-                let prev_text = self.doc.line_text(block.start - 1);
+                let prev_start = self.doc.read(cx).line_start(block.start - 1);
+                let prev_text = self.doc.read(cx).line_text(block.start - 1);
                 edits.push((prev_start..block_end, format!("{block_text}\n{prev_text}")));
                 shifts.push((block_start..block_end + 1, -(prev_text.len() as isize + 1)));
             } else {
-                let next_end = self.doc.line_end(block.end);
-                let next_text = self.doc.line_text(block.end);
+                let next_end = self.doc.read(cx).line_end(block.end);
+                let next_text = self.doc.read(cx).line_text(block.end);
                 edits.push((block_start..next_end, format!("{next_text}\n{block_text}")));
                 shifts.push((block_start..block_end + 1, next_text.len() as isize + 1));
             }
@@ -1949,7 +1950,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.doc.edit(edits, &before, EditKind::Other);
+        self.doc.as_mut(cx).edit(edits, &before, EditKind::Other);
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
     }
@@ -1969,15 +1970,15 @@ impl Editor {
                 .selections
                 .iter()
                 .map(|s| {
-                    let r = word_range(&self.doc, s.head);
+                    let r = word_range(self.doc.read(cx), s.head);
                     Selection { anchor: r.start, head: r.end }
                 })
                 .collect();
             self.set_selections(selections, self.primary, cx);
             return;
         }
-        let needle = self.doc.slice(primary.range());
-        let haystack = self.doc.rope().to_string();
+        let needle = self.doc.read(cx).slice(primary.range());
+        let haystack = self.doc.read(cx).rope().to_string();
         let from = self.selections.iter().map(|s| s.range().end).max().unwrap_or(0);
         let found = haystack[from..]
             .find(&needle)
@@ -2002,8 +2003,8 @@ impl Editor {
             self.selections.iter().max_by_key(|s| s.head).copied()
         }
         .unwrap_or(primary);
-        let drow = self.display_row_of(edge.head) as isize + rows;
-        if drow < 0 || drow as usize >= self.display_row_count() {
+        let drow = self.display_row_of(edge.head, cx) as isize + rows;
+        if drow < 0 || drow as usize >= self.display_row_count(cx) {
             return;
         }
         let head = self.offset_for_display_row_x(drow as usize, goal, window, cx);
@@ -2024,7 +2025,7 @@ impl Editor {
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         // Escape leaves a snippet's stops (and still does the rest below).
-        self.doc.snippet = None;
+        self.doc.as_mut(cx).snippet = None;
         if self.open_hunk.take().is_some() {
             cx.notify();
             return;
@@ -2042,36 +2043,36 @@ impl Editor {
         self.set_selections(vec![sel], 0, cx);
     }
 
-    fn copy_text(&self) -> (String, bool) {
+    fn copy_text(&self, cx: &App) -> (String, bool) {
         if self.selections.iter().all(|s| s.is_empty()) {
             // Copy whole lines when nothing is selected.
             let mut out = String::new();
-            for block in self.selected_row_blocks() {
-                let start = self.doc.line_start(block.start);
-                let end = self.doc.line_end(block.end - 1);
-                out.push_str(&self.doc.slice(start..end));
+            for block in self.selected_row_blocks(cx) {
+                let start = self.doc.read(cx).line_start(block.start);
+                let end = self.doc.read(cx).line_end(block.end - 1);
+                out.push_str(&self.doc.read(cx).slice(start..end));
                 out.push('\n');
             }
             (out, true)
         } else {
-            let parts: Vec<String> = self.selections.iter().map(|s| self.doc.slice(s.range())).collect();
+            let parts: Vec<String> = self.selections.iter().map(|s| self.doc.read(cx).slice(s.range())).collect();
             (parts.join("\n"), false)
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        let (text, _) = self.copy_text();
+        let (text, _) = self.copy_text(cx);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        let (text, whole_lines) = self.copy_text();
+        let (text, whole_lines) = self.copy_text(cx);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         if whole_lines {
             let mut edits = Vec::new();
-            for block in self.selected_row_blocks() {
-                let start = self.doc.line_start(block.start);
-                let end = (self.doc.line_end(block.end - 1) + 1).min(self.doc.len());
+            for block in self.selected_row_blocks(cx) {
+                let start = self.doc.read(cx).line_start(block.start);
+                let end = (self.doc.read(cx).line_end(block.end - 1) + 1).min(self.doc.read(cx).len());
                 edits.push((start..end, String::new()));
             }
             self.edit_and_remap(edits, EditKind::Other, cx);
@@ -2105,8 +2106,9 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(selections) = self.doc.undo() {
-            let selections = self.clamp_selections(selections);
+        let undone = self.doc.as_mut(cx).undo();
+        if let Some(selections) = undone {
+            let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
             self.schedule_diff(Duration::from_millis(120), cx);
@@ -2115,8 +2117,9 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(selections) = self.doc.redo() {
-            let selections = self.clamp_selections(selections);
+        let redone = self.doc.as_mut(cx).redo();
+        if let Some(selections) = redone {
+            let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
             self.schedule_diff(Duration::from_millis(120), cx);
@@ -2124,10 +2127,10 @@ impl Editor {
         }
     }
 
-    fn clamp_selections(&self, selections: Vec<Selection>) -> Vec<Selection> {
+    fn clamp_selections(&self, selections: Vec<Selection>, cx: &App) -> Vec<Selection> {
         let mut s: Vec<Selection> = selections
             .into_iter()
-            .map(|s| Selection { anchor: self.doc.clip(s.anchor), head: self.doc.clip(s.head) })
+            .map(|s| Selection { anchor: self.doc.read(cx).clip(s.anchor), head: self.doc.read(cx).clip(s.head) })
             .collect();
         if s.is_empty() {
             s.push(Selection::cursor(0));
@@ -2141,10 +2144,10 @@ impl Editor {
 
     // ---- Mouse ---------------------------------------------------------------
 
-    fn scrollbar_geometry(&self) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
+    fn scrollbar_geometry(&self, cx: &App) -> Option<(Bounds<Pixels>, Bounds<Pixels>)> {
         let l = self.layout.as_ref()?;
         let viewport = l.bounds.size.height;
-        let content = l.line_height * self.display_row_count() as f32 + viewport - l.line_height;
+        let content = l.line_height * self.display_row_count(cx) as f32 + viewport - l.line_height;
         if content <= viewport {
             return None;
         }
@@ -2167,7 +2170,7 @@ impl Editor {
         self.sync_wrap(window, cx);
         let Some(layout) = self.layout.clone() else { return };
 
-        if let Some((track, thumb)) = self.scrollbar_geometry()
+        if let Some((track, thumb)) = self.scrollbar_geometry(cx)
             && track.contains(&event.position)
         {
             if thumb.contains(&event.position) {
@@ -2191,16 +2194,16 @@ impl Editor {
             // A ▶ runs its target.
             if event.position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) {
                 let y = event.position.y - layout.bounds.top() + self.scroll.y;
-                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
+                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize, cx);
                 if seg == 0
-                    && let Some(target) = self.run_target_at(row)
+                    && let Some(target) = self.run_target_at(row, cx)
                 {
                     cx.emit(EditorRunEvent { target, debug: false, menu_at: Some(event.position) });
                     return;
                 }
             }
             // A line number sets or clears a breakpoint (in files that can be debugged).
-            if let Some(row) = self.breakpoint_row_at(event.position, &layout) {
+            if let Some(row) = self.breakpoint_row_at(event.position, &layout, cx) {
                 self.toggle_breakpoint_at(row, cx);
                 return;
             }
@@ -2211,7 +2214,7 @@ impl Editor {
             }
             // The `⋯` placeholder unfolds.
             if let Some(&(_, start)) = self.fold_pills.iter().find(|(b, _)| b.contains(&event.position)) {
-                self.doc.unfold_where(|f| f.start == start);
+                self.doc.as_mut(cx).unfold_where(|f| f.start == start);
                 cx.notify();
                 return;
             }
@@ -2219,8 +2222,8 @@ impl Editor {
             let arrow_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT);
             if event.position.x <= arrow_right + px(2.) && event.position.x >= arrow_right - px(FOLD_ICON + 4.) {
                 let y = event.position.y - layout.bounds.top() + self.scroll.y;
-                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
-                if seg == 0 && (self.fold_under(row).is_some() || self.fold_regions().iter().any(|r| r.start == row)) {
+                let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize, cx);
+                if seg == 0 && (self.fold_under(row, cx).is_some() || self.fold_regions(cx).iter().any(|r| r.start == row)) {
                     self.toggle_fold_at(row, cx);
                     return;
                 }
@@ -2232,7 +2235,7 @@ impl Editor {
         if !self.is_chromeless() && (event.position.x - bar_x).abs() < px(6.) {
             let y = event.position.y - layout.bounds.top() + self.scroll.y;
             let row_f = y / layout.line_height;
-            if let Some(ix) = self.hunk_at(row_f) {
+            if let Some(ix) = self.hunk_at(row_f, cx) {
                 self.open_hunk = if self.open_hunk == Some(ix) { None } else { Some(ix) };
                 cx.notify();
                 return;
@@ -2250,9 +2253,9 @@ impl Editor {
             return;
         }
         let (mode, unit) = if in_gutter || event.click_count >= 3 {
-            (DragMode::Line, self.line_range(offset))
+            (DragMode::Line, self.line_range(offset, cx))
         } else if event.click_count == 2 {
-            (DragMode::Word, word_range(&self.doc, offset))
+            (DragMode::Word, word_range(self.doc.read(cx), offset))
         } else {
             (DragMode::Char, offset..offset)
         };
@@ -2260,7 +2263,7 @@ impl Editor {
         if event.modifiers.shift && event.modifiers.alt && !in_gutter && !self.is_single_line() {
             // Alt+Shift+click: a box from the caret to here (VS Code).
             let head = self.primary_selection().head;
-            let from = (self.doc.row_of(head), self.display_column_of(head));
+            let from = (self.doc.read(cx).row_of(head), self.display_column_of(head, cx));
             self.drag = Some(Drag { mode: DragMode::Char, origin: head..head, column_from: Some(from) });
             self.select_box(from, event.position, cx);
         } else if event.modifiers.shift {
@@ -2282,7 +2285,7 @@ impl Editor {
             }
             // Alt+drag selects a box (JetBrains); Alt+click alone adds a caret.
             let column_from = (event.modifiers.alt && mode == DragMode::Char && !in_gutter && !self.is_single_line())
-                .then(|| (self.doc.row_of(offset), self.column_at_x(event.position.x)));
+                .then(|| (self.doc.read(cx).row_of(offset), self.column_at_x(event.position.x)));
             self.drag = Some(Drag { mode, origin: unit, column_from });
         }
         self.goal_x = None;
@@ -2296,10 +2299,10 @@ impl Editor {
         ((x - layout.text_left + self.scroll.x) / layout.char_width).round().max(0.) as usize
     }
 
-    fn display_column_of(&self, offset: usize) -> usize {
-        let row = self.doc.row_of(offset);
-        let start = self.doc.line_start(row);
-        DisplayLine::new(&self.doc.line_text(row), self.tab_size).to_display(offset - start)
+    fn display_column_of(&self, offset: usize, cx: &App) -> usize {
+        let row = self.doc.read(cx).row_of(offset);
+        let start = self.doc.read(cx).line_start(row);
+        DisplayLine::new(&self.doc.read(cx).line_text(row), self.tab_size).to_display(offset - start)
     }
 
     /// Column (box) selection: on every line from `from`'s row to the one
@@ -2308,39 +2311,39 @@ impl Editor {
     fn select_box(&mut self, from: (usize, usize), to: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.as_ref() else { return };
         let y = to.y - layout.bounds.top() + self.scroll.y;
-        let drow = ((y / layout.line_height).floor().max(0.) as usize).min(self.display_row_count().saturating_sub(1));
-        let row = self.line_of_display_row(drow).0.min(self.doc.line_count() - 1);
+        let drow = ((y / layout.line_height).floor().max(0.) as usize).min(self.display_row_count(cx).saturating_sub(1));
+        let row = self.line_of_display_row(drow, cx).0.min(self.doc.read(cx).line_count() - 1);
         let col = self.column_at_x(to.x);
         let (left, right) = (from.1.min(col), from.1.max(col));
         let rows: Vec<usize> = if row >= from.0 { (from.0..=row).collect() } else { (row..=from.0).rev().collect() };
         let mut selections = Vec::new();
         for r in rows.into_iter().filter(|&r| !self.row_hidden(r)) {
-            let text = self.doc.line_text(r);
+            let text = self.doc.read(cx).line_text(r);
             let dl = DisplayLine::new(&text, self.tab_size);
             if left > dl.text.len() && right > left {
                 continue;
             }
-            let start = self.doc.line_start(r);
+            let start = self.doc.read(cx).line_start(r);
             let (a, b) = (start + dl.to_buffer(from.1), start + dl.to_buffer(col));
             selections.push(Selection { anchor: a, head: b });
         }
         if selections.is_empty() {
-            let start = self.doc.line_start(from.0);
-            selections.push(Selection::cursor(start + DisplayLine::new(&self.doc.line_text(from.0), self.tab_size).to_buffer(from.1)));
+            let start = self.doc.read(cx).line_start(from.0);
+            selections.push(Selection::cursor(start + DisplayLine::new(&self.doc.read(cx).line_text(from.0), self.tab_size).to_buffer(from.1)));
         }
         let primary = selections.len() - 1;
         self.set_selections(selections, primary, cx);
     }
 
     /// The row whose line number is at `position`, where clicks set breakpoints.
-    fn breakpoint_row_at(&self, position: Point<Pixels>, layout: &LayoutSnapshot) -> Option<usize> {
+    fn breakpoint_row_at(&self, position: Point<Pixels>, layout: &LayoutSnapshot, cx: &App) -> Option<usize> {
         let number_right = layout.bounds.left() + layout.gutter_width - px(FOLD_ZONE_RIGHT + 18.);
-        if !self.can_break() || position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) || position.x > number_right + px(4.) {
+        if !self.can_break(cx) || position.x < layout.bounds.left() + px(5. + RUN_ICON + 4.) || position.x > number_right + px(4.) {
             return None;
         }
         let y = position.y - layout.bounds.top() + self.scroll.y;
-        let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize);
-        (seg == 0 && row < self.doc.line_count()).then_some(row)
+        let (row, seg) = self.line_of_display_row((y / layout.line_height).floor().max(0.) as usize, cx);
+        (seg == 0 && row < self.doc.read(cx).line_count()).then_some(row)
     }
 
     /// Right-click: place the caret (unless clicking inside a selection, so
@@ -2354,7 +2357,7 @@ impl Editor {
         self.sync_wrap(window, cx);
         self.open_hunk = None;
         if let Some(layout) = self.layout.clone()
-            && let Some(row) = self.breakpoint_row_at(event.position, &layout)
+            && let Some(row) = self.breakpoint_row_at(event.position, &layout, cx)
         {
             cx.emit(EditorBreakpointMenu { row, position: event.position });
             return;
@@ -2374,34 +2377,34 @@ impl Editor {
     }
 
     /// Whether the caret is on a changed (git) line, for Rollback Lines.
-    pub fn has_change_at_cursor(&self) -> bool {
-        self.current_hunk().is_some()
+    pub fn has_change_at_cursor(&self, cx: &App) -> bool {
+        self.current_hunk(cx).is_some()
     }
 
     /// Whether the change at the caret is staged (`None`: no change there).
-    pub fn change_at_cursor_staged(&self) -> Option<bool> {
-        self.current_hunk().map(|i| self.hunk_staged.get(i).copied().unwrap_or(false))
+    pub fn change_at_cursor_staged(&self, cx: &App) -> Option<bool> {
+        self.current_hunk(cx).map(|i| self.hunk_staged.get(i).copied().unwrap_or(false))
     }
 
     /// Whether the caret is in a merge conflict (as of the last frame).
-    pub fn has_conflict_at_cursor(&self) -> bool {
-        let row = self.doc.row_of(self.primary_selection().head);
-        self.conflicts.current(&self.doc.version()).is_some_and(|c| c.iter().any(|c| c.rows().contains(&row)))
+    pub fn has_conflict_at_cursor(&self, cx: &App) -> bool {
+        let row = self.doc.read(cx).row_of(self.primary_selection().head);
+        self.conflicts.current(&self.doc.read(cx).version()).is_some_and(|c| c.iter().any(|c| c.rows().contains(&row)))
     }
 
-    fn line_range(&self, offset: usize) -> Range<usize> {
-        let row = self.doc.row_of(offset);
-        let start = self.doc.line_start(row);
-        let end = (self.doc.line_end(row) + 1).min(self.doc.len());
+    fn line_range(&self, offset: usize, cx: &App) -> Range<usize> {
+        let row = self.doc.read(cx).row_of(offset);
+        let start = self.doc.read(cx).line_start(row);
+        let end = (self.doc.read(cx).line_end(row) + 1).min(self.doc.read(cx).len());
         start..end
     }
 
     fn drag_scrollbar_to(&mut self, y: Pixels, cx: &mut Context<Self>) {
-        let (Some(grab), Some((track, thumb)), Some(l)) = (self.scrollbar_drag, self.scrollbar_geometry(), self.layout.as_ref()) else {
+        let (Some(grab), Some((track, thumb)), Some(l)) = (self.scrollbar_drag, self.scrollbar_geometry(cx), self.layout.as_ref()) else {
             return;
         };
         let viewport = l.bounds.size.height;
-        let content = l.line_height * self.display_row_count() as f32 + viewport - l.line_height;
+        let content = l.line_height * self.display_row_count(cx) as f32 + viewport - l.line_height;
         let range = track.size.height - thumb.size.height;
         if range <= px(0.) {
             return;
@@ -2439,7 +2442,7 @@ impl Editor {
         let (mode, origin, column_from) = (drag.mode, drag.origin.clone(), drag.column_from);
         self.sync_wrap(window, cx);
         if let Some(from) = column_from {
-            let row = self.doc.row_of(self.offset_for_position(event.position, window, cx));
+            let row = self.doc.read(cx).row_of(self.offset_for_position(event.position, window, cx));
             // Still on the spot it started: an Alt+click, not a box yet.
             if (row, self.column_at_x(event.position.x)) != from {
                 self.select_box(from, event.position, cx);
@@ -2450,8 +2453,8 @@ impl Editor {
         let offset = self.offset_for_position(event.position, window, cx);
         let unit = match mode {
             DragMode::Char => offset..offset,
-            DragMode::Word => word_range(&self.doc, offset),
-            DragMode::Line => self.line_range(offset),
+            DragMode::Word => word_range(self.doc.read(cx), offset),
+            DragMode::Line => self.line_range(offset, cx),
         };
         let sel = if offset < origin.start {
             Selection { anchor: origin.end, head: unit.start }
@@ -2486,14 +2489,14 @@ impl Editor {
         }
         self.scroll.y -= delta.y;
         self.scroll.x -= delta.x;
-        self.clamp_scroll();
+        self.clamp_scroll(cx);
         self.lsp.hover = None;
         cx.notify();
     }
 
-    fn clamp_scroll(&mut self) {
+    fn clamp_scroll(&mut self, cx: &App) {
         let Some(l) = self.layout.as_ref() else { return };
-        let max_y = l.line_height * (self.display_row_count().saturating_sub(1)) as f32;
+        let max_y = l.line_height * (self.display_row_count(cx).saturating_sub(1)) as f32;
         self.scroll.y = self.scroll.y.clamp(px(0.), max_y.max(px(0.)));
         if self.wrap.as_ref().is_some_and(|w| w.key.wrap) {
             self.scroll.x = px(0.);
@@ -2527,7 +2530,7 @@ impl Editor {
             .map(|s| s.width)
             .unwrap_or(font_size * 0.6);
 
-        let line_count = self.doc.line_count();
+        let line_count = self.doc.read(cx).line_count();
         let digits = line_count.to_string().len().max(3);
         // Diagnostic dot, numbers, fold arrow, git bar.
         let gutter_width = if single { px(0.) } else { char_width * digits as f32 + px(58.) };
@@ -2554,7 +2557,7 @@ impl Editor {
 
         // Keep the primary cursor visible after keyboard navigation.
         if std::mem::take(&mut self.reveal_primary) {
-            let drow = self.display_row_of(self.primary_selection().head) as f32;
+            let drow = self.display_row_of(self.primary_selection().head, cx) as f32;
             let visible = self.scroll.y..self.scroll.y + bounds.size.height - line_height;
             if !visible.contains(&(line_height * drow)) {
                 self.center_on_next_frame = true;
@@ -2563,12 +2566,12 @@ impl Editor {
             }
         }
         if std::mem::take(&mut self.center_on_next_frame) && !single {
-            let drow = self.display_row_of(self.primary_selection().head);
+            let drow = self.display_row_of(self.primary_selection().head, cx);
             self.scroll.y = (line_height * drow as f32 - bounds.size.height / 3.).max(px(0.));
             self.scroll.x = px(0.);
         } else if std::mem::take(&mut self.autoscroll) {
             let head = self.primary_selection().head;
-            let drow = self.display_row_of(head);
+            let drow = self.display_row_of(head, cx);
             let margin = line_height * 3.;
             let top = line_height * drow as f32;
             let viewport = bounds.size.height;
@@ -2589,45 +2592,45 @@ impl Editor {
                 }
             }
         }
-        self.clamp_scroll();
+        self.clamp_scroll(cx);
 
         // Visible display rows, and the buffer lines they show.
-        let display_rows = self.display_row_count();
+        let display_rows = self.display_row_count(cx);
         let first_drow = (self.scroll.y / line_height).floor() as usize;
         let visible_rows = (bounds.size.height / line_height).ceil() as usize + 1;
         let last_drow = (first_drow + visible_rows).min(display_rows);
         let first_drow = first_drow.min(last_drow);
-        let first_row = self.line_of_display_row(first_drow).0;
-        let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1).0 + 1).min(line_count) };
-        let range_start = self.doc.line_start(first_row);
-        let range_end = if last_row == 0 { 0 } else { self.doc.line_end(last_row - 1) };
+        let first_row = self.line_of_display_row(first_drow, cx).0;
+        let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1, cx).0 + 1).min(line_count) };
+        let range_start = self.doc.read(cx).line_start(first_row);
+        let range_end = if last_row == 0 { 0 } else { self.doc.read(cx).line_end(last_row - 1) };
         self.fold_pills.clear();
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
-        let fold_regions = (!single && (self.gutter_hovered || !self.doc.folds().is_empty())).then(|| self.shown_fold_regions(cx));
+        let fold_regions = (!single && (self.gutter_hovered || !self.doc.read(cx).folds().is_empty())).then(|| self.shown_fold_regions(cx));
         let run_rows: Vec<usize> =
             if single { Vec::new() } else { self.shown_run_targets(cx).iter().filter_map(|t| t.row).collect() };
         let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
-        let debug_row = self.doc.debug_row();
+        let debug_row = self.doc.read(cx).debug_row();
         self.conflict_hits.clear();
-        let highlights = self.visible_highlights(first_drow, last_drow, first_row, last_row);
+        let highlights = self.visible_highlights(first_drow, last_drow, first_row, last_row, cx);
         // Bracket pairs around carets.
         let brackets: Vec<Range<usize>> = if focused && !single {
-            self.bracket_pairs().iter().filter(|r| (range_start..=range_end).contains(&r.start)).cloned().collect()
+            self.bracket_pairs(cx).iter().filter(|r| (range_start..=range_end).contains(&r.start)).cloned().collect()
         } else {
             Vec::new()
         };
         // Sorted by start: none past the last visible line.
-        let below = self.doc.diagnostics.partition_point(|d| d.range.start <= range_end);
+        let below = self.doc.read(cx).diagnostics.partition_point(|d| d.range.start <= range_end);
         let diagnostics: Vec<&lint::Diagnostic> =
-            self.doc.diagnostics[..below].iter().filter(|d| d.range.end >= range_start).collect();
+            self.doc.read(cx).diagnostics[..below].iter().filter(|d| d.range.end >= range_start).collect();
 
-        let breakpoints = if single { Vec::new() } else { self.doc.breakpoints() };
+        let breakpoints = if single { Vec::new() } else { self.doc.read(cx).breakpoints() };
         let head_rows: Vec<usize> = self
             .selections
             .iter()
             .filter(|s| s.is_empty())
-            .map(|s| self.doc.row_of(s.head))
+            .map(|s| self.doc.read(cx).row_of(s.head))
             .collect();
 
         let mut frame = FrameLayout {
@@ -2654,7 +2657,7 @@ impl Editor {
         // Indentation (in columns) for indent guides.
         let indents: Vec<Option<usize>> = (first_row..last_row)
             .map(|row| {
-                let t = self.doc.line_text(row);
+                let t = self.doc.read(cx).line_text(row);
                 if t.trim().is_empty() {
                     None
                 } else {
@@ -2668,10 +2671,10 @@ impl Editor {
             if self.row_hidden(row) {
                 continue;
             }
-            let line_start = self.doc.line_start(row);
-            let text = self.doc.line_text(row);
+            let line_start = self.doc.read(cx).line_start(row);
+            let text = self.doc.read(cx).line_text(row);
             let line_end = line_start + text.len();
-            let dl = self.display_line(row);
+            let dl = self.display_line(row, cx);
 
             // Build styled runs from highlight spans and diagnostics.
             while hl_ix < highlights.len() && highlights[hl_ix].0.end <= line_start {
@@ -2744,7 +2747,7 @@ impl Editor {
             });
             let breaks = self.line_breaks(row).to_vec();
             let row_first_drow = self.first_display_row(row);
-            let worst = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).min_by_key(|d| d.severity);
+            let worst = row_diags.iter().filter(|d| self.doc.read(cx).row_of(d.range.start) == row).min_by_key(|d| d.severity);
 
             // Each wrapped segment of the line is its own display row.
             for seg in 0..=breaks.len() {
@@ -2901,7 +2904,7 @@ impl Editor {
                 }
 
                 // Other uses of the symbol at the caret (from the language server).
-                let symbols = self.current_symbol_highlights();
+                let symbols = self.current_symbol_highlights(cx);
                 for r in symbols.iter().skip(symbols.partition_point(|r| r.end < line_start)) {
                     if r.start > line_end {
                         break;
@@ -2965,7 +2968,7 @@ impl Editor {
                 if focused && (self.cursor_visible || block) {
                     for sel in &self.selections {
                         let head = self.vim_cursor_of(sel);
-                        if self.doc.row_of(head) != row {
+                        if self.doc.read(cx).row_of(head) != row {
                             continue;
                         }
                         let col = dl.to_display(head - line_start);
@@ -2974,7 +2977,7 @@ impl Editor {
                         }
                         let x = x_of(col);
                         let bounds = if block {
-                            let next = dl.to_display((head - line_start + self.doc.char_at(head).filter(|c| *c != '\n').map_or(0, char::len_utf8)).min(text.len()));
+                            let next = dl.to_display((head - line_start + self.doc.read(cx).char_at(head).filter(|c| *c != '\n').map_or(0, char::len_utf8)).min(text.len()));
                             let width = if next > col { x_of(next) - x } else { char_width };
                             Bounds::new(point(origin.x + x, y + px(1.)), size(width, line_height - px(2.)))
                         } else {
@@ -2986,7 +2989,7 @@ impl Editor {
                 }
 
                 if single {
-                    if first_seg && self.doc.len() == 0 && !self.placeholder.is_empty() {
+                    if first_seg && self.doc.read(cx).len() == 0 && !self.placeholder.is_empty() {
                         let placeholder = text_system.shape_line(
                             self.placeholder.clone(),
                             font_size,
@@ -3062,7 +3065,7 @@ impl Editor {
                         frame.numbers.push((point(nx, y), number_line));
                     }
 
-                    let folded = self.fold_under(row).is_some();
+                    let folded = self.fold_under(row, cx).is_some();
                     let foldable = !folded
                         && self.gutter_hovered
                         && fold_regions.as_ref().is_some_and(|r| r.binary_search_by_key(&row, |region| region.start).is_ok());
@@ -3165,8 +3168,8 @@ impl Editor {
                         frame.inline_texts.push((point(pill.left() + px(5.), y), line));
                         self.conflict_hits.push((pill, c.start, resolution));
                     }
-                } else if let Some(fold) = self.fold_under(row) {
-                    let label = self.fold_placeholder(&fold);
+                } else if let Some(fold) = self.fold_under(row, cx) {
+                    let label = self.fold_placeholder(&fold, cx);
                     let pill_line = text_system.shape_line(
                         SharedString::from(label.clone()),
                         font_size,
@@ -3197,7 +3200,7 @@ impl Editor {
                         message.truncate(message.floor_char_boundary(160));
                         message.push('…');
                     }
-                    let count = row_diags.iter().filter(|d| self.doc.row_of(d.range.start) == row).count();
+                    let count = row_diags.iter().filter(|d| self.doc.read(cx).row_of(d.range.start) == row).count();
                     if count > 1 {
                         message.push_str(&format!("  (+{})", count - 1));
                     }
@@ -3275,12 +3278,12 @@ impl Editor {
         }
 
         // Scrollbar with diagnostic and search markers.
-        if let Some((track, thumb)) = self.scrollbar_geometry().filter(|_| !single) {
+        if let Some((track, thumb)) = self.scrollbar_geometry(cx).filter(|_| !single) {
             let hovered_color = if self.scrollbar_drag.is_some() { 0.28 } else { 0.16 };
             frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(hovered_color)).corner_radii(px(4.)));
             let rows = display_rows.max(1) as f32;
-            for d in &self.doc.diagnostics {
-                let row = self.first_display_row(self.doc.row_of(d.range.start)) as f32;
+            for d in &self.doc.read(cx).diagnostics {
+                let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
                     Bounds::new(point(track.right() - px(5.), y), size(px(4.), px(2.))),
@@ -3301,7 +3304,7 @@ impl Editor {
             }
             let mut last_y = None;
             for m in &self.search_matches {
-                let row = self.first_display_row(self.doc.row_of(m.start)) as f32;
+                let row = self.first_display_row(self.doc.read(cx).row_of(m.start)) as f32;
                 let y = (track.top() + track.size.height * (row / rows)).round();
                 if last_y == Some(y) {
                     continue;
@@ -3313,7 +3316,7 @@ impl Editor {
                 ));
             }
             for s in &self.selections {
-                let row = self.first_display_row(self.doc.row_of(s.head)) as f32;
+                let row = self.first_display_row(self.doc.read(cx).row_of(s.head)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
                     Bounds::new(point(track.left() + px(1.), y), size(px(4.), px(2.))),
@@ -3595,20 +3598,20 @@ impl DisplayLine {
 impl Editor {
     /// The change marker under a gutter position (display rows as a fraction, so
     /// deletion markers on a row boundary can be hit).
-    fn hunk_at(&self, row: f32) -> Option<usize> {
+    fn hunk_at(&self, row: f32, cx: &App) -> Option<usize> {
         let deleted = self.hunks.iter().position(|h| {
             h.kind == HunkKind::Deleted && (row - self.first_display_row(h.new_rows.start) as f32).abs() < 0.35
         });
         deleted.or_else(|| {
-            let r = self.line_of_display_row(row.floor().max(0.) as usize).0;
+            let r = self.line_of_display_row(row.floor().max(0.) as usize, cx).0;
             self.hunks.iter().position(|h| h.kind != HunkKind::Deleted && h.new_rows.contains(&r))
         })
     }
 
     /// The change at the cursor, preferring an open popover.
-    fn current_hunk(&self) -> Option<usize> {
+    fn current_hunk(&self, cx: &App) -> Option<usize> {
         self.open_hunk.or_else(|| {
-            let row = self.doc.row_of(self.primary_selection().head);
+            let row = self.doc.read(cx).row_of(self.primary_selection().head);
             self.hunks.iter().position(|h| {
                 h.new_rows.contains(&row) || (h.kind == HunkKind::Deleted && (h.new_rows.start == row || h.new_rows.start == row + 1))
             })
@@ -3616,15 +3619,15 @@ impl Editor {
     }
 
     fn rollback_hunk(&mut self, _: &RollbackHunk, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(hunk) = self.current_hunk().and_then(|i| self.hunks.get(i)).cloned() else {
+        let Some(hunk) = self.current_hunk(cx).and_then(|i| self.hunks.get(i)).cloned() else {
             return;
         };
-        let line_count = self.doc.line_count();
-        let start = self.doc.line_start(hunk.new_rows.start.min(line_count));
-        let end = if hunk.new_rows.end >= line_count { self.doc.len() } else { self.doc.line_start(hunk.new_rows.end) };
+        let line_count = self.doc.read(cx).line_count();
+        let start = self.doc.read(cx).line_start(hunk.new_rows.start.min(line_count));
+        let end = if hunk.new_rows.end >= line_count { self.doc.read(cx).len() } else { self.doc.read(cx).line_start(hunk.new_rows.end) };
         let mut text = hunk.old_text.clone();
         // Keep the file's final-newline state when the hunk reaches the end.
-        if end == self.doc.len() && !self.doc.rope().to_string().ends_with('\n') && text.ends_with('\n') {
+        if end == self.doc.read(cx).len() && !self.doc.read(cx).rope().to_string().ends_with('\n') && text.ends_with('\n') {
             text.pop();
         }
         self.open_hunk = None;
@@ -3642,11 +3645,11 @@ impl Editor {
     /// Stages (or unstages) the change at the caret, as the buffer shows it,
     /// unsaved edits included.
     fn stage_current_hunk(&mut self, stage: bool, cx: &mut Context<Self>) {
-        let (Some(hunk), Some(git_file)) = (self.current_hunk().and_then(|i| self.hunks.get(i)).cloned(), self.git_file.clone()) else {
+        let (Some(hunk), Some(git_file)) = (self.current_hunk(cx).and_then(|i| self.hunks.get(i)).cloned(), self.git_file.clone()) else {
             cx.emit(EditorLspEvent::Message("No change at the caret".into()));
             return;
         };
-        let (rel, text, rows) = (git_file.rel, self.text(), hunk.new_rows);
+        let (rel, text, rows) = (git_file.rel, self.text(cx), hunk.new_rows);
         let op = if stage {
             crate::git_panel::GitOp::StageLines { rel, text, rows }
         } else {
@@ -3659,14 +3662,14 @@ impl Editor {
         if self.hunks.is_empty() {
             return;
         }
-        let row = self.doc.row_of(self.primary_selection().head);
+        let row = self.doc.read(cx).row_of(self.primary_selection().head);
         let starts: Vec<usize> = self.hunks.iter().map(|h| h.new_rows.start).collect();
         let target = if forward {
             starts.iter().copied().find(|&s| s > row).unwrap_or(starts[0])
         } else {
             starts.iter().rev().copied().find(|&s| s < row).unwrap_or(*starts.last().unwrap())
         };
-        let offset = self.doc.line_start(target.min(self.doc.line_count() - 1));
+        let offset = self.doc.read(cx).line_start(target.min(self.doc.read(cx).line_count() - 1));
         let ix = self.hunks.iter().position(|h| h.new_rows.start == target);
         if self.open_hunk.is_some() {
             self.open_hunk = ix;
@@ -3697,13 +3700,13 @@ impl Editor {
         if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || self.diff_base.is_none() {
             return;
         }
-        let row = self.doc.row_of(self.primary_selection().head);
-        let version = self.doc.version();
+        let row = self.doc.read(cx).row_of(self.primary_selection().head);
+        let version = self.doc.read(cx).version();
         if self.blame_request == Some((row, version)) {
             return;
         }
         self.blame_request = Some((row, version));
-        let rope = self.doc.rope().clone();
+        let rope = self.doc.read(cx).rope().clone();
         self.blame_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(350)).await;
             let blame = cx
@@ -3836,12 +3839,12 @@ impl Editor {
             return;
         }
         let mut edits = Vec::new();
-        for block in self.selected_row_blocks() {
-            let mut start = self.doc.line_start(block.start);
-            let mut end = self.doc.line_start(block.end);
-            if block.end >= self.doc.line_count() {
+        for block in self.selected_row_blocks(cx) {
+            let mut start = self.doc.read(cx).line_start(block.start);
+            let mut end = self.doc.read(cx).line_start(block.end);
+            if block.end >= self.doc.read(cx).line_count() {
                 // Last line: remove the newline before it instead.
-                end = self.doc.len();
+                end = self.doc.read(cx).len();
                 start = start.saturating_sub(1);
             }
             edits.push((start..end, String::new()));
@@ -3851,18 +3854,18 @@ impl Editor {
 
     fn extend_selection(&mut self, _: &ExtendSelection, _: &mut Window, cx: &mut Context<Self>) {
         let before = self.selections.clone();
-        let len = self.doc.len();
+        let len = self.doc.read(cx).len();
         let expanded: Vec<Selection> = before
             .iter()
             .map(|s| {
                 let r = s.range();
                 if r.is_empty() {
-                    let w = word_range(&self.doc, r.start);
+                    let w = word_range(self.doc.read(cx), r.start);
                     if !w.is_empty() {
                         return Selection { anchor: w.start, head: w.end };
                     }
                 }
-                let next = self.doc.syntax().expand(r.clone()).unwrap_or(0..len);
+                let next = self.doc.read(cx).syntax().expand(r.clone()).unwrap_or(0..len);
                 Selection { anchor: next.start, head: next.end }
             })
             .collect();
@@ -3894,12 +3897,12 @@ impl Editor {
 
     fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
         let p = self.primary_selection();
-        let range = if p.is_empty() { word_range(&self.doc, p.head) } else { p.range() };
+        let range = if p.is_empty() { word_range(self.doc.read(cx), p.head) } else { p.range() };
         if range.is_empty() {
             return;
         }
-        let needle = self.doc.slice(range.clone());
-        let haystack = self.doc.rope().to_string();
+        let needle = self.doc.read(cx).slice(range.clone());
+        let haystack = self.doc.read(cx).rope().to_string();
         let selections: Vec<Selection> = haystack
             .match_indices(&needle)
             .map(|(i, _)| Selection { anchor: i, head: i + needle.len() })
@@ -3926,15 +3929,15 @@ impl Editor {
             return;
         }
         let mut edits = Vec::new();
-        for block in self.selected_row_blocks() {
+        for block in self.selected_row_blocks(cx) {
             let last = if block.len() == 1 { block.start + 1 } else { block.end - 1 };
-            for row in block.start..last.min(self.doc.line_count() - 1) {
-                let current = self.doc.line_text(row);
-                let next = self.doc.line_text(row + 1);
+            for row in block.start..last.min(self.doc.read(cx).line_count() - 1) {
+                let current = self.doc.read(cx).line_text(row);
+                let next = self.doc.read(cx).line_text(row + 1);
                 let trimmed_current = current.trim_end();
                 let next_trimmed = next.trim_start();
-                let start = self.doc.line_start(row) + trimmed_current.len();
-                let end = self.doc.line_start(row + 1) + (next.len() - next_trimmed.len());
+                let start = self.doc.read(cx).line_start(row) + trimmed_current.len();
+                let end = self.doc.read(cx).line_start(row + 1) + (next.len() - next_trimmed.len());
                 let glue = if next_trimmed.is_empty()
                     || trimmed_current.is_empty()
                     || next_trimmed.starts_with([')', ']', '}', ',', ';', '.'])
@@ -3966,7 +3969,7 @@ impl Editor {
     }
 
     fn toggle_block_comment(&mut self, _: &ToggleBlockComment, _: &mut Window, cx: &mut Context<Self>) {
-        let Some((open, close)) = self.doc.language.block_comment() else {
+        let Some((open, close)) = self.doc.read(cx).language.block_comment() else {
             return;
         };
         self.edit_selections(EditKind::Other, cx, |doc, s| {
@@ -3991,23 +3994,23 @@ impl Editor {
 // ---- IME / platform text input ---------------------------------------------
 
 impl Editor {
-    fn to_utf16(&self, offset: usize) -> usize {
-        let r = self.doc.rope();
+    fn to_utf16(&self, offset: usize, cx: &App) -> usize {
+        let r = self.doc.read(cx).rope();
         r.char_to_utf16_cu(r.byte_to_char(offset.min(r.len_bytes())))
     }
 
-    fn from_utf16(&self, offset: usize) -> usize {
-        let r = self.doc.rope();
+    fn from_utf16(&self, offset: usize, cx: &App) -> usize {
+        let r = self.doc.read(cx).rope();
         let ch = r.utf16_cu_to_char(offset.min(r.len_utf16_cu()));
         r.char_to_byte(ch)
     }
 
-    fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
-        self.from_utf16(r.start)..self.from_utf16(r.end)
+    fn range_from_utf16(&self, r: &Range<usize>, cx: &App) -> Range<usize> {
+        self.from_utf16(r.start, cx)..self.from_utf16(r.end, cx)
     }
 
-    fn range_to_utf16(&self, r: &Range<usize>) -> Range<usize> {
-        self.to_utf16(r.start)..self.to_utf16(r.end)
+    fn range_to_utf16(&self, r: &Range<usize>, cx: &App) -> Range<usize> {
+        self.to_utf16(r.start, cx)..self.to_utf16(r.end, cx)
     }
 }
 
@@ -4017,23 +4020,23 @@ impl EntityInputHandler for Editor {
         range_utf16: Range<usize>,
         actual_range: &mut Option<Range<usize>>,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.range_from_utf16(&range_utf16);
-        actual_range.replace(self.range_to_utf16(&range));
-        Some(self.doc.slice(range))
+        let range = self.range_from_utf16(&range_utf16, cx);
+        actual_range.replace(self.range_to_utf16(&range, cx));
+        Some(self.doc.read(cx).slice(range))
     }
 
-    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, cx: &mut Context<Self>) -> Option<UTF16Selection> {
         let s = self.primary_selection();
         Some(UTF16Selection {
-            range: self.range_to_utf16(&s.range()),
+            range: self.range_to_utf16(&s.range(), cx),
             reversed: s.reversed(),
         })
     }
 
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range.as_ref().map(|r| self.range_to_utf16(r, cx))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -4049,13 +4052,13 @@ impl EntityInputHandler for Editor {
     ) {
         let explicit = range_utf16
             .as_ref()
-            .map(|r| self.range_from_utf16(r))
+            .map(|r| self.range_from_utf16(r, cx))
             .or(self.marked_range.clone());
         match explicit {
             Some(range) => {
                 // IME commit: replace the composed range only.
                 let before = self.selections.clone();
-                let new = self.doc.edit(vec![(range, text.to_string())], &before, EditKind::Other);
+                let new = self.doc.as_mut(cx).edit(vec![(range, text.to_string())], &before, EditKind::Other);
                 let end = new[0].end;
                 self.set_selections(vec![Selection::cursor(end)], 0, cx);
                 self.after_edit(cx);
@@ -4076,17 +4079,17 @@ impl EntityInputHandler for Editor {
     ) {
         let range = range_utf16
             .as_ref()
-            .map(|r| self.range_from_utf16(r))
+            .map(|r| self.range_from_utf16(r, cx))
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.primary_selection().range());
         let before = self.selections.clone();
-        let new = self.doc.edit(vec![(range, new_text.to_string())], &before, EditKind::Other);
+        let new = self.doc.as_mut(cx).edit(vec![(range, new_text.to_string())], &before, EditKind::Other);
         let new_range = new[0].clone();
         let sel = match new_selected_range_utf16 {
             Some(r) => {
-                let base = self.to_utf16(new_range.start);
-                let s = self.from_utf16(base + r.start);
-                let e = self.from_utf16(base + r.end);
+                let base = self.to_utf16(new_range.start, cx);
+                let s = self.from_utf16(base + r.start, cx);
+                let e = self.from_utf16(base + r.end, cx);
                 Selection { anchor: s, head: e }
             }
             None => Selection::cursor(new_range.end),
@@ -4105,12 +4108,12 @@ impl EntityInputHandler for Editor {
     ) -> Option<Bounds<Pixels>> {
         self.sync_wrap(window, cx);
         let layout = self.layout.clone()?;
-        let range = self.range_from_utf16(&range_utf16);
-        let drow = self.display_row_of(range.start);
+        let range = self.range_from_utf16(&range_utf16, cx);
+        let drow = self.display_row_of(range.start, cx);
         let y = layout.bounds.top() + layout.line_height * drow as f32 - self.scroll.y;
         let x0 = self.x_for_offset(range.start, window, cx);
         let end = range.end.max(range.start);
-        let x1 = if self.display_row_of(end) == drow { self.x_for_offset(end, window, cx) } else { x0 };
+        let x1 = if self.display_row_of(end, cx) == drow { self.x_for_offset(end, window, cx) } else { x0 };
         let left = layout.text_left - self.scroll.x;
         Some(Bounds::from_corners(
             point(left + x0, y),
@@ -4125,7 +4128,7 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) -> Option<usize> {
         let offset = self.offset_for_position(point, window, cx);
-        Some(self.to_utf16(offset))
+        Some(self.to_utf16(offset, cx))
     }
 }
 
@@ -4137,12 +4140,12 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(path) = self.doc.image.clone() {
+        if let Some(path) = self.doc.read(cx).image.clone() {
             return self.render_image(path, cx).into_any_element();
         }
         let popover = self.render_hunk_popover(cx);
         let lsp_popovers = self.render_lsp_popovers(window, cx);
-        let markdown = self.mode == EditorMode::Full && self.doc.language == crate::syntax::Language::Markdown;
+        let markdown = self.mode == EditorMode::Full && self.doc.read(cx).language == crate::syntax::Language::Markdown;
         let preview = (markdown && self.md_preview).then(|| self.render_markdown_preview(cx).into_any_element());
         let preview_toggle = markdown.then(|| {
             let theme = Theme::get(cx);

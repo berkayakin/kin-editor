@@ -40,22 +40,22 @@ impl Editor {
         }
         let nothing_selected = self.selections.iter().all(|s| s.is_empty());
         let blocks: Vec<Range<usize>> =
-            if nothing_selected { vec![0..self.doc.line_count()] } else { self.selected_row_blocks() };
+            if nothing_selected { vec![0..self.doc.read(cx).line_count()] } else { self.selected_row_blocks(cx) };
         let mut edits = Vec::new();
         for block in blocks {
             // A trailing empty line (the file's final newline) stays where it is.
             let mut end = block.end;
-            if end > block.start + 1 && end == self.doc.line_count() && self.doc.line_text(end - 1).is_empty() {
+            if end > block.start + 1 && end == self.doc.read(cx).line_count() && self.doc.read(cx).line_text(end - 1).is_empty() {
                 end -= 1;
             }
-            let mut lines: Vec<String> = (block.start..end).map(|r| self.doc.line_text(r).to_string()).collect();
+            let mut lines: Vec<String> = (block.start..end).map(|r| self.doc.read(cx).line_text(r).to_string()).collect();
             let before = lines.clone();
             f(&mut lines);
             if lines == before {
                 continue;
             }
-            let start = self.doc.line_start(block.start);
-            let stop = self.doc.line_start(end - 1) + self.doc.line_text(end - 1).len();
+            let start = self.doc.read(cx).line_start(block.start);
+            let stop = self.doc.read(cx).line_start(end - 1) + self.doc.read(cx).line_text(end - 1).len();
             edits.push((start..stop, lines.join("\n")));
         }
         self.edit_and_remap(edits, EditKind::Other, cx);

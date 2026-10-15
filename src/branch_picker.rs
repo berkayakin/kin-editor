@@ -70,7 +70,7 @@ impl BranchPicker {
     }
 
     fn update_items(&mut self, cx: &mut Context<Self>) {
-        let query = self.query.read(cx).text().trim().to_string();
+        let query = self.query.read(cx).text(cx).trim().to_string();
         let needle = query.to_lowercase();
         let mut items = Vec::new();
         let branches = self.branches.clone().unwrap_or_default();
