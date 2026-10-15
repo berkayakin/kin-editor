@@ -331,7 +331,6 @@ impl Workspace {
     pub(super) fn render_branch_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let s = &self.git_status;
-        let dirty = !s.files.is_empty();
         div()
             .id("branch-chip")
             .flex()
@@ -351,8 +350,7 @@ impl Workspace {
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
             .child(icon_el(Icon::GitBranch, px(12.), theme.text_dim.into()))
             .child(div().min_w_0().truncate().child(ellipsize(&self.branch_label(), if narrow { 12 } else { 28 })))
-            // Uncommitted changes, like a shell prompt's marker.
-            .when(dirty, |el| el.child(div().flex_shrink_0().size(px(5.)).rounded_full().bg(theme.git_modified)))
+            // Uncommitted changes aren't marked here: the Commit tab counts them.
             .when(s.ahead > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↑{}", s.ahead))))
             .when(s.behind > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↓{}", s.behind))))
     }
