@@ -106,6 +106,11 @@ pub fn def(language: Language) -> Option<&'static BuiltinDef> {
     BUILTINS.iter().find(|d| d.language == language)
 }
 
+/// The built-in language with this name ("rust" finds Rust).
+pub fn by_name(name: &str) -> Option<&'static BuiltinDef> {
+    BUILTINS.iter().find(|d| d.name.eq_ignore_ascii_case(name))
+}
+
 /// The built-in language a file name or extension says `path` is.
 pub fn for_path(path: &Path) -> Option<Language> {
     let name = path.file_name()?.to_string_lossy().to_lowercase();
@@ -160,7 +165,7 @@ impl BuiltinDef {
 
     /// The text of one kind of query ("highlights", "injections"…): what
     /// `[queries]` lists for it, else the folder's `<kind>.scm`.
-    fn source(&self, kind: &str) -> Option<String> {
+    pub(crate) fn source(&self, kind: &str) -> Option<String> {
         let own = |name: &str| file(&format!("{}/{name}", self.dir)).map(str::to_string);
         match self.queries.get(kind).and_then(Value::as_array) {
             Some(sources) => {

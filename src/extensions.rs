@@ -35,7 +35,7 @@ use tree_sitter::Language as TsLanguage;
 
 use crate::{
     lsp::servers::{self, ServerSpec},
-    syntax::{LangConfig, LanguageQueries, OutlineConfig},
+    syntax::{LangConfig, Language, LanguageQueries, OutlineConfig},
     theme::config_dir,
 };
 
@@ -153,6 +153,9 @@ pub struct LanguageDef {
     dir: PathBuf,
     /// `tasks.json`: commands for `runnables.scm` tags (and untagged ones).
     pub tasks: Vec<Task>,
+    /// Queries for this built-in language (named like it, without a grammar
+    /// of its own): its files replace the built-in ones of the same kind.
+    builtin: Option<Language>,
     /// Set once the grammar's library is loaded (None: it failed to).
     loaded: OnceLock<Option<Loaded>>,
 }
@@ -217,12 +220,18 @@ impl LanguageDef {
         if let Some(loaded) = self.loaded.get() {
             return loaded.as_ref();
         }
-        let grammar = self.grammar.as_ref()?;
-        // Not built yet: try again when it is.
-        if !grammar.wasm.is_file() && (!grammar.library.is_file() || BUILDING.lock().unwrap().contains(&grammar.library)) {
-            return None;
-        }
-        let loaded = match self.load_now(grammar) {
+        let language = match self.builtin {
+            Some(builtin) => Ok(crate::languages::def(builtin)?.grammar()),
+            None => {
+                let grammar = self.grammar.as_ref()?;
+                // Not built yet: try again when it is.
+                if !grammar.wasm.is_file() && (!grammar.library.is_file() || BUILDING.lock().unwrap().contains(&grammar.library)) {
+                    return None;
+                }
+                if grammar.wasm.is_file() { load_wasm(&grammar.wasm, &grammar.name) } else { load_library(&grammar.library, &grammar.name) }
+            }
+        };
+        let loaded = match language.and_then(|language| self.load_now(language)) {
             Ok(loaded) => Some(loaded),
             Err(err) => {
                 add_problem(&self.extension, format!("{}: {err}", self.name));
@@ -232,12 +241,7 @@ impl LanguageDef {
         self.loaded.get_or_init(|| loaded).as_ref()
     }
 
-    fn load_now(&self, grammar: &Grammar) -> Result<Loaded, String> {
-        let language = if grammar.wasm.is_file() {
-            load_wasm(&grammar.wasm, &grammar.name)?
-        } else {
-            load_library(&grammar.library, &grammar.name)?
-        };
+    fn load_now(&self, language: TsLanguage) -> Result<Loaded, String> {
         // A query that doesn't fit the grammar leaves the language unhighlighted
         // (it still parses, for outlines and syntax errors).
         let highlights = LangConfig::build(language.clone(), &self.highlights).or_else(|err| {
@@ -252,7 +256,11 @@ impl LanguageDef {
             }
         });
         let mut problems = Vec::new();
-        let queries = LanguageQueries::build(&language, |file| std::fs::read_to_string(self.dir.join(file)).ok(), &mut problems);
+        let builtin = self.builtin.and_then(crate::languages::def);
+        let source = |file: &str| {
+            std::fs::read_to_string(self.dir.join(file)).ok().or_else(|| builtin?.source(file.trim_end_matches(".scm")))
+        };
+        let queries = LanguageQueries::build(&language, source, &mut problems);
         for problem in problems {
             add_problem(&self.extension, format!("{}: {problem}", self.name));
         }
@@ -271,6 +279,8 @@ struct Registry {
     /// By `Language::Extension` index. Names keep their index across reloads,
     /// so open files keep their language; a removed one is None.
     languages: Vec<Option<&'static LanguageDef>>,
+    /// Extensions' queries for built-in languages.
+    overrides: Vec<&'static LanguageDef>,
     /// Servers by the language name they serve (built-in languages too).
     /// Per language, the servers extensions bring for it.
     servers: HashMap<String, Vec<&'static ServerSpec>>,
@@ -281,6 +291,12 @@ struct Registry {
 static REGISTRY: LazyLock<RwLock<Registry>> = LazyLock::new(Default::default);
 /// Libraries being built, which mustn't be loaded half-written or built twice.
 static BUILDING: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+/// An extension's queries for a built-in language, once they're loaded.
+pub(crate) fn override_for(language: Language) -> Option<&'static LanguageDef> {
+    let def = REGISTRY.read().unwrap().overrides.iter().find(|d| d.builtin == Some(language)).copied()?;
+    def.load().map(|_| def)
+}
 
 pub fn language(ix: u16) -> Option<&'static LanguageDef> {
     REGISTRY.read().unwrap().languages.get(ix as usize).copied().flatten()
@@ -458,6 +474,8 @@ fn load() -> Vec<(String, Grammar)> {
 
     let mut registry = REGISTRY.write().unwrap();
     let mut slots: Vec<Option<&'static LanguageDef>> = vec![None; registry.languages.len()];
+    let (overrides, defs): (Vec<&'static LanguageDef>, Vec<_>) = defs.into_iter().partition(|d| d.builtin.is_some());
+    registry.overrides = overrides;
     for def in defs {
         // A language keeps its index; an old one with the same name is replaced.
         let old = registry.languages.iter().position(|l| l.is_some_and(|l| l.name == def.name));
@@ -695,12 +713,22 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
     let config = read_toml(&dir.join("config.toml"))?;
     let text = |key: &str| config.get(key).and_then(Value::as_str).map(str::to_string);
     let name = text("name").ok_or("config.toml has no name")?;
-    let grammar = text("grammar").map(|g| grammars.get(&g).cloned().ok_or(format!("grammar {g} isn't in extension.toml"))).transpose()?;
-    // The language's own queries, else the ones its grammar ships.
+    let builtin = crate::languages::by_name(&name);
+    let grammar = match text("grammar") {
+        Some(g) if grammars.contains_key(&g) => grammars.get(&g).cloned(),
+        // Queries for a built-in language, on its grammar.
+        _ if builtin.is_some() => None,
+        Some(g) => return Err(format!("grammar {g} isn't in extension.toml")),
+        None => None,
+    };
+    let builtin = builtin.filter(|_| grammar.is_none());
+    // The language's own queries, else the ones its grammar ships (or the
+    // built-in language's).
     let query = |file: &str, fallback: &str| {
-        std::fs::read_to_string(dir.join(file))
-            .ok()
-            .or_else(|| grammar.as_ref().and_then(|g| std::fs::read_to_string(g.src.parent()?.join("queries").join(fallback)).ok()))
+        std::fs::read_to_string(dir.join(file)).ok().or_else(|| match builtin {
+            Some(def) => def.source(file.trim_end_matches(".scm")),
+            None => grammar.as_ref().and_then(|g| std::fs::read_to_string(g.src.parent()?.join("queries").join(fallback)).ok()),
+        })
     };
     let (line_comment, block_comment) = comment_tokens(&config);
     let id = text("language_id").unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
@@ -723,6 +751,7 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
             .and_then(|text| serde_json::from_str(&crate::settings::strip_jsonc(&text)).ok())
             .unwrap_or_default(),
         grammar,
+        builtin: builtin.map(|def| def.language),
         loaded: OnceLock::new(),
     })
 }
@@ -1093,6 +1122,23 @@ formatter = ["gleam", "format", "--stdin"]
         let later = std::fs::metadata(&config).unwrap().modified().unwrap() + std::time::Duration::from_secs(2);
         std::fs::File::options().write(true).open(&config).unwrap().set_modified(later).unwrap();
         assert!(!std::ptr::eq(first, read_cached(&mut cache, &dir).1[0]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extensions_can_replace_a_built_in_languages_queries() {
+        let dir = temp_dir("override");
+        write(dir.join("extension.toml"), "id = \"rust-extra\"\nname = \"Rust Extra\"\n");
+        write(dir.join("languages/rust/config.toml"), "name = \"Rust\"\ngrammar = \"rust\"\n");
+        write(dir.join("languages/rust/highlights.scm"), "(identifier) @variable.special\n");
+        let (info, languages, _, _) = read_extension(&dir);
+        assert!(info.problems.is_empty(), "{:?}", info.problems);
+        let def: &'static LanguageDef = Box::leak(Box::new(languages.into_iter().next().unwrap()));
+        assert_eq!(def.builtin, Some(Language::Rust));
+        // Its own highlights; the built-in outline and injections.
+        let loaded = def.load().expect("loads on the built-in grammar");
+        assert!(loaded.highlights.capture_names().contains(&"variable.special"));
+        assert!(loaded.outline.is_some() && loaded.queries.has_injections());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -617,6 +617,10 @@ sticky scroll, syntax errors in Problems, comment toggling, its indentation, sni
 language server and formatter, and a row in **Settings → Languages**. Built-in languages win for
 their file extensions, except that a language naming an exact file (`docker-compose.yml`) gets it.
 
+A language named like a built-in one (`name = "Rust"`) without a grammar of its own changes the
+built-in language's queries instead: each of its `.scm` files replaces Kin's of the same kind, and the
+others stay. Kin's own are in [`assets/languages`](assets/languages), in this same format.
+
 Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
 Catppuccin themes, installed from their repositories.
 

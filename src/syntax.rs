@@ -256,6 +256,11 @@ pub(crate) struct LangConfig {
 }
 
 impl LangConfig {
+    #[cfg(test)]
+    pub(crate) fn capture_names(&self) -> &[&str] {
+        self.query.capture_names()
+    }
+
     fn new(language: TsLanguage, source: &str) -> Self {
         Self::build(language, source).expect("invalid highlight query")
     }
@@ -406,7 +411,10 @@ fn guess_kind(node: &str) -> &'static str {
 fn outline_config(language: Language) -> Option<&'static OutlineConfig> {
     match language {
         Language::Extension(_) => language.extension()?.outline_config(),
-        _ => crate::languages::def(language)?.outline_config(),
+        _ => match crate::extensions::override_for(language) {
+            Some(def) => def.outline_config(),
+            None => crate::languages::def(language)?.outline_config(),
+        },
     }
 }
 
@@ -416,7 +424,10 @@ const MAX_SYMBOLS: usize = 5000;
 fn config(language: Language) -> Option<&'static LangConfig> {
     match language {
         Language::Extension(_) => language.extension()?.highlight_config(),
-        _ => Some(crate::languages::def(language)?.highlight_config()),
+        _ => match crate::extensions::override_for(language) {
+            Some(def) => def.highlight_config(),
+            None => Some(crate::languages::def(language)?.highlight_config()),
+        },
     }
 }
 
@@ -439,6 +450,11 @@ struct InjectionQuery {
 }
 
 impl LanguageQueries {
+    #[cfg(test)]
+    pub(crate) fn has_injections(&self) -> bool {
+        self.injections.is_some()
+    }
+
     /// Compiles the queries that are there; one that doesn't fit the grammar
     /// is reported and left out.
     pub(crate) fn build(language: &TsLanguage, source: impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
@@ -465,7 +481,10 @@ impl LanguageQueries {
 pub(crate) fn queries(language: Language) -> Option<&'static LanguageQueries> {
     match language {
         Language::Extension(_) => language.extension()?.queries(),
-        _ => Some(crate::languages::def(language)?.queries()),
+        _ => match crate::extensions::override_for(language) {
+            Some(def) => def.queries(),
+            None => Some(crate::languages::def(language)?.queries()),
+        },
     }
 }
 
