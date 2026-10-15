@@ -4,7 +4,11 @@
 //! over the byte range that is actually on screen, so cost is proportional to
 //! the viewport rather than the file.
 
-use std::{ops::Range, path::Path, sync::LazyLock};
+use std::{
+    ops::{Deref, DerefMut, Range},
+    path::Path,
+    sync::{LazyLock, Mutex},
+};
 
 use ropey::Rope;
 use tree_sitter::{
@@ -730,13 +734,66 @@ fn injected_config(name: &str) -> Option<&'static LangConfig> {
 /// An embedded language's tree: every range of that language, parsed as one.
 struct Injection {
     config: &'static LangConfig,
-    parser: Parser,
+    parser: PooledParser,
     tree: Option<Tree>,
+}
+
+/// Parsers kept for reuse. A parser for a WASM grammar needs a `WasmStore`,
+/// and making one compiles tree-sitter's WASM runtime again; short-lived
+/// parses (the syntax-error lint, Markdown code blocks, diffs) are frequent.
+static PARSERS: Mutex<Vec<Parser>> = Mutex::new(Vec::new());
+const PARSER_POOL_SIZE: usize = 16;
+
+/// A parser set to a language, from the pool; it goes back when dropped.
+struct PooledParser(Option<Parser>);
+
+impl PooledParser {
+    fn new(language: &TsLanguage) -> Option<Self> {
+        let mut parser = PARSERS.lock().ok().and_then(|mut pool| pool.pop()).unwrap_or_default();
+        crate::extensions::prepare_parser(&mut parser, language);
+        // On failure it goes back to the pool too.
+        let mut pooled = PooledParser(Some(parser));
+        pooled.set_language(language).ok()?;
+        Some(pooled)
+    }
+}
+
+impl Deref for PooledParser {
+    type Target = Parser;
+    fn deref(&self) -> &Parser {
+        self.0.as_ref().expect("taken only on drop")
+    }
+}
+
+impl DerefMut for PooledParser {
+    fn deref_mut(&mut self) -> &mut Parser {
+        self.0.as_mut().expect("taken only on drop")
+    }
+}
+
+impl Drop for PooledParser {
+    fn drop(&mut self) {
+        let Some(mut parser) = self.0.take() else { return };
+        parser.reset();
+        if parser.set_included_ranges(&[]).is_ok()
+            && let Ok(mut pool) = PARSERS.lock()
+            && pool.len() < PARSER_POOL_SIZE
+        {
+            pool.push(parser);
+        }
+    }
+}
+
+/// Runs `f` with a parser for `language` from the pool.
+pub fn with_parser<R>(language: &TsLanguage, f: impl FnOnce(&mut Parser) -> R) -> Option<R> {
+    let mut parser = PooledParser::new(language)?;
+    Some(f(&mut parser))
 }
 
 pub struct Syntax {
     language: Language,
-    parser: Parser,
+    /// None for plain text (or a grammar that failed to load).
+    parser: Option<PooledParser>,
     tree: Option<Tree>,
     /// Embedded languages (see [`injection`] and extensions' injection queries).
     injections: Vec<Injection>,
@@ -744,11 +801,7 @@ pub struct Syntax {
 
 impl Syntax {
     pub fn new(language: Language, rope: &Rope) -> Self {
-        let mut parser = Parser::new();
-        if let Some(config) = config(language) {
-            crate::extensions::prepare_parser(&mut parser, &config.language);
-            parser.set_language(&config.language).ok();
-        }
+        let parser = config(language).and_then(|config| PooledParser::new(&config.language));
         let mut this = Self { language, parser, tree: None, injections: Vec::new() };
         this.reparse(rope);
         this
@@ -771,10 +824,8 @@ impl Syntax {
     }
 
     pub fn reparse(&mut self, rope: &Rope) {
-        if self.language == Language::PlainText {
-            return;
-        }
-        let tree = self.parser.parse_with_options(
+        let Some(parser) = self.parser.as_mut() else { return };
+        let tree = parser.parse_with_options(
             &mut |byte, _| rope_chunk(rope, byte),
             self.tree.as_ref(),
             None,
@@ -787,11 +838,7 @@ impl Syntax {
             let mut injection = match old.iter().position(|i| std::ptr::eq(i.config, config)) {
                 Some(ix) => old.swap_remove(ix),
                 None => {
-                    let mut parser = Parser::new();
-                    crate::extensions::prepare_parser(&mut parser, &config.language);
-                    if parser.set_language(&config.language).is_err() {
-                        continue;
-                    }
+                    let Some(parser) = PooledParser::new(&config.language) else { continue };
                     Injection { config, parser, tree: None }
                 }
             };
@@ -1191,6 +1238,25 @@ pub fn input_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pooled_parsers_come_back_clean() {
+        // HTML's script injection parses only included ranges; the parser
+        // must read whole files again when the pool hands it out next.
+        for _ in 0..3 {
+            let html = Rope::from_str("<p>x</p><script>let a = 1;</script>");
+            let syntax = Syntax::new(Language::Html, &html);
+            assert_eq!(syntax.injections.len(), 1);
+            drop(syntax);
+            let js = Rope::from_str("let b = 2;\nlet c = 3;\n");
+            let syntax = Syntax::new(Language::JavaScript, &js);
+            let root = syntax.tree().unwrap().root_node();
+            assert!(!root.has_error());
+            assert_eq!(root.named_child_count(), 2, "{}", root.to_sexp());
+        }
+        let tree = with_parser(&config(Language::Json).unwrap().language, |p| p.parse("[1, 2]", None)).flatten();
+        assert_eq!(tree.unwrap().root_node().kind(), "document");
+    }
 
     #[test]
     fn highlight_queries_compile() {

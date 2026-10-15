@@ -1,7 +1,7 @@
 //! Syntax errors for any language with a tree-sitter grammar: reports the
 //! `ERROR` and `MISSING` nodes the parser produced while recovering.
 
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::{Language, Node};
 
 use super::{Diagnostic, Severity};
 
@@ -10,12 +10,7 @@ use super::{Diagnostic, Severity};
 const MAX_ERRORS: usize = 100;
 
 pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
-    let mut parser = Parser::new();
-    crate::extensions::prepare_parser(&mut parser, language);
-    if parser.set_language(language).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(text, None) else {
+    let Some(tree) = crate::syntax::with_parser(language, |parser| parser.parse(text, None)).flatten() else {
         return Vec::new();
     };
     let mut out = Vec::new();

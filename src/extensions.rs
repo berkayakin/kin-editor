@@ -835,9 +835,11 @@ fn load_wasm(path: &Path, name: &str) -> Result<TsLanguage, String> {
 
 /// Readies `parser` for `language`: a WASM grammar runs in a store of its own.
 pub fn prepare_parser(parser: &mut tree_sitter::Parser, language: &TsLanguage) {
-    if language.is_wasm()
-        && let Ok(store) = tree_sitter::WasmStore::new(&WASM_ENGINE)
-    {
+    if !language.is_wasm() {
+        return;
+    }
+    // A parser from the pool keeps its store (making one is the slow part).
+    if let Some(store) = parser.take_wasm_store().or_else(|| tree_sitter::WasmStore::new(&WASM_ENGINE).ok()) {
         parser.set_wasm_store(store).ok();
     }
 }
