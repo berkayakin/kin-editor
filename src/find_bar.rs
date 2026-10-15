@@ -1,10 +1,10 @@
 //! In-file Find / Replace bar shown above the active editor (Ctrl+F / Ctrl+R).
 
-use std::ops::Range;
+use std::{ops::Range, time::Duration};
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement, Render, Subscription,
-    Window, div, prelude::*, px,
+    Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement, Render, Subscription,
+    Task, Window, div, prelude::*, px,
 };
 
 use crate::{
@@ -29,6 +29,10 @@ pub struct FindBar {
     target: Option<Entity<Editor>>,
     target_subscription: Option<Subscription>,
     matches: Vec<Range<usize>>,
+    /// What `matches` were found for: editor, document version, query, options.
+    searched: Option<(EntityId, u64, String, SearchOptions)>,
+    /// A search running in the background.
+    search_task: Option<Task<()>>,
     active: Option<usize>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -49,6 +53,8 @@ impl FindBar {
             target: None,
             target_subscription: None,
             matches: Vec::new(),
+            searched: None,
+            search_task: None,
             active: None,
             error: None,
             _subscriptions: vec![subscription],
@@ -105,23 +111,80 @@ impl FindBar {
         SearchQuery::new(&self.query.read(cx).text(), self.options)
     }
 
-    /// Recomputes matches. When the query changed, jumps to the nearest match.
+    /// Recomputes matches, in the background (the whole text is scanned),
+    /// shortly after typing stops. When the query changed, jumps to the
+    /// nearest match.
     fn update_matches(&mut self, jump: bool, cx: &mut Context<Self>) {
         let Some(target) = self.target.clone() else { return };
-        self.error = None;
-        self.matches = match self.query(cx) {
-            Ok(Some(q)) => q.find_all(&target.read(cx).doc.rope().to_string()),
-            Ok(None) => Vec::new(),
-            Err(e) => {
-                self.error = Some(e);
-                Vec::new()
+        let text = self.query.read(cx).text();
+        let key = (target.entity_id(), target.read(cx).doc.version(), text, self.options);
+        if self.searched.as_ref() == Some(&key) {
+            self.search_task = None;
+            self.show_matches(jump, cx);
+            return;
+        }
+        let query = match SearchQuery::new(&key.2, self.options) {
+            Ok(Some(query)) => query,
+            result => {
+                self.error = result.err();
+                self.search_task = None;
+                self.matches.clear();
+                self.searched = Some(key);
+                self.show_matches(jump, cx);
+                return;
             }
         };
+        self.error = None;
+        let rope = target.read(cx).doc.rope().clone();
+        // Typing a query waits less than editing the text with the bar open.
+        let delay = Duration::from_millis(if jump { 30 } else { 100 });
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let matches = cx.background_executor().spawn(async move { query.find_all(&rope.to_string()) }).await;
+            this.update(cx, |this, cx| {
+                let current = this.target.as_ref().map(|t| (t.entity_id(), t.read(cx).doc.version()));
+                if current != Some((key.0, key.1)) {
+                    return;
+                }
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = this.search_task.take() {
+                    task.detach();
+                }
+                this.matches = matches;
+                this.searched = Some(key);
+                this.show_matches(jump, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Brings the matches up to date here and now, for an action on them
+    /// (next, replace), which mustn't wait for the search or use old ones.
+    fn search_now(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let text = self.query.read(cx).text();
+        let key = (target.entity_id(), target.read(cx).doc.version(), text, self.options);
+        if self.searched.as_ref() == Some(&key) {
+            return;
+        }
+        self.search_task = None;
+        self.matches = match SearchQuery::new(&key.2, self.options) {
+            Ok(Some(query)) => query.find_all(&target.read(cx).doc.rope().to_string()),
+            _ => Vec::new(),
+        };
+        self.searched = Some(key);
+        self.show_matches(false, cx);
+    }
+
+    /// Highlights the matches in the editor, the one at or after the caret
+    /// as the current one (selected when `jump`).
+    fn show_matches(&mut self, jump: bool, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
         let cursor = target.read(cx).primary_selection().range().start;
         self.active = if self.matches.is_empty() {
             None
         } else {
-            Some(self.matches.iter().position(|m| m.end > cursor).unwrap_or(0))
+            Some(self.matches.partition_point(|m| m.end <= cursor) % self.matches.len())
         };
         let (matches, active) = (self.matches.clone(), self.active);
         target.update(cx, |e, cx| {
@@ -142,6 +205,7 @@ impl FindBar {
     }
 
     fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.search_now(cx);
         let Some(target) = self.target.clone() else { return };
         if self.matches.is_empty() {
             return;
@@ -163,6 +227,7 @@ impl FindBar {
     }
 
     fn replace_one(&mut self, cx: &mut Context<Self>) {
+        self.search_now(cx);
         let (Some(target), Some(ix), Ok(Some(query))) = (self.target.clone(), self.active, self.query(cx)) else {
             return;
         };
@@ -178,11 +243,12 @@ impl FindBar {
             e.replace_ranges(vec![(range, replacement)], cx);
             e.select_range(after..after, cx);
         });
-        // Matches were recomputed by the edit subscription; go to the next one.
+        // Go to the next match (`step` searches the edited text first).
         self.select_next(cx);
     }
 
     fn replace_all(&mut self, cx: &mut Context<Self>) {
+        self.search_now(cx);
         let (Some(target), Ok(Some(query))) = (self.target.clone(), self.query(cx)) else {
             return;
         };
