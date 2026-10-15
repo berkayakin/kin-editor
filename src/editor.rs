@@ -1785,7 +1785,7 @@ impl Editor {
             };
             // `def f():`, `if x:`, `steps:`
             let opens_colon_block = colon_opens && prev == Some(':') && !before.trim_start().starts_with('#');
-            // An extension's indents.scm: an @indent node opens on this line.
+            // The language's indents.scm: an @indent node opens on this line.
             let opens_by_query = doc.syntax().indent_after(doc.rope(), r.start, row) == Some(true);
             let opens = matches!(prev, Some('{' | '[' | '(')) || opens_html_tag || opens_colon_block || opens_by_query;
             let closes_next = match prev {
