@@ -253,6 +253,8 @@ pub struct Editor {
     tab_size: usize,
     /// Resolved settings for this file (see `apply_settings`).
     file_settings: FileSettings,
+    /// What `apply_settings` last applied (None: not yet).
+    applied_settings: Option<FileSettings>,
     cursor_visible: bool,
     blink_epoch: usize,
     blink_task: Option<Task<()>>,
@@ -342,6 +344,7 @@ impl Editor {
             indent_unit: String::new(),
             tab_size: file_settings.tab_size,
             file_settings,
+            applied_settings: None,
             cursor_visible: true,
             blink_epoch: 0,
             blink_task: None,
@@ -675,6 +678,12 @@ impl Editor {
     /// indentation, soft wrap and what saving does.
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let fs = Settings::get(cx).for_file(self.doc.language, self.doc.path.as_deref());
+        // Settings reloads come for every editor; most files resolve the same.
+        self.sync_vim(cx);
+        if self.applied_settings.as_ref() == Some(&fs) {
+            return;
+        }
+        self.applied_settings = Some(fs.clone());
         self.file_settings = fs.clone();
         self.tab_size = fs.tab_size;
         let configured = if fs.hard_tabs { "\t".to_string() } else { " ".repeat(fs.tab_size) };
@@ -686,7 +695,6 @@ impl Editor {
         }
         self.wrap = None;
         self.schedule_inlay_hints(cx);
-        self.sync_vim(cx);
         cx.notify();
     }
 
