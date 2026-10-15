@@ -421,12 +421,14 @@ impl Document {
 
     // ---- Editing --------------------------------------------------------------
 
-    /// Applies non-overlapping edits given in current-buffer coordinates.
-    /// Returns, for each edit (in input order), the range the new text occupies
-    /// afterwards.
+    /// Applies edits given in current-buffer coordinates. Overlapping edits
+    /// are merged into one (their texts joined in order), as two carets'
+    /// deletions can overlap (Backspace deleting a bracket pair next to
+    /// another caret). Returns, for each edit (in input order), the range its
+    /// new text occupies afterwards, including edits that changed nothing.
     pub fn edit(
         &mut self,
-        mut edits: Vec<(Range<usize>, String)>,
+        edits: Vec<(Range<usize>, String)>,
         selections_before: &[Selection],
         kind: EditKind,
     ) -> Vec<Range<usize>> {
@@ -434,34 +436,56 @@ impl Document {
         if self.image.is_some() {
             return Vec::new();
         }
-        let mut order: Vec<usize> = (0..edits.len()).collect();
-        order.sort_by_key(|&i| edits[i].0.start);
+        let count = edits.len();
+        let mut edits: Vec<(usize, Range<usize>, String)> = edits
+            .into_iter()
+            .enumerate()
+            .map(|(i, (range, text))| {
+                let start = self.clip(range.start);
+                (i, start..self.clip(range.end.max(start)), text)
+            })
+            .collect();
+        edits.sort_by_key(|(_, range, _)| (range.start, range.end));
+
+        // Group overlapping edits; each member remembers where its text starts
+        // inside the group's text.
+        struct Group {
+            range: Range<usize>,
+            text: String,
+            members: Vec<(usize, Range<usize>)>,
+        }
+        let mut groups: Vec<Group> = Vec::with_capacity(count);
+        for (i, range, text) in edits {
+            match groups.last_mut() {
+                Some(g) if range.start < g.range.end => {
+                    g.range.end = g.range.end.max(range.end);
+                    g.members.push((i, g.text.len()..g.text.len() + text.len()));
+                    g.text.push_str(&text);
+                }
+                _ => groups.push(Group { members: vec![(i, 0..text.len())], range, text }),
+            }
+        }
 
         // Apply from last to first so earlier ranges remain valid.
-        let mut records = Vec::with_capacity(edits.len());
-        for &i in order.iter().rev() {
-            let (range, text) = &mut edits[i];
-            let range = self.clip(range.start)..self.clip(range.end.max(range.start));
-            let old = self.slice(range.clone());
-            if old.is_empty() && text.is_empty() {
+        let mut records = Vec::with_capacity(groups.len());
+        for g in groups.iter().rev() {
+            if g.range.is_empty() && g.text.is_empty() {
                 continue;
             }
-            self.raw_replace(range.clone(), text);
-            records.push(EditRecord {
-                start: range.start,
-                old,
-                new: std::mem::take(text),
-            });
+            let old = self.slice(g.range.clone());
+            self.raw_replace(g.range.clone(), &g.text);
+            records.push(EditRecord { start: g.range.start, old, new: g.text.clone() });
         }
 
         // Compute post-edit ranges by accumulating deltas front to back.
-        let mut result = vec![0..0; edits.len()];
+        let mut result = vec![0..0; count];
         let mut delta: isize = 0;
-        let rec_by_start = records.iter().rev(); // ascending order of start
-        for (&i, rec) in order.iter().zip(rec_by_start) {
-            let start = (rec.start as isize + delta) as usize;
-            result[i] = start..start + rec.new.len();
-            delta += rec.new.len() as isize - rec.old.len() as isize;
+        for g in &groups {
+            let start = (g.range.start as isize + delta) as usize;
+            for (i, within) in &g.members {
+                result[*i] = start + within.start..start + within.end;
+            }
+            delta += g.text.len() as isize - g.range.len() as isize;
         }
 
         if !records.is_empty() {
@@ -897,6 +921,43 @@ mod tests {
         assert_eq!(doc.rope().to_string(), "abc\ndef");
         doc.redo();
         assert_eq!(doc.rope().to_string(), "bc\nXdef");
+    }
+
+    #[test]
+    fn edits_that_change_nothing_still_get_their_range() {
+        // Delete with carets at 3 and at the end: the second deletes nothing.
+        let mut doc = Document::from_text("abc\ndef".into(), None);
+        let r = doc.edit(vec![(3..4, String::new()), (7..7, String::new())], &[], EditKind::Deleting);
+        assert_eq!(doc.rope().to_string(), "abcdef");
+        assert_eq!(r, vec![3..3, 6..6]);
+
+        // Cut with an empty selection between two non-empty ones.
+        let mut doc = Document::from_text("one two three".into(), None);
+        let r = doc.edit(
+            vec![(8..13, String::new()), (0..3, String::new()), (5..5, String::new())],
+            &[],
+            EditKind::Other,
+        );
+        assert_eq!(doc.rope().to_string(), " two ");
+        assert_eq!(r, vec![5..5, 0..0, 2..2]);
+    }
+
+    #[test]
+    fn overlapping_edits_are_merged() {
+        // Backspace with carets at 1 and 2 in "()a": the first deletes the
+        // pair 0..2, the second 1..2. The "a" must survive.
+        let mut doc = Document::from_text("()a".into(), None);
+        let r = doc.edit(vec![(0..2, String::new()), (1..2, String::new())], &[], EditKind::Deleting);
+        assert_eq!(doc.rope().to_string(), "a");
+        assert_eq!(r, vec![0..0, 0..0]);
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "()a");
+
+        // Overlapping replacements keep both texts, in order.
+        let mut doc = Document::from_text("abcdef".into(), None);
+        let r = doc.edit(vec![(2..5, "Y".into()), (1..3, "X".into())], &[], EditKind::Other);
+        assert_eq!(doc.rope().to_string(), "aXYf");
+        assert_eq!(r, vec![2..3, 1..2]);
     }
 
     #[test]
