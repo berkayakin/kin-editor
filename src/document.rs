@@ -246,9 +246,14 @@ impl Document {
     }
 
     /// Replaces the contents with the file on disk. Returns whether anything
-    /// changed. Undo history is cleared since it no longer applies.
+    /// changed. Undo history is cleared since it no longer applies. A file
+    /// whose modification time is unchanged isn't read (window focus and Git
+    /// operations ask every open tab).
     pub fn reload_from_disk(&mut self) -> std::io::Result<bool> {
         let Some(path) = self.path.clone() else { return Ok(false) };
+        if self.disk_mtime.is_some() && !self.changed_on_disk() {
+            return Ok(false);
+        }
         if self.image.is_some() {
             let changed = mtime(&path) != self.disk_mtime;
             self.disk_mtime = mtime(&path);
@@ -978,6 +983,16 @@ mod tests {
         assert!(doc.changed_on_disk());
         doc.reload_from_disk().unwrap();
         assert!(!doc.changed_on_disk());
+
+        // Without a newer modification time the file isn't read again.
+        let same = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "other").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(same).unwrap();
+        assert!(!doc.reload_from_disk().unwrap());
+        assert_eq!(doc.rope().to_string(), "one!");
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later + Duration::from_secs(5)).unwrap();
+        assert!(doc.reload_from_disk().unwrap());
+        assert_eq!(doc.rope().to_string(), "other");
 
         std::fs::remove_file(&path).unwrap();
         assert!(doc.changed_on_disk(), "a deleted file counts as changed");
