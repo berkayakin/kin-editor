@@ -251,7 +251,7 @@ impl Workspace {
                     .child(counter(Icon::TriangleAlert, warnings, theme.warning.into()))
                     .when(infos > 0, |el| el.child(counter(Icon::CircleAlert, infos, theme.info.into()))),
             )
-            .when_some(self.git_busy, |el, busy| {
+            .when_some(self.git_busy.label().cloned(), |el, busy| {
                 el.child(
                     div()
                         .flex()

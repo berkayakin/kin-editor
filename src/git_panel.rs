@@ -6,12 +6,13 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Task, Window, div,
+    IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Window, div,
     prelude::*, px, uniform_list, UniformListScrollHandle,
 };
 
 use crate::{
     assets::Icon,
+    busy::Busy,
     editor::{Editor, Submit},
     git::{self, Branch, Change, FileStatus, RepoState, RepoStatus},
     theme::Theme,
@@ -87,11 +88,9 @@ pub struct GitPanel {
     /// The open folder (to offer `git init` when it isn't a repository).
     project: Option<PathBuf>,
     status: Arc<RepoStatus>,
-    busy: Option<SharedString>,
-    /// Whether `busy` has lasted long enough to show; quick operations
-    /// (staging a file) finish before it would only flash.
-    busy_shown: bool,
-    _busy_timer: Option<Task<()>>,
+    /// The running Git operation; its progress pill shows only if it takes a
+    /// while (staging a file doesn't), then long enough to read.
+    busy: Busy,
     selected: Option<(String, bool)>,
     /// The row whose context menu is open (outlined while it is).
     menu_target: Option<(String, bool)>,
@@ -122,9 +121,7 @@ impl GitPanel {
             repo: None,
             project: None,
             status: Arc::new(RepoStatus::default()),
-            busy: None,
-            busy_shown: false,
-            _busy_timer: None,
+            busy: Busy::default(),
             selected: None,
             menu_target: None,
             scroll: UniformListScrollHandle::new(),
@@ -158,19 +155,7 @@ impl GitPanel {
     }
 
     pub fn set_busy(&mut self, busy: Option<SharedString>, cx: &mut Context<Self>) {
-        self._busy_timer = busy.is_some().then(|| {
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-                this.update(cx, |this, cx| {
-                    this.busy_shown = true;
-                    cx.notify();
-                })
-                .ok();
-            })
-        });
-        self.busy = busy;
-        self.busy_shown = false;
-        cx.notify();
+        self.busy.set(busy, |panel: &mut Self| &mut panel.busy, cx);
     }
 
     pub fn set_menu_target(&mut self, target: Option<(String, bool)>, cx: &mut Context<Self>) {
@@ -195,7 +180,7 @@ impl GitPanel {
     }
 
     fn can_commit(&self, cx: &App) -> bool {
-        self.busy.is_none()
+        !self.busy.is_running()
             && !self.message_text(cx).is_empty()
             && (self.amend || !self.status.files.is_empty())
             // Unresolved conflicts would be committed with their markers.
@@ -428,7 +413,7 @@ impl GitPanel {
     fn render_state_banner(&self, state: RepoState, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let conflicts = self.status.conflicted().count();
-        let busy = self.busy.is_some();
+        let busy = self.busy.is_running();
         let detail = match conflicts {
             0 => "conflicts resolved".to_string(),
             1 => "1 conflict".to_string(),
@@ -693,7 +678,7 @@ impl Render for GitPanel {
                     .flex_col()
                     .child(list)
                     .child(crate::ui::list_scrollbar("git-changes-scrollbar", &self.scroll, cx))
-                    .when_some(self.busy.clone().filter(|_| self.busy_shown), |el, busy| {
+                    .when_some(self.busy.label().cloned(), |el, busy| {
                         el.child(
                             div().absolute().left_0().right_0().bottom(px(8.)).flex().justify_center().child(
                                 div()

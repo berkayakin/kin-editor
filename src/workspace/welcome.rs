@@ -462,7 +462,7 @@ impl Workspace {
                                 .child(format!("{changes} changed file{}", if changes == 1 { "" } else { "s" }))
                         }
                     })
-                    .when_some(self.git_busy, |el, busy| el.child(div().flex_1()).child(div().text_color(theme.accent).child(busy))),
+                    .when_some(self.git_busy.label().cloned(), |el, busy| el.child(div().flex_1()).child(div().text_color(theme.accent).child(busy))),
             )
             .when_some(self.last_commit.clone(), |el, c| {
                 el.child(

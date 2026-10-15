@@ -19,6 +19,7 @@ use gpui::{
 
 use crate::{
     assets::{self, Icon},
+    busy::Busy,
     document::{Breakpoint, Document},
     branch_picker::{BranchPicker, BranchPickerEvent},
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
@@ -240,6 +241,8 @@ struct Toast {
     kind: ToastKind,
     message: SharedString,
     detail: Option<SharedString>,
+    /// Dismissed, fading out before it's removed.
+    leaving: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -607,7 +610,8 @@ pub struct Workspace {
     last_commit: Option<git::CommitInfo>,
     /// Project folders opened before, newest first.
     recent_projects: Vec<PathBuf>,
-    git_busy: Option<&'static str>,
+    /// The running Git operation (one at a time), shown in the status bar.
+    git_busy: Busy,
     status_task: Option<Task<()>>,
     git_op_task: Option<Task<()>>,
     toasts: Vec<Toast>,
@@ -895,7 +899,7 @@ impl Workspace {
             git_remote: None,
             last_commit: None,
             recent_projects: state.recent_projects.clone(),
-            git_busy: None,
+            git_busy: Busy::default(),
             status_task: None,
             git_op_task: None,
             toasts: Vec::new(),

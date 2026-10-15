@@ -195,19 +195,19 @@ impl Workspace {
             (_, Some(repo), _) => repo.clone(),
             _ => return,
         };
-        if self.git_busy.is_some() {
+        if self.git_busy.is_running() {
             self.toast(ToastKind::Error, "Another Git operation is still running", None, cx);
             return;
         }
         let label = op.busy_label();
-        self.git_busy = Some(label);
+        self.git_busy.set(Some(label.into()), |ws: &mut Self| &mut ws.git_busy, cx);
         self.git_panel.update(cx, |p, cx| p.set_busy(Some(label.into()), cx));
         let status = self.git_status.clone();
         let op2 = op.clone();
         self.git_op_task = Some(cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { perform_git(&dir, op2, &status) }).await;
             this.update(cx, |ws, cx| {
-                ws.git_busy = None;
+                ws.git_busy.set(None, |ws: &mut Self| &mut ws.git_busy, cx);
                 ws.git_panel.update(cx, |p, cx| p.set_busy(None, cx));
                 match result {
                     Ok(message) => {
@@ -283,20 +283,37 @@ impl Workspace {
     pub(super) fn toast(&mut self, kind: ToastKind, message: impl Into<SharedString>, detail: Option<String>, cx: &mut Context<Self>) {
         let id = self.next_toast;
         self.next_toast += 1;
-        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into) });
-        if self.toasts.len() > 4 {
-            self.toasts.remove(0);
+        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into), leaving: false });
+        let shown: Vec<usize> = self.toasts.iter().filter(|t| !t.leaving).map(|t| t.id).collect();
+        if let Some(&oldest) = shown.first().filter(|_| shown.len() > 4) {
+            self.dismiss_toast(oldest, cx);
         }
         let seconds = if kind == ToastKind::Error { 9 } else { 4 };
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(seconds)).await;
-            this.update(cx, |ws, cx| {
-                ws.toasts.retain(|t| t.id != id);
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |ws, cx| ws.dismiss_toast(id, cx)).ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    /// Fades a toast out, then removes it.
+    pub(super) fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(toast) = self.toasts.iter_mut().find(|t| t.id == id && !t.leaving) else { return };
+        if Theme::get(cx).reduce_effects {
+            self.toasts.retain(|t| t.id != id);
+        } else {
+            toast.leaving = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(transition::TOAST).await;
+                this.update(cx, |ws, cx| {
+                    ws.toasts.retain(|t| t.id != id);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 

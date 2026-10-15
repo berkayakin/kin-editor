@@ -21,6 +21,8 @@ impl Workspace {
                 .w(px(360.))
                 .children(self.toasts.iter().map(|t| {
                     let id = t.id;
+                    // Slides up and fades in; leaving, the reverse.
+                    let fade = move |el: Stateful<Div>, t: f32| el.opacity(t).relative().top(px((1. - t) * 12.));
                     let (icon, color): (Icon, Hsla) = match t.kind {
                         ToastKind::Success => (Icon::CircleCheck, theme.success.into()),
                         ToastKind::Info => (Icon::CircleAlert, theme.text_muted.into()),
@@ -37,10 +39,7 @@ impl Workspace {
                         .border_color(Hsla::from(theme.border).alpha(0.85))
                         .shadow(soft_shadow(&theme, 2))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |ws, _, _, cx| {
-                            ws.toasts.retain(|t| t.id != id);
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |ws, _, _, cx| ws.dismiss_toast(id, cx)))
                         .child(div().pt(px(1.)).child(icon_el(icon, px(16.), color)))
                         .child(
                             div()
@@ -53,6 +52,8 @@ impl Workspace {
                                     el.child(div().text_size(px(12.)).text_color(theme.text_muted).line_clamp(4).child(d))
                                 }),
                         )
+                        .with_transition(gpui::ElementId::NamedInteger("toast-fade".into(), id as u64), !t.leaving, transition::TOAST, fade)
+                        .appear()
                 }))
                 .into_any_element(),
         )

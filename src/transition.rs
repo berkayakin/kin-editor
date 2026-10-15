@@ -14,8 +14,8 @@
 //! when it changes.
 //!
 //! The first frame shows the current state without animating (nothing fades out
-//! at startup), a change midway reverses from where it is, and with Reduce visual
-//! effects it snaps.
+//! at startup) unless it's built with `appear` (a toast sliding in), a change
+//! midway reverses from where it is, and with Reduce visual effects it snaps.
 
 use std::{
     cell::Cell,
@@ -36,6 +36,8 @@ use crate::theme::Theme;
 pub const FOCUS: Duration = Duration::from_millis(250);
 /// List rows: the mouse sweeps across them, so they settle quickly.
 pub const ROW: Duration = Duration::from_millis(150);
+/// Toasts sliding in and out.
+pub const TOAST: Duration = Duration::from_millis(220);
 
 pub trait TransitionExt: IntoElement + Sized + 'static {
     /// Eases this element toward `on`: `style` gets it and the progress, and
@@ -71,6 +73,8 @@ pub struct Transition<E> {
     style: Option<Box<dyn FnOnce(E, f32) -> E>>,
     /// While laying out a hover transition: the hover state it was styled for.
     hovered: Option<Rc<Cell<bool>>>,
+    /// Whether its first frame starts from off.
+    appear: bool,
 }
 
 enum Trigger {
@@ -80,7 +84,14 @@ enum Trigger {
 
 impl<E> Transition<E> {
     fn new(id: ElementId, trigger: Trigger, duration: Duration, element: E, style: Box<dyn FnOnce(E, f32) -> E>) -> Self {
-        Self { id, trigger, duration, element: Some(element), style: Some(style), hovered: None }
+        Self { id, trigger, duration, element: Some(element), style: Some(style), hovered: None, appear: false }
+    }
+
+    /// Animates in from off when first shown, instead of starting where it is:
+    /// for elements that come and go, like toasts.
+    pub fn appear(mut self) -> Self {
+        self.appear = true;
+        self
     }
 }
 
@@ -141,7 +152,7 @@ impl<E: IntoElement + 'static> Element for Transition<E> {
         cx: &mut App,
     ) -> (LayoutId, AnyElement) {
         let snap = Theme::get(cx).reduce_effects;
-        let duration = self.duration;
+        let (duration, appear) = (self.duration, self.appear);
         let (progress, running, hovered) = window.with_element_state(id.expect("has an id"), |state: Option<State>, _| {
             let now = Instant::now();
             let hovered = state.as_ref().map_or_else(Rc::default, |state| state.hovered.clone());
@@ -150,8 +161,9 @@ impl<E: IntoElement + 'static> Element for Transition<E> {
                 Trigger::Hover => hovered.get(),
             };
             let mut progress = match state {
-                Some(state) if !snap => state.progress,
-                _ => Progress::settled(on),
+                _ if snap => Progress::settled(on),
+                Some(state) => state.progress,
+                None => Progress::settled(on && !appear),
             };
             progress.set(on, now, duration);
             let result = (progress.value(now, duration), !progress.done(now, duration), hovered.clone());

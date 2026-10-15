@@ -5,6 +5,7 @@ mod about;
 mod python;
 mod assets;
 mod branch_picker;
+mod busy;
 mod cli;
 mod clone_dialog;
 mod conflict;
