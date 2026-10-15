@@ -9,7 +9,7 @@ A small, fast code editor written in Rust, rendered entirely on the GPU with
 platform-native text rendering (CoreText / DirectWrite).
 
 <p align="center">
-  <img src="docs/screenshots/default.png" alt="Kin with the file tree and a Rust file open, in the Clay Black theme">
+  <img src="docs/screenshots/default.png" alt="Kin with the file tree and a Rust file open, in the Monokai Pro theme">
 </p>
 
 ## Features
