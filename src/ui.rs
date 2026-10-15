@@ -5,6 +5,8 @@ use gpui::{
     Img, Render, SharedString, Stateful, Styled, Window, div, img, prelude::*, px, svg,
 };
 
+use std::time::{Duration, Instant};
+
 use crate::{
     assets::Icon,
     editor::Editor,
@@ -12,6 +14,212 @@ use crate::{
     theme::{Appearance, Theme},
     transition::{self, Transition, TransitionExt, mix},
 };
+
+// ---- Scrollbars ---------------------------------------------------------------------
+
+/// Width of a list's scrollbar strip; the thumb is narrower, off its right edge.
+pub const SCROLLBAR_WIDTH: f32 = 10.0;
+/// How long a scrollbar stays after scrolling or hovering, and how long it
+/// takes to fade in and out.
+const SCROLLBAR_HOLD: Duration = Duration::from_millis(1000);
+const SCROLLBAR_FADE_IN: Duration = Duration::from_millis(150);
+const SCROLLBAR_FADE_OUT: Duration = Duration::from_millis(300);
+
+/// When a scrollbar's thumb shows: while its content scrolls, it's hovered or
+/// dragged, then for `SCROLLBAR_HOLD`; it fades in and out, a reversal
+/// continuing from where it is. Kept by whatever draws the scrollbar and stepped
+/// once per paint.
+#[derive(Default)]
+pub struct ScrollbarFade {
+    /// The scroll position last painted; a change counts as activity.
+    offset: Option<Pixels>,
+    active_at: Option<Instant>,
+    /// When a redraw is already scheduled for, so frames don't pile up timers.
+    wake_at: Option<Instant>,
+    /// 0 hidden → 1 shown, moving at the fade speeds (eased when painted).
+    level: f32,
+    painted_at: Option<Instant>,
+}
+
+/// When a scrollbar wants to be painted again.
+pub enum FadeWake {
+    None,
+    /// Next frame: it's fading.
+    Frame,
+    /// When the hold ends.
+    After(Duration),
+}
+
+impl ScrollbarFade {
+    /// The thumb's opacity (0–1) this paint, and when to paint again.
+    pub fn step(&mut self, offset: Pixels, active: bool, minimal: bool) -> (f32, FadeWake) {
+        let now = Instant::now();
+        if active || self.offset.is_some_and(|o| o != offset) {
+            self.active_at = Some(now);
+        }
+        self.offset = Some(offset);
+        let held = self.active_at.map(|t| now.saturating_duration_since(t)).filter(|d| *d < SCROLLBAR_HOLD);
+        let target = if active || held.is_some() { 1. } else { 0. };
+        // At most a frame's worth (60 Hz), so a first paint after a while
+        // starts the fade instead of jumping into it.
+        let dt = self.painted_at.map_or(0., |t| now.saturating_duration_since(t).as_secs_f32().min(1. / 60.));
+        self.painted_at = Some(now);
+        self.level = if minimal {
+            target
+        } else if target > self.level {
+            (self.level + dt / SCROLLBAR_FADE_IN.as_secs_f32()).min(1.)
+        } else {
+            (self.level - dt / SCROLLBAR_FADE_OUT.as_secs_f32()).max(0.)
+        };
+        let wake = if self.level != target {
+            FadeWake::Frame
+        } else if let Some(d) = held.filter(|_| !active)
+            && self.wake_at.is_none_or(|w| w < now)
+        {
+            self.wake_at = Some(now + (SCROLLBAR_HOLD - d));
+            FadeWake::After(SCROLLBAR_HOLD - d)
+        } else {
+            FadeWake::None
+        };
+        (self.level * self.level * (3. - 2. * self.level), wake)
+    }
+}
+
+#[derive(Default)]
+pub struct ScrollbarState {
+    /// Where in the thumb it was grabbed, while it's dragged.
+    grab: Option<Pixels>,
+    hovered: bool,
+    fade: ScrollbarFade,
+}
+
+/// A scrollbar for what `handle` tracks (a `uniform_list`'s `base_handle`, or a
+/// div's `track_scroll`), laid over the right edge of its parent, which must be
+/// `relative` and as tall as the scrolled area. Like an overlay scrollbar: it
+/// shows while the content scrolls or the pointer is over it, then fades out
+/// (`ScrollbarFade`; no fades with Minimal visual effects); only when the
+/// content overflows.
+/// Drag the thumb, or click the track to jump there.
+pub fn scrollbar(id: impl Into<gpui::ElementId>, handle: &gpui::ScrollHandle, cx: &App) -> gpui::Canvas<(gpui::Hitbox, Entity<ScrollbarState>)> {
+    let id = id.into();
+    let handle = handle.clone();
+    let theme = Theme::get(cx);
+    let (color, minimal): (Hsla, bool) = (theme.text.into(), theme.reduce_effects);
+    gpui::canvas(
+        move |bounds, window, cx| {
+            let state = window.use_keyed_state(id, cx, |_, _| ScrollbarState::default());
+            (window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal), state)
+        },
+        move |bounds, (hitbox, state), window, cx| {
+            let max = handle.max_offset().height;
+            let track = bounds.size.height;
+            if max <= px(0.) || track <= px(0.) {
+                return;
+            }
+            let offset = handle.offset().y;
+            let (fade, wake) = state.update(cx, |s, _| s.fade.step(offset, s.grab.is_some() || s.hovered, minimal));
+            match wake {
+                FadeWake::Frame => window.request_animation_frame(),
+                FadeWake::After(delay) => {
+                    let view = window.current_view();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor().timer(delay).await;
+                        cx.update(|cx| cx.notify(view)).ok();
+                    })
+                    .detach();
+                }
+                FadeWake::None => {}
+            }
+            // Over the rows' own cursor (a pointing hand on clickable ones).
+            window.set_cursor_style(gpui::CursorStyle::Arrow, &hitbox);
+
+            let thumb_h = (track * (track / (track + max))).max(px(24.)).min(track);
+            let travel = (track - thumb_h).max(px(1.));
+            let t = (-offset / max).clamp(0., 1.);
+            let thumb = gpui::Bounds::new(
+                gpui::point(bounds.right() - px(8.), bounds.top() + travel * t),
+                gpui::size(px(6.), thumb_h),
+            );
+            if fade > 0. {
+                let lit = state.read(cx).grab.is_some() || state.read(cx).hovered;
+                let alpha = if lit { 0.28 } else { 0.16 } * fade;
+                window.paint_quad(gpui::fill(thumb, color.alpha(alpha)).corner_radii(px(3.)));
+            }
+
+            let top = bounds.top();
+            let scroll_to = {
+                let handle = handle.clone();
+                move |y: Pixels, grab: Pixels| {
+                    let t = ((y - grab - top) / travel).clamp(0., 1.);
+                    handle.set_offset(gpui::point(handle.offset().x, -(max * t)));
+                }
+            };
+            window.on_mouse_event({
+                let (state, hitbox, scroll_to) = (state.clone(), hitbox.clone(), scroll_to.clone());
+                move |e: &gpui::MouseDownEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble || e.button != gpui::MouseButton::Left || !hitbox.is_hovered(window) {
+                        return;
+                    }
+                    let on_thumb = thumb.contains(&e.position);
+                    let grab = if on_thumb { e.position.y - thumb.top() } else { thumb_h / 2. };
+                    if !on_thumb {
+                        scroll_to(e.position.y, grab);
+                    }
+                    state.update(cx, |s, cx| {
+                        s.grab = Some(grab);
+                        cx.notify();
+                    });
+                    // The rows under the bar don't take the click.
+                    cx.stop_propagation();
+                }
+            });
+            window.on_mouse_event({
+                let state = state.clone();
+                move |e: &gpui::MouseMoveEvent, phase, window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    let hovered = hitbox.is_hovered(window);
+                    let (grab, was_hovered) = (state.read(cx).grab, state.read(cx).hovered);
+                    match grab {
+                        Some(grab) if e.pressed_button == Some(gpui::MouseButton::Left) => {
+                            scroll_to(e.position.y, grab);
+                            state.update(cx, |_, cx| cx.notify());
+                        }
+                        _ if hovered != was_hovered => state.update(cx, |s, cx| {
+                            s.hovered = hovered;
+                            cx.notify();
+                        }),
+                        _ => {}
+                    }
+                }
+            });
+            window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble && state.read(cx).grab.is_some() {
+                    state.update(cx, |s, cx| {
+                        s.grab = None;
+                        cx.notify();
+                    });
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .w(px(SCROLLBAR_WIDTH))
+}
+
+/// `scrollbar` for a `uniform_list` tracking `handle`.
+pub fn list_scrollbar(
+    id: impl Into<gpui::ElementId>,
+    handle: &gpui::UniformListScrollHandle,
+    cx: &App,
+) -> gpui::Canvas<(gpui::Hitbox, Entity<ScrollbarState>)> {
+    let base = handle.0.borrow().base_handle.clone();
+    scrollbar(id, &base, cx)
+}
 
 // ---- Islands ------------------------------------------------------------------------
 //

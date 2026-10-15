@@ -559,6 +559,7 @@ pub struct Workspace {
     /// The debug session (running or finished) whose panel shows in the bottom area.
     debug: Option<(Entity<DebugSession>, Subscription)>,
     last_debug: Option<RunTarget>,
+    welcome_scroll: gpui::ScrollHandle,
     /// Where the debug session is paused (file, 1-based line), to mark it in that file's editor.
     debug_location: Option<(PathBuf, u32)>,
     /// Breakpoints of files that aren't open; open files keep theirs in their documents.
@@ -862,6 +863,7 @@ impl Workspace {
             last_run: None,
             debug: None,
             last_debug: None,
+            welcome_scroll: gpui::ScrollHandle::new(),
             debug_location: None,
             breakpoints: HashMap::new(),
             venv_shown: Default::default(),

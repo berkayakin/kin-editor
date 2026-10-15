@@ -235,7 +235,7 @@ impl Render for ThemePicker {
         .w_full();
         // Padding goes on a wrapper: GPUI's scroll-to-item counts a list's own
         // padding twice, so a list that fits its rows would scroll by 8px.
-        let list = div().py_1().child(list);
+        let list = div().py_1().child(div().relative().child(list).child(crate::ui::list_scrollbar("themes-scrollbar", &self.scroll, cx)));
 
         let footer = div()
             .flex()

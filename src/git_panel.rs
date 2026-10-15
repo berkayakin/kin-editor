@@ -7,7 +7,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Task, Window, div,
-    prelude::*, px, uniform_list,
+    prelude::*, px, uniform_list, UniformListScrollHandle,
 };
 
 use crate::{
@@ -95,6 +95,7 @@ pub struct GitPanel {
     selected: Option<(String, bool)>,
     /// The row whose context menu is open (outlined while it is).
     menu_target: Option<(String, bool)>,
+    scroll: UniformListScrollHandle,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -126,6 +127,7 @@ impl GitPanel {
             _busy_timer: None,
             selected: None,
             menu_target: None,
+            scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -672,6 +674,7 @@ impl Render for GitPanel {
                         .collect()
                 }),
             )
+            .track_scroll(self.scroll.clone())
             .flex_1()
             .min_h_0()
             .pb_2()
@@ -689,6 +692,7 @@ impl Render for GitPanel {
                     .flex()
                     .flex_col()
                     .child(list)
+                    .child(crate::ui::list_scrollbar("git-changes-scrollbar", &self.scroll, cx))
                     .when_some(self.busy.clone().filter(|_| self.busy_shown), |el, busy| {
                         el.child(
                             div().absolute().left_0().right_0().bottom(px(8.)).flex().justify_center().child(

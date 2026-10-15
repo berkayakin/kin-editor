@@ -440,6 +440,7 @@ impl Render for ProjectSearch {
         .track_scroll(self.scroll.clone())
         .h(px(260.))
         .w_full();
+        let list = div().relative().child(list).child(crate::ui::list_scrollbar("project-results-scrollbar", &self.scroll, cx));
 
         let path_line = self
             .matches
