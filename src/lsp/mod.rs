@@ -276,7 +276,20 @@ impl LspStore {
             Some(Value::Array(command)) => Some(command.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()),
             _ => None,
         };
-        let root = |spec: &servers::ServerSpec| servers::root_for(spec, path, self.workspace_root.as_deref());
+        let workspace_root = self.workspace_root.as_deref();
+        let root = |spec: &servers::ServerSpec| {
+            // A file outside the project (a dependency Go to Declaration
+            // opened): a server of the same kind that's already running
+            // knows it, the project's first; starting another would index
+            // the dependency on its own.
+            if !workspace_root.is_some_and(|r| path.starts_with(r)) {
+                let running = self.servers.keys().filter(|k| k.id == spec.id);
+                if let Some(key) = running.min_by_key(|k| Some(k.root.as_path()) != workspace_root) {
+                    return key.root.clone();
+                }
+            }
+            servers::root_for(spec, path, workspace_root)
+        };
         #[cfg(test)]
         if let Some(specs) = &self.test_specs {
             return specs.iter().map(|spec| (ServerKey { id: spec.id.to_string(), root: root(spec) }, None, *spec)).collect();
@@ -937,6 +950,23 @@ pub(crate) fn fake_server(name: &str, triggers: &str) -> &'static servers::Serve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn files_outside_the_project_use_its_server(cx: &mut gpui::TestAppContext) {
+        let spec = fake_server("outside", "");
+        let mut store = LspStore::new();
+        store.test_specs = Some(vec![spec]);
+        store.set_root(Some(PathBuf::from("/work/project")));
+        let root_of = |store: &LspStore, path: &str, cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| store.server_keys(Language::Rust, Path::new(path), cx))[0].0.root.clone()
+        };
+        // Nothing running: a dependency gets a root of its own.
+        assert_eq!(root_of(&store, "/deps/serde/src/lib.rs", cx), PathBuf::from("/deps/serde/src"));
+        // The project's server is running: the dependency goes to it.
+        store.servers.insert(ServerKey { id: spec.id.to_string(), root: PathBuf::from("/work/project") }, ServerState::Finding);
+        assert_eq!(root_of(&store, "/deps/serde/src/lib.rs", cx), PathBuf::from("/work/project"));
+        assert_eq!(root_of(&store, "/work/project/src/main.rs", cx), PathBuf::from("/work/project"));
+    }
 
     #[test]
     fn advertises_both_encodings() {
