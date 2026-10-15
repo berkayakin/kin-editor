@@ -905,7 +905,7 @@ impl Render for Preferences {
             self.render_results(&words, window, cx)
         };
 
-        modal_panel(cx)
+        let panel = modal_panel(cx)
             .id("preferences")
             .key_context("Preferences")
             .track_focus(&self.focus_handle)
@@ -934,8 +934,11 @@ impl Render for Preferences {
                     .child(self.render_header(&words, cx))
                     .when_some(self.file_error.clone(), |el, error| el.child(self.render_file_error(error, cx)))
                     .child(content),
-            )
-            .children(self.overlay.take())
+            );
+        // An open dropdown list goes beside the panel, not in it: the panel
+        // clips its content to its rounded shape, which would cut the list off
+        // at its edge.
+        div().relative().child(panel).children(self.overlay.take())
     }
 }
 
@@ -1477,7 +1480,10 @@ impl Preferences {
             .child(dropdown_trigger(("pref-menu", menu as usize), label, width, open, &theme).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| this.toggle_menu(menu, window, cx),
             )))
-            .child(canvas(move |bounds, _, _| anchor.set(bounds), |_, _, _, _| {}).absolute().size_full())
+            // Pinned to the corner: an absolute child without insets sits where
+            // it would in the flow, below the button, and the list would open
+            // a button's height too low.
+            .child(canvas(move |bounds, _, _| anchor.set(bounds), |_, _, _, _| {}).absolute().top_0().left_0().size_full())
             .into_any_element()
     }
 
