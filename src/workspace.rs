@@ -5475,12 +5475,15 @@ impl Workspace {
             .items_center()
             .h(px(28.))
             .rounded(px(14.))
-            .bg(theme.background)
+            // Set off the chrome by its fill (the elevated color) and a
+            // full-strength edge, so it reads in dark themes too. No shadow:
+            // those mark the main areas (islands, popovers), not controls.
+            .bg(theme.elevated)
             .border_1()
-            .border_color(theme.border_subtle)
+            .border_color(theme.border)
             .cursor_pointer()
             .text_size(px(12.5))
-            .hover(|s| s.border_color(theme.border))
+            .hover(|s| s.border_color(Hsla::from(theme.accent).alpha(0.5)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)));
         let width = match capsule {
@@ -5489,7 +5492,7 @@ impl Workspace {
                     .w(px(28.))
                     .justify_center()
                     .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
-                    .child(icon_el(Icon::Search, px(13.), theme.text_dim.into()))
+                    .child(icon_el(Icon::Search, px(13.), theme.text_muted.into()))
                     .into_any_element();
             }
             Capsule::Compact(w) | Capsule::Full(w) => w,
@@ -5512,7 +5515,7 @@ impl Workspace {
             .min_w(px(160.))
             .pl_2p5()
             .pr(px(if full { 4. } else { 10. }))
-            .child(icon_el(Icon::Search, px(13.), theme.text_dim.into()))
+            .child(icon_el(Icon::Search, px(13.), theme.text_muted.into()))
             .child(
                 div()
                     .flex()
@@ -5531,11 +5534,11 @@ impl Workspace {
                                     .flex()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .when_some(folder, |el, f| el.child(div().flex_shrink().truncate().text_color(theme.text_dim).child(f)))
+                                    .when_some(folder, |el, f| el.child(div().flex_shrink().truncate().text_color(theme.text_muted).child(f)))
                                     .child(div().min_w_0().truncate().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(name)),
                             )
                             .when(dirty, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.accent))),
-                        None => el.text_color(theme.text_dim).child(div().truncate().child("Search Everywhere")),
+                        None => el.text_color(theme.text_muted).child(div().truncate().child("Search Everywhere")),
                     }),
             )
             .when(full, |el| {
@@ -5545,9 +5548,9 @@ impl Workspace {
                         .px_1p5()
                         .py(px(1.))
                         .rounded(px(10.))
-                        .bg(theme.hover)
+                        .bg(theme.active)
                         .text_size(px(11.))
-                        .text_color(theme.text_dim)
+                        .text_color(theme.text_muted)
                         .child(double_shift_label()),
                 )
             })
