@@ -66,6 +66,7 @@ impl Workspace {
                     .child(self.render_panel_dock(window, cx))
                     .child(separator(&theme))
                     .child(self.render_search_button(window, cx))
+                    .child(self.render_extensions_button(window, cx))
                     .child(self.render_settings_button(window, cx)),
             )
             .map(|el| match mac {
@@ -217,10 +218,28 @@ impl Workspace {
         .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
     }
 
+    /// Opens Settings' Extensions page; lit while it shows.
+    pub(super) fn render_extensions_button(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let on = self.preferences_shown(cx) == Some(true);
+        let (rest, hover) = if on { (theme.accent, None) } else { (theme.text_dim, Some(theme.text.into())) };
+        self.bar_button("open-extensions", Icon::Puzzle, rest.into(), hover, cx, |ws, _, window, cx| ws.open_extensions(&OpenExtensions, window, cx))
+            .tooltip(|window, cx| status_tooltip("Extensions", &OpenExtensions, window, cx))
+    }
+
+    /// Whether Settings is open, and if so whether on its Extensions page.
+    fn preferences_shown(&self, cx: &App) -> Option<bool> {
+        match &self.modals.current {
+            Some(Modal::Preferences(p)) => Some(matches!(p.read(cx).page(), preferences::Page::Extensions)),
+            _ => None,
+        }
+    }
+
     /// Windows and Linux have no app menu, so Settings needs a way in.
     pub(super) fn render_settings_button(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let on = matches!(self.modals.current, Some(Modal::Preferences(_)));
+        // The Extensions button stands for its own page.
+        let on = self.preferences_shown(cx) == Some(false);
         let (rest, hover) = if on { (theme.accent, None) } else { (theme.text_dim, Some(theme.text.into())) };
         self.bar_button("open-settings", Icon::Settings, rest.into(), hover, cx, |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx))
             .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))

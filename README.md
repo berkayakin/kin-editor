@@ -534,7 +534,7 @@ Extensions add languages, themes, icon themes and snippets without rebuilding Ki
 [Zed's extension format](https://zed.dev/docs/extensions/developing-extensions), so Zed's language
 and theme extensions work as they are, and VS Code snippet files too.
 
-**Install** from **Settings → Extensions** (or **Extensions…** in the Kin menu and Find Action):
+**Install** from **Settings → Extensions** (or **Extensions…** in the Kin menu, Find Action and the puzzle at the top right):
 paste the URL of an extension's Git repository and press **Install**, or **Install from Folder…**
 for one on disk, which is used in place (for making your own: edit it, then **Reload**). Each
 extension is listed with what it adds and any problems; the trash button removes it. If Zed is
