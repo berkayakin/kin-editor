@@ -61,6 +61,38 @@ impl DebugSpec {
     }
 }
 
+/// What rust-analyzer's Run / Debug lens describes (its `runnable`: cargo's
+/// arguments, the test binary's, and where to run), as a target to run or
+/// debug the same way Kin's own Rust targets are.
+pub fn from_rust_analyzer(runnable: &serde_json::Value) -> Option<RunTarget> {
+    let args = runnable.get("args")?;
+    let strings = |key: &str| -> Vec<String> {
+        args.get(key).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    };
+    let (cargo, exe) = (strings("cargoArgs"), strings("executableArgs"));
+    let subcommand = cargo.first()?.clone();
+    let cwd = ["cwd", "workspaceRoot"].iter().find_map(|k| args.get(*k).and_then(|v| v.as_str())).map(PathBuf::from)?;
+    let quote = |list: &[String]| list.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ");
+    let mut command = format!("cargo {}", quote(&cargo));
+    if !exe.is_empty() {
+        command.push_str(&format!(" -- {}", quote(&exe)));
+    }
+    // lldb runs the executable cargo builds: `run` builds, `test` builds without running.
+    let build: Option<Vec<String>> = match subcommand.as_str() {
+        "run" => Some(std::iter::once("build".to_string()).chain(cargo[1..].iter().cloned()).collect()),
+        "test" => Some(["test".to_string(), "--no-run".into()].into_iter().chain(cargo[1..].iter().cloned()).collect()),
+        _ => None,
+    };
+    Some(RunTarget {
+        name: runnable.get("label").and_then(|l| l.as_str()).unwrap_or("cargo").to_string(),
+        command,
+        cwd,
+        row: None,
+        rows: 0..0,
+        debug: build.map(|build| DebugSpec::Cargo { build, args: exe }),
+    })
+}
+
 /// Quotes for a POSIX shell when needed.
 pub fn sh_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+%,".contains(c)) {
@@ -789,6 +821,21 @@ mod tests {
         assert_eq!(got[0].0, "Tests in 'math'");
         assert!(got[1].1.starts_with("npx vitest run ") && got[1].1.ends_with("-t 'adds 1\\+1'"), "{}", got[1].1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runs_what_a_rust_analyzer_lens_describes() {
+        let runnable = serde_json::json!({
+            "label": "test tests::doubles",
+            "kind": "cargo",
+            "args": { "workspaceRoot": "/w", "cargoArgs": ["test", "--package", "demo", "--bin", "demo"], "executableArgs": ["tests::doubles", "--exact"] },
+        });
+        let target = from_rust_analyzer(&runnable).unwrap();
+        assert_eq!(target.name, "test tests::doubles");
+        assert_eq!(target.command, "cargo test --package demo --bin demo -- tests::doubles --exact");
+        assert_eq!(target.cwd, PathBuf::from("/w"));
+        let Some(DebugSpec::Cargo { build, args }) = target.debug else { panic!("no debug spec") };
+        assert_eq!((build[..2].to_vec(), args), (vec!["test".to_string(), "--no-run".into()], vec!["tests::doubles".to_string(), "--exact".into()]));
     }
 
     #[test]

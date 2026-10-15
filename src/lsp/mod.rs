@@ -68,6 +68,16 @@ pub struct Server {
 }
 
 impl Server {
+    /// A capability's options (`codeLensProvider` → `{ "resolveProvider": true }`).
+    pub fn capability_value(&self, name: &str) -> &Value {
+        self.capabilities.get(name).unwrap_or(&Value::Null)
+    }
+
+    /// Whether the server runs `command` through `workspace/executeCommand`.
+    pub fn executes(&self, command: &str) -> bool {
+        self.capability_value("executeCommandProvider")["commands"].as_array().is_some_and(|c| c.iter().any(|c| c == command))
+    }
+
     pub fn capability(&self, name: &str) -> bool {
         self.capabilities.get(name).is_some_and(|v| !v.is_null() && v != &Value::Bool(false))
     }
@@ -970,7 +980,11 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
                 },
                 "publishDiagnostics": {},
                 "inlayHint": {},
+                "codeLens": {},
             },
+            // Commands Kin runs itself, so servers send code lenses that use
+            // them (rust-analyzer's Run, Debug and references lenses).
+            "experimental": { "commands": { "commands": CLIENT_COMMANDS } },
         },
     });
     if !initialization_options.is_null() {
@@ -978,6 +992,15 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
     }
     params
 }
+
+/// Code lens commands the editor carries out (see `Editor::run_code_lens`).
+pub const CLIENT_COMMANDS: &[&str] = &[
+    "rust-analyzer.runSingle",
+    "rust-analyzer.debugSingle",
+    "rust-analyzer.showReferences",
+    "rust-analyzer.gotoLocation",
+    "editor.action.showReferences",
+];
 
 impl Default for LspStore {
     fn default() -> Self {
@@ -1076,7 +1099,7 @@ while True:
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
     elif method == "initialize":
         init = m["params"].get("initializationOptions") or {}
-        caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True}
+        caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True, "codeLensProvider": {"resolveProvider": True}}
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
@@ -1092,6 +1115,16 @@ while True:
         message = " ".join([name + " problem"] + extra)
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [problem]}})
+    elif method == "textDocument/codeLens":
+        # Unresolved: the title comes with codeLens/resolve.
+        lens_range = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
+        send({"jsonrpc": "2.0", "id": id, "result": [{"range": lens_range, "data": 1}]})
+    elif method == "codeLens/resolve":
+        lens = m["params"]
+        uri = last_uri or ""
+        location = {"uri": uri, "range": lens["range"]}
+        lens["command"] = {"title": name + " lens", "command": "editor.action.showReferences", "arguments": [uri, lens["range"]["start"], [location]]}
+        send({"jsonrpc": "2.0", "id": id, "result": lens})
     elif method == "textDocument/completion":
         send({"jsonrpc": "2.0", "id": id, "result": [{"label": name + "-item"}]})
     elif method == "textDocument/codeAction":

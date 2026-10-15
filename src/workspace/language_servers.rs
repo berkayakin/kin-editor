@@ -29,6 +29,7 @@ impl Workspace {
                 self.show_context_menu(entries, menu_actions, *position, None, window, cx);
             }
             EditorLspEvent::Message(message) => self.toast(ToastKind::Info, message.clone(), None, cx),
+            EditorLspEvent::Command { server, command } => self.execute_command(server.clone(), command.clone(), cx),
         }
     }
 

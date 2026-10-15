@@ -325,6 +325,10 @@ Tailwind beside TypeScript). All of them get the file; their problems show toget
 and code actions list all of theirs, and the rest (hover, Go to Declaration, rename, formatting)
 goes to the first that offers it. The status bar names the ones running.
 
+**Code lenses** sit above lines, as the server offers them: rust-analyzer's ▶ Run / Debug (run in a
+Run tab or the debugger, like the gutter ▶), implementations and references (which open the
+usages list), and other servers' commands. Turn them off with `code_lens`.
+
 **Inlay hints** show what the server infers inside the code, on a soft chip: variable types,
 parameter names at call sites and the like. Kin turns them on in typescript-language-server, vtsls
 and gopls, which leave them off unless asked (change that through `lsp`). Turn them off with
@@ -694,7 +698,8 @@ and theme colors.
 | `rulers` | `[]` (`.editorconfig`'s `max_line_length`) | columns for vertical guides, e.g. `[80, 120]` |
 | `show_whitespace` | `"selection"` | mark spaces and tabs: `"selection"`, `"boundary"` (indentation and line ends), `"trailing"`, `"all"`, `"none"` |
 | `inlay_hints` | `true` | types and parameter names from the language server |
-| `languages` | | per-language overrides of the nine above, by the name in the status bar |
+| `code_lens` | `true` | the language server's code lenses above lines ("3 references", "▶ Run \| Debug") |
+| `languages` | | per-language overrides of the ten above, by the name in the status bar |
 | `vim_mode` | `false` | Vim's modes and keys; see [Vim mode](#vim-mode) |
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |

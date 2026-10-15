@@ -184,6 +184,13 @@ impl WrapMap {
         self.count_rows(rope, from);
     }
 
+    /// The first display row of the blocks above `line` (where its text
+    /// starts when it has none).
+    pub fn block_start(&self, line: usize) -> usize {
+        let lines = self.row_starts.len().saturating_sub(1);
+        if line < lines { self.row_starts[line] } else { self.row_count() - self.blocks_above(lines) }
+    }
+
     fn blocks_above(&self, row: usize) -> usize {
         self.blocks.iter().filter(|(line, _)| *line == row).map(|(_, n)| n).sum()
     }

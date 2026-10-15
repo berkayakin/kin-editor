@@ -16,6 +16,7 @@ use nucleo_matcher::{
 use serde_json::{Value, json};
 
 use super::{Editor, EditorEvent, EditorMode};
+use crate::document::CodeLens;
 use crate::{
     assets::Icon,
     document::EditKind,
@@ -42,6 +43,8 @@ pub enum EditorLspEvent {
     CodeActions { actions: Vec<(Arc<Server>, CodeAction)>, position: Point<Pixels> },
     /// Something to tell the user ("No usages found").
     Message(SharedString),
+    /// Run a server's command (a code lens's): `workspace/executeCommand`.
+    Command { server: Arc<Server>, command: Value },
 }
 
 impl gpui::EventEmitter<EditorLspEvent> for Editor {}
@@ -105,6 +108,7 @@ pub(super) struct EditorLsp {
     pub(super) symbol_highlights: (u64, Vec<std::ops::Range<usize>>),
     symbol_highlight_task: Option<Task<()>>,
     inlay_task: Option<Task<()>>,
+    lens_task: Option<Task<()>>,
 }
 
 /// A server's name as a diagnostic source (sources are `&'static str`):
@@ -184,6 +188,7 @@ impl Editor {
         self.doc.as_mut(cx).set_lsp_diagnostics(diagnostics);
         // The server has (re)analysed the file: its hints may have changed too.
         self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
         if !self.lsp.active {
             self.lsp.active = true;
             // Re-run the built-in linter without its now-duplicate syntax check.
@@ -662,6 +667,111 @@ impl Editor {
         }));
     }
 
+    // ---- Code lens ------------------------------------------------------------------------
+
+    /// After edits settle, asks every server that has them for code lenses
+    /// (resolving the ones sent without their command), shown above lines.
+    pub(super) fn schedule_code_lenses(&mut self, cx: &mut Context<Self>) {
+        if self.mode != EditorMode::Full || self.doc.read(cx).large || !self.file_settings.code_lens {
+            self.lsp.lens_task = None;
+            if !self.doc.read(cx).code_lenses().is_empty() {
+                self.doc.as_mut(cx).set_code_lenses(Vec::new());
+                cx.notify();
+            }
+            return;
+        }
+        self.lsp.lens_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
+            let Ok(Some((servers, params, version))) = this.update(cx, |e, cx| {
+                let servers: Vec<Arc<Server>> = e.lsp_servers(cx).into_iter().filter(|s| s.capability("codeLensProvider")).collect();
+                if servers.is_empty() {
+                    return None;
+                }
+                Some((servers, json!({ "textDocument": e.text_document(cx)? }), e.doc.read(cx).version()))
+            }) else {
+                return;
+            };
+            let mut found: Vec<(Arc<Server>, Value)> = Vec::new();
+            for server in servers {
+                let Ok(Value::Array(lenses)) = server.request("textDocument/codeLens", params.clone()).await else { continue };
+                let resolves = server.capability_value("codeLensProvider")["resolveProvider"] == Value::Bool(true);
+                let resolved = lenses.into_iter().map(|lens| {
+                    let server = server.clone();
+                    async move {
+                        if !resolves || lens.get("command").is_some_and(|c| !c.is_null()) {
+                            return lens;
+                        }
+                        server.request("codeLens/resolve", lens.clone()).await.unwrap_or(lens)
+                    }
+                });
+                for lens in futures::future::join_all(resolved).await {
+                    found.push((server.clone(), lens));
+                }
+            }
+            this.update(cx, |e, cx| {
+                // Edited meanwhile: the next request answers for the new text.
+                if e.doc.read(cx).version() != version {
+                    return;
+                }
+                let doc = e.doc.read(cx);
+                let lenses = found
+                    .into_iter()
+                    .filter_map(|(server, lens)| {
+                        let command = lens.get("command").filter(|c| !c.is_null())?.clone();
+                        let title = command.get("title")?.as_str()?.trim().to_string();
+                        let start = protocol::Position::from_json(lens.pointer("/range/start")?)?;
+                        let offset = protocol::position_to_offset(doc.rope(), start, server.encoding);
+                        (!title.is_empty()).then(|| CodeLens { line_start: doc.line_start(doc.row_of(offset)), title, command, server: server.id.clone() })
+                    })
+                    .collect();
+                e.doc.as_mut(cx).set_code_lenses(lenses);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Carries out a clicked code lens. References and locations open the
+    /// usages list; rust-analyzer's Run and Debug run Kin's target for the
+    /// line; anything else goes to the server if it runs that command.
+    pub(super) fn run_code_lens(&mut self, lens: CodeLens, cx: &mut Context<Self>) {
+        let name = lens.command["command"].as_str().unwrap_or_default().to_string();
+        let args = lens.command.get("arguments").cloned().unwrap_or(Value::Null);
+        let server = self.lsp_servers(cx).into_iter().find(|s| s.id == lens.server);
+        let row = self.doc.read(cx).row_of(lens.line_start);
+        let navigate = |locations: Vec<protocol::Location>, server: Option<Arc<Server>>, cx: &mut Context<Self>| match server {
+            Some(server) if !locations.is_empty() => {
+                cx.emit(EditorLspEvent::Navigate { title: lens.title.clone().into(), locations, encoding: server.encoding })
+            }
+            _ => cx.emit(EditorLspEvent::Message("Nothing found".into())),
+        };
+        match name.as_str() {
+            "editor.action.showReferences" | "rust-analyzer.showReferences" => navigate(protocol::locations(&args[2]), server, cx),
+            "rust-analyzer.gotoLocation" => navigate(protocol::locations(&args[0]), server, cx),
+            "rust-analyzer.runSingle" | "rust-analyzer.debugSingle" => {
+                let debug = name.ends_with("debugSingle");
+                // What the lens describes, else Kin's own target on that line.
+                let target = crate::run::from_rust_analyzer(&args[0]).filter(|t| !debug || t.debug.is_some()).or_else(|| {
+                    let targets = self.run_targets(cx);
+                    targets
+                        .iter()
+                        .filter(|t| t.row == Some(row) || t.rows.contains(&row))
+                        .filter(|t| !debug || t.debug.is_some())
+                        .min_by_key(|t| t.rows.len())
+                        .cloned()
+                });
+                match target {
+                    Some(target) => cx.emit(super::EditorRunEvent { target, debug, menu_at: None }),
+                    None => cx.emit(EditorLspEvent::Message(if debug { "Nothing to debug here" } else { "Nothing to run here" }.into())),
+                }
+            }
+            _ => match server.filter(|s| s.executes(&name)) {
+                Some(server) => cx.emit(EditorLspEvent::Command { server, command: lens.command.clone() }),
+                None => cx.emit(EditorLspEvent::Message(format!("Kin can't run “{}”", lens.title).into())),
+            },
+        }
+    }
+
     // ---- Symbol highlights ---------------------------------------------------------------
 
     /// After the caret settles, asks for the other uses of the symbol under it.
@@ -1071,6 +1181,50 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[gpui::test]
+    fn code_lenses_come_resolved_sit_above_their_line_and_run(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-lens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("lens", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        wait_for(cx, "the server", |cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+        // Asked after a pause in editing; resolved for its title.
+        editor.update(cx, |e, cx| e.schedule_code_lenses(cx));
+        wait_for(cx, "the lens", |cx| {
+            cx.executor().advance_clock(std::time::Duration::from_millis(500));
+            editor.read_with(cx, |e, cx| !e.doc.read(cx).code_lenses().is_empty())
+        });
+        let lens = editor.read_with(cx, |e, cx| e.doc.read(cx).code_lenses()[0].clone());
+        assert_eq!((lens.title.as_str(), lens.line_start), ("lens lens", 0));
+        editor.read_with(cx, |e, cx| assert_eq!(e.block_rows(cx), [(0, 1)]));
+
+        // Clicked: a references lens opens the usages list.
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&editor, move |_, event: &EditorLspEvent, _| {
+                if let EditorLspEvent::Navigate { title, locations, .. } = event {
+                    seen.borrow_mut().push((title.to_string(), locations.len()));
+                }
+            })
+        });
+        editor.update(cx, |e, cx| e.run_code_lens(lens, cx));
+        assert_eq!(*events.borrow(), [("lens lens".to_string(), 1)]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[gpui::test]

@@ -17,7 +17,7 @@ pub use lsp::EditorLspEvent;
 pub use run::{EditorBreakpointMenu, EditorBreakpointsChanged, EditorRunEvent};
 pub use unloaded::{EditorLoaded, Unloaded};
 
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
@@ -316,6 +316,8 @@ pub struct Editor {
     conflicts: derived::Derived<u64, Vec<crate::conflict::Conflict>>,
     /// Accept labels on screen last frame: (bounds, conflict start row, choice).
     conflict_hits: Vec<(Bounds<Pixels>, usize, crate::conflict::Resolution)>,
+    /// Code lens titles on screen last frame, to click.
+    lens_hits: Vec<(Bounds<Pixels>, crate::document::CodeLens)>,
     /// A restored tab whose file isn't read yet (`load` reads it).
     unloaded: Option<Unloaded>,
     /// The document's id and version as this editor last saw them (its own
@@ -420,6 +422,7 @@ impl Editor {
             run_targets: derived::Derived::new(),
             conflicts: derived::Derived::new(),
             conflict_hits: Vec::new(),
+            lens_hits: Vec::new(),
             image_info: None,
             unloaded: None,
         }
@@ -808,6 +811,7 @@ impl Editor {
         }
         self.wrap = None;
         self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
         cx.notify();
     }
 
@@ -1039,6 +1043,7 @@ impl Editor {
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.doc.as_mut(cx).set_selections_after(&self.selections);
         self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
         self.schedule_lint(Duration::from_millis(150), cx);
         self.schedule_diff(Duration::from_millis(120), cx);
         self.edited(cx);
@@ -1378,6 +1383,7 @@ impl Editor {
     fn toggle_inlay_hints(&mut self, _: &ToggleInlayHints, _: &mut Window, cx: &mut Context<Self>) {
         self.file_settings.inlay_hints = !self.file_settings.inlay_hints;
         self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
         cx.notify();
     }
 
@@ -1430,15 +1436,36 @@ impl Editor {
         self.wrap = Some(map);
     }
 
-    /// Rows between lines that aren't text (see `wrap`): a hunk opened from
-    /// the gutter shows the lines it deleted, above the ones that replaced them.
-    fn block_rows(&self, cx: &App) -> Vec<(usize, usize)> {
-        let Some(hunk) = self.open_hunk.and_then(|ix| self.hunks.get(ix)) else { return Vec::new() };
-        let deleted = hunk.old_text.lines().count();
-        if deleted == 0 || self.is_single_line() {
+    /// Rows between lines that aren't text (see `wrap`), in the order they
+    /// sit above their line: a hunk opened from the gutter shows the lines it
+    /// deleted, and code lenses sit right above their line.
+    fn blocks(&self, cx: &App) -> Vec<Block> {
+        if self.is_single_line() {
             return Vec::new();
         }
-        vec![(hunk.new_rows.start.min(self.doc.read(cx).line_count()), deleted)]
+        let doc = self.doc.read(cx);
+        let mut blocks = Vec::new();
+        if let Some(hunk) = self.open_hunk.and_then(|ix| self.hunks.get(ix)) {
+            let deleted: Vec<String> = hunk.old_text.lines().map(str::to_string).collect();
+            if !deleted.is_empty() {
+                blocks.push(Block { line: hunk.new_rows.start.min(doc.line_count()), kind: BlockKind::Deleted(deleted) });
+            }
+        }
+        if self.file_settings.code_lens {
+            for lens in doc.code_lenses() {
+                let line = doc.row_of(lens.line_start);
+                match blocks.last_mut() {
+                    Some(Block { line: l, kind: BlockKind::Lenses(lenses) }) if *l == line => lenses.push(lens.clone()),
+                    _ => blocks.push(Block { line, kind: BlockKind::Lenses(vec![lens.clone()]) }),
+                }
+            }
+        }
+        blocks.sort_by_key(|b| (b.line, matches!(b.kind, BlockKind::Lenses(_))));
+        blocks
+    }
+
+    fn block_rows(&self, cx: &App) -> Vec<(usize, usize)> {
+        self.blocks(cx).iter().map(|b| (b.line, b.rows())).collect()
     }
 
     /// Both brackets of the pairs around carets (a few, so many cursors stay
@@ -2331,6 +2358,11 @@ impl Editor {
                 self.toggle_breakpoint_at(row, cx);
                 return;
             }
+            // A code lens runs its command.
+            if let Some((_, lens)) = self.lens_hits.iter().find(|(b, _)| b.contains(&event.position)).cloned() {
+                self.run_code_lens(lens, cx);
+                return;
+            }
             // Accept Current / Incoming / Both on a conflict.
             if let Some(&(_, start, resolution)) = self.conflict_hits.iter().find(|(b, _, _)| b.contains(&event.position)) {
                 self.resolve_conflict(start, resolution, cx);
@@ -2790,26 +2822,57 @@ impl Editor {
             })
             .collect();
 
-        // Block rows: an opened hunk's deleted lines, in the gap the display
-        // map leaves above the lines that replaced them.
-        if let (Some(hunk), Some(map)) = (self.open_hunk.and_then(|ix| self.hunks.get(ix)), self.wrap.as_ref()) {
-            let deleted: Vec<&str> = hunk.old_text.lines().collect();
-            let start = (first_drow..last_drow).find(|&d| map.block_at(d).is_some_and(|(_, i)| i == 0)).or_else(|| {
-                // Scrolled past the first block row: work back from a visible one.
-                (first_drow..last_drow).find_map(|d| map.block_at(d).map(|(_, i)| d - i))
-            });
-            let tint = Hsla::from(theme.git_deleted);
-            for (i, line) in deleted.iter().enumerate() {
-                let Some(drow) = start.map(|s| s + i).filter(|d| (first_drow..last_drow).contains(d)) else { continue };
-                let y = top + line_height * drow as f32 - self.scroll.y;
-                frame.backgrounds.push(fill(Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)), tint.alpha(0.12)));
-                let run = |text: &str, color: Hsla| TextRun { len: text.len(), font: editor_font.clone(), color, background_color: None, underline: None, strikethrough: None };
-                let text = DisplayLine::new(line, self.tab_size).text;
-                let shaped = text_system.shape_line(SharedString::from(text.clone()), font_size, &[run(&text, theme.text_muted.into())], None);
-                frame.lines.push((point(text_left - self.scroll.x, y), shaped));
-                let minus = text_system.shape_line("−".into(), font_size, &[run("−", tint)], None);
-                frame.numbers.push((point(text_left - char_width * 2., y), minus));
+        // Block rows, in the gaps the display map leaves above their lines.
+        self.lens_hits.clear();
+        if let Some(map) = self.wrap.as_ref() {
+            let mut lens_hits = Vec::new();
+            let mut used: HashMap<usize, usize> = HashMap::new();
+            let run = |text: &str, font: Font, color: Hsla| TextRun { len: text.len(), font, color, background_color: None, underline: None, strikethrough: None };
+            for block in self.blocks(cx) {
+                let offset = used.entry(block.line).or_insert(0);
+                let start = map.block_start(block.line) + *offset;
+                *offset += block.rows();
+                let visible = |drow: usize| (first_drow..last_drow).contains(&drow);
+                let y_of = |drow: usize| top + line_height * drow as f32 - self.scroll.y;
+                match &block.kind {
+                    BlockKind::Deleted(lines) => {
+                        let tint = Hsla::from(theme.git_deleted);
+                        for (i, line) in lines.iter().enumerate().filter(|(i, _)| visible(start + i)) {
+                            let y = y_of(start + i);
+                            frame.backgrounds.push(fill(Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)), tint.alpha(0.12)));
+                            let text = DisplayLine::new(line, self.tab_size).text;
+                            let shaped = text_system.shape_line(SharedString::from(text.clone()), font_size, &[run(&text, editor_font.clone(), theme.text_muted.into())], None);
+                            frame.lines.push((point(text_left - self.scroll.x, y), shaped));
+                            let minus = text_system.shape_line("−".into(), font_size, &[run("−", editor_font.clone(), tint)], None);
+                            frame.numbers.push((point(text_left - char_width * 2., y), minus));
+                        }
+                    }
+                    BlockKind::Lenses(lenses) if visible(start) => {
+                        // Lined up with the line's text, smaller, like a caption.
+                        let y = y_of(start);
+                        let line = self.doc.read(cx).line_text(block.line.min(line_count.saturating_sub(1)));
+                        let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
+                        let caption = font_size * 0.85;
+                        let mut x = text_left - self.scroll.x + char_width * indent as f32;
+                        for (i, lens) in lenses.iter().enumerate() {
+                            if i > 0 {
+                                let bar = text_system.shape_line(" | ".into(), caption, &[run(" | ", ui_font.clone(), Hsla::from(theme.text_dim).alpha(0.6))], None);
+                                let width = bar.width;
+                                frame.lines.push((point(x, y + (line_height - caption) / 4.), bar));
+                                x += width;
+                            }
+                            let title = text_system.shape_line(lens.title.clone().into(), caption, &[run(&lens.title, ui_font.clone(), theme.text_dim.into())], None);
+                            let hit = Bounds::new(point(x, y), size(title.width, line_height));
+                            lens_hits.push((hit, lens.clone()));
+                            frame.lens_bounds.push(hit);
+                            x += title.width;
+                            frame.lines.push((point(hit.left(), y + (line_height - caption) / 4.), title));
+                        }
+                    }
+                    BlockKind::Lenses(_) => {}
+                }
             }
+            self.lens_hits = lens_hits;
         }
 
         let mut hl_ix = 0;
@@ -4465,6 +4528,31 @@ impl Editor {
 
 // ---- Element ---------------------------------------------------------------------
 
+/// What block rows show (see `Editor::blocks`).
+#[derive(Clone)]
+enum BlockKind {
+    /// An opened hunk's deleted lines, a row each.
+    Deleted(Vec<String>),
+    /// A line's code lenses, on one row.
+    Lenses(Vec<crate::document::CodeLens>),
+}
+
+#[derive(Clone)]
+struct Block {
+    /// The line it sits above (one past the last: after it).
+    line: usize,
+    kind: BlockKind,
+}
+
+impl Block {
+    fn rows(&self) -> usize {
+        match &self.kind {
+            BlockKind::Deleted(lines) => lines.len(),
+            BlockKind::Lenses(_) => 1,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct FrameLayout {
     text_bounds: Bounds<Pixels>,
@@ -4482,6 +4570,9 @@ pub struct FrameLayout {
     /// Fold arrows: bounds, icon and color.
     fold_icons: Vec<(Bounds<Pixels>, &'static str, Hsla)>,
     inline_bgs: Vec<PaintQuad>,
+    /// Code lens titles, for the pointer cursor.
+    lens_bounds: Vec<Bounds<Pixels>>,
+    lens_hitboxes: Vec<Hitbox>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
     sticky_bgs: Vec<PaintQuad>,
@@ -4540,6 +4631,8 @@ impl Element for EditorElement {
             .editor
             .update(cx, |editor, cx| editor.layout_frame(bounds, window, cx));
         frame.hitbox = Some(window.insert_hitbox(frame.text_bounds, HitboxBehavior::Normal));
+        // Over the text's, so a code lens shows it can be clicked.
+        frame.lens_hitboxes = frame.lens_bounds.iter().map(|b| window.insert_hitbox(*b, HitboxBehavior::Normal)).collect();
         frame
     }
 
@@ -4557,6 +4650,9 @@ impl Element for EditorElement {
         window.handle_input(&focus_handle, ElementInputHandler::new(bounds, self.editor.clone()), cx);
         if let Some(hitbox) = frame.hitbox.as_ref() {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
+        for hitbox in &frame.lens_hitboxes {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
 
         let line_height = frame.line_height;

@@ -171,6 +171,8 @@ pub struct Document {
     /// The language server's inlay hints (sorted); they follow edits until
     /// the next answer replaces them.
     inlay_hints: Vec<InlayHint>,
+    /// Language servers' code lenses, by line (shown above it).
+    code_lenses: Vec<CodeLens>,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -276,6 +278,7 @@ impl Document {
             tree_version: 0,
             snippet: None,
             inlay_hints: Vec::new(),
+            code_lenses: Vec::new(),
             disk_mtime: None,
             image: None,
         }
@@ -834,11 +837,24 @@ impl Document {
             self.snippet = None;
         }
         self.shift_inlay_hints(patch);
+        self.code_lenses = std::mem::take(&mut self.code_lenses)
+            .into_iter()
+            .filter_map(|lens| Some(CodeLens { line_start: self.shift_line(lens.line_start, patch)?, ..lens }))
+            .collect();
         // The merged list too: shifting keeps its order, so it needn't be
         // built and sorted again.
         for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.lsp_diagnostics, &mut self.diagnostics] {
             shift_diagnostics(list, patch);
         }
+    }
+
+    pub fn code_lenses(&self) -> &[CodeLens] {
+        &self.code_lenses
+    }
+
+    pub fn set_code_lenses(&mut self, mut lenses: Vec<CodeLens>) {
+        lenses.sort_by_key(|l| l.line_start);
+        self.code_lenses = lenses;
     }
 
     pub fn inlay_hints(&self) -> &[InlayHint] {
@@ -1050,6 +1066,19 @@ pub struct InlayHint {
     pub pad_right: bool,
 }
 
+/// A language server's code lens ("3 references", "▶ Run"): shown above its
+/// line, which it keeps across edits (it goes with a line that does).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeLens {
+    /// The start of its line.
+    pub line_start: usize,
+    pub title: String,
+    /// The LSP `Command` it runs.
+    pub command: serde_json::Value,
+    /// The id of the server that sent it.
+    pub server: String,
+}
+
 /// One replacement in LSP terms: where it was (as line plus UTF-8 and
 /// UTF-16 columns, since servers differ) and the new text.
 #[derive(Clone, Debug, PartialEq)]
@@ -1184,6 +1213,18 @@ fn shift_diagnostics(diagnostics: &mut Vec<Diagnostic>, patch: &Patch) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn code_lenses_follow_their_lines() {
+        let mut doc = Document::from_text("fn a() {}\nfn b() {}\nfn c() {}\n".into(), None);
+        let lens = |line_start: usize| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
+        doc.set_code_lenses(vec![lens(10), lens(20)]);
+        // A line above pushes them down; deleting a lens's line drops it.
+        doc.edit(vec![(0..0, "// top\n".into())], &[], EditKind::Other);
+        assert_eq!(doc.code_lenses().iter().map(|l| l.line_start).collect::<Vec<_>>(), [17, 27]);
+        doc.edit(vec![(17..27, String::new())], &[], EditKind::Other);
+        assert_eq!(doc.code_lenses().iter().map(|l| l.line_start).collect::<Vec<_>>(), [17]);
+    }
+
     #[test]
     fn image_documents_are_never_edited_or_overwritten() {
         let dir = std::env::temp_dir().join(format!("kin-image-doc-{}", std::process::id()));

@@ -263,6 +263,8 @@ pub struct EditorSettings {
     pub show_whitespace: Option<ShowWhitespace>,
     /// Types and parameter names from the language server, shown in the text.
     pub inlay_hints: Option<bool>,
+    /// The language server's code lenses ("3 references", "▶ Run") above lines.
+    pub code_lens: Option<bool>,
 }
 
 impl EditorSettings {
@@ -278,6 +280,7 @@ impl EditorSettings {
             rulers: self.rulers.or(base.rulers),
             show_whitespace: self.show_whitespace.or(base.show_whitespace),
             inlay_hints: self.inlay_hints.or(base.inlay_hints),
+            code_lens: self.code_lens.or(base.code_lens),
         }
     }
 
@@ -334,6 +337,7 @@ const EDITOR_KEYS: &[&str] = &[
     "rulers",
     "show_whitespace",
     "inlay_hints",
+    "code_lens",
 ];
 
 /// Editor options resolved for one file.
@@ -350,6 +354,7 @@ pub struct FileSettings {
     pub rulers: Vec<usize>,
     pub show_whitespace: ShowWhitespace,
     pub inlay_hints: bool,
+    pub code_lens: bool,
 }
 
 impl Settings {
@@ -499,6 +504,7 @@ impl Settings {
             "rulers" => self.editor.rulers.is_some(),
             "show_whitespace" => self.editor.show_whitespace.is_some(),
             "inlay_hints" => self.editor.inlay_hints.is_some(),
+            "code_lens" => self.editor.code_lens.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
             "visual_effects" => self.visual_effects.is_some() || self.reduce_visual_effects.is_some(),
@@ -560,6 +566,7 @@ impl Settings {
             rulers: None,
             show_whitespace: None,
             inlay_hints: None,
+            code_lens: None,
         };
         let s = from_config
             .or(language_overrides)
@@ -577,6 +584,7 @@ impl Settings {
             rulers: s.rulers.or(config.max_line_length.map(|n| vec![n])).unwrap_or_default(),
             show_whitespace: s.show_whitespace.unwrap_or_default(),
             inlay_hints: s.inlay_hints.unwrap_or(true),
+            code_lens: s.code_lens.unwrap_or(true),
         }
     }
 }
@@ -769,6 +777,8 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
   // "show_whitespace": "selection",
   // Types and parameter names from the language server, in the text.
   // "inlay_hints": true,
+  // The language server's code lenses above lines ("3 references", "▶ Run").
+  // "code_lens": true,
   // Vim keys (Normal, Insert and Visual modes).
   // "vim_mode": false,
 
