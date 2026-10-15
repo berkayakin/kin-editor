@@ -1,0 +1,9 @@
+name = "TSX"
+grammar = "tsx"
+path_suffixes = ["tsx"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/" }
+
+[queries]
+highlights = ["crate:javascript/highlights", "crate:javascript/jsx", "crate:typescript/highlights", "highlights.scm"]
+outline = ["crate:javascript/tags", "crate:typescript/tags", "outline.scm"]

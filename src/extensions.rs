@@ -38,6 +38,29 @@ use crate::{
     theme::config_dir,
 };
 
+/// A language's comment tokens from its `config.toml`, spaced for
+/// inserting: `line_comments` (the first) and `block_comment`, as
+/// `["/*", "*/"]` or Zed's newer `{ start = "/*", end = "*/" }`.
+pub(crate) fn comment_tokens(config: &Table) -> (Option<String>, Option<(String, String)>) {
+    let line = match config.get("line_comments").or(config.get("line_comment")) {
+        Some(Value::Array(items)) => items.first().and_then(Value::as_str).map(str::to_string),
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let block = match config.get("block_comment") {
+        Some(Value::Array(items)) => match (items.first().and_then(Value::as_str), items.get(1).and_then(Value::as_str)) {
+            (Some(start), Some(end)) => Some((start.to_string(), end.to_string())),
+            _ => None,
+        },
+        Some(Value::Table(t)) => match (t.get("start").and_then(Value::as_str), t.get("end").and_then(Value::as_str)) {
+            (Some(start), Some(end)) => Some((start.to_string(), end.to_string())),
+            _ => None,
+        },
+        _ => None,
+    };
+    (line.map(|c| format!("{} ", c.trim_end())), block.map(|(start, end)| (format!("{} ", start.trim_end()), format!(" {}", end.trim_start()))))
+}
+
 pub fn extensions_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("extensions"))
 }
@@ -620,31 +643,15 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
             .ok()
             .or_else(|| grammar.as_ref().and_then(|g| std::fs::read_to_string(g.src.parent()?.join("queries").join(fallback)).ok()))
     };
-    let line_comment = match config.get("line_comments").or(config.get("line_comment")) {
-        Some(Value::Array(items)) => items.first().and_then(Value::as_str).map(str::to_string),
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    };
-    // `["/*", "*/"]`, or Zed's newer `{ start = "/*", end = "*/" }`.
-    let block_comment = match config.get("block_comment") {
-        Some(Value::Array(items)) => match (items.first().and_then(Value::as_str), items.get(1).and_then(Value::as_str)) {
-            (Some(start), Some(end)) => Some((start.to_string(), end.to_string())),
-            _ => None,
-        },
-        Some(Value::Table(t)) => match (t.get("start").and_then(Value::as_str), t.get("end").and_then(Value::as_str)) {
-            (Some(start), Some(end)) => Some((start.to_string(), end.to_string())),
-            _ => None,
-        },
-        _ => None,
-    };
+    let (line_comment, block_comment) = comment_tokens(&config);
     let id = text("language_id").unwrap_or_else(|| name.to_lowercase().replace(' ', "-"));
     let formatter = config.get("formatter").map(|v| strings(Some(v))).filter(|c| !c.is_empty());
     Ok(LanguageDef {
         name: leak(name),
         id: leak(id),
         suffixes: strings(config.get("path_suffixes")),
-        line_comment: line_comment.map(|c| leak(format!("{} ", c.trim_end()))),
-        block_comment: block_comment.map(|(start, end)| (leak(format!("{} ", start.trim_end())), leak(format!(" {}", end.trim_start())))),
+        line_comment: line_comment.map(leak),
+        block_comment: block_comment.map(|(start, end)| (leak(start), leak(end))),
         tab_size: config.get("tab_size").and_then(Value::as_integer).map(|n| n.clamp(1, 16) as usize),
         hard_tabs: config.get("hard_tabs").and_then(Value::as_bool),
         formatter,

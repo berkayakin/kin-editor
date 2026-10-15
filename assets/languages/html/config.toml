@@ -1,0 +1,6 @@
+name = "HTML"
+grammar = "html"
+path_suffixes = ["html", "htm", "xhtml"]
+block_comment = { start = "<!--", end = "-->" }
+tab_size = 2
+

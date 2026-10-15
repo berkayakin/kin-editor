@@ -73,63 +73,17 @@ impl Language {
         if let Some(ix) = crate::extensions::language_for_file_name(path) {
             return Language::Extension(ix);
         }
-        match Self::built_in(path) {
-            Language::PlainText => crate::extensions::language_for_path(path).map_or(Language::PlainText, Language::Extension),
-            language => language,
-        }
-    }
-
-    fn built_in(path: &Path) -> Self {
-        // Well-known files whose name, not extension, gives the language.
-        match path.file_name().and_then(|n| n.to_str()).unwrap_or("") {
-            ".bashrc" | ".bash_profile" | ".bash_aliases" | ".bash_logout" | ".profile" | ".zshrc"
-            | ".zshenv" | ".zprofile" | ".zlogin" | ".envrc" => return Language::Shell,
-            "Cargo.lock" | "poetry.lock" | "uv.lock" | "Pipfile" => return Language::Toml,
-            ".babelrc" | ".eslintrc" | ".swcrc" => return Language::Json,
-            _ => {}
-        }
-        match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("js" | "mjs" | "cjs" | "jsx") => Language::JavaScript,
-            Some("ts" | "mts" | "cts") => Language::TypeScript,
-            Some("tsx") => Language::Tsx,
-            Some("html" | "htm" | "xhtml") => Language::Html,
-            Some("css") => Language::Css,
-            Some("rs") => Language::Rust,
-            Some("go") => Language::Go,
-            Some("py" | "pyw" | "pyi") => Language::Python,
-            Some("php" | "phtml") => Language::Php,
-            Some("sh" | "bash" | "zsh") => Language::Shell,
-            Some("json" | "jsonc") => Language::Json,
-            Some("yaml" | "yml") => Language::Yaml,
-            Some("toml") => Language::Toml,
-            Some("md" | "markdown" | "mdown" | "mkd") => Language::Markdown,
-            _ => Language::PlainText,
+        match crate::languages::for_path(path) {
+            Some(language) => language,
+            None => crate::extensions::language_for_path(path).map_or(Language::PlainText, Language::Extension),
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            Language::JavaScript => "JavaScript",
-            Language::TypeScript => "TypeScript",
-            Language::Tsx => "TSX",
-            Language::Html => "HTML",
-            Language::Css => "CSS",
-            Language::Rust => "Rust",
-            Language::Go => "Go",
-            Language::Python => "Python",
-            Language::Php => "PHP",
-            Language::Shell => "Shell Script",
-            Language::Json => "JSON",
-            Language::Yaml => "YAML",
-            Language::Toml => "TOML",
-            Language::Markdown => "Markdown",
             Language::PlainText => "Plain Text",
             Language::Extension(ix) => crate::extensions::language(ix).map_or("Plain Text", |l| l.name),
+            _ => crate::languages::def(self).map_or("Plain Text", |d| d.name),
         }
     }
 
@@ -147,33 +101,15 @@ impl Language {
 
     pub fn line_comment(self) -> Option<&'static str> {
         match self {
-            Language::JavaScript
-            | Language::TypeScript
-            | Language::Tsx
-            | Language::Rust
-            | Language::Go
-            | Language::Php
-            // JSONC (tsconfig, VS Code settings); the grammar accepts comments.
-            | Language::Json => Some("// "),
-            Language::Python | Language::Shell | Language::Yaml | Language::Toml => Some("# "),
-            Language::Html | Language::Css | Language::Markdown | Language::PlainText => None,
             Language::Extension(_) => self.extension().and_then(|l| l.line_comment),
+            _ => crate::languages::def(self).and_then(|d| d.line_comment),
         }
     }
 
     pub fn block_comment(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Language::JavaScript
-            | Language::TypeScript
-            | Language::Tsx
-            | Language::Css
-            | Language::Rust
-            | Language::Go
-            | Language::Php
-            | Language::Json => Some(("/* ", " */")),
-            Language::Html | Language::Markdown => Some(("<!-- ", " -->")),
-            Language::Python | Language::Shell | Language::Yaml | Language::Toml | Language::PlainText => None,
             Language::Extension(_) => self.extension().and_then(|l| l.block_comment),
+            _ => crate::languages::def(self).and_then(|d| d.block_comment),
         }
     }
 }
@@ -181,26 +117,10 @@ impl Language {
 /// The tree-sitter grammar for `language`, used for highlighting and for
 /// syntax-error linting.
 pub fn grammar(language: Language) -> Option<TsLanguage> {
-    Some(match language {
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        Language::Html => tree_sitter_html::LANGUAGE.into(),
-        Language::Css => tree_sitter_css::LANGUAGE.into(),
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        // The PHP grammar that also accepts HTML around `<?php` tags.
-        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        Language::Shell => tree_sitter_bash::LANGUAGE.into(),
-        Language::Json => tree_sitter_json::LANGUAGE.into(),
-        Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
-        Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
-        // Block structure only; inline syntax is a second grammar (see `Syntax`).
-        Language::Markdown => tree_sitter_md::LANGUAGE.into(),
-        Language::PlainText => return None,
-        Language::Extension(_) => return language.extension()?.grammar(),
-    })
+    match language {
+        Language::Extension(_) => language.extension()?.grammar(),
+        _ => Some(crate::languages::def(language)?.grammar()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -262,40 +182,6 @@ impl Highlight {
     }
 }
 
-const HTML_HIGHLIGHTS: &str = r#"
-(tag_name) @tag
-(erroneous_end_tag_name) @tag.error
-(doctype) @constant
-(attribute_name) @attribute
-(quoted_attribute_value) @string
-(attribute_value) @string
-(comment) @comment
-(entity) @escape
-["<" ">" "</" "/>" "<!"] @punctuation.bracket
-"=" @operator
-"#;
-
-const JS_EXTRA_HIGHLIGHTS: &str = r#"
-(escape_sequence) @escape
-"#;
-
-/// The grammar's own query captures keys before strings; here the later
-/// pattern wins, so keys must come after `(string)` to get their own color.
-const JSON_HIGHLIGHTS: &str = r#"
-(string) @string
-(pair key: (string) @property)
-(number) @number
-[(null) (true) (false)] @constant.builtin
-(escape_sequence) @escape
-(comment) @comment
-"#;
-
-/// The Rust grammar's query tags literals as `constant.builtin`; numbers read
-/// better in the number color like the other languages.
-const RUST_EXTRA_HIGHLIGHTS: &str = r#"
-[(integer_literal) (float_literal)] @number
-"#;
-
 pub(crate) struct LangConfig {
     language: TsLanguage,
     query: Query,
@@ -324,79 +210,7 @@ impl LangConfig {
     }
 }
 
-static JS: LazyLock<LangConfig> = LazyLock::new(|| {
-    LangConfig::new(
-        tree_sitter_javascript::LANGUAGE.into(),
-        &format!(
-            "{}\n{}\n{}",
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
-            tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
-            JS_EXTRA_HIGHLIGHTS
-        ),
-    )
-});
-
-/// TypeScript's query only adds types and keywords on top of JavaScript's.
-fn typescript_config(language: TsLanguage, jsx: bool) -> LangConfig {
-    let jsx = if jsx { tree_sitter_javascript::JSX_HIGHLIGHT_QUERY } else { "" };
-    LangConfig::new(
-        language,
-        &format!(
-            "{}\n{}\n{}\n{}",
-            tree_sitter_javascript::HIGHLIGHT_QUERY,
-            jsx,
-            tree_sitter_typescript::HIGHLIGHTS_QUERY,
-            JS_EXTRA_HIGHLIGHTS
-        ),
-    )
-}
-
-static TYPESCRIPT: LazyLock<LangConfig> =
-    LazyLock::new(|| typescript_config(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), false));
-
-static TSX: LazyLock<LangConfig> =
-    LazyLock::new(|| typescript_config(tree_sitter_typescript::LANGUAGE_TSX.into(), true));
-
-static CSS: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_css::LANGUAGE.into(), tree_sitter_css::HIGHLIGHTS_QUERY));
-
-static SHELL: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_bash::LANGUAGE.into(), tree_sitter_bash::HIGHLIGHT_QUERY));
-
-static JSON: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_json::LANGUAGE.into(), JSON_HIGHLIGHTS));
-
-static YAML: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_yaml::LANGUAGE.into(), tree_sitter_yaml::HIGHLIGHTS_QUERY));
-
-static TOML: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_toml_ng::LANGUAGE.into(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY));
-
-static HTML: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_html::LANGUAGE.into(), HTML_HIGHLIGHTS));
-
-static RUST: LazyLock<LangConfig> = LazyLock::new(|| {
-    LangConfig::new(
-        tree_sitter_rust::LANGUAGE.into(),
-        &format!("{}\n{}", tree_sitter_rust::HIGHLIGHTS_QUERY, RUST_EXTRA_HIGHLIGHTS),
-    )
-});
-
-static GO: LazyLock<LangConfig> =
-    LazyLock::new(|| LangConfig::new(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::HIGHLIGHTS_QUERY));
-
-static PYTHON: LazyLock<LangConfig> = LazyLock::new(|| {
-    LangConfig::new(tree_sitter_python::LANGUAGE.into(), tree_sitter_python::HIGHLIGHTS_QUERY)
-});
-
-static PHP: LazyLock<LangConfig> = LazyLock::new(|| {
-    LangConfig::new(tree_sitter_php::LANGUAGE_PHP.into(), tree_sitter_php::HIGHLIGHTS_QUERY)
-});
-
-static MARKDOWN: LazyLock<LangConfig> = LazyLock::new(|| {
-    LangConfig::new(tree_sitter_md::LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)
-});
-
+/// Markdown's inline syntax: a second grammar, injected into its blocks.
 static MARKDOWN_INLINE: LazyLock<LangConfig> = LazyLock::new(|| {
     LangConfig::new(tree_sitter_md::INLINE_LANGUAGE.into(), tree_sitter_md::HIGHLIGHT_QUERY_INLINE)
 });
@@ -431,10 +245,6 @@ pub(crate) struct OutlineConfig {
 }
 
 impl OutlineConfig {
-    fn new(language: TsLanguage, source: &str) -> Self {
-        Self::build(language, source).expect("invalid outline query")
-    }
-
     pub(crate) fn build(language: TsLanguage, source: &str) -> Result<Self, String> {
         let query = Query::new(&language, source).map_err(|e| format!("outline query, line {}: {}", e.row + 1, e.message))?;
         let kinds = query
@@ -527,136 +337,24 @@ fn guess_kind(node: &str) -> &'static str {
     KINDS.iter().find(|(word, _)| node.contains(word)).map_or("symbol", |(_, kind)| kind)
 }
 
-/// Rust's tags query only references impl blocks; as containers they make
-/// methods easy to find.
-const RUST_OUTLINE: &str = r#"
-(impl_item type: (_) @name) @definition.implementation
-"#;
-
-/// Classes, type aliases and enums, whose names TypeScript parses as types.
-const TYPESCRIPT_OUTLINE: &str = r#"
-(class_declaration name: (type_identifier) @name) @definition.class
-(type_alias_declaration name: (type_identifier) @name) @definition.type
-(enum_declaration name: (identifier) @name) @definition.enum
-"#;
-
-const MARKDOWN_OUTLINE: &str = r#"
-(section (atx_heading heading_content: (inline) @name)) @definition.heading
-(section (setext_heading heading_content: (paragraph) @name)) @definition.heading
-"#;
-
-const CSS_OUTLINE: &str = r#"
-(rule_set (selectors) @name) @definition.selector
-(keyframes_statement (keyframes_name) @name) @definition.keyframes
-"#;
-
-const SHELL_OUTLINE: &str = r#"
-(function_definition name: (word) @name) @definition.function
-"#;
-
-const JSON_OUTLINE: &str = r#"
-(pair key: (string (string_content) @name)) @definition.key
-"#;
-
-const YAML_OUTLINE: &str = r#"
-(block_mapping_pair key: (flow_node) @name) @definition.key
-"#;
-
-const TOML_OUTLINE: &str = r#"
-(table [(bare_key) (dotted_key) (quoted_key)] @name) @definition.table
-(table_array_element [(bare_key) (dotted_key) (quoted_key)] @name) @definition.table
-"#;
-
 fn outline_config(language: Language) -> Option<&'static OutlineConfig> {
-    static JS: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_javascript::LANGUAGE.into(), tree_sitter_javascript::TAGS_QUERY));
-    static TS: LazyLock<OutlineConfig> = LazyLock::new(|| {
-        OutlineConfig::new(
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            &format!("{}\n{}\n{}", tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY, TYPESCRIPT_OUTLINE),
-        )
-    });
-    static TSX: LazyLock<OutlineConfig> = LazyLock::new(|| {
-        OutlineConfig::new(
-            tree_sitter_typescript::LANGUAGE_TSX.into(),
-            &format!("{}\n{}\n{}", tree_sitter_javascript::TAGS_QUERY, tree_sitter_typescript::TAGS_QUERY, TYPESCRIPT_OUTLINE),
-        )
-    });
-    static RUST: LazyLock<OutlineConfig> = LazyLock::new(|| {
-        OutlineConfig::new(tree_sitter_rust::LANGUAGE.into(), &format!("{}\n{}", tree_sitter_rust::TAGS_QUERY, RUST_OUTLINE))
-    });
-    static GO: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY));
-    static PYTHON: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_python::LANGUAGE.into(), tree_sitter_python::TAGS_QUERY));
-    static PHP: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_php::LANGUAGE_PHP.into(), tree_sitter_php::TAGS_QUERY));
-    static MARKDOWN: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_md::LANGUAGE.into(), MARKDOWN_OUTLINE));
-    static CSS: LazyLock<OutlineConfig> = LazyLock::new(|| OutlineConfig::new(tree_sitter_css::LANGUAGE.into(), CSS_OUTLINE));
-    static SHELL: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_bash::LANGUAGE.into(), SHELL_OUTLINE));
-    static JSON: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_json::LANGUAGE.into(), JSON_OUTLINE));
-    static YAML: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_yaml::LANGUAGE.into(), YAML_OUTLINE));
-    static TOML: LazyLock<OutlineConfig> =
-        LazyLock::new(|| OutlineConfig::new(tree_sitter_toml_ng::LANGUAGE.into(), TOML_OUTLINE));
-    Some(match language {
-        Language::JavaScript => &JS,
-        Language::TypeScript => &TS,
-        Language::Tsx => &TSX,
-        Language::Rust => &RUST,
-        Language::Go => &GO,
-        Language::Python => &PYTHON,
-        Language::Php => &PHP,
-        Language::Markdown => &MARKDOWN,
-        Language::Css => &CSS,
-        Language::Shell => &SHELL,
-        Language::Json => &JSON,
-        Language::Yaml => &YAML,
-        Language::Toml => &TOML,
-        Language::Html | Language::PlainText => return None,
-        Language::Extension(_) => return language.extension()?.outline_config(),
-    })
+    match language {
+        Language::Extension(_) => language.extension()?.outline_config(),
+        _ => crate::languages::def(language)?.outline_config(),
+    }
 }
 
 /// Huge data files (lockfiles) have more keys than anyone browses.
 const MAX_SYMBOLS: usize = 5000;
 
 fn config(language: Language) -> Option<&'static LangConfig> {
-    Some(match language {
-        Language::JavaScript => &JS,
-        Language::TypeScript => &TYPESCRIPT,
-        Language::Tsx => &TSX,
-        Language::Html => &HTML,
-        Language::Css => &CSS,
-        Language::Rust => &RUST,
-        Language::Go => &GO,
-        Language::Python => &PYTHON,
-        Language::Php => &PHP,
-        Language::Shell => &SHELL,
-        Language::Json => &JSON,
-        Language::Yaml => &YAML,
-        Language::Toml => &TOML,
-        Language::Markdown => &MARKDOWN,
-        Language::PlainText => return None,
-        Language::Extension(_) => return language.extension()?.highlight_config(),
-    })
-}
-
-/// A second grammar parsed over parts of the main tree: JavaScript inside
-/// HTML `<script>` tags, and Markdown's inline syntax inside its blocks.
-fn injection(language: Language) -> Option<(&'static LangConfig, fn(Node) -> Vec<tree_sitter::Range>)> {
     match language {
-        Language::Html => Some((&JS, script_ranges)),
-        Language::Markdown => Some((&MARKDOWN_INLINE, markdown_inline_ranges)),
-        _ => None,
+        Language::Extension(_) => language.extension()?.highlight_config(),
+        _ => Some(crate::languages::def(language)?.highlight_config()),
     }
 }
 
-/// Queries an extension's language brings besides highlights and outline,
-/// in Zed's format: `injections.scm`, `brackets.scm`, `indents.scm`,
+/// Queries a language brings besides highlights and outline, in Zed's format: `injections.scm`, `brackets.scm`, `indents.scm`,
 /// `textobjects.scm` and `runnables.scm`.
 pub(crate) struct LanguageQueries {
     injections: Option<InjectionQuery>,
@@ -699,7 +397,10 @@ impl LanguageQueries {
 }
 
 pub(crate) fn queries(language: Language) -> Option<&'static LanguageQueries> {
-    language.extension()?.queries()
+    match language {
+        Language::Extension(_) => language.extension()?.queries(),
+        _ => Some(crate::languages::def(language)?.queries()),
+    }
 }
 
 /// The highlighting for an embedded language named in an injection query:
@@ -796,7 +497,7 @@ pub struct Syntax {
     /// None for plain text (or a grammar that failed to load).
     parser: Option<PooledParser>,
     tree: Option<Tree>,
-    /// Embedded languages (see [`injection`] and extensions' injection queries).
+    /// Embedded languages (see the languages' injection queries).
     injections: Vec<Injection>,
 }
 
@@ -1143,13 +844,8 @@ fn apply_query(
     }
 }
 
-/// Embedded ranges per language: the built-in ones, or what the language's
-/// `injections.scm` finds (by `injection.language`, captured or `#set!`).
+/// Embedded ranges per language: what the language's `injections.scm` finds (by `injection.language`, captured or `#set!`).
 fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> {
-    if let Some((config, ranges_of)) = injection(language) {
-        let ranges = ranges_of(tree.root_node());
-        return if ranges.is_empty() { Vec::new() } else { vec![(config, ranges)] };
-    }
     let Some(injections) = queries(language).and_then(|q| q.injections.as_ref()) else { return Vec::new() };
     let own = config(language);
     let mut out: Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> = Vec::new();
@@ -1185,46 +881,6 @@ fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'stati
         });
     }
     out.retain(|(_, ranges)| !ranges.is_empty());
-    out
-}
-
-fn script_ranges(root: Node) -> Vec<tree_sitter::Range> {
-    let mut out = Vec::new();
-    let mut cursor = root.walk();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "script_element" {
-            for child in node.children(&mut cursor) {
-                if child.kind() == "raw_text" {
-                    out.push(child.range());
-                }
-            }
-            continue;
-        }
-        for child in node.children(&mut cursor) {
-            if child.child_count() > 0 {
-                stack.push(child);
-            }
-        }
-    }
-    out.sort_by_key(|r| r.start_byte);
-    out
-}
-
-/// Paragraph, heading and table-cell text, where Markdown's inline syntax
-/// (emphasis, links, code spans) lives.
-fn markdown_inline_ranges(root: Node) -> Vec<tree_sitter::Range> {
-    let mut out = Vec::new();
-    let mut cursor = root.walk();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if matches!(node.kind(), "inline" | "pipe_table_cell") {
-            out.push(node.range());
-            continue;
-        }
-        stack.extend(node.children(&mut cursor));
-    }
-    out.sort_by_key(|r| r.start_byte);
     out
 }
 

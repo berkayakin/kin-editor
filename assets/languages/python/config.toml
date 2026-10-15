@@ -1,0 +1,8 @@
+name = "Python"
+grammar = "python"
+path_suffixes = ["py", "pyw", "pyi"]
+line_comments = ["# "]
+
+[queries]
+highlights = ["crate:python/highlights"]
+outline = ["crate:python/tags"]

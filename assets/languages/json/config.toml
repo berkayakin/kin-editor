@@ -1,0 +1,7 @@
+name = "JSON"
+grammar = "json"
+# JSONC too (tsconfig, VS Code settings): the grammar accepts comments.
+path_suffixes = ["json", "jsonc", ".babelrc", ".eslintrc", ".swcrc"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/" }
+tab_size = 2

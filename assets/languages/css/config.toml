@@ -1,0 +1,7 @@
+name = "CSS"
+grammar = "css"
+path_suffixes = ["css"]
+block_comment = { start = "/*", end = "*/" }
+
+[queries]
+highlights = ["crate:css/highlights"]

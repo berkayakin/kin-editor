@@ -1,0 +1,9 @@
+name = "TypeScript"
+grammar = "typescript"
+path_suffixes = ["ts", "mts", "cts"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/" }
+
+[queries]
+highlights = ["crate:javascript/highlights", "crate:typescript/highlights", "highlights.scm"]
+outline = ["crate:javascript/tags", "crate:typescript/tags", "outline.scm"]

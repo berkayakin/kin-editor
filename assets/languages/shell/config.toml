@@ -1,0 +1,7 @@
+name = "Shell Script"
+grammar = "bash"
+path_suffixes = ["sh", "bash", "zsh", ".bashrc", ".bash_profile", ".bash_aliases", ".bash_logout", ".profile", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".envrc"]
+line_comments = ["# "]
+
+[queries]
+highlights = ["crate:bash/highlights"]

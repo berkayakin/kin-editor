@@ -1,0 +1,8 @@
+name = "YAML"
+grammar = "yaml"
+path_suffixes = ["yaml", "yml"]
+line_comments = ["# "]
+tab_size = 2
+
+[queries]
+highlights = ["crate:yaml/highlights"]

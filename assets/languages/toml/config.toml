@@ -1,0 +1,7 @@
+name = "TOML"
+grammar = "toml"
+path_suffixes = ["toml", "Cargo.lock", "poetry.lock", "uv.lock", "Pipfile"]
+line_comments = ["# "]
+
+[queries]
+highlights = ["crate:toml/highlights"]

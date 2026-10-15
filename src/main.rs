@@ -27,6 +27,7 @@ mod git_log;
 mod git_panel;
 mod input_dialog;
 mod keymap;
+mod languages;
 mod lint;
 mod lsp;
 mod markdown_preview;

@@ -280,21 +280,18 @@ impl EditorSettings {
     /// What Kin does for a language unless told otherwise.
     fn language_default(language: Language) -> EditorSettings {
         let mut s = EditorSettings::default();
-        match language {
-            // gofmt indents with tabs.
-            Language::Go => s.hard_tabs = Some(true),
-            // The usual style for markup and data files (and npm's package.json).
-            Language::Html | Language::Json | Language::Yaml => s.tab_size = Some(2),
+        // What the language's config.toml says (Kin's own in
+        // assets/languages, or the extension's).
+        if let Some(def) = crate::languages::def(language) {
+            s.tab_size = def.tab_size;
+            s.hard_tabs = def.hard_tabs;
+            s.soft_wrap = def.soft_wrap;
+        } else if let Some(def) = language.extension() {
+            s.tab_size = def.tab_size;
+            s.hard_tabs = def.hard_tabs;
+        } else if language == Language::PlainText {
             // Prose reads better wrapped; code keeps its lines (JetBrains does the same).
-            Language::Markdown | Language::PlainText => s.soft_wrap = Some(true),
-            // What the extension's config.toml says.
-            Language::Extension(_) => {
-                if let Some(def) = language.extension() {
-                    s.tab_size = def.tab_size;
-                    s.hard_tabs = def.hard_tabs;
-                }
-            }
-            _ => {}
+            s.soft_wrap = Some(true);
         }
         s
     }

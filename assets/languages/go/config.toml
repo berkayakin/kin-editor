@@ -1,0 +1,10 @@
+name = "Go"
+grammar = "go"
+path_suffixes = ["go"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/" }
+hard_tabs = true
+
+[queries]
+highlights = ["crate:go/highlights"]
+outline = ["crate:go/tags"]

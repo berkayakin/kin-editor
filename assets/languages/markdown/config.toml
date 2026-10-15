@@ -1,0 +1,9 @@
+name = "Markdown"
+grammar = "markdown"
+path_suffixes = ["md", "markdown", "mdown", "mkd"]
+block_comment = { start = "<!--", end = "-->" }
+# Kin's key: prose reads better wrapped.
+soft_wrap = true
+
+[queries]
+highlights = ["crate:markdown/highlights"]

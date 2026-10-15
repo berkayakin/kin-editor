@@ -1,0 +1,9 @@
+name = "Rust"
+grammar = "rust"
+path_suffixes = ["rs"]
+line_comments = ["// "]
+block_comment = { start = "/*", end = "*/" }
+
+[queries]
+highlights = ["crate:rust/highlights", "highlights.scm"]
+outline = ["crate:rust/tags", "outline.scm"]
