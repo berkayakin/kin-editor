@@ -29,7 +29,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # git-cliff needs the history and tags since the previous release.
           fetch-depth: 0
@@ -65,7 +65,7 @@ jobs:
       VERSION: ${{ needs.create.outputs.version }}
       APP: target/aarch64-apple-darwin/release/bundle/osx/Kin.app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -174,7 +174,7 @@ jobs:
     env:
       VERSION: ${{ needs.create.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -199,7 +199,7 @@ jobs:
     env:
       VERSION: ${{ needs.create.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install GPUI's build dependencies
         run: |
           sudo apt-get update
