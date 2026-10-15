@@ -143,21 +143,55 @@ fn extension_targets(language: Language, path: &Path, text: &str, tree: &Tree, o
                 vars.push((format!("ZED_CUSTOM_{name}"), text[c.node.byte_range()].to_string()));
             }
         }
-        // Longer names first, so $ZED_FILE doesn't eat $ZED_FILENAME.
-        vars.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-        let expand = |s: &str| vars.iter().fold(s.to_string(), |s, (k, v)| s.replace(&format!("${{{k}}}"), v).replace(&format!("${k}"), v));
+        let plain = |s: &str| expand_vars(s, &vars, str::to_string);
         for task in def.tasks.iter().filter(|t| t.tags.iter().any(|tag| tags.contains(&tag.as_str()))) {
-            let command = std::iter::once(&task.command).chain(&task.args).map(|a| expand(a)).collect::<Vec<_>>().join(" ");
+            // The command is shell text, so values put into it are quoted (a
+            // path with spaces, or a symbol that looks like `$(…)`); each
+            // argument is one word, as Zed passes them.
+            let command = std::iter::once(expand_vars(&task.command, &vars, sh_quote))
+                .chain(task.args.iter().map(|a| sh_quote(&plain(a))))
+                .collect::<Vec<_>>()
+                .join(" ");
             out.push(RunTarget {
-                name: expand(&task.label),
+                name: plain(&task.label),
                 command,
-                cwd: task.cwd.as_deref().map(|c| PathBuf::from(expand(c))).unwrap_or_else(|| root.to_path_buf()),
+                cwd: task.cwd.as_deref().map(|c| PathBuf::from(plain(c))).unwrap_or_else(|| root.to_path_buf()),
                 row: Some(node.start_position().row),
                 rows: node.start_position().row..node.end_position().row + 1,
                 debug: None,
             });
         }
     }
+}
+
+/// `$NAME` and `${NAME}` replaced by their values passed through `quote`, in
+/// one pass, so a value is never expanded again. Names that aren't variables
+/// stay as written (the shell's own, like `$HOME`).
+fn expand_vars(s: &str, vars: &[(String, String)], quote: impl Fn(&str) -> String) -> String {
+    let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let (name, len) = match after.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => ("", 0),
+            },
+            None => {
+                let end = after.find(|c| !is_name(c)).unwrap_or(after.len());
+                (&after[..end], end)
+            }
+        };
+        match vars.iter().find(|(k, _)| !name.is_empty() && k == name) {
+            Some((_, value)) => out.push_str(&quote(value)),
+            None => out.push_str(&rest[i..i + 1 + len]),
+        }
+        rest = &after[len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---- Rust ------------------------------------------------------------------------
@@ -687,6 +721,22 @@ mod tests {
             std::fs::write(path, content).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn task_variables_are_expanded_once_and_quoted() {
+        let vars = vec![
+            ("ZED_FILE".to_string(), "/tmp/my project/a b.rs".to_string()),
+            ("ZED_FILENAME".to_string(), "a b.rs".to_string()),
+            ("ZED_SYMBOL".to_string(), "$(rm -rf ~)".to_string()),
+            ("ZED_ROW".to_string(), "$ZED_FILE".to_string()),
+        ];
+        assert_eq!(
+            expand_vars("run $ZED_FILE ${ZED_FILENAME} $ZED_SYMBOL:$ZED_ROW $HOME ${X} $ ${", &vars, sh_quote),
+            "run '/tmp/my project/a b.rs' 'a b.rs' '$(rm -rf ~)':'$ZED_FILE' $HOME ${X} $ ${"
+        );
+        // Unquoted for labels and folders; values aren't expanded again.
+        assert_eq!(expand_vars("test ${ZED_ROW}x", &vars, str::to_string), "test $ZED_FILEx");
     }
 
     #[test]
