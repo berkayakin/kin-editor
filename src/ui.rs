@@ -324,6 +324,9 @@ impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
         popover(theme)
+            // Block, not the popover's flex column: in a column GPUI sizes the
+            // box for one unwrapped line, and wrapped text spills out of it.
+            .block()
             .max_w(px(420.))
             .px_2()
             .py_1()
