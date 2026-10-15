@@ -2363,8 +2363,9 @@ impl Editor {
         let max_scroll = content - viewport;
         let t = (self.scroll.y / max_scroll).clamp(0., 1.);
         let thumb = Bounds::new(
-            point(track.left() + px(2.), track.top() + (viewport - thumb_h) * t),
-            size(px(SCROLLBAR_WIDTH - 4.), thumb_h),
+            // As thin as the lists' (`ui::scrollbar`); the track stays wide for its markers.
+            point(track.right() - px(8.), track.top() + (viewport - thumb_h) * t),
+            size(px(6.), thumb_h),
         );
         Some((track, thumb))
     }
@@ -3574,7 +3575,7 @@ impl Editor {
             }
             if fade > 0. {
                 let alpha = if active { 0.28 } else { 0.16 } * fade;
-                frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(alpha)).corner_radii(px(4.)));
+                frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(alpha)).corner_radii(px(3.)));
             }
             frame.scrollbar_track = Some(track);
             let rows = display_rows.max(1) as f32;
