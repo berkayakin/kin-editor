@@ -716,7 +716,10 @@ mod tests {
     }
 
     fn temp_project(files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kin-run-{}-{}", std::process::id(), files[0].0.replace('/', "_")));
+        // Tests run in parallel, several with the same first file.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("kin-run-{}-{n}-{}", std::process::id(), files[0].0.replace('/', "_")));
         for (rel, content) in files {
             let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
