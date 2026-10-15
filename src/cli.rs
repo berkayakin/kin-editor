@@ -26,7 +26,22 @@ pub fn script(exe: &Path) -> String {
         Some(app) => format!("exec open -a {} \"$@\"", quote(app)),
         None => format!("{} \"$@\" >/dev/null 2>&1 &", quote(exe)),
     };
-    format!("#!/bin/sh\n# Opens files and folders in Kin: kin [path…]. Installed by Kin.\n{run}\n")
+    // `kin extension …` runs here, in the terminal.
+    let command = format!("[ \"$1\" = extension ] && exec {} \"$@\"", quote(exe));
+    format!("#!/bin/sh\n# Opens files and folders in Kin: kin [path…]. Installed by Kin.\n{command}\n{run}\n")
+}
+
+/// `kin extension check [folder]`, before any window opens. Returns the
+/// exit code.
+pub fn extension_command(args: &[String]) -> i32 {
+    match args {
+        [check] if check == "check" => crate::extensions::check::run(Path::new(".")),
+        [check, dir] if check == "check" => crate::extensions::check::run(Path::new(dir)),
+        _ => {
+            eprintln!("usage: kin extension check [folder]\n  checks an extension's manifest, grammars and queries");
+            2
+        }
+    }
 }
 
 /// Writes the script to [`COMMAND_PATH`], asking for an administrator
@@ -79,6 +94,7 @@ mod tests {
         assert!(bundled.contains(r#"exec open -a '/Applications/Kin'\''s.app' "$@""#), "{bundled}");
         let dev = script(Path::new("/src/kin/target/release/kin"));
         assert!(dev.contains(r#"'/src/kin/target/release/kin' "$@""#), "{dev}");
+        assert!(bundled.contains("[ \"$1\" = extension ] && exec"), "{bundled}");
         let urls = vec!["file:///Users/a/My%20Project/".to_string(), "https://example.com".to_string()];
         assert_eq!(paths_from_urls(&urls), vec![PathBuf::from("/Users/a/My Project/")]);
     }

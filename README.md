@@ -626,6 +626,14 @@ others stay. Kin's own are in [`assets/languages`](assets/languages), in this sa
 Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
 Catppuccin themes, installed from their repositories.
 
+To check an extension while making it, run `kin extension check <folder>` (or the binary inside
+Kin.app). It reads `extension.toml` and each `config.toml` (reporting keys Kin doesn't know, with a
+suggestion for typos), builds the grammars as Kin would, and compiles every query against its
+grammar: errors come with their file and line, and captures without a color in Kin's themes,
+or queries missing the captures Kin uses (`@open`/`@close`, `@indent`, `@run`…), are warnings. It
+exits with 1 when there are errors. `schema_version = 1` in `extension.toml` (Zed's) is the format
+this Kin reads.
+
 Grammars run as WebAssembly, sandboxed in Kin's runtime. One that comes prebuilt
 (`grammars/<name>.wasm`, as in the extensions Zed installs) runs as is. Otherwise it's compiled
 the first time, in the background, with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk): Kin

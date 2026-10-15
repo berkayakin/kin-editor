@@ -258,7 +258,11 @@ fn set_dock_icon() {
 }
 
 fn main() {
-    let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|a| a == "extension") {
+        std::process::exit(cli::extension_command(&raw[1..]));
+    }
+    let args: Vec<PathBuf> = raw.into_iter().map(PathBuf::from).collect();
 
     #[cfg(target_os = "macos")]
     set_app_name();

@@ -46,6 +46,8 @@ use crate::{
 /// A language's comment tokens from its `config.toml`, spaced for
 /// inserting: `line_comments` (the first) and `block_comment`, as
 /// `["/*", "*/"]` or Zed's newer `{ start = "/*", end = "*/" }`.
+pub mod check;
+
 pub(crate) fn comment_tokens(config: &Table) -> (Option<String>, Option<(String, String)>) {
     let line = match config.get("line_comments").or(config.get("line_comment")) {
         Some(Value::Array(items)) => items.first().and_then(Value::as_str).map(str::to_string),
@@ -224,24 +226,7 @@ impl LanguageDef {
         if let Some(loaded) = self.loaded.get() {
             return loaded.as_ref();
         }
-        let language = match self.builtin {
-            Some(builtin) => Ok(crate::languages::def(builtin)?.grammar()),
-            None => {
-                let grammar = self.grammar.as_ref()?;
-                // Not built yet: try again when it is.
-                if BUILDING.lock().unwrap().contains(&grammar.library) {
-                    return None;
-                }
-                if grammar.wasm.is_file() {
-                    load_wasm(&grammar.wasm, &grammar.name)
-                } else if grammar.library.is_file() && native(grammar) {
-                    load_library(&grammar.library, &grammar.name)
-                } else {
-                    return None;
-                }
-            }
-        };
-        let loaded = match language.and_then(|language| self.load_now(language)) {
+        let loaded = match self.tree_sitter_language()?.and_then(|language| self.load_now(language)) {
             Ok(loaded) => Some(loaded),
             Err(err) => {
                 add_problem(&self.extension, format!("{}: {err}", self.name));
@@ -249,6 +234,23 @@ impl LanguageDef {
             }
         };
         self.loaded.get_or_init(|| loaded).as_ref()
+    }
+
+    /// Its grammar, loaded; None while it isn't built.
+    fn tree_sitter_language(&self) -> Option<Result<TsLanguage, String>> {
+        if let Some(builtin) = self.builtin {
+            return Some(Ok(crate::languages::def(builtin)?.grammar()));
+        }
+        let grammar = self.grammar.as_ref()?;
+        if BUILDING.lock().unwrap().contains(&grammar.library) {
+            None
+        } else if grammar.wasm.is_file() {
+            Some(load_wasm(&grammar.wasm, &grammar.name))
+        } else if grammar.library.is_file() && native(grammar) {
+            Some(load_library(&grammar.library, &grammar.name))
+        } else {
+            None
+        }
     }
 
     fn load_now(&self, language: TsLanguage) -> Result<Loaded, String> {
@@ -991,7 +993,7 @@ fn compile(grammar: &Grammar) -> Result<(), String> {
     if src.join("scanner.cc").is_file() {
         return Err("its scanner is C++, which only builds as native code (the native_grammars setting)".into());
     }
-    let clang = wasi_sdk::clang().ok_or("the WebAssembly toolchain (wasi-sdk) isn't installed")?;
+    let clang = wasi_sdk::clang().ok_or("the WebAssembly toolchain (wasi-sdk) isn't installed: Kin offers to download it, or set WASI_SDK_PATH")?;
     let temp = grammar.wasm.with_extension("building");
     if let Err(err) = wasi_sdk::compile(&clang, src, &grammar.name, &temp) {
         std::fs::remove_file(&temp).ok();
@@ -1094,14 +1096,14 @@ fn load_library(path: &Path, name: &str) -> Result<TsLanguage, String> {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(super) fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kin-ext-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn write(path: PathBuf, text: &str) {
+    pub(super) fn write(path: PathBuf, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
