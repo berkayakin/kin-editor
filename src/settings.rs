@@ -336,11 +336,28 @@ impl Settings {
         config_dir().map(|d| d.join("settings.json"))
     }
 
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_reporting(text).map(|(settings, _)| settings)
+    }
+
+    /// Reads `settings.json`. Only text that isn't JSON fails: a value of the
+    /// wrong type (`"tab_size": "4"`, an option from a newer Kin) is left out
+    /// and reported as "key: why", so the other settings still apply.
+    pub fn parse_reporting(text: &str) -> Result<(Self, Vec<String>), String> {
         if text.trim().is_empty() {
-            return Ok(Self::default());
+            return Ok((Self::default(), Vec::new()));
         }
-        serde_json::from_str(&strip_jsonc(text)).map_err(|e| e.to_string())
+        let mut value: Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| e.to_string())?;
+        if let Ok(settings) = serde_json::from_value(value.clone()) {
+            return Ok((settings, Vec::new()));
+        }
+        let mut problems = Vec::new();
+        if let Value::Object(map) = &mut value {
+            drop_invalid(map, &mut problems);
+        }
+        let settings = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        Ok((settings, problems))
     }
 
     /// Top-level and per-language keys that aren't settings (likely typos),
@@ -550,22 +567,60 @@ fn modified(path: Option<PathBuf>) -> Option<SystemTime> {
     std::fs::metadata(path?).ok()?.modified().ok()
 }
 
-fn settings_problems() -> Result<Settings, Vec<String>> {
+/// Removes the values in `settings.json`'s top-level object that `Settings`
+/// can't read, reporting each. A language's overrides lose only their own
+/// bad keys.
+fn drop_invalid(map: &mut serde_json::Map<String, Value>, problems: &mut Vec<String>) {
+    fn reads<T: serde::de::DeserializeOwned>(key: &str, value: &Value) -> Result<(), String> {
+        let one = serde_json::Map::from_iter([(key.to_string(), value.clone())]);
+        serde_json::from_value::<T>(Value::Object(one)).map(|_| ()).map_err(|e| e.to_string())
+    }
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for key in keys {
+        let Err(err) = reads::<Settings>(&key, &map[&key]) else { continue };
+        if key == "languages"
+            && let Some(Value::Object(languages)) = map.get_mut(&key)
+        {
+            languages.retain(|name, overrides| {
+                if let Value::Object(overrides) = overrides {
+                    overrides.retain(|k, v| match reads::<EditorSettings>(k, v) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            problems.push(format!("languages.{name}.{k}: {err}"));
+                            false
+                        }
+                    });
+                }
+                match reads::<HashMap<String, EditorSettings>>(name, overrides) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        problems.push(format!("languages.{name}: {err}"));
+                        false
+                    }
+                }
+            });
+            continue;
+        }
+        problems.push(format!("{key}: {err}"));
+        map.remove(&key);
+    }
+}
+
+/// The settings in `settings.json` (`None` when it isn't valid JSON) and
+/// problems to report.
+fn settings_problems() -> (Option<Settings>, Vec<String>) {
     let text = Settings::path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    match Settings::parse(&text) {
-        Ok(settings) => Ok(settings),
-        Err(err) => Err(vec![format!("settings.json: {err}")]),
+    match Settings::parse_reporting(&text) {
+        Ok((settings, problems)) => (Some(settings), problems.into_iter().map(|p| format!("settings.json: {p}")).collect()),
+        Err(err) => (None, vec![format!("settings.json: {err}")]),
     }
 }
 
 /// Loads the settings and key bindings at startup. Returns problems with
 /// the user's files, for the first window to show.
 pub fn init(cx: &mut App) -> Vec<String> {
-    let mut problems = Vec::new();
-    let settings = settings_problems().unwrap_or_else(|p| {
-        problems.extend(p);
-        Settings::default()
-    });
+    let (settings, mut problems) = settings_problems();
+    let settings = settings.unwrap_or_default();
     problems.extend(unknown_key_problems());
     crate::trust::set_trust_all(settings.trust_all_projects == Some(true));
     cx.set_global(settings);
@@ -588,30 +643,29 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
         cx.try_global::<ConfigStamps>().map_or((None, None), |s| (s.settings, s.keymap));
     let mut problems = Vec::new();
     if settings_time != old_settings {
-        match settings_problems() {
-            Ok(settings) => {
-                problems.extend(unknown_key_problems());
-                let theme_changed = settings.theme != Settings::get(cx).theme;
-                let icons_changed = settings.icon_theme != Settings::get(cx).icon_theme;
-                let trust_all = settings.trust_all_projects == Some(true);
-                if trust_all != (Settings::get(cx).trust_all_projects == Some(true)) {
-                    crate::trust::set_trust_all(trust_all);
-                    crate::trust::changed(cx);
-                }
-                cx.set_global(settings.clone());
-                if icons_changed {
-                    crate::extensions::apply_icon_theme(cx);
-                }
-                // No theme set (any more) means the default one.
-                if theme_changed {
-                    let name = settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
-                    if !theme::apply_theme(name, cx) {
-                        problems.push(format!("settings.json: there's no theme named \"{name}\""));
-                    }
-                }
-                theme::apply_fonts(cx);
+        let (settings, invalid) = settings_problems();
+        problems.extend(invalid);
+        if let Some(settings) = settings {
+            problems.extend(unknown_key_problems());
+            let theme_changed = settings.theme != Settings::get(cx).theme;
+            let icons_changed = settings.icon_theme != Settings::get(cx).icon_theme;
+            let trust_all = settings.trust_all_projects == Some(true);
+            if trust_all != (Settings::get(cx).trust_all_projects == Some(true)) {
+                crate::trust::set_trust_all(trust_all);
+                crate::trust::changed(cx);
             }
-            Err(p) => problems.extend(p),
+            cx.set_global(settings.clone());
+            if icons_changed {
+                crate::extensions::apply_icon_theme(cx);
+            }
+            // No theme set (any more) means the default one.
+            if theme_changed {
+                let name = settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
+                if !theme::apply_theme(name, cx) {
+                    problems.push(format!("settings.json: there's no theme named \"{name}\""));
+                }
+            }
+            theme::apply_fonts(cx);
         }
     }
     // A different base keymap needs the bindings rebuilt too.
@@ -1017,6 +1071,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_wrong_value_loses_only_its_own_setting() {
+        let (s, problems) = Settings::parse_reporting(r#"{"theme": "Nord", "tab_size": "4"}"#).unwrap();
+        assert_eq!(s.theme.as_deref(), Some("Nord"));
+        assert_eq!(s.editor.tab_size, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("tab_size: invalid type"), "{problems:?}");
+
+        // An option value from a newer Kin, and bad keys inside a language's overrides.
+        let text = r#"{"auto_save": "sometimes", "vim_mode": true,
+            "languages": {"Go": {"tab_size": 8, "soft_wrap": "yes"}, "Rust": 3}}"#;
+        let (s, problems) = Settings::parse_reporting(text).unwrap();
+        assert_eq!((s.auto_save, s.vim_mode), (None, Some(true)));
+        assert_eq!(s.languages["Go"].tab_size, Some(8));
+        assert!(!s.languages.contains_key("Rust"));
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("languages.Go.soft_wrap: ")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.starts_with("languages.Rust: ")), "{problems:?}");
+    }
+
+    #[test]
     fn parses_jsonc() {
         let text = r#"// Settings
 {
@@ -1030,7 +1104,7 @@ mod tests {
         assert_eq!(s.languages["Go"].tab_size, Some(8));
         // Comment markers inside strings are text.
         assert_eq!(Settings::parse(r#"{"theme": "a // b /* c"}"#).unwrap().theme.as_deref(), Some("a // b /* c"));
-        assert!(Settings::parse("{ \"tab_size\": \"x\" }").is_err());
+        assert!(Settings::parse("{ \"tab_size\": ").is_err());
         assert!(Settings::parse(SETTINGS_TEMPLATE).unwrap() == Settings::default());
     }
 
