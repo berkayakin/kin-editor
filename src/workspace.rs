@@ -460,6 +460,13 @@ const TAB_FOOT: f32 = 8.0;
 /// A tab strip's padding at each end: the island's corner radius plus a
 /// foot, so the end tabs' feet land on the island's straight edge.
 const TAB_STRIP_INSET: f32 = crate::ui::ISLAND_RADIUS + TAB_FOOT;
+/// The sidebar's narrowest: room for its two tabs as icons (see
+/// `render_sidebar_tabs`), and for a file tree that's still usable.
+const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+/// A sidebar tab's padding, icon and gap around its name.
+const SIDEBAR_TAB_CHROME: f32 = 44.0;
+const _: () = assert!(SIDEBAR_MIN_WIDTH - 2. * TAB_STRIP_INSET >= 2. * TAB_ICON_WIDTH);
+
 /// A terminal strip's buttons (+, split, hide), each with its margin.
 const TERMINAL_BUTTON: f32 = 28.0;
 /// Tab widths when they don't all fit (see `fit_tabs`).
@@ -760,7 +767,7 @@ impl Workspace {
             run_problems: None,
             venv_shown: Default::default(),
             problems_height: px(state.problems_height.unwrap_or(200.).clamp(90., 4000.)),
-            sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(160., 4000.)),
+            sidebar_width: px(state.sidebar_width.unwrap_or(250.).clamp(SIDEBAR_MIN_WIDTH, 4000.)),
             resizing: None,
             window_title: String::new(),
             find_bar,
@@ -6080,7 +6087,7 @@ impl Workspace {
         ]
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         // Under the Files / Commit switch, the Commit view has a toolbar (its branch).
         let header = (self.sidebar_mode == SidebarMode::Commit && self.repo.is_some()).then(|| {
@@ -6294,17 +6301,32 @@ impl Workspace {
                     .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx))),
             )
             // After the island, so the current tab paints over its top border.
-            .child(self.render_sidebar_tabs(cx))
+            .child(self.render_sidebar_tabs(window, cx))
     }
 
     /// The sidebar's two views as tabs above its island, shaped like the
-    /// editor's (`tab_shape`), without close buttons.
-    fn render_sidebar_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// editor's (`tab_shape`), without close buttons. In a narrow sidebar they
+    /// give up their names: the other tab first, then the current one too
+    /// (their tooltips still name them). `SIDEBAR_MIN_WIDTH` keeps two icons in.
+    fn render_sidebar_tabs(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let files_on = self.sidebar_mode == SidebarMode::Files;
         let changes = self.git_status.files.len();
         let edge = Hsla::from(theme.border).alpha(0.75);
-        let tab = |id: &'static str, icon: Icon, label: &'static str, on: bool, after_active: bool| {
+        // Padding, icon and gap around a name; the change count adds a gap and itself.
+        let count = (changes > 0).then(|| changes.to_string());
+        let measured = measure_tab_names(&["Files".to_string(), "Commit".to_string(), count.clone().unwrap_or_default()], window, &theme);
+        let files_width = SIDEBAR_TAB_CHROME + measured[0].0;
+        let commit_width = SIDEBAR_TAB_CHROME + measured[1].0 + if count.is_some() { 6. + measured[2].0 } else { 0. };
+        let available = f32::from(self.sidebar_width) - 2. * TAB_STRIP_INSET;
+        let (active_width, other_width) = if files_on { (files_width, commit_width) } else { (commit_width, files_width) };
+        let (active_named, other_named) = if active_width + other_width <= available {
+            (true, true)
+        } else {
+            (active_width + TAB_ICON_WIDTH <= available, false)
+        };
+        let (files_named, commit_named) = if files_on { (active_named, other_named) } else { (other_named, active_named) };
+        let tab = |id: &'static str, icon: Icon, label: &'static str, on: bool, after_active: bool, named: bool| {
             let tab = div()
                 .id(id)
                 .group(id)
@@ -6314,13 +6336,13 @@ impl Workspace {
                 .items_center()
                 .gap_1p5()
                 .h_full()
-                .px_3()
+                .map(|el| if named { el.px_3() } else { el.w(px(TAB_ICON_WIDTH)).justify_center() })
                 .cursor_pointer()
                 .text_color(if on { theme.text } else { theme.text_muted })
                 .when(on, |el| el.font_weight(FontWeight::MEDIUM));
             tab_shape(tab, on, after_active, false, id.into(), edge, &theme)
                 .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
-                .child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label))
+                .when(named, |el| el.child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label)))
         };
         div()
             .absolute()
@@ -6331,25 +6353,31 @@ impl Workspace {
             .flex()
             .items_end()
             .pt(px(TAB_STRIP_TOP))
-            // Clear of the island's rounded corner, like the editor's tabs.
+            // Clear of the island's rounded corners, like the editor's tabs.
             .pl(px(TAB_STRIP_INSET))
+            .pr(px(TAB_STRIP_INSET))
+            .overflow_hidden()
             .child(
-                tab("sidebar-files", Icon::Folder, "Files", files_on, false)
+                tab("sidebar-files", Icon::Folder, "Files", files_on, false, files_named)
                     .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
                     .on_click(cx.listener(|ws, _, window, cx| ws.show_files(window, cx))),
             )
             .child(
-                tab("sidebar-commit", Icon::GitBranch, "Commit", !files_on, files_on)
-                    // Uncommitted changes, so they show from the Files view too.
-                    .when(changes > 0, |el| {
+                tab("sidebar-commit", Icon::GitBranch, "Commit", !files_on, files_on, commit_named)
+                    // Uncommitted changes, so they show from the Files view too (the
+                    // tooltip has them when the tab is only its icon).
+                    .when_some(count.clone().filter(|_| commit_named), |el, count| {
                         el.child(
                             div()
                                 .text_size(px(11.5))
                                 .text_color(if files_on { theme.text_dim } else { theme.accent })
-                                .child(changes.to_string()),
+                                .child(count),
                         )
                     })
-                    .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx))
+                    .tooltip(move |window, cx| {
+                        let label = if changes > 0 { format!("Commit ({changes} changed)") } else { "Commit".to_string() };
+                        status_tooltip(&label, &ToggleCommit, window, cx)
+                    })
                     .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
             )
     }
@@ -7637,8 +7665,8 @@ impl Workspace {
             }
             Edge::Sidebar => {
                 // Leave the editor at least 320pt wide.
-                let max = (viewport.width - px(320.)).max(px(160.));
-                self.sidebar_width = (resize.size + (event.position.x - resize.start)).clamp(px(160.), max);
+                let max = (viewport.width - px(320.)).max(px(SIDEBAR_MIN_WIDTH));
+                self.sidebar_width = (resize.size + (event.position.x - resize.start)).clamp(px(SIDEBAR_MIN_WIDTH), max);
             }
             Edge::Pane(ix) if ix + 1 < self.pane_sizes.len() => {
                 let bounds = self.panes_bounds.get();
@@ -8195,7 +8223,7 @@ impl Render for Workspace {
                     .min_h_0()
                     .px(px(GAP))
                     .gap(px(GAP))
-                    .when(self.show_sidebar, |el| el.child(self.render_sidebar(cx)))
+                    .when(self.show_sidebar, |el| el.child(self.render_sidebar(window, cx)))
                     .child(
                         div()
                             .flex()
