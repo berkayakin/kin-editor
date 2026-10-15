@@ -1,0 +1,24 @@
+name: Feature request
+description: An idea to make Kin better
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem or workflow, in your own words. Knowing the "why" helps find the best fix.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like Kin to do?
+      description: How it would work. If another editor does it well (JetBrains, VS Code, Zed…), say which and how.
+    validations:
+      required: true
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this myself

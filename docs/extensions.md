@@ -1,0 +1,134 @@
+# Extensions
+
+Extensions add languages, themes, icon themes and snippets without rebuilding Kin. They use
+[Zed's extension format](https://zed.dev/docs/extensions/developing-extensions), so Zed's language
+and theme extensions work as they are, and VS Code snippet files too.
+
+**Install** from **Settings → Extensions** (or **Extensions…** in the Kin menu, Find Action and the puzzle at the top right):
+paste the URL of an extension's Git repository and press **Install**, or **Install from Folder…**
+for one on disk, which is used in place (for making your own: edit it, then **Reload**). Each
+extension is listed with what it adds and any problems; the trash button removes it. If Zed is
+installed, **Installed in Zed** lists its extensions with an **Add** button: those come with their
+grammars prebuilt, so nothing needs compiling. Extensions live
+in `~/.config/kin/extensions/<id>/`; copying a folder there and choosing **Reload Extensions** works
+too.
+
+An extension is a folder like this (Zed's layout; every part is optional):
+
+```text
+my-extension/
+  extension.toml
+  languages/mylang/config.toml
+  languages/mylang/highlights.scm     tree-sitter highlight query
+  languages/mylang/outline.scm        File Structure, breadcrumbs, sticky scroll
+  languages/mylang/injections.scm     embedded languages (CSS in <style>, SQL in strings…)
+  languages/mylang/brackets.scm       bracket pairs, words too (do … end)
+  languages/mylang/indents.scm        what Enter indents after
+  languages/mylang/textobjects.scm    functions and classes for Vim's af / if / ac / ic
+  languages/mylang/runnables.scm      gutter ▶ for tests and mains, with tasks.json
+  languages/mylang/tasks.json         commands for runnables' tags ($ZED_FILE, $ZED_ROW…)
+  grammars/mylang.wasm                a prebuilt grammar (as in Zed's packaged extensions)
+  themes/*.json                       Kin themes, or Zed theme families
+  icon_themes/*.json                  file icon themes (Zed's format)
+  snippets/<language id>.json         VS Code / Zed snippets
+```
+
+```toml
+# extension.toml
+id = "mylang"
+name = "MyLang"
+version = "0.1.0"
+description = "MyLang support"
+authors = ["You <you@example.com>"]
+
+# The grammar: fetched from a repository at a commit (as in Zed), or
+# without `repository`, the sources in grammars/mylang/ (src/parser.c…).
+[grammars.mylang]
+repository = "https://github.com/someone/tree-sitter-mylang"
+rev = "0123456789abcdef0123456789abcdef01234567"
+# path = "dialect"   # the grammar's folder inside the repository
+
+# A language server for this extension's languages, or for a built-in one
+# (it then runs beside Kin's). Zed extensions find their server in code;
+# Kin runs `command`, else a well-known server's command (zls, gleam lsp,
+# nil, lua-language-server, haskell-language-server…), else the server's id
+# as a program. With several servers for a language in one extension, the
+# first one installed runs. Settings' "language_servers" and "lsp" can
+# always override.
+[language_servers.mylang-ls]
+name = "MyLang LS"
+languages = ["MyLang"]
+command = "mylang-ls"
+args = ["--stdio"]
+install = "brew install mylang-ls"   # shown when it isn't found
+# A debug adapter, for configurations naming its id or an alias in launch.json
+# or .zed/debug.json (Kin's keys: Zed extensions start theirs in code). With
+# `tcp`, it listens on the port Kin puts in its arguments as {port}.
+# [debug_adapters.mylang-dap]
+# command = "mylang-dap"
+# args = ["--listen", "{port}"]
+# tcp = true
+# aliases = ["MyLang"]
+
+# What Zed extensions' code would pass the server (Kin's keys):
+initialization_options = { lint = true }
+settings = { mylang = { formatting = "auto" } }
+
+# How the status bar's Install gets it (Kin's key; checksummed like Kin's own):
+# an npm package, a Go module, or a GitHub release asset per platform.
+[language_servers.mylang-ls.installer]
+github = "someone/mylang-ls"
+assets = { "macos-aarch64" = "mylang-ls-darwin-arm64.gz", "linux-x86_64" = "mylang-ls-linux-x64.gz" }
+# npm = "mylang-language-server"
+# go = "example.com/mylang/cmd/mylang-ls"
+```
+
+```toml
+# languages/mylang/config.toml
+name = "MyLang"                 # as the status bar and settings' "languages" call it
+grammar = "mylang"
+path_suffixes = ["ml", "MyLangfile"]   # extensions or whole file names
+line_comments = ["// "]
+block_comment = ["/* ", " */"]
+tab_size = 2
+hard_tabs = false
+formatter = ["mylang-fmt", "-"] # Kin only: reads stdin, writes stdout ({file} is the path)
+```
+
+Without `highlights.scm` (or `outline.scm`), the grammar's own `queries/highlights.scm` (and
+`tags.scm`) are used. A language from an extension gets highlighting, File Structure, breadcrumbs,
+sticky scroll, syntax errors in Problems, comment toggling, its indentation, snippets, its
+language server and formatter, and a row in **Settings → Languages**. Built-in languages win for
+their file extensions, except that a language naming an exact file (`docker-compose.yml`) gets it.
+
+A language named like a built-in one (`name = "Rust"`) without a grammar of its own changes the
+built-in language's queries instead: each of its `.scm` files replaces Kin's of the same kind, and the
+others stay. Kin's own are in [`assets/languages`](../assets/languages), in this same format.
+
+Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
+Catppuccin themes, installed from their repositories.
+
+To check an extension while making it, run `kin extension check <folder>` (or the binary inside
+Kin.app). It reads `extension.toml` and each `config.toml` (reporting keys Kin doesn't know, with a
+suggestion for typos), builds the grammars as Kin would, and compiles every query against its
+grammar: errors come with their file and line, and captures without a color in Kin's themes,
+or queries missing the captures Kin uses (`@open`/`@close`, `@indent`, `@run`…), are warnings. It
+exits with 1 when there are errors. `schema_version = 1` in `extension.toml` (Zed's) is the format
+this Kin reads.
+
+Grammars run as WebAssembly, sandboxed in Kin's runtime. One that comes prebuilt
+(`grammars/<name>.wasm`, as in the extensions Zed installs) runs as is. Otherwise it's compiled
+the first time, in the background, with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk): Kin
+asks before downloading it once (about 180 MB, 170 MB on disk in `~/.config/kin/toolchains/`;
+`WASI_SDK_PATH` uses one you have). Files of that language are highlighted when it's done.
+Fetching uses `git`. With `native_grammars` on, grammars of extensions in trusted folders are
+compiled with your C compiler instead (`cc`; on macOS `xcode-select --install`), which C++
+scanners need. Zed
+extensions' own WebAssembly code (downloading language servers, slash commands) isn't run yet, so
+a language server has to be installed (see `[language_servers]` above).
+
+Icon themes are chosen with `icon_theme` (Settings → Appearance → Icon theme); without one, Kin uses
+its built-in Charmed Icons.
+
+Kin reads Zed's extension format for compatibility; it isn't affiliated with or endorsed by Zed
+Industries. Extensions come from their authors' repositories, under their own licenses.
