@@ -28,6 +28,7 @@ const FILES: &[(&str, &str)] = &[
     ("go/config.toml", include_str!("../assets/languages/go/config.toml")),
     ("go/indents.scm", include_str!("../assets/languages/go/indents.scm")),
     ("go/textobjects.scm", include_str!("../assets/languages/go/textobjects.scm")),
+    ("html/brackets.scm", include_str!("../assets/languages/html/brackets.scm")),
     ("html/config.toml", include_str!("../assets/languages/html/config.toml")),
     ("html/highlights.scm", include_str!("../assets/languages/html/highlights.scm")),
     ("javascript/brackets.scm", include_str!("../assets/languages/javascript/brackets.scm")),

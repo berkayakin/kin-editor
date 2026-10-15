@@ -1528,6 +1528,15 @@ mod tests {
         assert_eq!(pair("a.sh", "‸[[ -n $x ]]\n"), Some((at("[[", 0), at("]]", 9))));
     }
 
+    #[test]
+    fn html_pairs_tags_and_quotes() {
+        let at = |text: &str, n: usize| (text.to_string(), n);
+        assert_eq!(pair("a.html", "‸<p class=\"a\">x</p>\n"), Some((at("<", 0), at(">", 12))));
+        assert_eq!(pair("a.html", "<p class=\"a\">x‸</p>\n"), Some((at("</", 14), at(">", 17))));
+        assert_eq!(pair("a.html", "<p class=‸\"a\">x</p>\n"), Some((at("\"", 9), at("\"", 11))));
+        assert_eq!(pair("a.html", "‸<br/>\n"), Some((at("<", 0), at("/>", 3))));
+    }
+
     /// `src` without its `‸`, and the offset the `‸` marks.
     fn caret(src: &str) -> (String, usize) {
         (src.replacen('‸', "", 1), src.find('‸').expect("a ‸ in the source"))
