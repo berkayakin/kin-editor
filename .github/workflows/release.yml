@@ -30,6 +30,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the history and tags since the previous release.
+          fetch-depth: 0
       - id: version
         name: Check the tag against Cargo.toml
         run: |
@@ -39,11 +42,21 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Release notes from the commits and pull requests since the previous tag,
+      # each change once, with contributors @mentioned (see cliff.toml).
+      - id: notes
+        name: Write the release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          version: v2.14.2
+          args: --latest --strip header
+        env:
+          OUTPUT: release-notes.md
       - name: Create a draft release
         run: |
           prerelease=""
           case "$TAG" in *-*) prerelease="--prerelease" ;; esac
-          gh release create "$TAG" --draft --verify-tag --generate-notes --title "Kin ${TAG#v}" $prerelease
+          gh release create "$TAG" --draft --verify-tag --notes-file "${{ steps.notes.outputs.changelog }}" --title "Kin ${TAG#v}" $prerelease
 
   macos:
     needs: create
