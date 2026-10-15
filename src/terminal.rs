@@ -10,6 +10,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use alacritty_terminal::{
@@ -49,7 +50,8 @@ use crate::{
 
 actions!(terminal, [TerminalCopy, TerminalPaste, TerminalClear, TerminalFind]);
 
-/// Matches beyond this aren't collected (a huge scrollback full of hits).
+/// Matches beyond this aren't collected (a huge scrollback full of hits):
+/// the newest ones are kept.
 const MAX_MATCHES: usize = 5000;
 
 /// Find in the output: the query field and its matches.
@@ -62,6 +64,8 @@ struct Search {
     current: Option<usize>,
     /// Output arrived since `matches` were found.
     stale: bool,
+    /// A search running in the background (see `schedule_search`).
+    task: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -343,6 +347,10 @@ impl TerminalView {
             TermEvent::Wakeup => {
                 if let Some(search) = self.search.as_mut() {
                     search.stale = true;
+                    // While output streams, at most one search at a time.
+                    if search.task.is_none() {
+                        self.schedule_search(Duration::from_millis(100), false, cx);
+                    }
                 }
             }
             _ => {}
@@ -421,13 +429,7 @@ impl TerminalView {
             None => {
                 let input = cx.new(|cx| Editor::single_line("Find", cx));
                 let subscription = cx.subscribe(&input, |this: &mut Self, _, _: &EditorEvent, cx| {
-                    this.find_matches(cx);
-                    // The newest output first: the bottom match.
-                    if let Some(search) = this.search.as_mut() {
-                        search.current = search.matches.len().checked_sub(1);
-                    }
-                    this.reveal_match();
-                    cx.notify();
+                    this.schedule_search(Duration::from_millis(30), true, cx);
                 });
                 self.search = Some(Search {
                     input: input.clone(),
@@ -435,6 +437,7 @@ impl TerminalView {
                     history: 0,
                     current: None,
                     stale: false,
+                    task: None,
                     _subscription: subscription,
                 });
                 input
@@ -455,30 +458,67 @@ impl TerminalView {
         }
     }
 
-    /// Finds the query in the scrollback and on screen (case-insensitive
-    /// unless it has capitals), keeping the current match where it was.
+    /// Finds the query in the scrollback and on screen here and now (for
+    /// stepping through matches, which mustn't use old ones).
     fn find_matches(&mut self, cx: &App) {
         let Some(search) = self.search.as_mut() else { return };
         let query = search.input.read(cx).text();
-        let term = self.term.lock();
-        let history = term.grid().history_size();
-        // Lines move up as output scrolls; their place from the top doesn't.
+        search.task = None;
+        search.stale = false;
+        let (matches, history) = find_in(&self.term.lock(), &query);
+        self.take_matches(matches, history);
+    }
+
+    /// Searches in the background after `delay`, scanning the whole
+    /// scrollback with the terminal locked there, not while drawing. A new
+    /// query (`jump`) shows the newest match.
+    fn schedule_search(&mut self, delay: Duration, jump: bool, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else { return };
+        let input = search.input.clone();
+        let term = self.term.clone();
+        search.task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let Ok(query) = this.update(cx, |this, cx| {
+                // Output from here on is caught by the next search.
+                if let Some(search) = this.search.as_mut() {
+                    search.stale = false;
+                }
+                input.read(cx).text()
+            }) else {
+                return;
+            };
+            let (matches, history) = cx.background_executor().spawn(async move { find_in(&term.lock(), &query) }).await;
+            this.update(cx, |this, cx| {
+                let Some(search) = this.search.as_mut() else { return };
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = search.task.take() {
+                    task.detach();
+                }
+                let again = search.stale;
+                this.take_matches(matches, history);
+                if jump && let Some(search) = this.search.as_mut() {
+                    // The newest output first: the bottom match.
+                    search.current = search.matches.len().checked_sub(1);
+                    this.reveal_match();
+                }
+                if again {
+                    this.schedule_search(Duration::from_millis(100), false, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// New matches, keeping the current one where it was: lines move up as
+    /// output scrolls, but their place from the top of the history doesn't.
+    fn take_matches(&mut self, matches: Vec<Match>, history: usize) {
+        let Some(search) = self.search.as_mut() else { return };
         let from_top = |m: &Match, history: usize| (m.start().line.0 + history as i32, m.start().column.0);
         let current = search.current.and_then(|i| search.matches.get(i)).map(|m| from_top(m, search.history));
-        search.matches.clear();
+        search.matches = matches;
         search.history = history;
-        search.stale = false;
-        if !query.is_empty()
-            && let Ok(mut regex) = RegexSearch::new(&regex::escape(&query))
-        {
-            let start = GridPoint::new(term.topmost_line(), Column(0));
-            let end = GridPoint::new(term.bottommost_line(), term.last_column());
-            search.matches.extend(RegexIter::new(start, end, Direction::Right, &term, &mut regex).take(MAX_MATCHES));
-        }
-        search.current = match current {
-            Some(at) => search.matches.iter().position(|m| from_top(m, history) == at),
-            None => None,
-        };
+        search.current = current.and_then(|at| search.matches.iter().position(|m| from_top(m, history) == at));
     }
 
     /// ↵ / ↑ goes to older output, ⇧↵ / ↓ to newer, wrapping around.
@@ -752,10 +792,6 @@ impl TerminalView {
         self.origin = inner.origin;
         self.cell = (cell_w, cell_h);
         let focused = self.focus_handle.is_focused(window) && window.is_window_active();
-        if self.search.as_ref().is_some_and(|s| s.stale) {
-            self.find_matches(cx);
-        }
-
         let term = self.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
@@ -918,6 +954,24 @@ fn word_at(chars: &[char], col: usize) -> Option<(Range<usize>, String)> {
         end -= 1;
     }
     (col < end).then(|| (start..end, chars[start..end].iter().collect()))
+}
+
+/// The query's matches in the scrollback and on screen (case-insensitive
+/// unless it has capitals), top to bottom, the newest `MAX_MATCHES`; and
+/// how many scrollback lines there were.
+fn find_in(term: &Term<Listener>, query: &str) -> (Vec<Match>, usize) {
+    let history = term.grid().history_size();
+    let mut matches = Vec::new();
+    if !query.is_empty()
+        && let Ok(mut regex) = RegexSearch::new(&regex::escape(query))
+    {
+        // From the bottom up, so a capped list keeps the newest.
+        let bottom = GridPoint::new(term.bottommost_line(), term.last_column());
+        let top = GridPoint::new(term.topmost_line(), Column(0));
+        matches.extend(RegexIter::new(bottom, top, Direction::Left, term, &mut regex).take(MAX_MATCHES));
+        matches.reverse();
+    }
+    (matches, history)
 }
 
 /// A process's working directory.
@@ -1348,6 +1402,22 @@ mod tests {
 
     fn keys(source: &str, mode: TermMode) -> Option<Vec<u8>> {
         escape_for(&gpui::Keystroke::parse(source).unwrap(), mode).map(|c| c.into_owned())
+    }
+
+    #[test]
+    fn find_keeps_the_newest_matches() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut term = Term::new(Config::default(), &TermSize::new(40, 10), Listener(tx));
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        let lines = MAX_MATCHES + 10;
+        let output: String = (0..lines).map(|i| format!("hit {i}\r\n")).collect();
+        parser.advance(&mut term, output.as_bytes());
+        let (matches, _) = find_in(&term, "hit");
+        assert_eq!(matches.len(), MAX_MATCHES);
+        assert!(matches.windows(2).all(|w| w[0].start() < w[1].start()), "top to bottom");
+        let text = |m: &Match| term.bounds_to_string(GridPoint::new(m.start().line, Column(0)), GridPoint::new(m.start().line, Column(12)));
+        assert!(text(matches.last().unwrap()).starts_with(&format!("hit {}", lines - 1)));
+        assert!(text(&matches[0]).starts_with("hit 10"), "{}", text(&matches[0]));
     }
 
     #[test]
