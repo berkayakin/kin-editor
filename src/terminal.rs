@@ -94,6 +94,10 @@ pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
     notifier: Notifier,
     title: SharedString,
+    /// A name the user gave the tab, shown instead of the shell's title.
+    custom_title: Option<SharedString>,
+    /// The shell's process, to find the folder it's in now.
+    pid: Option<u32>,
     focus_handle: FocusHandle,
     /// Columns, rows and cell size last sent to the shell.
     size: Option<(u16, u16, Pixels, Pixels)>,
@@ -169,6 +173,10 @@ impl TerminalView {
         let options = tty::Options { shell, working_directory: Some(cwd.clone()), drain_on_exit, env, ..Default::default() };
         let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, window_size, 0)?;
+        #[cfg(unix)]
+        let pid = Some(pty.child().id());
+        #[cfg(not(unix))]
+        let pid = None;
         let term = Term::new(Config::default(), &TermSize::new(80, 24), listener.clone());
         let term = Arc::new(FairMutex::new(term));
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
@@ -180,6 +188,7 @@ impl TerminalView {
         }
         Ok(cx.new(|cx| {
             let mut view = Self::new(term, notifier, rx, cwd, cx);
+            view.pid = pid;
             if let Some(target) = run {
                 view.title = target.name.clone().into();
                 view.run = Some((target, RunState::Running));
@@ -255,6 +264,8 @@ impl TerminalView {
             term,
             notifier,
             title: shell_name.into(),
+            custom_title: None,
+            pid: None,
             focus_handle: cx.focus_handle(),
             size: None,
             origin: Point::default(),
@@ -271,7 +282,24 @@ impl TerminalView {
     }
 
     pub fn title(&self) -> SharedString {
-        self.title.clone()
+        self.custom_title.clone().unwrap_or_else(|| self.title.clone())
+    }
+
+    /// The name the user gave the tab, if any.
+    pub fn custom_title(&self) -> Option<&SharedString> {
+        self.custom_title.as_ref()
+    }
+
+    /// Renames the tab; None goes back to the shell's own title.
+    pub fn set_custom_title(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        self.custom_title = title.filter(|t| !t.trim().is_empty()).map(Into::into);
+        cx.emit(TerminalEvent::TitleChanged);
+        cx.notify();
+    }
+
+    /// The folder the shell is in now (after any `cd`), else where it started.
+    pub fn current_dir(&self) -> PathBuf {
+        self.pid.and_then(process_cwd).unwrap_or_else(|| self.cwd.clone())
     }
 
     fn handle_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
@@ -370,6 +398,11 @@ impl TerminalView {
     }
 
     fn clear(&mut self, _: &TerminalClear, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_all(cx);
+    }
+
+    /// Clears the screen and the scrollback.
+    pub fn clear_all(&mut self, cx: &mut Context<Self>) {
         // Ctrl+L redraws the prompt at the top; the scrollback goes too.
         self.term.lock().grid_mut().clear_history();
         self.input(&b"\x0c"[..], cx);
@@ -885,6 +918,33 @@ fn word_at(chars: &[char], col: usize) -> Option<(Range<usize>, String)> {
     (col < end).then(|| (start..end, chars[start..end].iter().collect()))
 }
 
+/// A process's working directory.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: `info` is a buffer of `size` bytes for PROC_PIDVNODEPATHINFO.
+    let read = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast(), size) };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the kernel fills `vip_path` with a NUL-terminated path.
+    let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()));
+    path.is_dir().then_some(path)
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok().filter(|p| p.is_dir())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 /// A URL, or a file that exists (relative to `cwd`) with an optional
 /// `:line` and `:column`, as compilers and test runners print them.
 fn parse_link(text: &str, cwd: &Path) -> Option<Link> {
@@ -1268,6 +1328,21 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn finds_a_process_working_directory() {
+        let dir = std::env::temp_dir().join(format!("kin-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = std::process::Command::new("sleep").arg("5").current_dir(&dir).spawn().unwrap();
+        let found = process_cwd(child.id()).and_then(|p| p.canonicalize().ok());
+        let expected = dir.canonicalize().ok();
+        child.kill().ok();
+        child.wait().ok();
+        std::fs::remove_dir(&dir).ok();
+        assert!(found.is_some());
+        assert_eq!(found, expected);
+    }
 
     fn keys(source: &str, mode: TermMode) -> Option<Vec<u8>> {
         escape_for(&gpui::Keystroke::parse(source).unwrap(), mode).map(|c| c.into_owned())

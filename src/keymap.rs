@@ -28,7 +28,7 @@ use crate::{
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
         AddLogpoint, OpenExtensions, ReloadExtensions, ProjectTrust, UndoFileChange, RedoFileChange,
-        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, SelectOpenedFile, InstallShellCommand,
+        ToggleAutoSave, ToggleSidebar, CheckForUpdates, WelcomeSetup, GoToSymbol, SplitTerminal, RenameTerminal, SelectOpenedFile, InstallShellCommand,
     },
 };
 
@@ -655,6 +655,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Go to Type Definition", GoToTypeDefinition),
         a("Go to Symbol", GoToSymbol),
         a("Split Terminal", SplitTerminal),
+        a("Rename Terminal…", RenameTerminal),
         a("Select Opened File", SelectOpenedFile),
         a("Toggle Markdown Preview", ToggleMarkdownPreview),
         a("Debug at Caret", DebugAtCaret),

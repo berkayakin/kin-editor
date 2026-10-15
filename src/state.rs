@@ -128,6 +128,39 @@ pub struct ProjectSession {
     /// when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub python_venv: Option<String>,
+    /// The terminal panel; absent in sessions from before it was saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminals: Option<TerminalLayout>,
+}
+
+/// The terminal panel's shells, by group (splits side by side).
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct TerminalLayout {
+    /// The panel was showing.
+    pub open: bool,
+    pub groups: Vec<TerminalGroupSession>,
+    /// Index into `groups` of the one with the keyboard.
+    pub active: usize,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct TerminalGroupSession {
+    pub tabs: Vec<TerminalTabSession>,
+    /// Index into `tabs` of the current one.
+    pub active: usize,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct TerminalTabSession {
+    /// The name the user gave it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The folder its shell was in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 /// A file's line breakpoints.
@@ -249,6 +282,14 @@ mod tests {
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
             expanded: vec!["src".into(), "src/lsp".into()],
             python_venv: Some("off".into()),
+            terminals: Some(TerminalLayout {
+                open: true,
+                groups: vec![
+                    TerminalGroupSession { tabs: vec![TerminalTabSession { name: Some("server".into()), cwd: Some("/work/kin/web".into()) }], active: 0 },
+                    TerminalGroupSession { tabs: vec![TerminalTabSession::default(), TerminalTabSession::default()], active: 1 },
+                ],
+                active: 1,
+            }),
             breakpoints: vec![FileBreakpoints {
                 path: "src/a.rs".into(),
                 breakpoints: vec![Breakpoint::at(3), Breakpoint { condition: Some("i > 2".into()), ..Breakpoint::at(9) }],

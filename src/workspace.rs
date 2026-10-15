@@ -48,7 +48,10 @@ use crate::{
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery, openable_files},
-    state::{FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, WindowPlacement},
+    state::{
+        FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, TerminalGroupSession, TerminalLayout, TerminalTabSession,
+        WindowPlacement,
+    },
     syntax::Language,
     settings::{self, AutoSave, Settings, StartupProblems},
     run::{self, DebugSpec, RunTarget},
@@ -148,6 +151,7 @@ actions!(
         WelcomeSetup,
         GoToSymbol,
         SplitTerminal,
+        RenameTerminal,
         SelectOpenedFile,
         InstallShellCommand,
     ]
@@ -367,6 +371,24 @@ enum MenuAction {
     ChooseVenv,
     /// A terminal tab from its strip's overflow menu.
     Terminal(Entity<TerminalView>),
+    /// A terminal tab's right-click menu.
+    TerminalTab(TerminalTabAction, Entity<TerminalView>),
+}
+
+/// What a terminal tab's menu does with it.
+#[derive(Clone, Copy, PartialEq)]
+enum TerminalTabAction {
+    Rename,
+    ResetName,
+    Clear,
+    Rerun,
+    Stop,
+    New,
+    Split,
+    Close,
+    CloseOthers,
+    CloseToTheRight,
+    CloseAll,
 }
 
 /// What the breakpoint menu does with a row's breakpoint.
@@ -391,6 +413,7 @@ impl Clone for MenuAction {
             MenuAction::Venv(choice) => MenuAction::Venv(choice.clone()),
             MenuAction::ChooseVenv => MenuAction::ChooseVenv,
             MenuAction::Terminal(terminal) => MenuAction::Terminal(terminal.clone()),
+            MenuAction::TerminalTab(action, terminal) => MenuAction::TerminalTab(*action, terminal.clone()),
         }
     }
 }
@@ -496,6 +519,9 @@ pub struct Workspace {
     terminal_groups: Vec<TerminalGroup>,
     /// The group that has (or last had) the keyboard.
     active_group: usize,
+    /// The project's terminals from last time, not started yet: they open
+    /// with the panel.
+    saved_terminals: Option<TerminalLayout>,
     /// The terminal panel's bounds in the last frame, to fit its groups' tabs.
     terminal_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// While dragging over the tree: the folder a drop would go into.
@@ -720,6 +746,7 @@ impl Workspace {
             show_git_log: state.show_git_log.unwrap_or(false) && !state.show_terminal.unwrap_or(false) && !state.show_problems.unwrap_or(false),
             terminal_groups: Vec::new(),
             active_group: 0,
+            saved_terminals: None,
             terminal_bounds: Default::default(),
             tree_drop: None,
 
@@ -970,10 +997,21 @@ impl Workspace {
         // The folders that were open last time, if they still exist.
         self.breakpoints.clear();
         self.run_problems = None;
-        let session = ProjectSession::load(&root);
-        if let Some(session) = &session {
+        let mut session = ProjectSession::load(&root);
+        if let Some(session) = &mut session {
             self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
             self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
+            // The project's own terminal panel, unless this window has shells already.
+            if let Some(terminals) = session.terminals.take()
+                && self.terminal_groups.is_empty()
+            {
+                self.show_terminal = terminals.open;
+                if terminals.open {
+                    self.show_problems = false;
+                    self.show_git_log = false;
+                }
+                self.saved_terminals = Some(terminals);
+            }
         }
         // Before any tab's language server starts.
         let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
@@ -993,6 +1031,7 @@ impl Workspace {
         if self.tabs.is_empty() {
             self.restore_session(window, cx);
         }
+        self.start_terminal_panel(window, cx);
         if self.restricted(cx) && self.modal.is_none() {
             self.open_trust_dialog(window, cx);
         }
@@ -1059,7 +1098,46 @@ impl Workspace {
             .collect();
         breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
         let python_venv = crate::python::choice(&root).map(|c| c.to_saved());
-        ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv }.save()
+        let terminals = Some(self.terminal_layout(cx));
+        ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals }.save()
+    }
+
+    /// The terminal panel as the session keeps it: each shell's folder and
+    /// name, by group. Run tabs are left out (they'd run their program again).
+    fn terminal_layout(&self, cx: &App) -> TerminalLayout {
+        if self.terminal_groups.is_empty()
+            && let Some(saved) = &self.saved_terminals
+        {
+            return TerminalLayout { open: self.show_terminal, ..saved.clone() };
+        }
+        let mut groups = Vec::new();
+        let mut active = 0;
+        for (g, group) in self.terminal_groups.iter().enumerate() {
+            let mut tabs = Vec::new();
+            let mut current = 0;
+            for (ix, terminal) in group.tabs.iter().enumerate() {
+                let terminal = terminal.read(cx);
+                if terminal.run().is_some() {
+                    continue;
+                }
+                // The current tab, else the closest one before it.
+                if ix <= group.active {
+                    current = tabs.len();
+                }
+                tabs.push(TerminalTabSession {
+                    name: terminal.custom_title().map(|t| t.to_string()),
+                    cwd: Some(terminal.current_dir()),
+                });
+            }
+            if tabs.is_empty() {
+                continue;
+            }
+            if g <= self.active_group {
+                active = groups.len();
+            }
+            groups.push(TerminalGroupSession { tabs, active: current });
+        }
+        TerminalLayout { open: self.show_terminal, groups, active }
     }
 
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
@@ -1539,6 +1617,7 @@ impl Workspace {
         self.session_task = None;
         self.terminal_groups.clear();
         self.active_group = 0;
+        self.saved_terminals = None;
         self.show_terminal = false;
         if let Some((session, _)) = self.debug.take() {
             session.update(cx, |s, cx| s.stop(cx));
@@ -2922,13 +3001,14 @@ impl Workspace {
             self.show_problems = false;
             self.show_git_log = false;
             self.show_debug = false;
-            if self.terminal_groups.is_empty() {
+            if self.terminal_groups.is_empty() && !self.restore_terminals(window, cx) {
                 self.new_terminal(&NewTerminal, window, cx);
             } else {
                 self.focus_terminal(window, cx);
             }
         }
         self.save_state();
+        self.schedule_session_save(cx);
         cx.notify();
     }
 
@@ -2986,14 +3066,51 @@ impl Workspace {
     /// After `open_window`'s setup: start the shell for a terminal panel that
     /// was open last time, now that the project (its folder) is known.
     fn window_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.show_terminal && self.terminal_groups.is_empty() {
-            let focused = self.active_editor().cloned();
+        self.start_terminal_panel(window, cx);
+    }
+
+    /// Starts the shells of a terminal panel that shows without any (it was
+    /// open last time): the project's saved ones, else a new one.
+    fn start_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_terminal || !self.terminal_groups.is_empty() {
+            return;
+        }
+        let focused = self.active_editor().cloned();
+        if !self.restore_terminals(window, cx) {
             self.new_terminal(&NewTerminal, window, cx);
-            // Keep the editor focused, as it was before quitting.
-            if let Some(editor) = focused {
-                window.focus(&editor.focus_handle(cx));
+        }
+        // Keep the editor focused, as it was before quitting.
+        if let Some(editor) = focused {
+            window.focus(&editor.focus_handle(cx));
+        }
+    }
+
+    /// Reopens the project's shells from last time, in their groups, folders
+    /// and with their names. False when there were none to open.
+    fn restore_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.terminal_groups.is_empty() {
+            return false;
+        }
+        let Some(layout) = self.saved_terminals.take() else { return false };
+        let fallback = self.terminal_cwd(cx);
+        for saved in layout.groups {
+            let group = self.terminal_groups.len();
+            for tab in saved.tabs {
+                let cwd = tab.cwd.filter(|d| d.is_dir()).unwrap_or_else(|| fallback.clone());
+                // Into this group, which the first shell creates.
+                self.open_terminal(cwd, None, TerminalPlace::Tab { group, ix: None }, false, window, cx);
+                if let Some(name) = tab.name
+                    && let Some(terminal) = self.terminal_groups.get(group).and_then(|g| g.tabs.last()).cloned()
+                {
+                    terminal.update(cx, |t, cx| t.set_custom_title(Some(name), cx));
+                }
+            }
+            if let Some(g) = self.terminal_groups.get_mut(group) {
+                g.active = saved.active.min(g.tabs.len() - 1);
             }
         }
+        self.active_group = layout.active.min(self.terminal_groups.len().saturating_sub(1));
+        !self.terminal_groups.is_empty()
     }
 
     fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3028,6 +3145,8 @@ impl Workspace {
 
     /// Starts a shell in a new tab of the current group.
     fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        // The project's shells from last time come back first.
+        self.restore_terminals(window, cx);
         let cwd = self.terminal_cwd(cx);
         self.open_terminal(cwd, None, TerminalPlace::Tab { group: self.active_group, ix: None }, true, window, cx);
     }
@@ -3038,6 +3157,7 @@ impl Workspace {
         g.active = ix.min(g.tabs.len().saturating_sub(1));
         self.active_group = group;
         self.focus_terminal(window, cx);
+        self.schedule_session_save(cx);
         cx.notify();
     }
 
@@ -3184,6 +3304,7 @@ impl Workspace {
                     self.focus_terminal(window, cx);
                 }
                 self.save_state();
+                self.schedule_session_save(cx);
             }
             Err(err) => {
                 // A Run tab being replaced may have left its group empty.
@@ -3208,6 +3329,7 @@ impl Workspace {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
         }
+        self.restore_terminals(window, cx);
         // A rerun takes the previous run's place, in whichever group it is.
         let previous = self
             .all_terminals()
@@ -3621,6 +3743,7 @@ impl Workspace {
 
     /// Opens a new shell in a group of its own beside the current group.
     fn split_terminal(&mut self, _: &SplitTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.restore_terminals(window, cx);
         let cwd = self.terminal_cwd(cx);
         let place = if self.terminal_groups.is_empty() {
             TerminalPlace::Tab { group: 0, ix: None }
@@ -3656,7 +3779,125 @@ impl Workspace {
         } else if was_focused {
             self.focus_terminal(window, cx);
         }
+        self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    /// Renames the current terminal tab (Find Action's Rename Terminal).
+    fn rename_terminal(&mut self, _: &RenameTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_terminal().cloned() {
+            Some(terminal) => self.open_rename_terminal(terminal, window, cx),
+            None => self.toast(ToastKind::Info, "No terminal to rename", None, cx),
+        }
+    }
+
+    fn open_rename_terminal(&mut self, terminal: Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        let initial = terminal.read(cx).title().to_string();
+        self.close_modal(window, cx);
+        let hint = "Leave empty to show the shell's own title";
+        let dialog =
+            cx.new(|cx| InputDialog::new("Rename Terminal", Icon::Terminal, hint, &initial, Some(0..initial.len()), window, cx).allow_empty());
+        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, move |ws, _, event: &InputDialogEvent, window, cx| {
+            if let InputDialogEvent::Confirm(name) = event {
+                terminal.update(cx, |t, cx| t.set_custom_title(Some(name.clone()), cx));
+                ws.schedule_session_save(cx);
+            }
+            ws.close_modal(window, cx);
+            // Back to the terminal, rather than the editor `close_modal` focuses.
+            if let Some((g, ix)) = ws.terminal_position(&terminal) {
+                ws.activate_terminal(g, ix, window, cx);
+            }
+        }));
+        self.modal = Some(Modal::Input(dialog));
+        cx.notify();
+    }
+
+    /// A terminal tab's right-click menu.
+    fn open_terminal_tab_menu(&mut self, terminal: Entity<TerminalView>, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((g, ix)) = self.terminal_position(&terminal) else { return };
+        let count = self.terminal_groups[g].tabs.len();
+        let run = terminal.read(cx).run().map(|(_, state)| *state);
+        let renamed = terminal.read(cx).custom_title().is_some();
+        let mut entries = Vec::new();
+        let mut actions = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<MenuAction>| {
+            entries.push(entry);
+            actions.push(action);
+        };
+        let tab = |action: TerminalTabAction| Some(MenuAction::TerminalTab(action, terminal.clone()));
+        add(MenuEntry::item("Rename…", Icon::Pencil), tab(TerminalTabAction::Rename));
+        if renamed {
+            add(MenuEntry::text("Reset Name"), tab(TerminalTabAction::ResetName));
+        }
+        add(MenuEntry::text("Clear"), tab(TerminalTabAction::Clear));
+        match run {
+            Some(RunState::Running) => add(MenuEntry::item("Stop", Icon::Square).shortcut(binding_label(&StopRun, window)), tab(TerminalTabAction::Stop)),
+            Some(RunState::Exited(_)) => add(MenuEntry::item("Rerun", Icon::Refresh), tab(TerminalTabAction::Rerun)),
+            None => {}
+        }
+        add(MenuEntry::Separator, None);
+        add(MenuEntry::item("New Terminal", Icon::Plus).shortcut(binding_label(&NewTerminal, window)), tab(TerminalTabAction::New));
+        add(
+            MenuEntry::item("Split Terminal", Icon::SplitRight).shortcut(binding_label(&SplitTerminal, window)),
+            tab(TerminalTabAction::Split),
+        );
+        add(MenuEntry::Separator, None);
+        add(MenuEntry::item("Close", Icon::X), tab(TerminalTabAction::Close));
+        if count > 1 {
+            add(MenuEntry::text("Close Others"), tab(TerminalTabAction::CloseOthers));
+        }
+        if ix + 1 < count {
+            add(MenuEntry::text("Close Tabs to the Right"), tab(TerminalTabAction::CloseToTheRight));
+        }
+        if count > 1 {
+            add(MenuEntry::text("Close All"), tab(TerminalTabAction::CloseAll));
+        }
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
+    fn run_terminal_tab_action(&mut self, action: TerminalTabAction, terminal: Entity<TerminalView>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((g, ix)) = self.terminal_position(&terminal) else { return };
+        let closing: Vec<Entity<TerminalView>> = match action {
+            TerminalTabAction::Rename => return self.open_rename_terminal(terminal, window, cx),
+            TerminalTabAction::ResetName => {
+                terminal.update(cx, |t, cx| t.set_custom_title(None, cx));
+                self.schedule_session_save(cx);
+                return;
+            }
+            TerminalTabAction::Clear => {
+                terminal.update(cx, |t, cx| t.clear_all(cx));
+                return self.activate_terminal(g, ix, window, cx);
+            }
+            TerminalTabAction::Stop => {
+                terminal.update(cx, |t, cx| t.interrupt(cx));
+                return;
+            }
+            TerminalTabAction::Rerun => {
+                if let Some((target, _)) = terminal.read(cx).run().cloned() {
+                    self.run_target(target, window, cx);
+                }
+                return;
+            }
+            TerminalTabAction::New => {
+                self.active_group = g;
+                return self.new_terminal(&NewTerminal, window, cx);
+            }
+            TerminalTabAction::Split => {
+                self.active_group = g;
+                return self.split_terminal(&SplitTerminal, window, cx);
+            }
+            TerminalTabAction::Close => vec![terminal],
+            TerminalTabAction::CloseOthers => self.terminal_groups[g].tabs.iter().filter(|t| **t != terminal).cloned().collect(),
+            TerminalTabAction::CloseToTheRight => self.terminal_groups[g].tabs[ix + 1..].to_vec(),
+            TerminalTabAction::CloseAll => self.terminal_groups[g].tabs.clone(),
+        };
+        if action != TerminalTabAction::CloseAll && action != TerminalTabAction::Close {
+            // The tab that was right-clicked stays, as the current one.
+            self.activate_terminal(g, ix, window, cx);
+        }
+        for terminal in closing {
+            self.remove_terminal(&terminal, window, cx);
+        }
     }
 
     /// The bottom panel's terminals: each group is an island with its own
@@ -3714,7 +3955,7 @@ impl Workspace {
             let icon_only = matches!(slot, TabSlot::Icon(_));
             let compact = matches!(slot, TabSlot::Compact(_));
             let hover_group = SharedString::from(format!("terminal-tab-{g}-{ix}"));
-            let (for_close, for_middle) = (terminal.clone(), terminal.clone());
+            let (for_close, for_middle, for_menu) = (terminal.clone(), terminal.clone(), terminal.clone());
             let label = tab_label(&names[ix], slot, naturals[ix], name_widths[ix]);
             let name_color: Hsla = if is_active && current { theme.text.into() } else { theme.text_muted.into() };
             let tab = div()
@@ -3736,6 +3977,13 @@ impl Workspace {
                 .on_mouse_down(
                     MouseButton::Middle,
                     cx.listener(move |ws, _, window, cx| ws.remove_terminal(&for_middle, window, cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |ws, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        ws.open_terminal_tab_menu(for_menu.clone(), event.position, window, cx);
+                    }),
                 )
                 .child(match terminal.read(cx).run().map(|(_, state)| *state) {
                     // A Run tab shows how its program is doing.
@@ -3850,6 +4098,7 @@ impl Workspace {
                         ws.show_terminal = false;
                         ws.focus_active(window, cx);
                         ws.save_state();
+                        ws.schedule_session_save(cx);
                         cx.notify();
                     }))
                     .tooltip(|window, cx| status_tooltip("Hide Terminal", &ToggleTerminal, window, cx)),
@@ -4459,6 +4708,7 @@ impl Workspace {
                             ws.activate_terminal(g, ix, window, cx);
                         }
                     }
+                    Some(MenuAction::TerminalTab(action, terminal)) => ws.run_terminal_tab_action(action, terminal, window, cx),
                     None => {}
                 }
             }
@@ -7874,6 +8124,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::welcome_setup))
             .on_action(cx.listener(Self::go_to_symbol))
             .on_action(cx.listener(Self::split_terminal))
+            .on_action(cx.listener(Self::rename_terminal))
             .on_action(cx.listener(Self::select_opened_file))
             .on_action(cx.listener(Self::debug_configuration))
             .on_action(cx.listener(Self::attach_to_process))

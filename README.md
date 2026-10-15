@@ -72,7 +72,8 @@ platform-native text rendering (CoreText / DirectWrite).
   Window menu and the Dock icon's menu list them
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste, Find in the output and scrollback; shell keys
-  like Ctrl+R reach the shell
+  like Ctrl+R reach the shell; split groups, renamable tabs, and each project's terminals come back
+  in their folders
 - Code folding by indentation (Markdown by section), with gutter arrows and a `⋯` placeholder;
   folds are kept with the project
 - Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
@@ -386,8 +387,15 @@ from the theme's `terminal_*` keys.
 Hold ⌘ (Ctrl on Windows/Linux) over a URL or a file path in the output, such as a compiler's
 `src/main.rs:12:5`, to underline it, and click to open it: URLs in the browser, files in the editor
 at that line and column. Paths are relative to the terminal's folder and must exist. The split
-button in the panel header (or **Split Terminal** in Find Action) shows a second shell beside the
-current one; press it again to unsplit (both stay as tabs).
+button above the terminal (or **Split Terminal** in Find Action) opens a shell in a new group beside
+the current one, with its own tabs; a group goes away with its last tab.
+
+Right-click a terminal tab to **Rename** it (empty goes back to the shell's own title), clear it,
+open a new or split terminal, or close it, the others, the tabs to its right or all of its group's
+tabs; Run tabs also get **Stop** or **Rerun**. Each project remembers its terminals: how many,
+their names, which are split into groups, the folder each shell was in (after a `cd`) and whether
+the panel was open. They start again when the project opens (or when the panel first opens).
+Run tabs aren't brought back.
 
 **Find** (⌘F / Ctrl+Shift+F in the terminal; the selection becomes the query) highlights matches in
 the scrollback and on screen and jumps to the newest; ↵ or ↑ goes to older ones, ⇧↵ or ↓ to newer,
