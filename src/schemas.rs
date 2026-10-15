@@ -88,7 +88,8 @@ fn theme_schema() -> Value {
             "extends": { "type": "string", "description": "A theme to take the colors this one doesn't set from." },
             "italic_comments": { "type": "boolean" },
             "colors": { "type": "object", "properties": colors, "additionalProperties": false },
-            "syntax": { "type": "object", "properties": syntax, "additionalProperties": false },
+            // Any capture name ("keyword.control") besides the base kinds.
+            "syntax": { "type": "object", "properties": syntax, "additionalProperties": color },
         },
         "required": ["name"],
     }))

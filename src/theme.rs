@@ -116,6 +116,9 @@ pub struct Theme {
     pub terminal_bright_white: Rgba,
 
     pub syntax: SyntaxColors,
+    /// Colors for capture names besides the base kinds ("keyword.control",
+    /// "string.regex"), from the theme's `syntax`.
+    pub syntax_names: HashMap<String, Rgba>,
 }
 
 impl Global for Theme {}
@@ -293,12 +296,28 @@ impl Theme {
             terminal_bright_cyan: rgba(0x7ccbd4ff),
             terminal_bright_white: rgba(0xffffffff),
             syntax,
+            syntax_names: HashMap::new(),
         }
     }
 
+    /// The color for a capture: the theme's color for the longest prefix of
+    /// its name ("keyword.control.return" → "keyword.control"), stopping at
+    /// the level Kin's base kinds cover, whose color is then used.
     pub fn highlight_color(&self, h: Highlight) -> Hsla {
+        if !self.syntax_names.is_empty() {
+            let mut name = h.name();
+            while !name.is_empty() {
+                if let Some(color) = self.syntax_names.get(name) {
+                    return (*color).into();
+                }
+                if Highlight::base_at(name).is_some() {
+                    break;
+                }
+                name = name.rfind('.').map_or("", |dot| &name[..dot]);
+            }
+        }
         let s = &self.syntax;
-        match h {
+        match h.base() {
             Highlight::None | Highlight::Variable => s.plain,
             Highlight::Keyword => s.keyword,
             Highlight::String => s.string,
@@ -315,6 +334,7 @@ impl Theme {
             Highlight::Tag => s.tag,
             Highlight::Attribute => s.attribute,
             Highlight::Escape => s.escape,
+            _ => s.plain,
         }
         .into()
     }
@@ -568,6 +588,13 @@ fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
                 syntax.insert(kin.to_string(), value);
             }
         }
+        // And every name the theme colors, for captures more specific than
+        // the base kinds.
+        for (name, style) in syntax_style.and_then(|s| s.as_object()).into_iter().flatten() {
+            if let Some(color) = style.get("color").and_then(|v| v.as_str()) {
+                syntax.entry(name.clone()).or_insert_with(|| color.to_string());
+            }
+        }
         out.push(ThemeFile {
             name: theme.get("name")?.as_str()?.to_string(),
             appearance: theme.get("appearance").and_then(|a| a.as_str()).map(str::to_string),
@@ -632,6 +659,21 @@ fn resolve(
         .map(|(k, v)| (k.clone(), v))
         .chain(file.syntax.iter().map(|(k, v)| (format!("syntax.{k}"), v)));
     for (key, value) in entries {
+        // Any capture name is a syntax key; only near-misses of the base
+        // names ("syntax.keywrd") are reported.
+        if let Some(name) = key.strip_prefix("syntax.").filter(|_| color_mut(&mut theme, &key).is_none()) {
+            match parse_color(value) {
+                Some(_) if !name.contains('.') && Highlight::base_at(name).is_none() && suggest_key(&key).is_some() => {
+                    let hint = suggest_key(&key).map(|k| format!(" (did you mean \"{k}\"?)")).unwrap_or_default();
+                    errors.push(format!("{}: unknown color \"{key}\"{hint}", file.name));
+                }
+                Some(color) => {
+                    theme.syntax_names.insert(name.to_string(), color);
+                }
+                None => errors.push(format!("{}: invalid color \"{value}\" for \"{key}\"", file.name)),
+            }
+            continue;
+        }
         match (color_mut(&mut theme, &key), parse_color(value)) {
             (Some(slot), Some(color)) => *slot = color,
             (None, _) => {
@@ -865,6 +907,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn captures_take_the_longest_prefix_a_theme_colors() {
+        let file: ThemeFile = serde_json::from_str(
+            r##"{ "name": "T", "syntax": { "keyword": "#111111", "keyword.control": "#222222", "variable": "#333333", "keywrd": "#444444" } }"##,
+        )
+        .unwrap();
+        let mut errors = Vec::new();
+        let theme = resolve(&file, &builtins(), &mut Vec::new(), &mut errors).unwrap();
+        let color = |name: &str| theme.highlight_color(Highlight::from_capture(name));
+        let hex = |s: &str| Hsla::from(parse_color(s).unwrap());
+        assert_eq!(color("keyword.control.return"), hex("#222222"));
+        assert_eq!(color("keyword.function"), hex("#111111"));
+        assert_eq!(color("variable.parameter"), hex("#333333"));
+        // A more specific base kind wins over a shorter name the theme colors.
+        assert_eq!(color("variable.builtin"), Hsla::from(theme.syntax.variable_builtin));
+        assert_eq!(color("function.method.call"), Hsla::from(theme.syntax.method));
+        // A misspelled base name is still reported.
+        assert!(errors.iter().any(|e| e.contains("keywrd") && e.contains("keyword")), "{errors:?}");
+    }
+
+    #[test]
     fn reads_zed_theme_families() {
         let family = r##"{
             "name": "Sea", "author": "x",
@@ -872,7 +934,8 @@ mod tests {
                 { "name": "Sea Dark", "appearance": "dark", "style": {
                     "editor.background": "#101820ff", "text": "#e0e0e0", "border": "#303840",
                     "terminal.ansi.red": "#ff5555", "players": [{ "cursor": "#ffcc00", "selection": "#ffcc0033" }],
-                    "syntax": { "keyword": { "color": "#ff79c6", "font_weight": 700 }, "comment": { "color": "#6272a4" } }
+                    "syntax": { "keyword": { "color": "#ff79c6", "font_weight": 700 }, "comment": { "color": "#6272a4" },
+                                "string.regex": { "color": "#ff9900" } }
                 } },
                 { "name": "Sea Light", "appearance": "light", "style": {} }
             ]
@@ -889,6 +952,8 @@ mod tests {
         assert_eq!(dark.syntax["keyword"], "#ff79c6");
         let theme = resolve(dark, &builtins(), &mut Vec::new(), &mut Vec::new()).unwrap();
         assert_eq!(theme.background, parse_color("#101820ff").unwrap());
+        // Colors for names Kin has no base kind for are kept.
+        assert_eq!(theme.highlight_color(Highlight::from_capture("string.regex")), Hsla::from(parse_color("#ff9900").unwrap()));
         assert!(zed_theme_family("{\"name\": \"not a family\"}").is_none());
     }
 

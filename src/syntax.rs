@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     ops::{ControlFlow, Deref, DerefMut, Range},
     path::Path,
-    sync::{LazyLock, Mutex},
+    sync::{LazyLock, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -124,62 +124,127 @@ pub fn grammar(language: Language) -> Option<TsLanguage> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Highlight {
-    #[default]
-    None,
-    Keyword,
-    String,
-    Number,
-    Constant,
-    Function,
-    Method,
-    Property,
-    Type,
-    Variable,
-    VariableBuiltin,
-    Comment,
-    Operator,
-    Punctuation,
-    Tag,
-    Attribute,
-    Escape,
+/// What a highlight query captured: the capture's name ("keyword.control",
+/// "function.method"), interned. A theme colors a name by the longest dotted
+/// prefix it defines (`Theme::highlight_color`), else by its `base`: the
+/// few kinds every theme has a color for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Highlight(u16);
+
+/// The base kinds' capture names, in the order of their `Highlight` ids.
+const BASE: [&str; 17] = [
+    "", "keyword", "string", "number", "constant", "function", "function.method", "property", "type", "variable",
+    "variable.builtin", "comment", "operator", "punctuation", "tag", "attribute", "escape",
+];
+
+struct Names {
+    /// Per id: the name and its base kind.
+    list: Vec<(&'static str, Highlight)>,
+    ids: HashMap<&'static str, u16>,
+}
+
+static NAMES: LazyLock<RwLock<Names>> = LazyLock::new(|| {
+    let list: Vec<(&'static str, Highlight)> = BASE.iter().enumerate().map(|(i, n)| (*n, Highlight(i as u16))).collect();
+    let ids = list.iter().enumerate().map(|(i, (n, _))| (*n, i as u16)).collect();
+    RwLock::new(Names { list, ids })
+});
+
+// The base kinds, named like the variants they used to be.
+#[allow(non_upper_case_globals)]
+impl Highlight {
+    pub const None: Highlight = Highlight(0);
+    pub const Keyword: Highlight = Highlight(1);
+    pub const String: Highlight = Highlight(2);
+    pub const Number: Highlight = Highlight(3);
+    pub const Constant: Highlight = Highlight(4);
+    pub const Function: Highlight = Highlight(5);
+    pub const Method: Highlight = Highlight(6);
+    pub const Property: Highlight = Highlight(7);
+    pub const Type: Highlight = Highlight(8);
+    pub const Variable: Highlight = Highlight(9);
+    pub const VariableBuiltin: Highlight = Highlight(10);
+    pub const Comment: Highlight = Highlight(11);
+    pub const Operator: Highlight = Highlight(12);
+    pub const Punctuation: Highlight = Highlight(13);
+    pub const Tag: Highlight = Highlight(14);
+    pub const Attribute: Highlight = Highlight(15);
+    pub const Escape: Highlight = Highlight(16);
 }
 
 impl Highlight {
-    fn from_capture(name: &str) -> Self {
-        let head = name.split('.').next().unwrap_or(name);
-        match (head, name) {
-            (_, "function.method") => Highlight::Method,
-            (_, "variable.builtin") => Highlight::VariableBuiltin,
-            (_, "string.special") => Highlight::Escape,
-            (_, "string.special.key") => Highlight::Property,
-            (_, "tag.error") => Highlight::Tag,
-            // Markdown (nvim-treesitter style "text.*" captures).
-            (_, "text.title" | "text.strong") => Highlight::Keyword,
-            (_, "text.literal") => Highlight::String,
-            (_, "text.uri") => Highlight::Property,
-            (_, "text.reference") => Highlight::Function,
-            (_, "text.emphasis") => Highlight::Type,
-            // CSS at-rules capture under their own names.
-            ("keyword" | "charset" | "import" | "keyframes" | "media" | "namespace" | "supports", _) => {
-                Highlight::Keyword
-            }
-            ("string", _) => Highlight::String,
-            ("number", _) => Highlight::Number,
-            ("constant" | "boolean" | "label", _) => Highlight::Constant,
-            ("function", _) => Highlight::Function,
-            ("property", _) => Highlight::Property,
-            ("constructor" | "type", _) => Highlight::Type,
-            ("variable" | "embedded", _) => Highlight::Variable,
-            ("comment", _) => Highlight::Comment,
-            ("operator", _) => Highlight::Operator,
-            ("punctuation", _) => Highlight::Punctuation,
-            ("tag", _) => Highlight::Tag,
-            ("attribute", _) => Highlight::Attribute,
-            ("escape", _) => Highlight::Escape,
-            _ => Highlight::None,
+    /// The id of a capture name (queries are compiled once, so names are few).
+    pub fn from_capture(name: &str) -> Self {
+        if let Some(&id) = NAMES.read().unwrap().ids.get(name) {
+            return Highlight(id);
         }
+        let mut names = NAMES.write().unwrap();
+        if let Some(&id) = names.ids.get(name) {
+            return Highlight(id);
+        }
+        let Ok(id) = u16::try_from(names.list.len()) else { return Highlight::None };
+        let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        names.list.push((name, Self::base_of(name)));
+        names.ids.insert(name, id);
+        Highlight(id)
+    }
+
+    pub fn name(self) -> &'static str {
+        NAMES.read().unwrap().list.get(self.0 as usize).map_or("", |(n, _)| n)
+    }
+
+    /// The base kind, for themes that don't color this name.
+    pub fn base(self) -> Highlight {
+        if (self.0 as usize) < BASE.len() {
+            return self;
+        }
+        NAMES.read().unwrap().list.get(self.0 as usize).map_or(Highlight::None, |(_, b)| *b)
+    }
+
+    /// The base kind of the longest prefix of `name` that has one.
+    fn base_of(name: &str) -> Highlight {
+        let mut prefix = name;
+        loop {
+            if let Some(base) = Self::base_at(prefix) {
+                return base;
+            }
+            match prefix.rfind('.') {
+                Some(dot) => prefix = &prefix[..dot],
+                None => return Highlight::None,
+            }
+        }
+    }
+
+    /// The base kind for exactly this name (one level of a dotted name).
+    pub(crate) fn base_at(name: &str) -> Option<Highlight> {
+        Some(match name {
+            "function.method" => Highlight::Method,
+            "variable.builtin" => Highlight::VariableBuiltin,
+            "string.special" => Highlight::Escape,
+            "string.special.key" => Highlight::Property,
+            "tag.error" => Highlight::Tag,
+            // Markdown (nvim-treesitter style "text.*" captures).
+            "text.title" | "text.strong" => Highlight::Keyword,
+            "text.literal" => Highlight::String,
+            "text.uri" => Highlight::Property,
+            "text.reference" => Highlight::Function,
+            "text.emphasis" => Highlight::Type,
+            // CSS at-rules capture under their own names.
+            "keyword" | "charset" | "import" | "keyframes" | "media" | "namespace" | "supports" => Highlight::Keyword,
+            "string" => Highlight::String,
+            "number" => Highlight::Number,
+            "constant" | "boolean" | "label" => Highlight::Constant,
+            "function" => Highlight::Function,
+            "property" => Highlight::Property,
+            "constructor" | "type" => Highlight::Type,
+            "variable" | "embedded" => Highlight::Variable,
+            "comment" => Highlight::Comment,
+            "operator" => Highlight::Operator,
+            "punctuation" => Highlight::Punctuation,
+            "tag" => Highlight::Tag,
+            "attribute" => Highlight::Attribute,
+            "escape" => Highlight::Escape,
+            _ => return None,
+        })
     }
 }
 
@@ -1085,7 +1150,7 @@ mod tests {
     }
 
     fn has(spans: &[(String, Highlight)], text: &str, h: Highlight) -> bool {
-        spans.iter().any(|(t, x)| t == text && *x == h)
+        spans.iter().any(|(t, x)| t == text && x.base() == h)
     }
 
     fn outline(path: &str, src: &str) -> Vec<(String, &'static str, usize)> {
@@ -1227,4 +1292,5 @@ mod tests {
         assert!(has(&sh, "if", Highlight::Keyword), "{sh:?}");
     }
 }
+
 

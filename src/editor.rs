@@ -2707,7 +2707,7 @@ impl Editor {
                     .map(|(_, k)| *k)
                     .unwrap_or_default();
                 let mut run_font = editor_font.clone();
-                if kind == crate::syntax::Highlight::Comment && theme.italic_comments {
+                if kind.base() == crate::syntax::Highlight::Comment && theme.italic_comments {
                     run_font.style = FontStyle::Italic;
                 }
                 let severity = row_diags

@@ -851,7 +851,11 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 
 `syntax` keys: `plain`, `keyword`, `string`, `number`, `constant`, `function`, `method`,
 `property`, `type`, `variable_builtin`, `comment`, `operator`, `punctuation`, `tag`,
-`attribute`, `escape`. Set `"italic_comments": false` for upright comments.
+`attribute`, `escape`. Any tree-sitter capture name works too, for finer colors:
+`"keyword.control"`, `"string.regex"`, `"variable.parameter"`. A capture takes the color of
+the longest part of its name the theme sets (`keyword.control.return` → `keyword.control` →
+`keyword`). Zed themes keep all their syntax colors. Set `"italic_comments": false` for
+upright comments.
 
 ## Layout
 

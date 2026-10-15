@@ -525,7 +525,7 @@ mod tests {
         assert!(matches!(&blocks[4], Block::Quote(inner) if matches!(&inner[0], Block::Paragraph(i) if i.text == "quoted")));
         let Block::Code { lang, text, highlights } = &blocks[5] else { panic!("{:?}", blocks[5]) };
         assert_eq!((lang.as_str(), text.as_str()), ("rust", "fn main() {}"));
-        assert!(highlights.iter().any(|(r, h)| *r == (0..2) && *h == Highlight::Keyword), "{highlights:?}");
+        assert!(highlights.iter().any(|(r, h)| *r == (0..2) && h.base() == Highlight::Keyword), "{highlights:?}");
         let Block::Table { aligns, rows } = &blocks[6] else { panic!("{:?}", blocks[6]) };
         assert_eq!((aligns[1], rows.len(), rows[1][1].text.as_str()), (Alignment::Right, 2, "2"));
         assert_eq!(blocks[7], Block::Rule);
