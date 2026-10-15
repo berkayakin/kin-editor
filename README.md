@@ -76,7 +76,7 @@ platform-native text rendering (CoreText / DirectWrite).
   in their folders
 - Code folding by indentation (Markdown by section), with gutter arrows and a `⋯` placeholder;
   folds are kept with the project
-- Split panes (side by side or stacked) with draggable dividers; drag tabs to reorder them or
+- Split panes (side by side or stacked, a file in both if you like) with draggable dividers; drag tabs to reorder them or
   move them between panes; pinned tabs; a tab menu with Close Others / All / to the Right
 - Debugger for Rust, Go, Python and JavaScript/TypeScript (lldb-dap, Delve, debugpy, js-debug):
   breakpoints with conditions and logpoints, attaching to running processes, stepping, frames,
@@ -225,7 +225,7 @@ The table below is the JetBrains keymap.
 | Toggle line breakpoint / conditional breakpoint | ⌘F8 / ⇧⌘F8 | Ctrl+F8 / Ctrl+Shift+F8 |
 | Attach to Process… | ⌥⇧F5 | Ctrl+Alt+F5 |
 | Resume / Step Over / Into / Out | ⌥⌘R / F8 / F7 / ⇧F8 | F9 / F8 / F7 / Shift+F8 |
-| Split and Move Right / Down | ⌘\\ / ⌘⇧\\ | Ctrl+\\ / Ctrl+Shift+\\ |
+| Split Right / Down | ⌘\\ / ⌘⇧\\ | Ctrl+\\ / Ctrl+Shift+\\ |
 | Next pane | ⌥⇥ | — |
 | New / close terminal tab (in the terminal) | ⌘T / ⌘W | Ctrl+Shift+T / Ctrl+Shift+W |
 | Copy / paste / clear (in the terminal) | ⌘C / ⌘V / ⌘K | Ctrl+Shift+C / Ctrl+Shift+V / — |
@@ -369,9 +369,9 @@ read their own config (`.prettierrc`, `rustfmt.toml`, `pyproject.toml`…). Set 
 
 ## Panes and tabs
 
-**Split and Move Right / Down** (View menu, a tab's right-click menu, or ⌘\\ / ⌘⇧\\) moves the
-current tab into a new pane; if it's the pane's only tab, the new pane starts empty for the next
-file you open. A file has one editor, so it isn't shown in two panes at once. Drag a tab to
+**Split Right / Down** (View menu, a tab's right-click menu, or ⌘\\ / ⌘⇧\\) opens a new pane
+showing the current file too: both panes edit the same text, each with its own carets and scroll,
+and closing one keeps the file open in the other. Drag a tab to
 reorder it, onto another pane's tab bar or editor to move it there; a pane closes with its last
 tab. Drag the line between panes to resize them.
 

@@ -90,6 +90,12 @@ pub enum EditKind {
 /// rebuild from scratch.
 const LINE_EDIT_LOG: usize = 10_000;
 
+/// How many versions' patches are kept for other editors of a document to
+/// catch up with (each editor catches up when it's notified, so a few).
+const PATCH_LOG: usize = 512;
+
+static NEXT_DOCUMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// How long an edit may parse on the UI thread; a longer parse finishes in
 /// the background (the editor shows the old tree, edited, meanwhile).
 const PARSE_BUDGET: Duration = Duration::from_millis(1);
@@ -102,6 +108,11 @@ const LARGE_FILE_SIZE: u64 = 20_000_000;
 const MAX_FILE_SIZE: u64 = 500_000_000;
 
 pub struct Document {
+    /// Unique per document: an editor showing it notices when it's replaced
+    /// as a whole (an unloaded tab read its file).
+    id: u64,
+    /// Only a stand-in for a file not read yet (`Document::unloaded`).
+    stand_in: bool,
     rope: Rope,
     pub path: Option<PathBuf>,
     pub language: Language,
@@ -133,6 +144,10 @@ pub struct Document {
     /// What each edit did to lines, tagged with the version it led to, so
     /// views can update just those lines (see `line_edits_since`).
     line_edits: Vec<(u64, LineEdit)>,
+    /// Each version's edits since `patches_base`, for the other editors of
+    /// this document to move their carets.
+    patches: std::collections::VecDeque<(u64, Patch)>,
+    patches_base: u64,
     /// The version `line_edits` start from.
     line_edits_base: u64,
     /// How many lines are longer than `wrap::LONG_LINE` (they always break
@@ -174,6 +189,7 @@ impl Document {
     /// kept unsaved edits for it.
     pub fn unloaded(path: Option<PathBuf>, dirty: bool) -> Self {
         let mut doc = Self::empty();
+        doc.stand_in = true;
         doc.path = path;
         if dirty {
             doc.mark_unsaved();
@@ -227,6 +243,8 @@ impl Document {
         };
         let long_lines = long_lines(&rope, 0..usize::MAX);
         Self {
+            id: NEXT_DOCUMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            stand_in: false,
             rope,
             path,
             language,
@@ -248,6 +266,8 @@ impl Document {
             debug_line: None,
             line_edits: Vec::new(),
             line_edits_base: 0,
+            patches: std::collections::VecDeque::new(),
+            patches_base: 0,
             long_lines,
             parse_behind: !parsed,
             parse_edits: Vec::new(),
@@ -383,6 +403,8 @@ impl Document {
         self.folds.clear();
         self.snippet = None;
         self.version += 1;
+        self.patches.clear();
+        self.patches_base = self.version;
         self.saved_version = self.version;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -555,6 +577,7 @@ impl Document {
             groups.iter().filter(|g| !(g.range.is_empty() && g.text.is_empty())).map(|g| (g.range.clone(), g.text.len())).collect(),
         );
         self.shift_tracked(&patch);
+        let mut patch = Some(patch);
 
         // Compute post-edit ranges by accumulating deltas front to back.
         let mut result = vec![0..0; count];
@@ -569,6 +592,7 @@ impl Document {
 
         if !records.is_empty() {
             self.version += 1;
+            self.log_patch(patch.take().expect("set above"));
             self.reparse();
             self.redo_stack.clear();
             let now = Instant::now();
@@ -632,12 +656,16 @@ impl Document {
 
     pub fn undo(&mut self) -> Option<Vec<Selection>> {
         let t = self.undo_stack.pop()?;
+        let mut steps = Vec::new();
         for rec in t.edits.iter().rev() {
             let range = rec.start..rec.start + rec.new.len();
             self.raw_replace(range.clone(), &rec.old);
-            self.shift_tracked(&Patch::new(vec![(range, rec.old.len())]));
+            let patch = Patch::new(vec![(range, rec.old.len())]);
+            self.shift_tracked(&patch);
+            steps.push(patch);
         }
         self.version += 1;
+        self.log_patches(steps);
         self.reparse();
         let selections = t.before.clone();
         self.redo_stack.push(t);
@@ -646,12 +674,16 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<Vec<Selection>> {
         let t = self.redo_stack.pop()?;
+        let mut steps = Vec::new();
         for rec in &t.edits {
             let range = rec.start..rec.start + rec.old.len();
             self.raw_replace(range.clone(), &rec.new);
-            self.shift_tracked(&Patch::new(vec![(range, rec.new.len())]));
+            let patch = Patch::new(vec![(range, rec.new.len())]);
+            self.shift_tracked(&patch);
+            steps.push(patch);
         }
         self.version += 1;
+        self.log_patches(steps);
         self.reparse();
         let selections = t.after.clone();
         self.undo_stack.push(t);
@@ -742,6 +774,42 @@ impl Document {
     /// The line edits that lead from `version` to the current text, oldest
     /// first, each in the lines of the text before it; None when they
     /// aren't kept (too many, or the whole text was replaced).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn is_stand_in(&self) -> bool {
+        self.stand_in
+    }
+
+    fn log_patch(&mut self, patch: Patch) {
+        self.log_patches(vec![patch]);
+    }
+
+    /// The edits that made the current version, in the order they applied.
+    fn log_patches(&mut self, patches: Vec<Patch>) {
+        for patch in patches {
+            self.patches.push_back((self.version, patch));
+        }
+        while self.patches.len() > PATCH_LOG {
+            let (version, _) = self.patches.pop_front().expect("not empty");
+            // Versions up to this one can't be caught up with any more.
+            self.patches_base = version;
+            while self.patches.front().is_some_and(|(v, _)| *v == version) {
+                self.patches.pop_front();
+            }
+        }
+    }
+
+    /// The edits since `version`, in order, to move positions from then to
+    /// now; None when that's too long ago (or `version` isn't this text's).
+    pub fn patches_since(&self, version: u64) -> Option<impl Iterator<Item = &Patch>> {
+        if version < self.patches_base || version > self.version {
+            return None;
+        }
+        Some(self.patches.iter().filter(move |(v, _)| *v > version).map(|(_, patch)| patch))
+    }
+
     pub fn line_edits_since(&self, version: u64) -> Option<impl Iterator<Item = &LineEdit>> {
         if version < self.line_edits_base || version > self.version {
             return None;
@@ -1057,6 +1125,22 @@ impl Patch {
 
     pub fn change(range: &Range<usize>, new_len: usize) -> isize {
         new_len as isize - range.len() as isize
+    }
+
+    /// Where `offset` is after the edits: moved by the ones before it; inside
+    /// a replaced range, the end of the new text; at an insertion, before it.
+    pub fn map(&self, offset: usize) -> usize {
+        let (mut delta, near) = self.around(offset..offset);
+        for (range, new_len) in near {
+            if offset <= range.start {
+                break;
+            } else if offset >= range.end {
+                delta += Patch::change(range, *new_len);
+            } else {
+                return moved(range.start, delta) + new_len;
+            }
+        }
+        moved(offset, delta)
     }
 
     /// For something spanning `span`: the length change of the edits that

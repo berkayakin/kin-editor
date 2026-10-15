@@ -964,6 +964,13 @@ impl Workspace {
     /// What starts once a tab's text is there (when it opens, or when a
     /// restored tab is first shown): breakpoints, language server, Git changes.
     fn file_opened(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        // Another editor of the document has what's per document already
+        // (breakpoints, the language server); this one needs its own gutter.
+        if self.siblings(editor, cx).iter().any(|s| s.read(cx).is_loaded()) {
+            self.lsp.update(cx, |s, cx| s.register(editor, cx));
+            self.load_diff_base(editor, cx);
+            return;
+        }
         // Breakpoints it had while closed, and the paused line if it's here.
         let path = editor.read(cx).doc.read(cx).path.clone();
         if let Some(path) = path {
@@ -1003,14 +1010,32 @@ impl Workspace {
     /// Activation reads its tab already; this covers a pane whose current tab
     /// changed otherwise (a tab closed or moved out of it).
     fn load_shown_tabs(&mut self, cx: &mut Context<Self>) {
-        for pane in &self.panes {
-            if let Some(editor) = pane.tabs.get(pane.active)
-                && !editor.read(cx).is_loaded()
-            {
-                // A failure is reported (and the tab closed) through `EditorLoaded`.
-                let _ = editor.update(cx, |e, cx| e.load(cx));
-            }
+        let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|pane| pane.tabs.get(pane.active).cloned()).collect();
+        for editor in shown {
+            self.load_tab(&editor, cx);
         }
+    }
+
+    /// Reads a restored tab's file; for a split of one, the tab holding the
+    /// restored state reads it (the document is theirs together). A failure
+    /// is reported (and the tab closed) through `EditorLoaded`.
+    fn load_tab(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        if editor.read(cx).is_loaded() {
+            return;
+        }
+        let reader = match editor.read(cx).unloaded().is_some() {
+            true => Some(editor.clone()),
+            false => self.siblings(editor, cx).into_iter().find(|s| s.read(cx).unloaded().is_some()),
+        };
+        if let Some(reader) = reader {
+            let _ = reader.update(cx, |e, cx| e.load(cx));
+        }
+    }
+
+    /// The other tabs showing `editor`'s document.
+    fn siblings(&self, editor: &Entity<Editor>, cx: &App) -> Vec<Entity<Editor>> {
+        let e = editor.read(cx);
+        self.tabs.iter().filter(|t| *t != editor && t.read(cx).shares_document(e)).cloned().collect()
     }
 
     /// Shows an open editor in its pane and focuses it.
@@ -1042,7 +1067,7 @@ impl Workspace {
             self.active_pane = pane;
             self.panes[pane].active = ix;
             // A restored tab reads its file when first shown.
-            let _ = editor.update(cx, |e, cx| e.load(cx));
+            self.load_tab(&editor, cx);
             window.focus(&editor.focus_handle(cx));
             if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
                 self.recent.retain(|p| p != &path);
@@ -1271,6 +1296,7 @@ impl Workspace {
         };
         // Tabs read their files when first shown (see `Editor::load`): the
         // current tab of each pane right away, the others when activated.
+        let mut restored: Vec<(PathBuf, Entity<Editor>)> = Vec::new();
         for tab in session.tabs {
             // The file is gone and there's nothing unsaved to keep.
             if tab.unsaved.is_none() && tab.path.as_deref().is_none_or(|p| !p.is_file()) {
@@ -1282,7 +1308,15 @@ impl Workspace {
                 folds: tab.folds,
                 encoding: tab.encoding.as_deref().and_then(TextEncoding::from_key),
             };
-            let editor = cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx));
+            // A file shown in two panes is one document, in two editors.
+            let shown = tab.path.as_ref().and_then(|p| restored.iter().find(|(q, _)| q == p)).map(|(_, e)| e.clone());
+            let editor = match shown {
+                Some(first) => cx.new(|cx| Editor::view_of(&first, cx)),
+                None => cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx)),
+            };
+            if let Some(path) = &tab.path {
+                restored.push((path.clone(), editor.clone()));
+            }
             // Into the pane it was in, creating panes as needed.
             while self.panes.len() <= tab.pane.min(7) {
                 self.panes.push(Pane::new());
@@ -2323,7 +2357,8 @@ impl Workspace {
         if self.auto_save != AutoSave::Off {
             self.auto_save(&editor, cx);
         }
-        if editor.read(cx).doc.read(cx).is_dirty() {
+        // Another tab still shows the document: nothing is lost.
+        if editor.read(cx).doc.read(cx).is_dirty() && self.siblings(&editor, cx).is_empty() {
             let name = editor.read(cx).doc.read(cx).file_name();
             let rx = window.prompt(
                 PromptLevel::Warning,
@@ -2359,7 +2394,15 @@ impl Workspace {
         self.tabs.remove(ix);
         self.pinned.remove(&editor.entity_id());
         let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
-        if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
+        if let Some(sibling) = self.siblings(editor, cx).into_iter().next() {
+            // The document stays open in another tab: it takes over.
+            if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
+                self.lsp.update(cx, |s, _| s.rebind(&path, &sibling));
+            }
+            if let Some(unloaded) = editor.update(cx, |e, _| e.take_unloaded()) {
+                sibling.update(cx, |e, _| e.put_unloaded(unloaded));
+            }
+        } else if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
             self.lsp.update(cx, |s, _| s.did_close(&path));
             let breakpoints = editor.read(cx).breakpoints(cx);
             if !breakpoints.is_empty() {
@@ -2420,9 +2463,8 @@ impl Workspace {
         self.split(PaneAxis::Column, window, cx);
     }
 
-    /// Split and Move: a new pane after the current one takes the current
-    /// tab (or starts empty when that's the pane's only tab). A file has one
-    /// editor, so it isn't duplicated.
+    /// A new pane after the current one, showing the current file too (a
+    /// second editor of the same document, with its own carets and scroll).
     fn split(&mut self, axis: PaneAxis, window: &mut Window, cx: &mut Context<Self>) {
         if self.panes.len() >= 6 {
             return;
@@ -2430,7 +2472,7 @@ impl Workspace {
         // One direction at a time: splitting the other way re-flows the panes.
         self.pane_axis = axis;
         let source = self.active_pane;
-        let moving = (self.panes[source].tabs.len() > 1).then(|| self.active_editor().cloned()).flatten();
+        let shown = self.active_editor().cloned();
         let at = source + 1;
         self.panes.insert(at, Pane::new());
         // The new pane takes half of the current one's space.
@@ -2438,8 +2480,12 @@ impl Workspace {
         self.pane_sizes[source] = half;
         self.pane_sizes.insert(at, half);
         self.active_pane = at;
-        match moving {
-            Some(editor) => self.move_tab(&editor, at, None, window, cx),
+        match shown {
+            Some(editor) => {
+                self.load_tab(&editor, cx);
+                let view = cx.new(|cx| Editor::view_of(&editor, cx));
+                self.add_tab(view, window, cx);
+            }
             None => window.focus(&self.focus_handle),
         }
         self.schedule_session_save(cx);
@@ -2578,11 +2624,11 @@ impl Workspace {
         add(MenuEntry::item(if pinned { "Unpin Tab" } else { "Pin Tab" }, Icon::Pin), tab(TabAction::TogglePin));
         add(MenuEntry::Separator, None);
         add(
-            MenuEntry::item("Split and Move Right", Icon::SplitRight).shortcut(binding_label(&SplitRight, window)),
+            MenuEntry::item("Split Right", Icon::SplitRight).shortcut(binding_label(&SplitRight, window)),
             tab(TabAction::SplitRight),
         );
         add(
-            MenuEntry::item("Split and Move Down", Icon::SplitDown).shortcut(binding_label(&SplitDown, window)),
+            MenuEntry::item("Split Down", Icon::SplitDown).shortcut(binding_label(&SplitDown, window)),
             tab(TabAction::SplitDown),
         );
         if let Some(path) = path {

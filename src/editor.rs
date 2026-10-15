@@ -318,11 +318,22 @@ pub struct Editor {
     conflict_hits: Vec<(Bounds<Pixels>, usize, crate::conflict::Resolution)>,
     /// A restored tab whose file isn't read yet (`load` reads it).
     unloaded: Option<Unloaded>,
+    /// The document's id and version as this editor last saw them (its own
+    /// edits included): another editor's edits move its carets from there.
+    seen: (u64, u64),
+    _doc_observer: gpui::Subscription,
+    /// A split of a restored tab not read yet: that tab reads the file.
+    waiting: bool,
 }
 
 impl Editor {
     pub fn new(doc: Document, cx: &mut Context<Self>) -> Self {
-        let mut this = Self::blank(doc, cx);
+        Self::with_document(cx.new(|_| doc), cx)
+    }
+
+    /// An editor for a document entity, maybe one other editors show too.
+    pub fn with_document(doc: Entity<Document>, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::blank_in(doc, cx);
         this.apply_settings(cx);
         this.detect_external_linter(cx);
         this.schedule_lint(Duration::ZERO, cx);
@@ -334,9 +345,20 @@ impl Editor {
     /// The editor's state for `doc`, before anything reads settings or
     /// starts work on the text.
     fn blank(doc: Document, cx: &mut Context<Self>) -> Self {
-        let file_settings = Settings::get(cx).for_file(doc.language, doc.path.as_deref());
+        Self::blank_in(cx.new(|_| doc), cx)
+    }
+
+    fn blank_in(doc: Entity<Document>, cx: &mut Context<Self>) -> Self {
+        let (file_settings, seen) = {
+            let d = doc.read(cx);
+            (Settings::get(cx).for_file(d.language, d.path.as_deref()), (d.id(), d.version()))
+        };
+        let doc_observer = cx.observe(&doc, |editor, _, cx| editor.document_changed(cx));
         Self {
-            doc: cx.new(|_| doc),
+            doc,
+            seen,
+            _doc_observer: doc_observer,
+            waiting: false,
             mode: EditorMode::Full,
             placeholder: SharedString::default(),
             search_matches: Vec::new(),
@@ -401,6 +423,80 @@ impl Editor {
             image_info: None,
             unloaded: None,
         }
+    }
+
+    /// A second editor for the same document (a split): it starts where
+    /// this one is, then has carets and scrolling of its own.
+    pub fn view_of(other: &Entity<Editor>, cx: &mut Context<Self>) -> Self {
+        let (doc, selections, scroll) = {
+            let other = other.read(cx);
+            (other.doc.clone(), other.selections.clone(), other.scroll)
+        };
+        let waiting = doc.read(cx).is_stand_in();
+        let mut this = Self::blank_in(doc, cx);
+        this.waiting = waiting;
+        this.apply_settings(cx);
+        this.detect_external_linter(cx);
+        this.selections = selections;
+        this.scroll = scroll;
+        this
+    }
+
+    /// Whether `other` shows the same document.
+    pub fn shares_document(&self, other: &Editor) -> bool {
+        self.doc == other.doc
+    }
+
+    /// Changes the text (or replaces it). This editor places its own carets,
+    /// so its change isn't replayed onto them when the document notifies.
+    fn change_doc<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Document) -> R) -> R {
+        let result = f(&mut self.doc.as_mut(cx));
+        let doc = self.doc.read(cx);
+        self.seen = (doc.id(), doc.version());
+        result
+    }
+
+    /// The document changed: another editor of it edited (carets here move
+    /// with its edits), or it was replaced as a whole (an unloaded tab of it
+    /// read its file), or something it holds (diagnostics) did.
+    fn document_changed(&mut self, cx: &mut Context<Self>) {
+        let (id, version) = {
+            let doc = self.doc.read(cx);
+            (doc.id(), doc.version())
+        };
+        if (id, version) == self.seen {
+            cx.notify();
+            return;
+        }
+        if id != self.seen.0 {
+            // Fresh state around the new text, outside this observer's callback.
+            self.seen = (id, version);
+            let this = cx.weak_entity();
+            cx.defer(move |cx| {
+                this.update(cx, |editor, cx| {
+                    let (focus_handle, waited) = (editor.focus_handle.clone(), editor.waiting);
+                    *editor = Self::with_document(editor.doc.clone(), cx);
+                    editor.focus_handle = focus_handle;
+                    // A split of a restored tab: its text is here now too.
+                    if waited {
+                        cx.emit(unloaded::EditorLoaded { error: None });
+                    }
+                    cx.notify();
+                })
+                .ok();
+            });
+            return;
+        }
+        let moved: Option<Vec<Selection>> = self.doc.read(cx).patches_since(self.seen.1).map(|patches| {
+            let patches: Vec<&crate::document::Patch> = patches.collect();
+            let map = |offset: usize| patches.iter().fold(offset, |offset, patch| patch.map(offset));
+            self.selections.iter().map(|s| Selection { anchor: map(s.anchor), head: map(s.head) }).collect()
+        });
+        let selections = moved.unwrap_or_else(|| self.selections.clone());
+        self.selections = self.clamp_selections(selections, cx);
+        self.seen = (id, version);
+        self.schedule_diff(Duration::from_millis(120), cx);
+        cx.notify();
     }
 
     /// Finishes in the background a parse that ran out of time on the UI
@@ -468,7 +564,7 @@ impl Editor {
         let text = if self.is_single_line() { text.replace('\n', " ") } else { text.to_string() };
         let before = self.selections.clone();
         let len = self.doc.read(cx).len();
-        self.doc.as_mut(cx).edit(vec![(0..len, text)], &before, EditKind::Other);
+        self.change_doc(cx, |doc| doc.edit(vec![(0..len, text)], &before, EditKind::Other));
         let len = self.doc.read(cx).len();
         self.set_selections(vec![Selection { anchor: 0, head: len }], 0, cx);
         self.after_edit(cx);
@@ -663,7 +759,7 @@ impl Editor {
         if self.doc.read(cx).is_dirty() || !self.is_loaded() {
             return;
         }
-        let reloaded = self.doc.as_mut(cx).reload_from_disk();
+        let reloaded = self.change_doc(cx, |doc| doc.reload_from_disk());
         if let Ok(true) = reloaded {
             self.after_reload(cx);
         }
@@ -671,7 +767,7 @@ impl Editor {
 
     /// Reads the file again as `encoding`; unsaved edits are dropped.
     pub fn reload_with_encoding(&mut self, encoding: crate::encoding::TextEncoding, cx: &mut Context<Self>) -> std::io::Result<()> {
-        self.doc.as_mut(cx).reload_with_encoding(encoding)?;
+        self.change_doc(cx, |doc| doc.reload_with_encoding(encoding))?;
         self.after_reload(cx);
         Ok(())
     }
@@ -888,7 +984,7 @@ impl Editor {
             placements.push(cursor);
             edits.push((range, text));
         }
-        let new_ranges = self.doc.as_mut(cx).edit(edits, &before, kind);
+        let new_ranges = self.change_doc(cx, |doc| doc.edit(edits, &before, kind));
         let selections = new_ranges
             .into_iter()
             .zip(placements)
@@ -934,7 +1030,7 @@ impl Editor {
             .iter()
             .map(|s| Selection { anchor: map(s.anchor, &edits), head: map(s.head, &edits) })
             .collect();
-        self.doc.as_mut(cx).edit(edits, &before, kind);
+        self.change_doc(cx, |doc| doc.edit(edits, &before, kind));
         self.goal_x = None;
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
@@ -1907,7 +2003,7 @@ impl Editor {
                 Selection { anchor: s.anchor + shift, head: s.head + shift }
             })
             .collect();
-        self.doc.as_mut(cx).edit(edits, &before, EditKind::Other);
+        self.change_doc(cx, |doc| doc.edit(edits, &before, EditKind::Other));
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
     }
@@ -1950,7 +2046,7 @@ impl Editor {
                 }
             })
             .collect();
-        self.doc.as_mut(cx).edit(edits, &before, EditKind::Other);
+        self.change_doc(cx, |doc| doc.edit(edits, &before, EditKind::Other));
         self.set_selections(selections, self.primary, cx);
         self.after_edit(cx);
     }
@@ -2106,7 +2202,11 @@ impl Editor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        let undone = self.doc.as_mut(cx).undo();
+        self.undo_step(cx);
+    }
+
+    pub(crate) fn undo_step(&mut self, cx: &mut Context<Self>) {
+        let undone = self.change_doc(cx, |doc| doc.undo());
         if let Some(selections) = undone {
             let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
@@ -2117,7 +2217,11 @@ impl Editor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        let redone = self.doc.as_mut(cx).redo();
+        self.redo_step(cx);
+    }
+
+    pub(crate) fn redo_step(&mut self, cx: &mut Context<Self>) {
+        let redone = self.change_doc(cx, |doc| doc.redo());
         if let Some(selections) = redone {
             let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
@@ -4058,7 +4162,7 @@ impl EntityInputHandler for Editor {
             Some(range) => {
                 // IME commit: replace the composed range only.
                 let before = self.selections.clone();
-                let new = self.doc.as_mut(cx).edit(vec![(range, text.to_string())], &before, EditKind::Other);
+                let new = self.change_doc(cx, |doc| doc.edit(vec![(range, text.to_string())], &before, EditKind::Other));
                 let end = new[0].end;
                 self.set_selections(vec![Selection::cursor(end)], 0, cx);
                 self.after_edit(cx);
@@ -4083,7 +4187,7 @@ impl EntityInputHandler for Editor {
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.primary_selection().range());
         let before = self.selections.clone();
-        let new = self.doc.as_mut(cx).edit(vec![(range, new_text.to_string())], &before, EditKind::Other);
+        let new = self.change_doc(cx, |doc| doc.edit(vec![(range, new_text.to_string())], &before, EditKind::Other));
         let new_range = new[0].clone();
         let sel = match new_selected_range_utf16 {
             Some(r) => {

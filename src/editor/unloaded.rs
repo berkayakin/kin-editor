@@ -50,7 +50,17 @@ impl Editor {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.unloaded.is_none()
+        self.unloaded.is_none() && !self.waiting
+    }
+
+    /// Hands a tab's restored state to another editor of the same document
+    /// (the tab is closing before it was read).
+    pub fn take_unloaded(&mut self) -> Option<Unloaded> {
+        self.unloaded.take()
+    }
+
+    pub fn put_unloaded(&mut self, unloaded: Unloaded) {
+        self.unloaded = Some(unloaded);
     }
 
     /// Reads an unloaded tab's file and brings back its unsaved text, folds
@@ -75,9 +85,11 @@ impl Editor {
             // Untitled, or a deleted file with edits: keep the text.
             _ => Document::empty(),
         };
-        // A fresh editor for the text, in the same view (tabs and focus refer to it).
+        // A fresh editor for the text, in the same view (tabs and focus refer
+        // to it) and the same document entity (other editors may show it).
         let focus_handle = self.focus_handle.clone();
-        *self = Self::new(doc, cx);
+        self.doc.write(cx, doc);
+        *self = Self::with_document(self.doc.clone(), cx);
         self.focus_handle = focus_handle;
         if let Some(text) = unloaded.unsaved {
             // An edit on top of the file, so undo gets back to the saved text.
@@ -161,6 +173,52 @@ mod tests {
             assert_eq!(Some(e.doc.read(cx).encoding), encoding);
             assert!(!e.doc.read(cx).is_dirty());
         });
+    }
+
+    #[gpui::test]
+    fn two_editors_of_one_document_follow_each_others_edits(cx: &mut TestAppContext) {
+        let a = cx.new(|cx| Editor::new(Document::empty(), cx));
+        a.update(cx, |e, cx| e.set_text("hello world\n", cx));
+        let b = cx.new(|cx| Editor::view_of(&a, cx));
+        b.update(cx, |e, cx| e.set_selections(vec![Selection::cursor(11)], 0, cx));
+
+        // An edit in one moves the other's caret with the text.
+        a.update(cx, |e, cx| e.replace_ranges(vec![(6..6, "big ".into())], cx));
+        cx.run_until_parked();
+        b.read_with(cx, |e, cx| {
+            assert_eq!(e.text(cx), "hello big world\n");
+            assert_eq!(e.primary_selection().head, 15);
+        });
+        // Either one edits; undo in either undoes the document's last step.
+        b.update(cx, |e, cx| e.replace_ranges(vec![(0..5, "goodbye".into())], cx));
+        cx.run_until_parked();
+        a.read_with(cx, |e, cx| assert_eq!(e.text(cx), "goodbye big world\n"));
+        a.update(cx, |e, cx| e.undo_step(cx));
+        cx.run_until_parked();
+        b.read_with(cx, |e, cx| {
+            assert_eq!(e.text(cx), "hello big world\n");
+            assert_eq!(e.primary_selection().head, 15);
+        });
+    }
+
+    #[gpui::test]
+    fn a_split_of_a_tab_not_read_yet_shows_the_file_once_it_is(cx: &mut TestAppContext) {
+        let path = temp_file("split.txt", b"one\ntwo\n");
+        let first = cx.new(|cx| Editor::new_unloaded(Some(path.clone()), unloaded(4, None), cx));
+        let second = cx.new(|cx| Editor::view_of(&first, cx));
+        // It waits for the first to read the file (that one has the session's state).
+        second.read_with(cx, |e, _| assert!(!e.is_loaded() && e.unloaded().is_none()));
+        first.update(cx, |e, cx| e.load(cx)).unwrap();
+        cx.run_until_parked();
+        second.read_with(cx, |e, cx| {
+            assert!(e.is_loaded());
+            assert_eq!(e.text(cx), "one\ntwo\n");
+            assert_eq!(e.doc.read(cx).path.as_deref(), Some(path.as_path()));
+        });
+        // Still one document: an edit in the second shows in the first.
+        second.update(cx, |e, cx| e.replace_ranges(vec![(0..3, "1".into())], cx));
+        cx.run_until_parked();
+        first.read_with(cx, |e, cx| assert_eq!(e.text(cx), "1\ntwo\n"));
     }
 
     #[gpui::test]

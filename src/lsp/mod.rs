@@ -243,6 +243,14 @@ impl LspStore {
         if self.documents.get(&path).is_some_and(|d| d.editor.upgrade().as_ref() == Some(editor)) {
             return;
         }
+        // Another editor of the same document (a split): the servers know it
+        // already, and this one sends its edits through the same store.
+        let shown = self.documents.get(&path).and_then(|d| d.editor.upgrade());
+        if shown.is_some_and(|shown| shown.read(cx).shares_document(editor.read(cx))) {
+            let store = cx.weak_entity();
+            editor.update(cx, |e, _| e.set_lsp(store));
+            return;
+        }
         // Servers run the project's code (build scripts, plugins, its own binaries).
         if !crate::trust::is_trusted(&path) {
             return;
@@ -708,6 +716,14 @@ impl LspStore {
     }
 
     /// Stops tracking a closed tab's document.
+    /// The editor the store tracks `path` through is closing while another
+    /// editor of the same document stays: track it through that one.
+    pub fn rebind(&mut self, path: &Path, editor: &Entity<Editor>) {
+        if let Some(doc) = self.documents.get_mut(path) {
+            doc.editor = editor.downgrade();
+        }
+    }
+
     pub fn did_close(&mut self, path: &Path) {
         let Some(doc) = self.documents.remove(path) else { return };
         for (key, _) in doc.servers.iter().filter(|(_, opened)| *opened) {
