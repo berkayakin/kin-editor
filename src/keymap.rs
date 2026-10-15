@@ -49,7 +49,11 @@ pub fn bindings(base: BaseKeymap) -> Vec<KeyBinding> {
         BaseKeymap::SublimeText => sublime_text(mac),
         BaseKeymap::Zed => zed(mac),
     });
-    b
+    // GPUI ranks a binding without a context as deep as the deepest context,
+    // so between the two the later one wins: a keymap's global ⌘T would beat
+    // the terminal's own. Context bindings go last so they win where they apply.
+    let (global, contextual): (Vec<KeyBinding>, Vec<KeyBinding>) = b.into_iter().partition(|b| b.predicate().is_none());
+    global.into_iter().chain(contextual).collect()
 }
 
 /// How `base` binds `action` out of the box (its first binding that works in
@@ -1064,6 +1068,35 @@ fn apply_shortcut_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a keystroke runs in the innermost of `contexts`, as GPUI resolves it.
+    fn resolve(base: BaseKeymap, keys: &str, contexts: &[&str]) -> Option<&'static str> {
+        let defaults = bindings(base);
+        let mut all = defaults.clone();
+        all.extend(terminal_passthrough(&defaults));
+        let keymap = gpui::Keymap::new(all);
+        let stack: Vec<gpui::KeyContext> = contexts.iter().map(|c| gpui::KeyContext::parse(c).unwrap()).collect();
+        let input = [gpui::Keystroke::parse(keys).unwrap()];
+        keymap.bindings_for_input(&input, &stack).0.first().map(|b| b.action().name())
+    }
+
+    #[test]
+    fn context_bindings_win_where_they_apply() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        for base in [BaseKeymap::JetBrains, BaseKeymap::VSCode, BaseKeymap::SublimeText, BaseKeymap::Zed] {
+            // A keymap's own ⌘T (Update Project, Go to Symbol, Go to File) stays outside the terminal.
+            assert_eq!(resolve(base, "cmd-t", &["Workspace", "Terminal"]), Some("workspace::NewTerminal"), "{base:?}");
+            assert_ne!(resolve(base, "cmd-t", &["Workspace", "Editor"]), Some("workspace::NewTerminal"), "{base:?}");
+            assert_eq!(resolve(base, "cmd-k", &["Workspace", "Terminal"]), Some("terminal::TerminalClear"), "{base:?}");
+            assert_eq!(resolve(base, "cmd-w", &["Workspace", "Terminal"]), Some("workspace::CloseTerminal"), "{base:?}");
+        }
+        assert_eq!(resolve(BaseKeymap::JetBrains, "cmd-t", &["Workspace", "Editor"]), Some("workspace::GitPull"));
+        // JetBrains' F7: Next Change in a diff, Step Into elsewhere.
+        assert_eq!(resolve(BaseKeymap::JetBrains, "f7", &["Workspace", "DiffView"]), Some("editor::NextChange"));
+        assert_eq!(resolve(BaseKeymap::JetBrains, "f7", &["Workspace", "Editor"]), Some("workspace::StepInto"));
+    }
     use serde_json::json;
 
     fn layers(base: BaseKeymap, mac: bool) -> Vec<KeyBinding> {
@@ -1142,3 +1175,4 @@ mod tests {
         assert_eq!(sections, vec![json!({"bindings": {"f9": "Git Log"}})]);
     }
 }
+
