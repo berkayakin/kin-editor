@@ -280,6 +280,10 @@ pub struct Editor {
     wrap: Option<WrapMap>,
     /// Language server state: completion, hover, signature help.
     lsp: lsp::EditorLsp,
+    /// The carets' bracket pairs, for a version and caret offsets.
+    bracket_cache: Option<((u64, Vec<usize>), Arc<Vec<Range<usize>>>)>,
+    /// Highlights of what was on screen: for a version, language and ranges.
+    highlight_cache: Option<((u64, crate::syntax::Language, Vec<Range<usize>>), Arc<Vec<(Range<usize>, crate::syntax::Highlight)>>)>,
     /// Fold regions for a (version, tab size, language).
     fold_regions: derived::Derived<(u64, usize, crate::syntax::Language), Vec<crate::fold::FoldRegion>>,
     /// `⋯` placeholders on screen last frame, for clicks: (bounds, fold start).
@@ -357,6 +361,8 @@ impl Editor {
             soft_wrap: false,
             wrap: None,
             lsp: lsp::EditorLsp::default(),
+            highlight_cache: None,
+            bracket_cache: None,
             fold_regions: derived::Derived::new(),
             fold_pills: Vec::new(),
             outline: derived::Derived::new(),
@@ -712,6 +718,7 @@ impl Editor {
             return false;
         }
         self.doc.set_language(language);
+        self.highlight_cache = None;
         self.apply_settings(cx);
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
@@ -1225,8 +1232,8 @@ impl Editor {
     /// before anything maps between offsets and display rows.
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
         let wrap = self.soft_wrap && !self.is_single_line();
-        // Without wrapping or folds, display rows are buffer lines.
-        if !wrap && self.doc.folds().is_empty() {
+        // Without wrapping, folds or long lines, display rows are buffer lines.
+        if !wrap && self.doc.folds().is_empty() && !self.doc.has_long_lines() {
             self.wrap = None;
             return;
         }
@@ -1253,6 +1260,56 @@ impl Editor {
             }
         }
         self.wrap = Some(WrapMap::new(key, version, folds, rope, window.text_system(), font, char_width));
+    }
+
+    /// Both brackets of the pairs around carets (a few, so many cursors stay
+    /// cheap). Cached: in a big array or object finding a partner is a walk,
+    /// and a caret blink draws again.
+    fn bracket_pairs(&mut self) -> Arc<Vec<Range<usize>>> {
+        let heads: Vec<usize> = self.selections.iter().filter(|s| s.is_empty()).take(8).map(|s| s.head).collect();
+        let key = (self.doc.version(), heads);
+        if let Some((k, pairs)) = &self.bracket_cache
+            && *k == key
+        {
+            return pairs.clone();
+        }
+        let syntax = self.doc.syntax();
+        let pairs: Arc<Vec<_>> =
+            Arc::new(key.1.iter().filter_map(|&head| syntax.bracket_pair(self.doc.rope(), head)).flat_map(|(a, b)| [a, b]).collect());
+        self.bracket_cache = Some((key, pairs.clone()));
+        pairs
+    }
+
+    /// Highlights for display rows `first_drow..last_drow` (buffer lines
+    /// `first_row..last_row`): folded lines and a long line's rows off
+    /// screen are left out. Cached, since a caret blink draws again.
+    fn visible_highlights(&mut self, first_drow: usize, last_drow: usize, first_row: usize, last_row: usize) -> Arc<Vec<(Range<usize>, crate::syntax::Highlight)>> {
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for row in (first_row..last_row).filter(|&row| !self.row_hidden(row)) {
+            let (start, end) = (self.doc.line_start(row), self.doc.line_end(row));
+            match ranges.last_mut() {
+                Some(r) if r.end + 1 >= start => r.end = end,
+                _ => ranges.push(start..end),
+            }
+        }
+        let (row, seg) = self.line_of_display_row(first_drow);
+        if let (Some(r), Some(b)) = (ranges.first_mut(), seg.checked_sub(1).and_then(|s| self.line_breaks(row).get(s))) {
+            r.start = (self.doc.line_start(row) + b.byte as usize).min(r.end);
+        }
+        let (row, seg) = self.line_of_display_row(last_drow.saturating_sub(1));
+        if let (Some(r), Some(b)) = (ranges.last_mut(), self.line_breaks(row).get(seg)) {
+            r.end = (self.doc.line_start(row) + b.byte as usize).max(r.start);
+        }
+        let key = (self.doc.version(), self.doc.language, ranges);
+        if let Some((k, highlights)) = &self.highlight_cache
+            && *k == key
+        {
+            return highlights.clone();
+        }
+        let syntax = self.doc.syntax();
+        let highlights: Arc<Vec<_>> = Arc::new(key.2.iter().flat_map(|r| syntax.highlights(self.doc.rope(), r.clone())).collect());
+        self.highlight_cache = Some((key, highlights.clone()));
+        highlights
     }
 
     fn display_row_count(&self) -> usize {
@@ -2491,13 +2548,17 @@ impl Editor {
         let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
         let debug_row = self.doc.debug_row();
         self.conflict_hits.clear();
-        let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
-        let diagnostics: Vec<&lint::Diagnostic> = self
-            .doc
-            .diagnostics
-            .iter()
-            .filter(|d| d.range.start <= range_end && d.range.end >= range_start)
-            .collect();
+        let highlights = self.visible_highlights(first_drow, last_drow, first_row, last_row);
+        // Bracket pairs around carets.
+        let brackets: Vec<Range<usize>> = if focused && !single {
+            self.bracket_pairs().iter().filter(|r| (range_start..=range_end).contains(&r.start)).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        // Sorted by start: none past the last visible line.
+        let below = self.doc.diagnostics.partition_point(|d| d.range.start <= range_end);
+        let diagnostics: Vec<&lint::Diagnostic> =
+            self.doc.diagnostics[..below].iter().filter(|d| d.range.end >= range_start).collect();
 
         let breakpoints = if single { Vec::new() } else { self.doc.breakpoints() };
         let head_rows: Vec<usize> = self
@@ -2506,19 +2567,6 @@ impl Editor {
             .filter(|s| s.is_empty())
             .map(|s| self.doc.row_of(s.head))
             .collect();
-        // Bracket pairs around carets (a few, so many cursors stay cheap).
-        let brackets: Vec<Range<usize>> = if focused && !single {
-            self.selections
-                .iter()
-                .filter(|s| s.is_empty())
-                .take(8)
-                .filter_map(|s| self.doc.syntax().bracket_pair(self.doc.rope(), s.head))
-                .flat_map(|(a, b)| [a, b])
-                .filter(|r| (range_start..=range_end).contains(&r.start))
-                .collect()
-        } else {
-            Vec::new()
-        };
 
         let mut frame = FrameLayout {
             text_bounds,
@@ -2737,7 +2785,10 @@ impl Editor {
                         .map(|s| s.range())
                         .filter(|r| !r.is_empty() && r.start <= line_end && r.end > line_start)
                         .collect();
-                    for (i, c) in text.char_indices().filter(|(_, c)| *c == ' ' || *c == '\t') {
+                    // Only this row's part of the line (a long line has many rows).
+                    let seg_text = dl.to_buffer(seg_range.start)..dl.to_buffer(seg_range.end).max(dl.to_buffer(seg_range.start));
+                    let chars = text[seg_text.clone()].char_indices().map(|(i, c)| (seg_text.start + i, c));
+                    for (i, c) in chars.filter(|(_, c)| *c == ' ' || *c == '\t') {
                         let shown = match show_whitespace {
                             ShowWhitespace::All => true,
                             ShowWhitespace::Boundary => i < body_start || i >= body_end,
@@ -2986,7 +3037,9 @@ impl Editor {
 
                 // Git change bars.
                 let bar_x = bounds.left() + gutter_width - px(GIT_BAR_OFFSET) - px(1.5);
-                for (hix, hunk) in self.hunks.iter().enumerate() {
+                // Hunks are sorted and don't overlap: just the ones at this row.
+                let first_hunk = self.hunks.partition_point(|h| h.new_rows.end < row);
+                for (hix, hunk) in self.hunks.iter().enumerate().skip(first_hunk).take_while(|(_, h)| h.new_rows.start <= row) {
                     let color: Hsla = match hunk.kind {
                         HunkKind::Added => theme.git_added,
                         HunkKind::Modified => theme.git_modified,

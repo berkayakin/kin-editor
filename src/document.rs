@@ -128,6 +128,9 @@ pub struct Document {
     line_edits: Vec<(u64, LineEdit)>,
     /// The version `line_edits` start from.
     line_edits_base: u64,
+    /// How many lines are longer than `wrap::LONG_LINE` (they always break
+    /// into rows, so the editor needs a wrap map).
+    long_lines: usize,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// The language server's inlay hints (sorted); they follow edits until
@@ -186,6 +189,7 @@ impl Document {
             _ => Language::PlainText,
         };
         let syntax = Syntax::new(language, &rope);
+        let long_lines = long_lines(&rope, 0..usize::MAX);
         Self {
             rope,
             path,
@@ -208,6 +212,7 @@ impl Document {
             debug_line: None,
             line_edits: Vec::new(),
             line_edits_base: 0,
+            long_lines,
             snippet: None,
             inlay_hints: Vec::new(),
             disk_mtime: None,
@@ -326,6 +331,7 @@ impl Document {
         // Breakpoints and the debug line keep their line numbers across a reload.
         let (breakpoints, debug_row) = (self.breakpoints(), self.debug_row());
         self.rope = Rope::from_str(&text);
+        self.long_lines = long_lines(&self.rope, 0..usize::MAX);
         self.line_edits.clear();
         self.line_edits_base = self.version + 1;
         self.set_breakpoints(&breakpoints);
@@ -619,18 +625,25 @@ impl Document {
             self.line_edits_base = self.version + 1;
         }
         let row = self.rope.byte_to_line(range.start);
-        let edit = LineEdit {
+        let lines = LineEdit {
             row,
             old_rows: self.rope.byte_to_line(range.end) - row + 1,
             new_rows: 1 + text.bytes().filter(|&b| b == b'\n').count(),
         };
-        self.line_edits.push((self.version + 1, edit));
+        self.line_edits.push((self.version + 1, lines));
+        self.long_lines -= long_lines(&self.rope, row..row + lines.old_rows);
         let edit = input_edit(&self.rope, range.clone(), text);
         let s = self.rope.byte_to_char(range.start);
         let e = self.rope.byte_to_char(range.end);
         self.rope.remove(s..e);
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
+        self.long_lines += long_lines(&self.rope, row..row + lines.new_rows);
+    }
+
+    /// Whether some line is longer than `wrap::LONG_LINE`.
+    pub fn has_long_lines(&self) -> bool {
+        self.long_lines > 0
     }
 
     /// The line edits that lead from `version` to the current text, oldest
@@ -961,6 +974,12 @@ impl Patch {
         let last = first + self.edits[first..].partition_point(|(range, _)| range.start <= span.end);
         (self.before[first], &self.edits[first..last])
     }
+}
+
+/// How many of `rows` are longer than `wrap::LONG_LINE`.
+fn long_lines(rope: &Rope, rows: Range<usize>) -> usize {
+    let rows = rows.start.min(rope.len_lines())..rows.end.min(rope.len_lines());
+    rows.filter(|&row| rope.line(row).len_bytes() > crate::wrap::LONG_LINE).count()
 }
 
 fn moved(offset: usize, delta: isize) -> usize {

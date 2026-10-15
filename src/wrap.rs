@@ -17,6 +17,8 @@ use crate::{document::LineEdit, editor::DisplayLine};
 pub struct Break {
     /// Display-text byte offset where the row starts.
     pub ix: u32,
+    /// The same place as a byte offset in the line's own text.
+    pub byte: u32,
     /// Leading spaces drawn before the row's text.
     pub indent: u32,
 }
@@ -29,7 +31,8 @@ pub struct WrapKey {
     pub font_family: SharedString,
     pub font_size: Pixels,
     pub tab_size: usize,
-    /// Break long lines (off when only folds need the map).
+    /// Break lines at the view's width (off when only folds or long lines
+    /// need the map).
     pub wrap: bool,
 }
 
@@ -45,6 +48,13 @@ pub struct WrapMap {
     row_starts: Vec<usize>,
 }
 
+/// A line longer than this (in bytes) always breaks into rows, soft wrap or
+/// not: shaping, highlighting and drawing it whole each frame is too slow
+/// (minified code, one-line JSON).
+pub const LONG_LINE: usize = 1024;
+/// The most display columns on a row of a long line without soft wrap.
+const LONG_LINE_ROW: usize = 512;
+
 /// Finds a line's breaks; only lines that may be wider than the view are
 /// shaped.
 struct Measure {
@@ -52,6 +62,7 @@ struct Measure {
     width: Pixels,
     max_cols: usize,
     tab_size: usize,
+    wrap: bool,
 }
 
 impl Measure {
@@ -63,20 +74,29 @@ impl Measure {
             // shaping-free measurement for most lines.
             max_cols: (key.width / char_width).floor().max(1.) as usize,
             tab_size: key.tab_size,
+            wrap: key.wrap,
         }
     }
 
     fn line(&mut self, rope: &Rope, row: usize) -> Vec<Break> {
         let line = rope.line(row);
-        if line.len_chars() <= self.max_cols / self.tab_size || display_columns(line, self.tab_size) <= self.max_cols {
+        let long = line.len_bytes() > LONG_LINE;
+        if !self.wrap && !long {
+            return Vec::new();
+        }
+        if self.wrap && (line.len_chars() <= self.max_cols / self.tab_size || display_columns(line, self.tab_size) <= self.max_cols) {
             return Vec::new();
         }
         // Same text as `Document::line_text`: without the newline.
         let text = line.to_string();
         let text = text.strip_suffix('\n').unwrap_or(&text);
         let dl = DisplayLine::new(text, self.tab_size);
+        let at = |ix: usize, indent: u32| Break { ix: ix as u32, byte: dl.to_buffer(ix) as u32, indent };
+        if !self.wrap {
+            return dl.text.char_indices().map(|(ix, _)| ix).step_by(LONG_LINE_ROW).skip(1).map(|ix| at(ix, 0)).collect();
+        }
         let fragments = [LineFragment::text(&dl.text)];
-        self.wrapper.wrap_line(&fragments, self.width).map(|b| Break { ix: b.ix as u32, indent: b.next_indent }).collect()
+        self.wrapper.wrap_line(&fragments, self.width).map(|b| at(b.ix, b.next_indent)).collect()
     }
 }
 
@@ -90,12 +110,8 @@ impl WrapMap {
         font: Font,
         char_width: Pixels,
     ) -> Self {
-        let breaks = if key.wrap {
-            let mut measure = Measure::new(&key, text_system, font, char_width);
-            (0..rope.len_lines()).map(|row| measure.line(rope, row)).collect()
-        } else {
-            vec![Vec::new(); rope.len_lines()]
-        };
+        let mut measure = Measure::new(&key, text_system, font, char_width);
+        let breaks = (0..rope.len_lines()).map(|row| measure.line(rope, row)).collect();
         let mut map = WrapMap { key, version, folds: folds.to_vec(), breaks, row_starts: Vec::new() };
         map.count_rows(rope, 0);
         map
@@ -134,7 +150,7 @@ impl WrapMap {
         if self.breaks.len() != rope.len_lines() {
             return false;
         }
-        if self.key.wrap && first < dirty.len() {
+        if first < dirty.len() {
             let mut measure = Measure::new(&self.key, text_system, font, char_width);
             for row in (first..dirty.len()).filter(|&row| dirty[row]) {
                 self.breaks[row] = measure.line(rope, row);
@@ -277,9 +293,28 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn long_lines_break_without_soft_wrap(cx: &mut gpui::TestAppContext) {
+        use crate::document::{Document, EditKind};
+        let text_system = cx.update(|cx| cx.text_system().clone());
+        let key = WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false };
+        // A one-line JSON file of 1300 characters, "é" (two bytes) among them.
+        let json = format!("[{}é]", "1,".repeat(649));
+        let mut doc = Document::from_text(format!("short\n{json}\n"), None);
+        assert!(doc.has_long_lines());
+        let map = WrapMap::new(key.clone(), doc.version(), doc.folds(), doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
+        assert!(map.breaks(0).is_empty());
+        assert_eq!(map.breaks(1), [Break { ix: 512, byte: 512, indent: 0 }, Break { ix: 1024, byte: 1024, indent: 0 }]);
+        assert_eq!(map.row_count(), 1 + 3 + 1);
+        // Shortened below the limit, it's an ordinary line again.
+        let start = doc.line_start(1);
+        doc.edit(vec![(start + 10..start + 1000, String::new())], &[], EditKind::Other);
+        assert!(!doc.has_long_lines());
+    }
+
     #[test]
     fn segments_cover_the_line() {
-        let breaks = [Break { ix: 10, indent: 4 }, Break { ix: 20, indent: 4 }];
+        let breaks = [Break { ix: 10, byte: 10, indent: 4 }, Break { ix: 20, byte: 20, indent: 4 }];
         assert_eq!(segment(&breaks, 0, 25), (0..10, 0));
         assert_eq!(segment(&breaks, 1, 25), (10..20, 4));
         assert_eq!(segment(&breaks, 2, 25), (20..25, 4));
@@ -304,7 +339,7 @@ mod tests {
             key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true },
             version: 0,
             folds: Vec::new(),
-            breaks: vec![vec![], vec![Break { ix: 5, indent: 0 }, Break { ix: 9, indent: 0 }], vec![]],
+            breaks: vec![vec![], vec![Break { ix: 5, byte: 5, indent: 0 }, Break { ix: 9, byte: 9, indent: 0 }], vec![]],
             row_starts: vec![0, 1, 4, 5],
         };
         assert_eq!(map.row_count(), 5);
