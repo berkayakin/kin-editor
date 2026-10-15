@@ -6408,18 +6408,76 @@ impl Workspace {
 
     /// The Git diff covers only the editor area, so the sidebar (Commit view)
     /// and the bottom panels (Git log) stay usable beside it.
+    /// The Git diff over the editor area, with a tab of its own in place of
+    /// the file tabs (hidden meanwhile, so they don't seem to control it).
     fn render_diff_overlay(&self, view: Entity<DiffView>, cx: &App) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let (path, rel) = view.read(cx).tab_file();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
+        let edge = Hsla::from(theme.border).alpha(0.75);
+        let close_view = view.clone();
+        let tab = div()
+            .id("diff-tab")
+            .relative()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1p5()
+            .h_full()
+            .pl_3()
+            .pr_1p5()
+            .max_w(px(360.))
+            .text_color(theme.text)
+            .font_weight(FontWeight::MEDIUM);
+        let tab = tab_shape(tab, true, false, false, "diff-tab".into(), edge, &theme)
+            .tooltip(move |_, cx| tooltip_view(format!("Changes in {rel}"), cx))
+            .child(icon_el(Icon::GitCompare, px(14.), theme.accent.into()))
+            .child(div().min_w_0().truncate().child(name))
+            .child(
+                div()
+                    .id("close-diff-tab")
+                    .flex_shrink_0()
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.active))
+                    .on_click(move |_, _, cx| close_view.update(cx, |v, cx| v.close(cx)))
+                    .child(icon_el(Icon::X, px(13.), theme.text_muted.into())),
+            );
         gpui::deferred(
-            island(Theme::get(cx))
-                .id("diff-layer")
+            div()
                 .absolute()
-                // Over the islands, under the tab strip: activating a tab closes it.
-                .top(px(TAB_STRIP_HEIGHT - 1.))
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .occlude()
-                .child(div().size_full().overflow_hidden().child(view)),
+                .inset_0()
+                .flex()
+                .flex_col()
+                .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
+                .child(
+                    island(&theme)
+                        .id("diff-layer")
+                        .flex_1()
+                        .min_h_0()
+                        .occlude()
+                        .child(div().size_full().overflow_hidden().child(view)),
+                )
+                // After the island, so the tab paints over its top border.
+                .child(
+                    div()
+                        .id("diff-tab-strip")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(TAB_STRIP_HEIGHT))
+                        .flex()
+                        .items_end()
+                        .pt(px(TAB_STRIP_TOP))
+                        .pl(px(TAB_STRIP_INSET))
+                        .occlude()
+                        .child(tab),
+                ),
         )
         .with_priority(1)
     }
@@ -6495,7 +6553,10 @@ impl Workspace {
             .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
             .child(island)
             // After the island, so the current tab paints over its top border.
-            .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, edge, self.tab_strip_width(pane_ix), window, cx)))
+                        // A Git diff over the panes shows its own tab instead.
+            .when(!pane.tabs.is_empty() && self.diff_view().is_none(), |el| {
+                el.child(self.render_tab_bar(pane_ix, edge, self.tab_strip_width(pane_ix), window, cx))
+            })
             // Finder files dragged anywhere over the pane (tabs included) open in it.
             .group(drop_group.clone())
             .child(

@@ -169,6 +169,17 @@ impl DiffView {
         .detach();
     }
 
+    /// The file this diff is of, for its tab: the path and the path shown.
+    pub fn tab_file(&self) -> (PathBuf, String) {
+        let (path, rel, _) = self.file_label();
+        (path, rel)
+    }
+
+    /// Closes the diff the way its own × does (back to where it came from).
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        cx.emit(DiffViewEvent::Close);
+    }
+
     fn file_label(&self) -> (PathBuf, String, Change) {
         match &self.source {
             DiffSource::Working { file, staged, .. } => {
