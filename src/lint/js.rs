@@ -55,7 +55,7 @@ pub fn lint(source: &str, base: usize, context: Context, dialect: Dialect) -> Ve
         out.push(Diagnostic {
             range: base + span.start as usize..base + span.end as usize,
             severity,
-            message,
+            message: message.into(),
             rule: rule.into(),
         });
     };

@@ -44,7 +44,7 @@ pub fn lint(text: &str, path: Option<&Path>) -> Vec<Diagnostic> {
                     rumdl_lib::rule::Severity::Warning => Severity::Warning,
                     rumdl_lib::rule::Severity::Info => Severity::Info,
                 },
-                message: w.message,
+                message: w.message.into(),
                 rule: w.rule_name.unwrap_or_else(|| "markdown".into()).into(),
             }
         })

@@ -244,7 +244,7 @@ pub fn diagnostics(value: &Value, rope: &Rope, encoding: Encoding, server: &'sta
             Some(Diagnostic {
                 range,
                 severity,
-                message: d.get("message")?.as_str()?.to_string(),
+                message: d.get("message")?.as_str()?.into(),
                 rule: rule.into(),
             })
         })

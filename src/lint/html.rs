@@ -39,7 +39,7 @@ pub fn lint(src: &str) -> Vec<Diagnostic> {
         out.push(Diagnostic {
             range,
             severity,
-            message,
+            message: message.into(),
             rule: rule.into(),
         })
     };

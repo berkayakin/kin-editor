@@ -91,7 +91,7 @@ fn parse_eslint(json: &Value, rope: &Rope) -> Vec<Diagnostic> {
         out.push(Diagnostic {
             range: start..end.max(start),
             severity,
-            message: message.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+            message: message.get("message").and_then(Value::as_str).unwrap_or_default().into(),
             rule,
         });
     }

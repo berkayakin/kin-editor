@@ -489,7 +489,7 @@ impl Editor {
             .diagnostics
             .iter()
             .filter(|d| d.range.start <= range.end && d.range.end >= range.start)
-            .map(|d| (d.severity, d.message.clone()))
+            .map(|d| (d.severity, d.message.to_string()))
             .collect();
         if !diagnostics.is_empty() {
             self.lsp.hover = Some(HoverPopover { range: range.clone(), diagnostics: diagnostics.clone(), blocks: Vec::new(), anchor });

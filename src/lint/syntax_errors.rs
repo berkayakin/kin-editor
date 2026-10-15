@@ -66,7 +66,7 @@ fn unexpected(node: Node, text: &str) -> Diagnostic {
     Diagnostic {
         range: range.start..line_end,
         severity: Severity::Error,
-        message,
+        message: message.into(),
         rule: "syntax".into(),
     }
 }
@@ -81,7 +81,7 @@ fn missing(node: Node) -> Diagnostic {
     Diagnostic {
         range: node.byte_range(),
         severity: Severity::Error,
-        message,
+        message: message.into(),
         rule: "syntax".into(),
     }
 }
@@ -100,7 +100,7 @@ mod tests {
     fn errors(language: Language, src: &str) -> Vec<(String, String)> {
         super::lint(&grammar(language).unwrap(), src)
             .into_iter()
-            .map(|d| (src[d.range].to_string(), d.message))
+            .map(|d| (src[d.range].to_string(), d.message.to_string()))
             .collect()
     }
 

@@ -6,7 +6,7 @@ mod js;
 mod markdown;
 mod syntax_errors;
 
-use std::{borrow::Cow, ops::Range};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use crate::syntax::{self, Language};
 
@@ -22,7 +22,7 @@ pub struct Diagnostic {
     /// Byte range in the document.
     pub range: Range<usize>,
     pub severity: Severity,
-    pub message: String,
+    pub message: Arc<str>,
     /// Rule name, e.g. `no-unused-vars`.
     pub rule: Cow<'static, str>,
 }
