@@ -299,7 +299,7 @@ pub fn icon_themes() -> Vec<IconThemeInfo> {
         let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
         files.sort();
         for file in files {
-            let Some(value) = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { continue };
+            let Some(value) = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&crate::settings::strip_jsonc(&t)).ok()) else { continue };
             for (index, theme) in value["themes"].as_array().into_iter().flatten().enumerate() {
                 if let Some(name) = theme["name"].as_str() {
                     out.push(IconThemeInfo { name: name.to_string(), file: file.clone(), index });

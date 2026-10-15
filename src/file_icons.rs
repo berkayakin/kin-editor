@@ -251,7 +251,7 @@ pub fn select(theme: Option<(&Path, usize)>) {
 }
 
 fn load_theme(json: &Path, index: usize) -> Option<IconTheme> {
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(json).ok()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&crate::settings::strip_jsonc(&std::fs::read_to_string(json).ok()?)).ok()?;
     let theme = &value["themes"][index];
     let root = json.parent()?.parent()?;
     let path = |p: &serde_json::Value| p.as_str().map(|p| root.join(p.trim_start_matches("./")));

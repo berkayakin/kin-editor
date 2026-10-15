@@ -438,8 +438,9 @@ impl ThemeRegistry {
                 .collect();
             paths.sort();
             for path in paths {
+                // Comments and trailing commas are fine, as in Zed's theme files.
                 let text = match std::fs::read_to_string(&path) {
-                    Ok(text) => text,
+                    Ok(text) => crate::settings::strip_jsonc(&text),
                     Err(e) => {
                         errors.push(format!("{}: {e}", file_label(&path)));
                         continue;
@@ -857,6 +858,9 @@ mod tests {
         }"##;
         let themes = zed_theme_family(family).unwrap();
         assert_eq!(themes.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Sea Dark", "Sea Light"]);
+        // Zed's theme files may start with a license comment.
+        let commented = format!("// Copyright 2025 Someone.\n/* more */\n{family}");
+        assert!(zed_theme_family(&crate::settings::strip_jsonc(&commented)).is_some());
         let dark = &themes[0];
         assert_eq!(dark.colors["background"], "#101820ff");
         assert_eq!(dark.colors["cursor"], "#ffcc00");
