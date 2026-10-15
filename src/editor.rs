@@ -1121,13 +1121,13 @@ impl Editor {
         let blocks = match &self.md_cache {
             Some((v, blocks)) if *v == version => blocks.clone(),
             _ => {
-                let blocks = Arc::new(crate::markdown_preview::parse(&self.doc.rope().to_string()));
+                let base = self.doc.path.as_deref().and_then(std::path::Path::parent);
+                let blocks = Arc::new(crate::markdown_preview::parse(&self.doc.rope().to_string(), base));
                 self.md_cache = Some((version, blocks.clone()));
                 blocks
             }
         };
         let theme = Theme::get(cx).clone();
-        let base = self.doc.path.as_deref().and_then(std::path::Path::parent);
         let zoom = self.md_zoom;
         let step = |id: &'static str, icon: crate::assets::Icon, delta: f32, cx: &mut Context<Self>| {
             div()
@@ -1199,7 +1199,7 @@ impl Editor {
                             }
                         }
                     }))
-                    .child(crate::markdown_preview::render(&blocks, crate::markdown_preview::Draw { base, zoom }, cx)),
+                    .child(crate::markdown_preview::render(&blocks, crate::markdown_preview::Draw { zoom }, cx)),
             )
             .child(zoom_bar)
     }

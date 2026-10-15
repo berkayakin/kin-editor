@@ -16,7 +16,7 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 use ropey::Rope;
 
 use crate::{
-    syntax::{Language, Syntax},
+    syntax::{Highlight, Language, Syntax},
     theme::Theme,
 };
 
@@ -42,9 +42,10 @@ pub enum Style {
 pub enum Block {
     Heading(u8, Inline),
     Paragraph(Inline),
-    /// A paragraph that's just an image.
-    Image { src: String, alt: String },
-    Code { lang: String, text: String },
+    /// A paragraph that's just an image; `path` is the local file it shows.
+    Image { src: String, alt: String, path: Option<PathBuf> },
+    /// A fenced block, highlighted when its language is one Kin knows.
+    Code { lang: String, text: String, highlights: Vec<(Range<usize>, Highlight)> },
     Quote(Vec<Block>),
     /// `start`: the first number of an ordered list.
     List { start: Option<u64>, items: Vec<Item> },
@@ -59,9 +60,11 @@ pub struct Item {
     pub blocks: Vec<Block>,
 }
 
-pub fn parse(markdown: &str) -> Vec<Block> {
+/// The document's blocks. Code is highlighted and images found here, once per
+/// version, not per frame; `base` is the document's folder (for relative images).
+pub fn parse(markdown: &str, base: Option<&Path>) -> Vec<Block> {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let mut builder = Builder::default();
+    let mut builder = Builder { base: base.map(Path::to_path_buf), ..Builder::default() };
     for event in Parser::new_ext(markdown, options) {
         builder.event(event);
     }
@@ -81,6 +84,7 @@ struct Builder {
     image: Option<(String, String)>,
     table: Option<(Vec<Alignment>, Vec<Vec<Inline>>)>,
     heading: Option<u8>,
+    base: Option<PathBuf>,
 }
 
 enum Container {
@@ -204,7 +208,9 @@ impl Builder {
             }
             TagEnd::CodeBlock => {
                 if let Some((lang, text)) = self.code.take() {
-                    self.blocks().push(Block::Code { lang, text: text.trim_end_matches('\n').to_string() });
+                    let text = text.trim_end_matches('\n').to_string();
+                    let highlights = code_highlights(&lang, &text);
+                    self.blocks().push(Block::Code { lang, text, highlights });
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -245,7 +251,8 @@ impl Builder {
                     let alone = self.inline.as_ref().is_none_or(|i| i.text.trim().is_empty());
                     if alone && self.table.is_none() {
                         self.inline = None;
-                        self.blocks().push(Block::Image { src, alt });
+                        let path = self.base.as_ref().map(|b| b.join(&src)).filter(|p| !src.contains("://") && p.is_file());
+                        self.blocks().push(Block::Image { src, alt, path });
                     } else {
                         self.text(&alt);
                     }
@@ -289,10 +296,9 @@ fn heading_level(level: HeadingLevel) -> u8 {
 
 // ---- Drawing -------------------------------------------------------------------------
 
-/// How to draw: the document's folder (for relative images) and the zoom.
+/// How to draw.
 #[derive(Clone, Copy)]
-pub struct Draw<'a> {
-    pub base: Option<&'a Path>,
+pub struct Draw {
     /// 1.0 is the UI font size.
     pub zoom: f32,
 }
@@ -332,14 +338,13 @@ fn render_block(block: &Block, ix: usize, d: Draw, cx: &App) -> AnyElement {
                 .into_any_element()
         }
         Block::Paragraph(inline) => render_inline(inline, ("md-p", ix), cx),
-        Block::Image { src, alt } => {
-            let local = d.base.map(|b| b.join(src)).filter(|p| !src.contains("://") && p.is_file());
-            match local {
-                Some(path) => img(path).max_w_full().rounded(px(6.)).into_any_element(),
+        Block::Image { src, alt, path } => {
+            match path {
+                Some(path) => img(path.clone()).max_w_full().rounded(px(6.)).into_any_element(),
                 None => div().text_color(theme.text_dim).child(format!("[{}]", if alt.is_empty() { src } else { alt })).into_any_element(),
             }
         }
-        Block::Code { lang, text } => div()
+        Block::Code { text, highlights, .. } => div()
             .px_3()
             .py_2()
             .rounded(px(8.))
@@ -349,7 +354,7 @@ fn render_block(block: &Block, ix: usize, d: Draw, cx: &App) -> AnyElement {
             .font(font(theme.mono_font.clone()))
             .text_size(px((theme.editor_font_size - 1.) * d.zoom))
             .line_height(px((theme.editor_font_size - 1.) * d.zoom * 1.45))
-            .child(highlighted_code(lang, text, cx))
+            .child(highlighted_code(text, highlights, cx))
             .into_any_element(),
         Block::Quote(blocks) => div()
             .pl_3()
@@ -464,9 +469,8 @@ fn render_inline(inline: &Inline, id: (&'static str, usize), cx: &App) -> AnyEle
         .into_any_element()
 }
 
-/// A fenced block, highlighted when its language is one Kin knows.
-fn highlighted_code(lang: &str, text: &str, cx: &App) -> AnyElement {
-    let theme = Theme::get(cx);
+/// The highlights of a fenced block, when its language is one Kin knows.
+fn code_highlights(lang: &str, text: &str) -> Vec<(Range<usize>, Highlight)> {
     let extension = match lang.to_lowercase().as_str() {
         "rust" => "rs".to_string(),
         "javascript" | "jsx" => "js".into(),
@@ -478,16 +482,18 @@ fn highlighted_code(lang: &str, text: &str, cx: &App) -> AnyElement {
         other => other.to_string(),
     };
     let language = Language::from_path(&PathBuf::from(format!("code.{extension}")));
+    if language == Language::PlainText || lang.is_empty() {
+        return Vec::new();
+    }
     let rope = Rope::from_str(text);
-    let highlights: Vec<(Range<usize>, HighlightStyle)> = if language == Language::PlainText || lang.is_empty() {
-        Vec::new()
-    } else {
-        Syntax::new(language, &rope)
-            .highlights(&rope, 0..text.len())
-            .into_iter()
-            .map(|(range, kind)| (range, HighlightStyle { color: Some(theme.highlight_color(kind)), ..Default::default() }))
-            .collect()
-    };
+    Syntax::new(language, &rope).highlights(&rope, 0..text.len())
+}
+
+fn highlighted_code(text: &str, highlights: &[(Range<usize>, Highlight)], cx: &App) -> AnyElement {
+    let theme = Theme::get(cx);
+    let highlights = highlights
+        .iter()
+        .map(|(range, kind)| (range.clone(), HighlightStyle { color: Some(theme.highlight_color(*kind)), ..Default::default() }));
     div()
         .whitespace_nowrap()
         .overflow_hidden()
@@ -502,7 +508,10 @@ mod tests {
     #[test]
     fn parses_common_markdown() {
         let md = "# Title\n\nSome **bold** and `code` with a [link](https://x.y).\n\n- one\n- [x] done\n\n1. first\n2. second\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n\n---\n\n![logo](img.png)\n";
-        let blocks = parse(md);
+        let dir = std::env::temp_dir().join(format!("kin-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("img.png"), b"").unwrap();
+        let blocks = parse(md, Some(&dir));
         assert!(matches!(&blocks[0], Block::Heading(1, i) if i.text == "Title"));
         let Block::Paragraph(p) = &blocks[1] else { panic!("{:?}", blocks[1]) };
         assert_eq!(p.text, "Some bold and code with a link.");
@@ -514,10 +523,13 @@ mod tests {
         assert!(matches!(&items[1].blocks[0], Block::Paragraph(i) if i.text == "done"));
         assert!(matches!(&blocks[3], Block::List { start: Some(1), items } if items.len() == 2));
         assert!(matches!(&blocks[4], Block::Quote(inner) if matches!(&inner[0], Block::Paragraph(i) if i.text == "quoted")));
-        assert_eq!(blocks[5], Block::Code { lang: "rust".into(), text: "fn main() {}".into() });
+        let Block::Code { lang, text, highlights } = &blocks[5] else { panic!("{:?}", blocks[5]) };
+        assert_eq!((lang.as_str(), text.as_str()), ("rust", "fn main() {}"));
+        assert!(highlights.iter().any(|(r, h)| *r == (0..2) && *h == Highlight::Keyword), "{highlights:?}");
         let Block::Table { aligns, rows } = &blocks[6] else { panic!("{:?}", blocks[6]) };
         assert_eq!((aligns[1], rows.len(), rows[1][1].text.as_str()), (Alignment::Right, 2, "2"));
         assert_eq!(blocks[7], Block::Rule);
-        assert_eq!(blocks[8], Block::Image { src: "img.png".into(), alt: "logo".into() });
+        assert_eq!(blocks[8], Block::Image { src: "img.png".into(), alt: "logo".into(), path: Some(dir.join("img.png")) });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
