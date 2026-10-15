@@ -1462,6 +1462,72 @@ mod tests {
         assert_eq!(pair("a.json", "‸{\"a\": 1}\n"), Some((at("{", 0), at("}", 7))));
     }
 
+    #[test]
+    fn python_php_and_shell_text_objects() {
+        let src = "class A:\n    @staticmethod\n    def f(x):\n        y = x\n        ‸return y\n";
+        assert_eq!(object("a.py", src, "function", false).as_deref(), Some("y = x\n        return y"));
+        assert_eq!(object("a.py", src, "function", true).as_deref(), Some("@staticmethod\n    def f(x):\n        y = x\n        return y"));
+        assert_eq!(object("a.py", src, "class", false).as_deref(), Some("@staticmethod\n    def f(x):\n        y = x\n        return y"));
+        assert_eq!(object("a.py", src, "class", true).as_deref(), Some(src.replace('‸', "").trim_end()));
+        assert_eq!(object("a.py", "g = lambda x: x ‸+ 1\n", "function", false).as_deref(), Some("x + 1"));
+        let src = "<?php\nclass A {\n    public function f() {\n        $a = 1;\n        ‸return $a;\n    }\n}\n";
+        assert_eq!(object("a.php", src, "function", false).as_deref(), Some("$a = 1;\n        return $a;"));
+        assert_eq!(object("a.php", src, "function", true).as_deref(), Some("public function f() {\n        $a = 1;\n        return $a;\n    }"));
+        assert_eq!(object("a.php", src, "class", false).as_deref(), Some("public function f() {\n        $a = 1;\n        return $a;\n    }"));
+        assert_eq!(object("a.php", "<?php\n$g = fn($x) => $x ‸* 2;\n", "function", false).as_deref(), Some("$x * 2"));
+        let src = "f() {\n  a\n  ‸b\n}\n";
+        assert_eq!(object("a.sh", src, "function", false).as_deref(), Some("a\n  b"));
+        assert_eq!(object("a.sh", src, "function", true).as_deref(), Some("f() {\n  a\n  b\n}"));
+    }
+
+    #[test]
+    fn python_php_and_shell_indent_after_openers() {
+        assert!(indents("a.py", "def f():‸\n    pass\n"));
+        assert!(indents("a.py", "def f():  # why‸\n    pass\n"));
+        assert!(indents("a.py", "if (a and\n        b):‸\n    pass\n"));
+        assert!(indents("a.py", "foo(a,‸\n    b)\n"));
+        assert!(indents("a.py", "if (a and‸\n        b):\n    pass\n"));
+        assert!(!indents("a.py", "if x:\n    pass‸\n"));
+        assert!(indents("a.php", "<?php\nfunction f() {‸\n}\n"));
+        assert!(indents("a.php", "<?php\nif ($x):‸\n    echo 1;\nendif;\n"));
+        assert!(indents("a.php", "<?php\n$a = match ($x) {\n    1 =>‸\n        'a',\n};\n"));
+        assert!(!indents("a.php", "<?php\nfunction f() {\n    echo 1;‸\n}\n"));
+        assert!(indents("a.sh", "if true; then‸\n  echo\nfi\n"));
+        assert!(indents("a.sh", "if true; then\n  a\nelse‸\n  b\nfi\n"));
+        assert!(indents("a.sh", "for x in a; do‸\n  echo\ndone\n"));
+        assert!(indents("a.sh", "case $x in‸\n  a) echo ;;\nesac\n"));
+        assert!(indents("a.sh", "f() {‸\n  echo\n}\n"));
+        // `then` and `do` may start the next line, level with `if` and `for`.
+        assert!(!indents("a.sh", "if true‸\nthen\n  echo\nfi\n"));
+        assert!(!indents("a.sh", "for x in a‸\ndo\n  echo\ndone\n"));
+        assert!(!indents("a.sh", "if true; then\n  echo‸\nfi\n"));
+    }
+
+    #[test]
+    fn python_php_and_shell_pair_words_and_quotes() {
+        let at = |text: &str, n: usize| (text.to_string(), n);
+        let find = |src: &str, word: &str| (word.to_string(), src.replace('‸', "").find(word).unwrap());
+        assert_eq!(pair("a.py", "s = ‸\"ab\"\n"), Some((at("\"", 4), at("\"", 7))));
+        assert_eq!(pair("a.py", "s = ‸f'a{b}'\n"), Some((at("f'", 4), at("'", 10))));
+        assert_eq!(pair("a.py", "s = f'a‸{b}'\n"), Some((at("{", 7), at("}", 9))));
+        let src = "<?php\n‸if ($x):\n    echo 1;\nendif;\n";
+        assert_eq!(pair("a.php", src), Some((find(src, "if"), find(src, "endif"))));
+        let src = "<?php\nforeach ($a as $b):\n    echo 1;\n‸endforeach;\n";
+        assert_eq!(pair("a.php", src), Some((find(src, "endforeach"), find(src, "foreach"))));
+        assert_eq!(pair("a.php", "<?php\n$s = ‸'ab';\n"), Some((at("'", 11), at("'", 14))));
+        assert_eq!(pair("a.php", "<?php\n$s = ‸\"a$b\";\n"), Some((at("\"", 11), at("\"", 15))));
+        let src = "for x in a; ‸do echo; done\n";
+        assert_eq!(pair("a.sh", src), Some((find(src, "do"), find(src, "done"))));
+        let src = "if true; then :; ‸fi\n";
+        assert_eq!(pair("a.sh", src), Some((find(src, "fi"), find(src, "if"))));
+        let src = "‸case $x in a) ;; esac\n";
+        assert_eq!(pair("a.sh", src), Some((find(src, "case"), find(src, "esac"))));
+        assert_eq!(pair("a.sh", "echo ‸\"$x\"\n"), Some((at("\"", 5), at("\"", 8))));
+        assert_eq!(pair("a.sh", "echo ‸${x}\n"), Some((at("${", 5), at("}", 8))));
+        assert_eq!(pair("a.sh", "echo ‸$(ls)\n"), Some((at("$(", 5), at(")", 9))));
+        assert_eq!(pair("a.sh", "‸[[ -n $x ]]\n"), Some((at("[[", 0), at("]]", 9))));
+    }
+
     /// `src` without its `‸`, and the offset the `‸` marks.
     fn caret(src: &str) -> (String, usize) {
         (src.replacen('‸', "", 1), src.find('‸').expect("a ‸ in the source"))

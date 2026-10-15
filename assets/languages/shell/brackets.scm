@@ -1,0 +1,12 @@
+; (), [] and {} pair by the grammar's tokens without a query.
+(if_statement "if" @open "fi" @close)
+(do_group "do" @open "done" @close)
+(case_statement "case" @open "esac" @close)
+(string "\"" @open "\"" @close)
+(command_substitution "$(" @open ")" @close)
+(command_substitution "`" @open "`" @close)
+(expansion "${" @open "}" @close)
+(arithmetic_expansion "$((" @open "))" @close)
+(compound_statement "((" @open "))" @close)
+(c_style_for_statement "((" @open "))" @close)
+(test_command "[[" @open "]]" @close)
