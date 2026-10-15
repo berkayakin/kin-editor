@@ -25,7 +25,7 @@ use crate::{
     syntax::Symbol,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline, PageDown, PageUp, Submit},
     theme::Theme,
-    ui::{binding_label, icon_el, input_box, kbd, modal_panel},
+    ui::{HoverFill, binding_label, icon_el, input_box, kbd, modal_panel},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -627,17 +627,18 @@ impl Render for Picker {
                                 .text_size(px(11.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.text_dim)
-                                .child(label.to_uppercase()),
+                                .child(label.to_uppercase())
+                                .into_any_element(),
                             item => {
                                 let is_selected = ix == selected;
                                 let row = row
                                     .cursor_pointer()
                                     .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
-                                    .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                                    .row_hover(theme.hover)
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
                                         this.confirm(ix, ev.modifiers().secondary(), cx)
                                     }));
-                                match item {
+                                let row = match item {
                                     Item::File { path, name, dir, name_hl, dir_hl } => {
                                         row.child(crate::ui::file_icon(path, px(16.), &theme))
                                             .child(
@@ -746,7 +747,8 @@ impl Render for Picker {
                                             )
                                     }
                                     Item::Header(_) => unreachable!(),
-                                }
+                                };
+                                row.into_any_element()
                             }
                         };
                         div().w_full().px_1().child(row)

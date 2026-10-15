@@ -28,7 +28,7 @@ use crate::{
         },
     },
     theme::Theme,
-    ui::{icon_el, tooltip_view},
+    ui::{HoverFill, icon_el, tooltip_view},
 };
 
 /// Requests the workspace carries out, since they reach beyond this editor.
@@ -915,13 +915,12 @@ impl Editor {
                 .items_center()
                 .justify_center()
                 .rounded(px(5.))
-                .bg(theme.elevated)
                 .border_1()
                 .border_color(theme.border)
                 .cursor_pointer()
                 .invisible()
                 .group_hover("hover-popover", |s| s.visible())
-                .hover(|s| s.bg(theme.hover))
+                .hover_fill(theme.elevated, theme.hover)
                 .tooltip(|_, cx| tooltip_view("Copy", cx))
                 .on_click(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone())))
                 .child(icon_el(Icon::Copy, px(13.), theme.text_muted.into()));

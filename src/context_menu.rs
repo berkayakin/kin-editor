@@ -10,7 +10,7 @@ use crate::{
     assets::Icon,
     editor::{Cancel, MoveDown, MoveUp, Newline},
     theme::Theme,
-    ui::icon_el,
+    ui::{HoverFill, icon_el},
 };
 
 pub enum MenuEntry {
@@ -169,7 +169,7 @@ impl Render for ContextMenu {
                                 .cursor_pointer()
                                 .text_color(color)
                                 .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
-                                .hover(|s| s.bg(theme.accent_soft))
+                                .row_hover(theme.accent_soft)
                                 .on_mouse_move(cx.listener(move |this, _, _, cx| {
                                     if this.selected != Some(ix) {
                                         this.selected = Some(ix);

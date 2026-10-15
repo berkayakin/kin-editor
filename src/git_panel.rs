@@ -6,7 +6,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, Stateful, Task, Window, div, prelude::*, px,
+    IntoElement, Render, SharedString, Task, Window, div, prelude::*, px,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     editor::{Editor, Submit},
     git::{self, Branch, Change, FileStatus, RepoState, RepoStatus},
     theme::Theme,
-    ui::{icon_el, kbd, tooltip_view},
+    ui::{Button, HoverFill, focus_ring, icon_el, kbd, tooltip_view},
 };
 
 #[derive(Clone, Debug)]
@@ -226,7 +226,7 @@ impl GitPanel {
         self.commit(false, cx);
     }
 
-    fn small_button(&self, id: impl Into<gpui::ElementId>, icon: Icon, tip: &'static str, cx: &App) -> Stateful<gpui::Div> {
+    fn small_button(&self, id: impl Into<gpui::ElementId>, icon: Icon, tip: &'static str, cx: &App) -> Button {
         let theme = Theme::get(cx);
         div()
             .id(id)
@@ -237,7 +237,7 @@ impl GitPanel {
             .justify_center()
             .rounded(px(5.))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.active))
+            .hover_bg(theme.active)
             .tooltip(move |_, cx| tooltip_view(tip, cx))
             .child(icon_el(icon, px(14.), theme.text_muted.into()))
     }
@@ -278,7 +278,7 @@ impl GitPanel {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
-                .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                .row_hover(theme.hover)
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                     this.selected = Some((f.rel.clone(), staged));
                     // A conflict is resolved in the editor, not read in a diff.
@@ -481,15 +481,17 @@ impl GitPanel {
                 .font_weight(FontWeight::MEDIUM)
                 .when(!can_commit, |el| el.opacity(0.45))
                 .when(can_commit, |el| el.cursor_pointer())
-                .when(primary, |el| {
-                    el.bg(theme.accent_soft)
-                        .text_color(theme.accent)
-                        .border_1()
-                        .border_color(Hsla::from(theme.accent).alpha(0.3))
-                        .when(can_commit, |el| el.hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24))))
-                })
-                .when(!primary, |el| el.bg(theme.hover).text_color(theme.text).when(can_commit, |el| el.hover(|s| s.bg(theme.active))))
+                .when(primary, |el| el.text_color(theme.accent).border_1().border_color(Hsla::from(theme.accent).alpha(0.3)))
+                .when(!primary, |el| el.text_color(theme.text))
                 .child(div().truncate().child(label))
+                .map(|el| {
+                    let (rest, hover) = if primary {
+                        (Hsla::from(theme.accent_soft), Hsla::from(theme.accent).alpha(0.24))
+                    } else {
+                        (Hsla::from(theme.hover), Hsla::from(theme.active))
+                    };
+                    el.hover_fill(rest, if can_commit { hover } else { rest })
+                })
         };
         div()
             .flex()
@@ -499,19 +501,19 @@ impl GitPanel {
             .pb_1p5()
             .border_t_1()
             .border_color(theme.border_subtle)
-            .child(
+            .child(focus_ring(
                 div()
                     .h(px(96.))
                     .px_2p5()
                     .py_1p5()
                     .rounded(px(10.))
                     .bg(theme.background)
-                    .border_1()
-                    .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
-                    .when(focused, |el| el.shadow(crate::ui::focus_glow(&theme)))
                     .overflow_hidden()
                     .child(self.message.clone()),
-            )
+                "commit-message",
+                focused,
+                &theme,
+            ))
             .child(
                 div()
                     .flex()

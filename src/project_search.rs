@@ -19,7 +19,7 @@ use crate::{
     editor::{Cancel, Editor, EditorEvent, Indent, MoveDown, MoveUp, Newline, Outdent, PageDown, PageUp},
     search::{ProjectMatch, SearchOptions, SearchQuery, search_project},
     theme::Theme,
-    ui::{icon_el, input_box, kbd, modal_panel, text_button, toggle},
+    ui::{HoverFill, icon_el, input_box, kbd, modal_panel, text_button, toggle},
 };
 
 pub enum ProjectSearchEvent {
@@ -385,7 +385,7 @@ impl Render for ProjectSearch {
                             .rounded(px(7.))
                             .cursor_pointer()
                             .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
-                            .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                            .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                 this.select(ix, cx);
                                 if e.click_count() >= 2 {

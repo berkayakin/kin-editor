@@ -13,7 +13,7 @@ use crate::{
     assets::Icon,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp, Newline},
     theme::{self, Appearance, Theme, ThemeRegistry},
-    ui::{icon_el, input_box, modal_panel, text_button, tooltip_view},
+    ui::{HoverFill, icon_el, input_box, modal_panel, text_button, tooltip_view},
 };
 
 pub enum ThemePickerEvent {
@@ -177,7 +177,7 @@ impl Render for ThemePicker {
                                 .rounded(px(8.))
                                 .cursor_pointer()
                                 .when(is_selected, |el| el.bg(current.accent_soft).child(crate::ui::selected_edge(&current)))
-                                .when(!is_selected, |el| el.hover(|s| s.bg(current.hover)))
+                                .row_hover(current.hover)
                                 .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                     this.select(ix, cx);
                                     if e.click_count() >= 2 {

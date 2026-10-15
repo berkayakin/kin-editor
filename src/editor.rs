@@ -34,6 +34,7 @@ use crate::{
     lint::{self, Severity, external::ExternalLinter},
     settings::{FileSettings, Settings, ShowWhitespace},
     theme::Theme,
+    ui::HoverFill,
     wrap::{self, Break, WrapKey, WrapMap},
 };
 
@@ -1137,7 +1138,7 @@ impl Editor {
                 .justify_center()
                 .rounded(px(5.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .on_click(cx.listener(move |e, _, _, cx| e.zoom_preview(delta, cx)))
                 .child(crate::ui::icon_el(icon, px(12.), theme.text_muted.into()))
         };
@@ -3630,7 +3631,7 @@ impl Editor {
                 .justify_center()
                 .rounded(px(5.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
                 .child(crate::ui::icon_el(icon, px(14.), theme.text_muted.into()))
         };
@@ -4045,9 +4046,8 @@ impl Render for Editor {
                 .rounded(px(6.))
                 .border_1()
                 .border_color(theme.border)
-                .bg(if on { Hsla::from(theme.accent_soft) } else { Hsla::from(theme.elevated) })
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_fill(if on { Hsla::from(theme.accent_soft) } else { Hsla::from(theme.elevated) }, theme.hover)
                 .tooltip(move |_, cx| crate::ui::tooltip_view(if on { "Hide Preview" } else { "Show Preview" }, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|e, _, window, cx| e.toggle_markdown_preview(&ToggleMarkdownPreview, window, cx)))

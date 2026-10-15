@@ -44,7 +44,7 @@ use crate::{
     run::RunTarget,
     settings::Settings,
     theme::Theme,
-    ui::{icon_el, input_box, tooltip_view},
+    ui::{HoverFill, icon_el, input_box, tooltip_view},
 };
 
 actions!(terminal, [TerminalCopy, TerminalPaste, TerminalClear, TerminalFind]);
@@ -545,7 +545,7 @@ impl TerminalView {
                 .justify_center()
                 .rounded(px(5.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .tooltip(move |_, cx| tooltip_view(tip, cx))
                 .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| f(this, window, cx)))
                 .child(icon_el(icon, px(13.), theme.text_muted.into()))

@@ -48,6 +48,7 @@ mod syntax;
 mod terminal;
 mod theme;
 mod theme_picker;
+mod transition;
 mod ui;
 mod updater;
 mod watcher;

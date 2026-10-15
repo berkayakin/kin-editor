@@ -14,7 +14,7 @@ use crate::{
     keymap,
     settings::{self, AutoSave, BaseKeymap, Settings},
     theme::{self, Appearance, Theme, ThemeRegistry},
-    ui::{focus_glow, icon_el, kbd, switch},
+    ui::{Button, HoverFill, focus_glow, icon_el, kbd, switch},
     workspace::{FindAction, GoToFile, OpenSettings},
 };
 use crate::editor::{DeleteLine, DuplicateLine};
@@ -251,7 +251,7 @@ impl Onboarding {
                 .justify_center()
                 .rounded(px(6.))
                 .when(enabled, |el| {
-                    el.cursor_pointer().hover(|s| s.bg(theme.hover)).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    el.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let size = Settings::get(cx).editor_font_size.unwrap_or(theme::DEFAULT_EDITOR_FONT_SIZE);
                         let size = (size.round() + delta).clamp(8., 32.);
                         this.set_or_default("editor_font_size", json!(size), json!(theme::DEFAULT_EDITOR_FONT_SIZE), cx);
@@ -259,6 +259,7 @@ impl Onboarding {
                         theme::zoom(None, cx);
                     }))
                 })
+                .hover_bg(if enabled { Hsla::from(theme.hover) } else { gpui::transparent_black() })
                 .child(icon_el(icon, px(13.), if enabled { theme.text_muted.into() } else { Hsla::from(theme.text_dim).alpha(0.5) }))
         };
         let font_size = div()
@@ -540,7 +541,7 @@ fn grid(mut cells: Vec<AnyElement>, columns: usize, gap: gpui::Pixels) -> gpui::
     div().flex().flex_col().gap(gap).children(rows)
 }
 
-fn link_button(id: &'static str, label: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+fn link_button(id: &'static str, label: &'static str, theme: &Theme) -> Button {
     div()
         .id(id)
         .flex()
@@ -554,7 +555,8 @@ fn link_button(id: &'static str, label: &'static str, theme: &Theme) -> gpui::St
         .border_1()
         .border_color(theme.border)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+        .hover_bg(theme.hover)
+        .hover(|s| s.text_color(theme.text))
         .child(label)
 }
 

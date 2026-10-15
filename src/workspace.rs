@@ -9,7 +9,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
     CursorStyle, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, PromptLevel, Render,
     SharedString, Stateful, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
@@ -59,7 +59,8 @@ use crate::{
     theme::{self, Theme},
     preferences::{self, Preferences, PreferencesEvent},
     theme_picker::{ThemePicker, ThemePickerEvent},
-    ui::{binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
+    transition::{self, TransitionExt, mix},
+    ui::{Button, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
     updater,
 };
 
@@ -4017,7 +4018,7 @@ impl Workspace {
                             .rounded(px(5.))
                             .when(!is_active, |el| el.invisible())
                             .group_hover(hover_group.clone(), |s| s.visible())
-                            .hover(|s| s.bg(theme.active))
+                            .hover_bg(theme.active)
                             .on_click(cx.listener(move |ws, _, window, cx| {
                                 cx.stop_propagation();
                                 ws.remove_terminal(&for_close, window, cx);
@@ -4028,7 +4029,7 @@ impl Workspace {
                 .into_any_element()
         });
         // Buttons on the chrome, centered on the tabs.
-        let button = |button: Stateful<gpui::Div>| button.flex_shrink_0().size(px(TERMINAL_BUTTON - 2.)).mb(px(4.)).mr(px(2.));
+        let button = |button: Button| button.flex_shrink_0().size(px(TERMINAL_BUTTON - 2.)).mb(px(4.)).mr(px(2.));
         let strip = div()
             .id(("terminal-tabs", g))
             .absolute()
@@ -4062,7 +4063,8 @@ impl Workspace {
                         .cursor_pointer()
                         .text_size(px(12.))
                         .text_color(theme.text_muted)
-                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                        .hover_bg(theme.hover)
+                        .hover(|s| s.text_color(theme.text))
                         .tooltip(move |_, cx| tooltip_view(format!("{count} more terminal{}", plural(count)), cx))
                         .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
                             let entries = hidden.iter().map(|(_, name)| MenuEntry::item(name.clone(), Icon::Terminal)).collect();
@@ -5718,6 +5720,8 @@ impl Workspace {
     /// Everywhere (which it opens), like a command palette's field.
     fn render_command_capsule(&self, capsule: Capsule, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let (edge, lit) = (Hsla::from(theme.border), Hsla::from(theme.accent).alpha(0.5));
+        let hover = move |el: Stateful<Div>, t| el.border_color(mix(edge, lit, t));
         let base = div()
             .id("command-capsule")
             .flex()
@@ -5730,10 +5734,8 @@ impl Workspace {
             // those mark the main areas (islands, popovers), not controls.
             .bg(theme.elevated)
             .border_1()
-            .border_color(theme.border)
             .cursor_pointer()
             .text_size(px(12.5))
-            .hover(|s| s.border_color(Hsla::from(theme.accent).alpha(0.5)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)));
         let width = match capsule {
@@ -5743,6 +5745,7 @@ impl Workspace {
                     .justify_center()
                     .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
                     .child(icon_el(Icon::Search, px(13.), theme.text_muted.into()))
+                    .with_hover_transition("command-capsule-hover", transition::FOCUS, hover)
                     .into_any_element();
             }
             Capsule::Compact(w) | Capsule::Full(w) => w,
@@ -5804,6 +5807,7 @@ impl Workspace {
                         .child(double_shift_label()),
                 )
             })
+            .with_hover_transition("command-capsule-hover", transition::FOCUS, hover)
             .into_any_element()
     }
 
@@ -5827,7 +5831,7 @@ impl Workspace {
             .text_size(px(12.5))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text)
-            .hover(|st| st.bg(theme.hover))
+            .hover_bg(theme.hover)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
@@ -5876,8 +5880,8 @@ impl Workspace {
             .cursor_pointer()
             .text_size(px(12.))
             .text_color(theme.text_muted)
-            .bg(theme.hover)
-            .hover(|st| st.bg(theme.active).text_color(theme.text))
+            .hover_fill(theme.hover, theme.active)
+            .hover(|st| st.text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
@@ -5904,8 +5908,7 @@ impl Workspace {
             .cursor_pointer()
             .text_size(px(12.))
             .text_color(theme.warning)
-            .bg(Hsla::from(theme.warning).alpha(0.12))
-            .hover(|st| st.bg(Hsla::from(theme.warning).alpha(0.2)))
+            .hover_fill(Hsla::from(theme.warning).alpha(0.12), Hsla::from(theme.warning).alpha(0.2))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.open_trust_dialog(window, cx)))
             .tooltip(|_, cx| tooltip_view("Language servers, formatters and project tools are off until you trust this folder", cx))
@@ -6007,7 +6010,7 @@ impl Workspace {
         active: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<gpui::Div> {
+    ) -> Button {
         let theme = Theme::get(cx);
         let color = if active { theme.text } else { theme.text_dim };
         div()
@@ -6018,7 +6021,7 @@ impl Workspace {
             .justify_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .hover(|s| s.bg(theme.hover))
+            .hover_bg(theme.hover)
             .active(|s| s.bg(theme.active))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(on_click))
@@ -6045,7 +6048,7 @@ impl Workspace {
                 .cursor_pointer()
                 .text_size(px(11.))
                 .text_color(theme.text_muted)
-                .hover(|st| st.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .tooltip(move |_, cx| tooltip_view(tip, cx))
                 .on_click(cx.listener(move |ws, _, window, cx| ws.run_git(op.clone(), window, cx)))
                 .child(icon_el(icon, px(14.), theme.text_muted.into()))
@@ -6065,7 +6068,7 @@ impl Workspace {
                 .rounded(px(5.))
                 .cursor_pointer()
                 .text_size(px(12.5))
-                .hover(|st| st.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
                 .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
                 .child(icon_el(Icon::GitBranch, px(14.), theme.text_dim.into()))
@@ -6140,7 +6143,7 @@ impl Workspace {
                                 .text_color(if selected { theme.text } else { theme.text_muted })
                                 // A lit edge marks the open file.
                                 .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(theme)))
-                                .when(!selected, |el| el.hover(|s| s.bg(theme.hover)))
+                                .row_hover(theme.hover)
                                 .on_click(cx.listener(move |ws, _, window, cx| ws.click_entry(ix, window, cx)))
                                 .on_drag(dragged, |entry, _, _, cx| cx.new(|_| DraggedTabView(entry.name.clone())))
                                 // While dragging, the folder a drop goes into lights up (see `tree_drop`).
@@ -6408,13 +6411,12 @@ impl Workspace {
             .h(px(30.))
             .px_3()
             .rounded(px(15.))
-            .bg(theme.accent_soft)
             .border_1()
             .border_color(Hsla::from(theme.accent).alpha(0.3))
             .text_color(theme.accent)
             .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
-            .hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24)))
+            .hover_fill(theme.accent_soft, Hsla::from(theme.accent).alpha(0.24))
             .on_click(cx.listener(on_click))
             .child(icon_el(icon, px(15.), theme.accent.into()))
             .child(label)
@@ -6545,7 +6547,7 @@ impl Workspace {
                             .items_center()
                             .justify_center()
                             .rounded(px(5.))
-                            .hover(|s| s.bg(theme.active))
+                            .hover_bg(theme.active)
                             .on_click(cx.listener(move |ws, _, window, cx| {
                                 cx.stop_propagation();
                                 // A pinned tab's pin unpins it; otherwise this closes.
@@ -6601,7 +6603,8 @@ impl Workspace {
                         .cursor_pointer()
                         .text_size(px(12.))
                         .text_color(theme.text_muted)
-                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                        .hover_bg(theme.hover)
+                        .hover(|s| s.text_color(theme.text))
                         .tooltip(move |_, cx| tooltip_view(format!("{count} more tab{}", plural(count)), cx))
                         .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
                             let entries = hidden.iter().map(|e| MenuEntry::item(e.read(cx).doc.file_name(), Icon::File)).collect();
@@ -6693,7 +6696,7 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.active))
+                    .hover_bg(theme.active)
                     .on_click(move |_, _, cx| close_view.update(cx, |v, cx| v.close(cx)))
                     .child(icon_el(Icon::X, px(13.), theme.text_muted.into())),
             );
@@ -6908,7 +6911,7 @@ impl Workspace {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .text_color(if ix == last { theme.text } else { theme.text_muted })
-                    .hover(|s| s.bg(theme.hover))
+                    .hover_bg(theme.hover)
                     .on_click(move |_, window, cx| {
                         editor.update(cx, |e, cx| e.go_to(offset, window, cx));
                         window.focus(&editor.focus_handle(cx));
@@ -6971,7 +6974,8 @@ impl Workspace {
                     .text_size(px(12.))
                     .text_color(theme.text_muted)
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                    .hover_bg(theme.hover)
+                    .hover(|s| s.text_color(theme.text))
                     .on_click(cx.listener(|ws, _, window, cx| ws.select_theme(&SelectTheme, window, cx)))
                     .tooltip(|window, cx| status_tooltip("Select Theme…", &SelectTheme, window, cx))
                     .child(icon_el(Icon::Palette, px(13.), theme.text_dim.into()))
@@ -7078,7 +7082,7 @@ impl Workspace {
                     .px_2()
                     .rounded(px(8.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover))
+                    .row_hover(theme.hover)
                     .when(missing, |el| el.opacity(0.55))
                     .on_click(cx.listener(move |ws, ev: &ClickEvent, window, cx| {
                         ws.open_recent_project(open.clone(), ev.modifiers().secondary(), window, cx)
@@ -7157,7 +7161,7 @@ impl Workspace {
                         .px_2()
                         .rounded(px(7.))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
+                        .row_hover(theme.hover)
                         .on_click(cx.listener(move |ws, _, window, cx| ws.open_path(open.clone(), window, cx)))
                         .child(icon)
                         .child(div().truncate().text_color(theme.text_muted).child(rel))
@@ -7534,7 +7538,7 @@ impl Workspace {
                 .px_2()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .child(icon_el(icon, px(14.), color))
                 .child(div().min_w_0().text_color(theme.text).truncate().child(message))
         };
@@ -7834,7 +7838,8 @@ impl Workspace {
                     .px_2()
                     .rounded(px(9.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                    .hover_bg(theme.hover)
+                    .hover(|s| s.text_color(theme.text))
                     .tooltip(move |_, cx| tooltip_view(tip, cx))
                     .child(label)
             };
@@ -7894,7 +7899,7 @@ impl Workspace {
 
         // Panel toggles sit in two small docks, like segmented controls.
         let dock = || dock(&theme);
-        let toggle = |button: Stateful<gpui::Div>, on: bool| {
+        let toggle = |button: Button, on: bool| {
             button.size(px(20.)).rounded(px(7.)).when(on, |el| segment_on(el, &theme))
         };
 
@@ -7932,7 +7937,8 @@ impl Workspace {
                     .px_2()
                     .rounded(px(9.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.hover).text_color(theme.text_muted))
+                    .hover_bg(theme.hover)
+                    .hover(|s| s.text_color(theme.text_muted))
                     .on_click(cx.listener(|ws, _, window, cx| ws.toggle_problems(&ToggleProblems, window, cx)))
                     .child(counter(Icon::CircleX, errors, theme.error.into()))
                     .child(counter(Icon::TriangleAlert, warnings, theme.warning.into()))
@@ -7963,8 +7969,7 @@ impl Workspace {
                         .rounded(px(9.))
                         .cursor_pointer()
                         .text_color(theme.accent)
-                        .bg(theme.accent_soft)
-                        .hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24)))
+                        .hover_fill(theme.accent_soft, Hsla::from(theme.accent).alpha(0.24))
                         .on_click(cx.listener(|ws, _, _, cx| ws.restart_to_update(cx)))
                         .child(icon_el(Icon::Download, px(13.), theme.accent.into()))
                         .child("Restart to Update")
@@ -8600,9 +8605,10 @@ fn shared_limit(widths: &[f32], available: f32) -> f32 {
 /// A browser-like tab's shape, around a tab of `TAB_STRIP_HEIGHT - TAB_STRIP_TOP`
 /// on the chrome: the current one island-colored, rounded on top, outlined in
 /// the island's border color `edge` down to its feet, which join it to the
-/// island; the others plain, with a hairline after them (`separator`) and, on
-/// hover (`group`), the same shape, borderless, between the chrome's and the
-/// island's colors, stopping above the island's border.
+/// island; the others plain, with a hairline after them (`separator`, hidden
+/// while the tab's `group` is hovered) and, fading in on hover, the same shape,
+/// borderless, between the chrome's and the island's colors, stopping above the
+/// island's border.
 ///
 /// Tabs paint left to right, so the hover shape of the tab right after the
 /// current one would cover the current tab's right foot: it repaints that
@@ -8667,8 +8673,6 @@ fn tab_shape(
             .right_0()
             .rounded_t(px(TAB_RADIUS))
             .bg(hover_fill)
-            .invisible()
-            .group_hover(group.clone(), |s| s.visible())
             .when(!after_active, |el| el.child(tab_foot(true, hover_fill, None)))
             .child(tab_foot(false, hover_fill, None))
             // The current tab's right foot, back on top, from the same snapped
@@ -8691,7 +8695,9 @@ fn tab_shape(
                     .left(px(-TAB_FOOT))
                     .w(px(2. * TAB_FOOT)),
                 )
-            }),
+            })
+            // It covers the tab, so its own hover is the tab's.
+            .with_hover_transition("tab-hover", transition::FOCUS, |el, t| el.opacity(t)),
     )
     .when(separator, |el| {
         el.child(
@@ -8799,7 +8805,7 @@ fn welcome_row(
     keys: Option<String>,
     theme: &Theme,
     cx: &App,
-) -> Stateful<gpui::Div> {
+) -> Button {
     div()
         .id(id)
         .flex()
@@ -8810,7 +8816,8 @@ fn welcome_row(
         .rounded(px(8.))
         .cursor_pointer()
         .text_color(theme.text_muted)
-        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+        .hover_bg(theme.hover)
+        .hover(|s| s.text_color(theme.text))
         .active(|s| s.bg(theme.active))
         .child(icon_el(icon, px(15.), theme.text_dim.into()))
         .child(div().flex_1().min_w_0().truncate().child(label))

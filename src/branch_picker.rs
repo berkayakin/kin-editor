@@ -15,7 +15,7 @@ use crate::{
     git::{self, Branch},
     git_panel::GitOp,
     theme::Theme,
-    ui::{icon_el, input_box, modal_panel},
+    ui::{HoverFill, icon_el, input_box, modal_panel},
 };
 
 pub enum BranchPickerEvent {
@@ -151,7 +151,7 @@ impl Render for BranchPicker {
                             .rounded(px(8.))
                             .cursor_pointer()
                             .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
-                            .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                            .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, _, _, cx| this.confirm(ix, cx)));
                         let row = match &items[ix] {
                             Item::Create(name) => row
@@ -184,10 +184,10 @@ impl Render for BranchPicker {
                                             .rounded(px(10.))
                                             .text_size(px(11.5))
                                             .text_color(theme.text_muted)
-                                            .bg(theme.elevated)
                                             .border_1()
                                             .border_color(theme.border)
-                                            .hover(|s| s.text_color(theme.text).bg(theme.hover))
+                                            .hover_fill(theme.elevated, theme.hover)
+                                            .hover(|s| s.text_color(theme.text))
                                             .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
                                             .on_click(cx.listener(move |_, _, _, cx| {
                                                 cx.stop_propagation();

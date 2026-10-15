@@ -17,7 +17,7 @@ use crate::{
     git::{self, CommitFile, LogEntry},
     git_panel::change_color,
     theme::Theme,
-    ui::{icon_el, input_box, tooltip_view},
+    ui::{HoverFill, icon_el, input_box, tooltip_view},
 };
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -377,7 +377,7 @@ impl GitLog {
                                     .justify_center()
                                     .rounded(px(4.))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(theme.hover))
+                                    .hover_bg(theme.hover)
                                     .tooltip(|_, cx| tooltip_view("Copy Commit Hash", cx))
                                     .on_click(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(sha.clone())))
                                     .child(icon_el(Icon::Copy, px(12.), theme.text_muted.into())),
@@ -412,7 +412,7 @@ impl GitLog {
                         .px_2()
                         .rounded(px(5.))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
+                        .row_hover(theme.hover)
                         .tooltip(|_, cx| tooltip_view("Show Diff", cx))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(GitLogEvent::OpenDiff(source.clone()))))
                         .child(icon)
@@ -443,7 +443,7 @@ impl Render for GitLog {
                 .justify_center()
                 .rounded(px(7.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .when(on, |el| crate::ui::segment_on(el, &theme))
                 .tooltip(move |_, cx| tooltip_view(tip, cx))
                 .child(icon_el(icon, px(14.), if on { theme.text.into() } else { theme.text_muted.into() }))
@@ -536,7 +536,7 @@ impl Render for GitLog {
                                     .rounded(px(7.))
                                     .cursor_pointer()
                                     .when(is_selected, |el| el.bg(theme.accent_soft))
-                                    .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                                    .row_hover(theme.hover)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                         window.focus(&this.focus_handle);
                                         this.select(ix, cx);

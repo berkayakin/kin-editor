@@ -16,7 +16,7 @@ use crate::{
     git::{self, CommitFile, PushPreview},
     git_panel::change_color,
     theme::Theme,
-    ui::{icon_el, modal_panel, text_button, tooltip_view},
+    ui::{HoverFill, icon_el, modal_panel, text_button, tooltip_view},
 };
 
 actions!(push_dialog, [ConfirmPush]);
@@ -189,7 +189,7 @@ impl PushDialog {
                         .px_2()
                         .rounded(px(5.))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
+                        .row_hover(theme.hover)
                         .tooltip(|_, cx| tooltip_view("Show Diff", cx))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(PushDialogEvent::OpenDiff(source.clone()))))
                         .child(icon)
@@ -289,7 +289,7 @@ impl Render for PushDialog {
                                         .cursor_pointer()
                                         .relative()
                                         .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
-                                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.hover)))
+                                        .row_hover(theme.hover)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.focus(window);
                                             this.select(ix, cx);

@@ -14,7 +14,7 @@ use crate::{
     picker::ActionEntry,
     settings::{self, BaseKeymap},
     theme::Theme,
-    ui::{icon_button, icon_el, input_box, kbd, shortcut_label, text_button, tooltip_view},
+    ui::{HoverFill, icon_button, icon_el, input_box, kbd, shortcut_label, text_button, tooltip_view},
     workspace::SearchEverywhere,
 };
 
@@ -268,7 +268,7 @@ impl Render for KeymapPage {
                             .rounded(px(6.))
                             .cursor_pointer()
                             .when(recording, |el| el.bg(theme.accent_soft))
-                            .when(!recording, |el| el.hover(|s| s.bg(theme.hover)))
+                            .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.start_recording(ix, cx)))
                             .child(div().flex_1().min_w_0().truncate().text_color(theme.text).child(row.entry.name))
                             .when(customized && !recording, |el| {

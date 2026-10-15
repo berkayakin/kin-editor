@@ -10,6 +10,7 @@ use crate::{
     editor::Editor,
     file_icons,
     theme::{Appearance, Theme},
+    transition::{self, Transition, TransitionExt, mix},
 };
 
 // ---- Islands ------------------------------------------------------------------------
@@ -138,10 +139,10 @@ pub fn icon_el(icon: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
 }
 
 /// A rounded text field wrapping a single-line editor.
-pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, cx: &App) -> Div {
+pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, cx: &App) -> Transition<Div> {
     let theme = Theme::get(cx);
     let focused = editor.read(cx).focus_handle(cx).is_focused(window);
-    div()
+    let field = div()
         .flex()
         .items_center()
         .gap_2()
@@ -151,15 +152,72 @@ pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, c
         .px_2p5()
         .rounded(px(10.))
         .bg(theme.background)
-        .border_1()
-        .border_color(if focused { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
-        .when(focused, |el| el.shadow(focus_glow(theme)))
         .when_some(icon, |el, icon| el.child(icon_el(icon, px(14.), theme.text_dim.into())))
-        .child(div().flex_1().min_w_0().overflow_hidden().child(editor.clone()))
+        .child(div().flex_1().min_w_0().overflow_hidden().child(editor.clone()));
+    focus_ring(field, ("input-focus", editor.entity_id().as_u64()), focused, theme)
+}
+
+/// A text field's border, accent with `focus_glow` while `focused`, fading in
+/// and out. Every field draws its focus this way; `id` must be stable across frames.
+pub fn focus_ring<E: Styled + IntoElement + 'static>(
+    field: E,
+    id: impl Into<gpui::ElementId>,
+    focused: bool,
+    theme: &Theme,
+) -> Transition<E> {
+    let (border, accent) = (Hsla::from(theme.border).alpha(0.75), Hsla::from(theme.accent).alpha(0.7));
+    let glow = focus_glow(theme);
+    field.border_1().with_transition(id, focused, transition::FOCUS, move |el, t| {
+        el.border_color(mix(border, accent, t)).when(t > 0., |el| el.shadow(faded(glow, t)))
+    })
+}
+
+/// `shadows` with their colors' alpha scaled by `t`, to fade them in or out.
+pub fn faded(mut shadows: Vec<gpui::BoxShadow>, t: f32) -> Vec<gpui::BoxShadow> {
+    for shadow in &mut shadows {
+        shadow.color.a *= t;
+    }
+    shadows
+}
+
+/// A button: a clickable element whose hover fill fades in and out.
+pub type Button = Transition<Stateful<Div>>;
+
+/// Hover fills that fade, for elements with an id (buttons, chips, pills, list
+/// rows), in place of `.hover(|s| s.bg(…))`; the transition is keyed by the
+/// element's id. A fill set on the element itself (a selected row, `segment_on`)
+/// wins and doesn't change on hover: GPUI doesn't expose a fill's color, so
+/// there's nothing to fade from.
+pub trait HoverFill: StatefulInteractiveElement + Styled + IntoElement + 'static {
+    /// No fill at rest, `hover` under the mouse.
+    fn hover_bg(self, hover: impl Into<Hsla>) -> Transition<Self> {
+        let hover = hover.into();
+        fade_fill(self, hover.alpha(0.), hover, transition::FOCUS)
+    }
+
+    /// `rest` easing to `hover` under the mouse, for elements with a resting fill.
+    fn hover_fill(self, rest: impl Into<Hsla>, hover: impl Into<Hsla>) -> Transition<Self> {
+        fade_fill(self, rest.into(), hover.into(), transition::FOCUS)
+    }
+
+    /// `hover_bg` for list rows, quicker.
+    fn row_hover(self, hover: impl Into<Hsla>) -> Transition<Self> {
+        let hover = hover.into();
+        fade_fill(self, hover.alpha(0.), hover, transition::ROW)
+    }
+}
+
+impl<E: StatefulInteractiveElement + Styled + IntoElement + 'static> HoverFill for E {}
+
+fn fade_fill<E: HoverFill>(mut el: E, rest: Hsla, hover: Hsla, duration: std::time::Duration) -> Transition<E> {
+    let id = el.interactivity().element_id.clone().expect("hover fills need an element id");
+    el.with_hover_transition(gpui::ElementId::NamedChild(Box::new(id), "hover".into()), duration, move |mut el, t| {
+        if el.style().background.is_some() { el } else { el.bg(mix(rest, hover, t)) }
+    })
 }
 
 /// A small toggle like JetBrains' "Cc", "W" and ".*" search options.
-pub fn toggle(id: &'static str, label: &'static str, active: bool, tooltip: &'static str, cx: &App) -> Stateful<Div> {
+pub fn toggle(id: &'static str, label: &'static str, active: bool, tooltip: &'static str, cx: &App) -> Button {
     let theme = Theme::get(cx);
     div()
         .id(id)
@@ -174,9 +232,10 @@ pub fn toggle(id: &'static str, label: &'static str, active: bool, tooltip: &'st
         .text_size(px(12.))
         .cursor_pointer()
         .when(active, |el| el.bg(theme.accent_soft).text_color(theme.accent))
-        .when(!active, |el| el.text_color(theme.text_muted).hover(|s| s.bg(theme.hover)))
+        .when(!active, |el| el.text_color(theme.text_muted))
         .tooltip(move |_, cx| tooltip_view(tooltip, cx))
         .child(label)
+        .hover_bg(theme.hover)
 }
 
 /// An on/off switch (draw only; the caller handles clicks).
@@ -193,7 +252,7 @@ pub fn switch(on: bool, theme: &Theme) -> impl IntoElement {
         .child(div().size(px(12.)).rounded_full().bg(if on { theme.background } else { theme.text_dim }))
 }
 
-pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: &App) -> Stateful<Div> {
+pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: &App) -> Button {
     let theme = Theme::get(cx);
     div()
         .id(id)
@@ -204,13 +263,18 @@ pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: 
         .justify_center()
         .rounded(px(8.))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.active))
         .child(icon_el(icon, px(15.), color))
+        .hover_bg(theme.hover)
 }
 
-pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary: bool, cx: &App) -> Stateful<Div> {
+pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary: bool, cx: &App) -> Button {
     let theme = Theme::get(cx);
+    let (rest, hover) = if primary {
+        (Hsla::from(theme.accent_soft), Hsla::from(theme.accent).alpha(0.24))
+    } else {
+        (Hsla::from(theme.hover), Hsla::from(theme.active))
+    };
     div()
         .id(id)
         .h(px(28.))
@@ -221,19 +285,10 @@ pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary:
         .rounded(px(14.))
         .cursor_pointer()
         .font_weight(gpui::FontWeight::MEDIUM)
-        .when(primary, |el| {
-            el.bg(theme.accent_soft)
-                .text_color(theme.accent)
-                .border_1()
-                .border_color(Hsla::from(theme.accent).alpha(0.3))
-                .hover(|s| s.bg(Hsla::from(theme.accent).alpha(0.24)))
-        })
-        .when(!primary, |el| {
-            el.bg(theme.hover)
-                .text_color(theme.text)
-                .hover(|s| s.bg(theme.active))
-        })
+        .when(primary, |el| el.text_color(theme.accent).border_1().border_color(Hsla::from(theme.accent).alpha(0.3)))
+        .when(!primary, |el| el.text_color(theme.text))
         .child(label)
+        .hover_fill(rest, hover)
 }
 
 /// A key hint chip, e.g. "⌘⇧F".

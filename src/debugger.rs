@@ -27,7 +27,7 @@ use crate::{
     editor::{Editor, Newline},
     run::{DebugSpec, RunTarget},
     theme::Theme,
-    ui::{icon_el, input_box, tooltip_view},
+    ui::{HoverFill, icon_el, input_box, tooltip_view},
 };
 
 pub enum DebugEvent {
@@ -874,8 +874,9 @@ impl Render for DebugSession {
                 .justify_center()
                 .rounded(px(5.))
                 .when(enabled, |el| {
-                    el.cursor_pointer().hover(|s| s.bg(theme.hover)).on_click(cx.listener(move |s, _: &ClickEvent, _, cx| f(s, cx)))
+                    el.cursor_pointer().on_click(cx.listener(move |s, _: &ClickEvent, _, cx| f(s, cx)))
                 })
+                .hover_bg(if enabled { Hsla::from(theme.hover) } else { gpui::transparent_black() })
                 .tooltip(move |_, cx| tooltip_view(tip, cx))
                 .child(icon_el(icon, px(14.), if enabled { color } else { Hsla::from(theme.text_dim).alpha(0.45) }))
         };
@@ -947,7 +948,7 @@ impl Render for DebugSession {
                     .rounded(px(6.))
                     .cursor_pointer()
                     .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(4.)).bottom(px(4.))))
-                    .when(!selected, |el| el.hover(|s| s.bg(theme.hover)))
+                    .row_hover(theme.hover)
                     .on_click(cx.listener(move |s, _: &ClickEvent, _, cx| s.select_frame(ix, cx)))
                     .child(div().flex_1().min_w_0().truncate().text_color(if ours { theme.text } else { theme.text_dim }).child(f.name.clone()))
                     .child(div().flex_shrink_0().text_size(px(11.)).text_color(theme.text_dim).child(place))
@@ -1016,8 +1017,9 @@ impl Render for DebugSession {
                     .font(mono.clone())
                     .text_size(code_size)
                     .when(reference > 0, |el| {
-                        el.cursor_pointer().hover(|s| s.bg(theme.hover)).on_click(cx.listener(move |s, _: &ClickEvent, _, cx| s.toggle(reference, cx)))
+                        el.cursor_pointer().on_click(cx.listener(move |s, _: &ClickEvent, _, cx| s.toggle(reference, cx)))
                     })
+                    .row_hover(if reference > 0 { Hsla::from(theme.hover) } else { gpui::transparent_black() })
                     .child(div().w(px(12.)).flex_shrink_0().when(reference > 0, |el| {
                         el.child(icon_el(if open { Icon::ChevronDown } else { Icon::ChevronRight }, px(11.), theme.text_dim.into()))
                     }))

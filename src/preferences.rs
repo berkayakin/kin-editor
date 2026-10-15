@@ -25,6 +25,7 @@ use crate::{
     theme::{self, Appearance, Theme, ThemeRegistry},
     workspace::Find,
     ui::{
+        Button, HoverFill,
         GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, selected_edge, switch, text_button,
         tooltip_view,
     },
@@ -967,7 +968,8 @@ impl Preferences {
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
                 .when(selected, |el| el.bg(theme.accent_soft).font_weight(FontWeight::MEDIUM).child(selected_edge(&theme)))
-                .when(!selected, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
+                .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
+                .row_hover(theme.hover)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show_page(page, window, cx)))
                 .child(icon_el(page.icon(), px(14.), if selected { theme.accent.into() } else { theme.text_dim.into() }))
                 .child(page.title())
@@ -987,7 +989,8 @@ impl Preferences {
                             .cursor_pointer()
                             .text_size(px(12.))
                             .text_color(theme.text_dim)
-                            .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                            .hover(|s| s.text_color(theme.text))
+                            .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.scroll.scroll_to_top_of_item(ix);
                                 cx.notify();
@@ -1393,10 +1396,10 @@ impl Preferences {
                 .rounded(px(5.))
                 .when(enabled, |el| {
                     el.cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
                         .active(|s| s.bg(theme.active))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| on_step(this, step, cx)))
                 })
+                .hover_bg(if enabled { Hsla::from(theme.hover) } else { gpui::transparent_black() })
                 .child(icon_el(icon, px(13.), if enabled { theme.text_muted.into() } else { Hsla::from(theme.text_dim).alpha(0.5) }))
         };
         div()
@@ -1453,7 +1456,7 @@ impl Preferences {
                     .rounded(px(6.))
                     .cursor_pointer()
                     .text_color(theme.text)
-                    .hover(|s| s.bg(theme.accent_soft))
+                    .row_hover(theme.accent_soft)
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_pick(this, ix, window, cx)))
                     .child(div().flex_1().child(text))
                     .when(selected, |el| el.child(icon_el(Icon::Check, px(13.), theme.accent.into())))
@@ -1549,7 +1552,7 @@ impl Preferences {
                                     .rounded(px(5.))
                                     .cursor_pointer()
                                     .text_color(theme.text)
-                                    .hover(|s| s.bg(theme.hover))
+                                    .row_hover(theme.hover)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                                         this.choose_font(family.clone(), window, cx)
                                     }))
@@ -2074,7 +2077,8 @@ impl Preferences {
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
                 .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(&theme)))
-                .when(!selected, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
+                .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
+                .row_hover(theme.hover)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.select_language(language, cx)))
                 .child(div().flex_1().child(language.name()))
                 .when(customized(language), |el| {
@@ -2469,7 +2473,7 @@ fn setting_row(
         .child(div().flex_shrink_0().child(control))
 }
 
-fn dropdown_trigger(id: impl Into<gpui::ElementId>, label: SharedString, width: Pixels, open: bool, theme: &Theme) -> Stateful<Div> {
+fn dropdown_trigger(id: impl Into<gpui::ElementId>, label: SharedString, width: Pixels, open: bool, theme: &Theme) -> Button {
     div()
         .id(id)
         .flex()
@@ -2483,9 +2487,8 @@ fn dropdown_trigger(id: impl Into<gpui::ElementId>, label: SharedString, width: 
         .border_1()
         .border_color(if open { Hsla::from(theme.accent).alpha(0.7) } else { Hsla::from(theme.border).alpha(0.75) })
         .when(open, |el| el.shadow(focus_glow(theme)))
-        .bg(theme.background)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover))
+        .hover_fill(theme.background, theme.hover)
         .child(div().flex_1().min_w_0().truncate().text_color(theme.text).child(label))
         .child(icon_el(Icon::ChevronDown, px(13.), theme.text_dim.into()))
 }
@@ -2497,7 +2500,7 @@ fn jump_row(
     label: impl Into<SharedString>,
     detail: impl Into<SharedString>,
     theme: &Theme,
-) -> Stateful<Div> {
+) -> Button {
     div()
         .id(id)
         .flex()
@@ -2507,14 +2510,14 @@ fn jump_row(
         .px_4()
         .rounded(px(9.))
         .cursor_pointer()
-        .hover(|s| s.bg(theme.hover))
+        .hover_bg(theme.hover)
         .child(icon_el(icon, px(14.), theme.text_dim.into()))
         .child(div().text_color(theme.text).child(label.into()))
         .child(div().flex_1().text_size(px(12.)).text_color(theme.text_dim).child(detail.into()))
         .child(icon_el(Icon::ChevronRight, px(13.), theme.text_dim.into()))
 }
 
-fn link_row(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn link_row(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) -> Button {
     div()
         .id(id)
         .flex()
@@ -2526,7 +2529,8 @@ fn link_row(id: &'static str, icon: Icon, label: &'static str, theme: &Theme) ->
         .cursor_pointer()
         .text_size(px(12.))
         .text_color(theme.text_muted)
-        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+        .hover_bg(theme.hover)
+        .hover(|s| s.text_color(theme.text))
         .child(icon_el(icon, px(13.), theme.text_dim.into()))
         .child(label)
 }

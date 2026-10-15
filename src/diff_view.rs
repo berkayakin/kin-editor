@@ -22,7 +22,7 @@ use crate::{
     git_panel::{GitOp, change_color},
     syntax::{Highlight, Language, Syntax},
     theme::Theme,
-    ui::{icon_el, text_button, tooltip_view},
+    ui::{HoverFill, icon_el, text_button, tooltip_view},
 };
 
 const ROW_HEIGHT: f32 = 20.;
@@ -375,7 +375,7 @@ impl Render for DiffView {
                 .justify_center()
                 .rounded(px(8.))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
+                .hover_bg(theme.hover)
                 .tooltip(move |_, cx| tooltip_view(tip, cx))
                 .child(icon_el(icon, px(15.), theme.text_muted.into()))
         };
@@ -646,14 +646,14 @@ impl DiffView {
                             .flex()
                             .items_center()
                             .rounded(px(4.))
-                            .bg(theme.elevated)
                             .border_1()
                             .border_color(theme.border)
                             .font_family(theme.ui_font.clone())
                             .text_size(px(11.))
                             .text_color(theme.text_muted)
                             .cursor_pointer()
-                            .hover(|s| s.text_color(theme.text).bg(theme.hover))
+                            .hover_fill(theme.elevated, theme.hover)
+                            .hover(|s| s.text_color(theme.text))
                             .on_click(cx.listener(move |_, _, _, cx| cx.emit(DiffViewEvent::Run(op.clone()))))
                             .child(label),
                     ),
