@@ -1,4 +1,4 @@
-//! Context menus: editor, tabs, terminal tabs, breakpoints.
+//! Context menus: editor, Git panel files, tabs, terminal tabs, breakpoints.
 
 use super::*;
 
@@ -108,6 +108,69 @@ impl Workspace {
         self.show_context_menu(entries, actions, position, None, window, cx);
     }
 
+    // ---- Git panel context menu --------------------------------------------------
+
+    /// A changed file's menu in the Commit view; `staged`: its row is in the Staged section.
+    pub(super) fn open_git_file_menu(&mut self, file: FileStatus, staged: bool, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        let change = if staged { file.staged } else { file.unstaged.or(file.staged) };
+        let conflicted = file.staged == Some(Change::Conflicted) || file.unstaged == Some(Change::Conflicted);
+        let deleted = change == Some(Change::Deleted);
+        let untracked = file.unstaged == Some(Change::Untracked);
+        // Nothing to show for a file that isn't in any commit yet.
+        let has_history = !untracked && file.staged != Some(Change::Added);
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        let mut actions: Vec<Option<MenuAction>> = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<TreeAction>| {
+            entries.push(entry);
+            actions.push(action.map(MenuAction::Tree));
+        };
+
+        add(MenuEntry::item("Show Diff", Icon::GitCompare), Some(TreeAction::ShowDiff(file.clone(), staged)));
+        if !deleted {
+            add(MenuEntry::item("Open File", Icon::File), Some(TreeAction::Open(file.path.clone())));
+        }
+        if has_history {
+            add(MenuEntry::item("Show History", Icon::History), Some(TreeAction::ShowHistory(file.rel.clone())));
+        }
+
+        add(MenuEntry::Separator, None);
+        let rels = vec![file.rel.clone()];
+        if staged {
+            add(MenuEntry::item("Unstage", Icon::Minus), Some(TreeAction::Git(GitOp::Unstage(rels))));
+        } else if conflicted {
+            add(MenuEntry::item("Mark as Resolved", Icon::Check), Some(TreeAction::Git(GitOp::Stage(rels))));
+        } else {
+            add(MenuEntry::item("Stage", Icon::Plus), Some(TreeAction::Git(GitOp::Stage(rels))));
+        }
+        if !staged && !conflicted {
+            add(MenuEntry::item("Rollback…", Icon::Undo).danger(), Some(TreeAction::Git(GitOp::Discard(vec![file.clone()]))));
+        }
+        if untracked {
+            add(MenuEntry::item("Add to .gitignore", Icon::EyeOff), Some(TreeAction::AddToGitignore(file.rel.clone())));
+        }
+
+        add(MenuEntry::Separator, None);
+        add(MenuEntry::item("Copy Path", Icon::Clipboard), Some(TreeAction::CopyPath(file.path.clone())));
+        if self.root.as_ref().is_some_and(|r| file.path.starts_with(r)) {
+            add(MenuEntry::item("Copy Relative Path", Icon::Clipboard), Some(TreeAction::CopyRelativePath(file.path.clone())));
+        }
+        if !deleted {
+            add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(TreeAction::Reveal(file.path.clone())));
+            add(MenuEntry::Separator, None);
+            add(
+                MenuEntry::item(if cfg!(windows) { "Move to Recycle Bin" } else { "Move to Trash" }, Icon::Trash).danger(),
+                Some(TreeAction::Delete(file.path.clone())),
+            );
+        }
+
+        let target = (file.rel.clone(), staged);
+        self.show_context_menu(entries, actions, position, None, window, cx);
+        if let Some(menu) = &mut self.context_menu {
+            menu.git_target = Some(target);
+        }
+    }
+
     pub(super) fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
             self.focus_active(window, cx);
@@ -168,6 +231,7 @@ impl Workspace {
             TreeAction::Git(op) => self.run_git(op, window, cx),
             TreeAction::ShowDiff(file, staged) => self.open_diff(file, staged, window, cx),
             TreeAction::AddToGitignore(rel) => self.add_to_gitignore(rel, cx),
+            TreeAction::ShowHistory(rel) => self.show_history_of(rel, window, cx),
             TreeAction::UndoFileChange => self.step_file_history(false, window, cx),
             TreeAction::RedoFileChange => self.step_file_history(true, window, cx),
         }

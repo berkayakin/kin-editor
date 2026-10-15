@@ -47,6 +47,11 @@ impl Workspace {
             self.toast(ToastKind::Info, "This file isn't in a Git repository", None, cx);
             return;
         };
+        self.show_history_of(rel, window, cx);
+    }
+
+    /// The commits touching `rel` (repository-relative) in the Git log.
+    pub(super) fn show_history_of(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
         self.git_log.update(cx, |l, cx| l.show_path(Some(rel), cx));
         self.open_git_log(window, cx);
         self.save_state();

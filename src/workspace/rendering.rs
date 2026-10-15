@@ -234,6 +234,8 @@ impl Render for Workspace {
         let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
         let git_paths = self.git_paths.clone();
         self.tree.update(cx, |t, cx| t.decorate(git_paths, active_path, menu_target, cx));
+        let git_target = self.context_menu.as_ref().and_then(|m| m.git_target.clone());
+        self.git_panel.update(cx, |p, cx| p.set_menu_target(git_target, cx));
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);

@@ -6,7 +6,8 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, Task, Window, div, prelude::*, px, uniform_list,
+    IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Task, Window, div,
+    prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -74,6 +75,8 @@ pub enum GitPanelEvent {
     Run(GitOp),
     OpenDiff { file: FileStatus, staged: bool },
     OpenFile(PathBuf),
+    /// A file's row was right-clicked (`staged`: in the Staged section).
+    Menu { file: FileStatus, staged: bool, position: Point<Pixels> },
 }
 
 pub struct GitPanel {
@@ -90,6 +93,8 @@ pub struct GitPanel {
     busy_shown: bool,
     _busy_timer: Option<Task<()>>,
     selected: Option<(String, bool)>,
+    /// The row whose context menu is open (outlined while it is).
+    menu_target: Option<(String, bool)>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -120,6 +125,7 @@ impl GitPanel {
             busy_shown: false,
             _busy_timer: None,
             selected: None,
+            menu_target: None,
         }
     }
 
@@ -163,6 +169,13 @@ impl GitPanel {
         self.busy = busy;
         self.busy_shown = false;
         cx.notify();
+    }
+
+    pub fn set_menu_target(&mut self, target: Option<(String, bool)>, cx: &mut Context<Self>) {
+        if self.menu_target != target {
+            self.menu_target = target;
+            cx.notify();
+        }
     }
 
     pub fn committed(&mut self, cx: &mut Context<Self>) {
@@ -256,9 +269,11 @@ impl GitPanel {
         let name = file.rel.rsplit('/').next().unwrap_or(&file.rel).to_string();
         let dir = file.rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         let is_selected = self.selected.as_ref().is_some_and(|(r, s)| *r == file.rel && *s == staged);
+        let is_menu_target = self.menu_target.as_ref().is_some_and(|(r, s)| *r == file.rel && *s == staged);
         let group = SharedString::from(format!("git-row-{}-{ix}", staged as u8));
         let f = file.clone();
         let f_open = file.clone();
+        let f_menu = file.clone();
         let rel = file.rel.clone();
         let deleted = change == Change::Deleted;
         let conflicted = change == Change::Conflicted;
@@ -278,7 +293,17 @@ impl GitPanel {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
+                .when(is_menu_target, |el| el.border_1().border_color(Hsla::from(theme.accent).alpha(0.6)))
                 .row_hover(theme.hover)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.selected = Some((f_menu.rel.clone(), staged));
+                        cx.emit(GitPanelEvent::Menu { file: f_menu.clone(), staged, position: e.position });
+                        cx.notify();
+                    }),
+                )
                 .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
                     this.selected = Some((f.rel.clone(), staged));
                     // A conflict is resolved in the editor, not read in a diff.
@@ -300,7 +325,9 @@ impl GitPanel {
                         .truncate()
                         .text_color(color)
                         .when(deleted, |el| el.line_through())
-                        .when(path.contains('/'), |el| el.tooltip(move |_, cx| tooltip_view(path.clone(), cx)))
+                        // Not while its menu is open: GPUI still shows a tooltip that was
+                        // waiting when the row was right-clicked, over the menu.
+                        .when(path.contains('/') && !is_menu_target, |el| el.tooltip(move |_, cx| tooltip_view(path.clone(), cx)))
                         .child(name)
                 })
                 .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_dim).child(dir))

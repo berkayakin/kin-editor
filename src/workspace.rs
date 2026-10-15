@@ -278,6 +278,8 @@ enum TreeAction {
     Git(GitOp),
     ShowDiff(FileStatus, bool),
     AddToGitignore(String),
+    /// The commits touching this repository-relative path.
+    ShowHistory(String),
     UndoFileChange,
     RedoFileChange,
 }
@@ -452,6 +454,8 @@ struct OpenContextMenu {
     actions: Vec<Option<MenuAction>>,
     /// The tree entry that was right-clicked (highlighted while open).
     target: Option<PathBuf>,
+    /// The Git panel row that was right-clicked: relative path, staged.
+    git_target: Option<(String, bool)>,
     _subscription: Subscription,
 }
 
@@ -684,6 +688,7 @@ impl Workspace {
             GitPanelEvent::Run(op) => ws.run_git(op.clone(), window, cx),
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
+            GitPanelEvent::Menu { file, staged, position } => ws.open_git_file_menu(file.clone(), *staged, *position, window, cx),
         });
         let tree = cx.new(ProjectTree::new);
         let tree_subscription = cx.subscribe_in(&tree, window, |ws, _, event: &TreeEvent, window, cx| match event {
