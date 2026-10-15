@@ -13,7 +13,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::{Duration, SystemTime},
 };
 
@@ -43,16 +43,35 @@ impl std::fmt::Debug for Installer {
 
 enum Source {
     /// A release asset on GitHub: the binary itself, gzipped, or in a zip.
-    GitHub { repo: &'static str, asset: fn() -> Option<String> },
+    GitHub { repo: &'static str, asset: Asset },
     Npm { package: &'static str },
     /// `go install <module>@latest`, with the user's Go.
     Go { module: &'static str },
 }
 
+/// Which release asset is this computer's.
+enum Asset {
+    Fn(fn() -> Option<String>),
+    /// By `<os>-<arch>` as Rust names them: "macos-aarch64", "linux-x86_64".
+    PerPlatform(Vec<(String, String)>),
+}
+
+impl Asset {
+    fn name(&self) -> Option<String> {
+        match self {
+            Asset::Fn(asset) => asset(),
+            Asset::PerPlatform(assets) => {
+                let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+                assets.iter().find(|(p, _)| *p == platform).map(|(_, name)| name.clone())
+            }
+        }
+    }
+}
+
 const INSTALLERS: &[Installer] = &[
-    Installer { command: "rust-analyzer", source: Source::GitHub { repo: "rust-lang/rust-analyzer", asset: rust_analyzer_asset } },
-    Installer { command: "taplo", source: Source::GitHub { repo: "tamasfe/taplo", asset: taplo_asset } },
-    Installer { command: "marksman", source: Source::GitHub { repo: "artempyanykh/marksman", asset: marksman_asset } },
+    Installer { command: "rust-analyzer", source: Source::GitHub { repo: "rust-lang/rust-analyzer", asset: Asset::Fn(rust_analyzer_asset) } },
+    Installer { command: "taplo", source: Source::GitHub { repo: "tamasfe/taplo", asset: Asset::Fn(taplo_asset) } },
+    Installer { command: "marksman", source: Source::GitHub { repo: "artempyanykh/marksman", asset: Asset::Fn(marksman_asset) } },
     Installer { command: "vtsls", source: Source::Npm { package: "@vtsls/language-server" } },
     Installer { command: "basedpyright-langserver", source: Source::Npm { package: "basedpyright" } },
     Installer { command: "intelephense", source: Source::Npm { package: "intelephense" } },
@@ -63,6 +82,40 @@ const INSTALLERS: &[Installer] = &[
     Installer { command: "bash-language-server", source: Source::Npm { package: "bash-language-server" } },
     Installer { command: "gopls", source: Source::Go { module: "golang.org/x/tools/gopls" } },
 ];
+
+/// Installers extensions declare (`[language_servers.<id>.installer]`).
+static EXTENSION_INSTALLERS: RwLock<Vec<&'static Installer>> = RwLock::new(Vec::new());
+
+/// Replaces the installers extensions declare (after they reload).
+pub fn set_extension_installers(installers: Vec<&'static Installer>) {
+    *EXTENSION_INSTALLERS.write().unwrap() = installers;
+}
+
+/// Kin's own installers, then extensions'.
+fn all() -> Vec<&'static Installer> {
+    INSTALLERS.iter().chain(EXTENSION_INSTALLERS.read().unwrap().iter().copied()).collect()
+}
+
+impl Installer {
+    /// From an extension's `[language_servers.<id>.installer]` for its
+    /// `command`: `npm = "package"`, `go = "module"`, or
+    /// `github = "owner/repo"` with `assets = { "macos-aarch64" = "…" }`.
+    pub fn from_manifest(command: &'static str, table: &toml::Table) -> Result<Installer, String> {
+        let text = |key: &str| table.get(key).and_then(toml::Value::as_str).map(|s| -> &'static str { Box::leak(s.to_string().into_boxed_str()) });
+        let source = if let Some(package) = text("npm") {
+            Source::Npm { package }
+        } else if let Some(module) = text("go") {
+            Source::Go { module }
+        } else if let Some(repo) = text("github") {
+            let assets = table.get("assets").and_then(toml::Value::as_table).ok_or("a GitHub installer needs assets")?;
+            let assets = assets.iter().filter_map(|(platform, name)| Some((platform.clone(), name.as_str()?.to_string()))).collect();
+            Source::GitHub { repo, asset: Asset::PerPlatform(assets) }
+        } else {
+            return Err("an installer needs npm, go or github".into());
+        };
+        Ok(Installer { command, source })
+    }
+}
 
 fn rust_analyzer_asset() -> Option<String> {
     let arch = std::env::consts::ARCH;
@@ -132,12 +185,13 @@ pub fn servers_dir() -> Option<PathBuf> {
 
 /// The installer for a server, by the first candidate Kin can install.
 pub fn for_spec(spec: &ServerSpec) -> Option<&'static Installer> {
-    spec.candidates.iter().find_map(|(command, _)| INSTALLERS.iter().find(|i| i.command == *command))
+    let installers = all();
+    spec.candidates.iter().find_map(|(command, _)| installers.iter().find(|i| i.command == *command).copied())
 }
 
 /// Kin's copy of `command`, if it installed one.
 pub fn installed(command: &str) -> Option<PathBuf> {
-    INSTALLERS.iter().filter(|i| i.command == command).find_map(|i| servers::executable(&i.binary(&current(&i.home()?)?)))
+    all().into_iter().filter(|i| i.command == command).find_map(|i| servers::executable(&i.binary(&current(&i.home()?)?)))
 }
 
 /// The version folder in use.
@@ -203,7 +257,7 @@ pub fn install(installer: &'static Installer) -> Result<(), String> {
 fn install_now(installer: &Installer) -> Result<(), String> {
     let home = installer.home().ok_or("Kin has no config folder")?;
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-    match installer.source {
+    match &installer.source {
         Source::GitHub { repo, asset } => install_github(installer, &home, repo, asset),
         Source::Npm { package } => install_npm(installer, &home, package),
         Source::Go { module } => install_go(installer, &home, module),
@@ -215,8 +269,8 @@ fn folder_name(version: &str) -> String {
     version.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).collect()
 }
 
-fn install_github(installer: &Installer, home: &Path, repo: &str, asset: fn() -> Option<String>) -> Result<(), String> {
-    let asset = asset().ok_or_else(|| format!("{} has no build for this computer", installer.command))?;
+fn install_github(installer: &Installer, home: &Path, repo: &str, asset: &Asset) -> Result<(), String> {
+    let asset = asset.name().ok_or_else(|| format!("{} has no build for this computer", installer.command))?;
     let release: Value = serde_json::from_slice(&crate::updater::fetch(&format!("https://api.github.com/repos/{repo}/releases/latest"))?)
         .map_err(|e| format!("GitHub's answer didn't parse: {e}"))?;
     let tag = release["tag_name"].as_str().ok_or("GitHub listed no release")?;
@@ -436,7 +490,7 @@ pub fn check_for_update(program: &Path) {
     if !program.starts_with(&dir) {
         return;
     }
-    let Some(installer) = INSTALLERS.iter().find(|i| i.home().is_some_and(|home| program.starts_with(home))) else { return };
+    let Some(installer) = all().into_iter().find(|i| i.home().is_some_and(|home| program.starts_with(home))) else { return };
     if matches!(installer.source, Source::Go { .. }) {
         return;
     }
@@ -458,6 +512,21 @@ pub fn check_for_update(program: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extensions_declare_installers() {
+        let table = |text: &str| -> toml::Table { toml::from_str(text).unwrap() };
+        let npm = Installer::from_manifest("mylang-ls", &table(r#"npm = "@me/mylang-ls""#)).unwrap();
+        assert!(matches!(npm.source, Source::Npm { package: "@me/mylang-ls" }));
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let github = Installer::from_manifest("x", &table(&format!("github = \"me/x\"\nassets = {{ \"{platform}\" = \"x.gz\" }}"))).unwrap();
+        match &github.source {
+            Source::GitHub { repo, asset } => assert_eq!((*repo, asset.name()), ("me/x", Some("x.gz".to_string()))),
+            _ => panic!("not GitHub"),
+        }
+        assert!(Installer::from_manifest("x", &table(r#"github = "me/x""#)).is_err());
+        assert!(Installer::from_manifest("x", &table("")).is_err());
+    }
 
     #[test]
     fn every_built_in_server_with_an_installer_is_known() {

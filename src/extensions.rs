@@ -102,6 +102,8 @@ pub struct ExtensionInfo {
     pub building: Vec<String>,
     /// What went wrong: a manifest that doesn't parse, a grammar that didn't build.
     pub problems: Vec<String>,
+    /// How to install its servers, where it says.
+    installers: Vec<&'static crate::lsp::install::Installer>,
 }
 
 /// A language an extension adds.
@@ -441,6 +443,7 @@ fn load() -> Vec<(String, Grammar)> {
     registry.snippet_dirs = extensions.iter().map(|e| e.path.join("snippets")).filter(|d| d.is_dir()).collect();
     registry.languages = slots;
     registry.servers = servers;
+    crate::lsp::install::set_extension_installers(extensions.iter().flat_map(|e| e.installers.iter().copied()).collect());
     registry.extensions = extensions;
     jobs
 }
@@ -463,6 +466,7 @@ fn read_extension(dir: &Path) -> Read {
         servers: Vec::new(),
         building: Vec::new(),
         problems: Vec::new(),
+        installers: Vec::new(),
     };
     let manifest = match read_toml(&dir.join("extension.toml")) {
         Ok(manifest) => manifest,
@@ -524,6 +528,12 @@ fn read_extension(dir: &Path) -> Read {
             },
         };
         info.servers.push(format!("{name} ({command})"));
+        if let Some(table) = server.get("installer").and_then(Value::as_table) {
+            match crate::lsp::install::Installer::from_manifest(leak(command.clone()), table) {
+                Ok(installer) => info.installers.push(Box::leak(Box::new(installer))),
+                Err(err) => info.problems.push(format!("language server {id}: {err}")),
+            }
+        }
         let candidate: Candidate = (leak(command), Box::leak(args.into_iter().map(leak).collect::<Vec<_>>().into_boxed_slice()));
         let install = server.get("install").and_then(Value::as_str).map(leak);
         let markers: Vec<&'static str> = strings(server.get("root_markers")).into_iter().map(leak).collect();

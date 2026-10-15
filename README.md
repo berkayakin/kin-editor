@@ -574,6 +574,14 @@ install = "brew install mylang-ls"   # shown when it isn't found
 # What Zed extensions' code would pass the server (Kin's keys):
 initialization_options = { lint = true }
 settings = { mylang = { formatting = "auto" } }
+
+# How the status bar's Install gets it (Kin's key; checksummed like Kin's own):
+# an npm package, a Go module, or a GitHub release asset per platform.
+[language_servers.mylang-ls.installer]
+github = "someone/mylang-ls"
+assets = { "macos-aarch64" = "mylang-ls-darwin-arm64.gz", "linux-x86_64" = "mylang-ls-linux-x64.gz" }
+# npm = "mylang-language-server"
+# go = "example.com/mylang/cmd/mylang-ls"
 ```
 
 ```toml
