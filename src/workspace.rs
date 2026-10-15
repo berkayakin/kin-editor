@@ -5845,7 +5845,7 @@ impl Workspace {
                     .justify_center()
                     .rounded(px(6.))
                     .map(|el| {
-                        if theme.reduce_effects {
+                        if !theme.gradients {
                             el.bg(tint)
                         } else {
                             el.bg(gpui::linear_gradient(

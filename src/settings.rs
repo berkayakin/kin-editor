@@ -60,8 +60,11 @@ pub struct Settings {
     pub vim_mode: Option<bool>,
     /// File icons from an extension's icon theme, by name (built-in when unset).
     pub icon_theme: Option<String>,
-    /// A plainer interface: solid colors instead of gradients, and no shadows
-    /// or glows (off by default).
+    /// How much decoration the interface draws (`VisualEffects`); see
+    /// `Settings::visual_effects`.
+    pub visual_effects: Option<VisualEffects>,
+    /// The switch `visual_effects` replaced: `true` reads as Minimal. Kept so
+    /// a settings.json that has it still works; writing the level removes it.
     pub reduce_visual_effects: Option<bool>,
 }
 
@@ -107,6 +110,42 @@ impl BaseKeymap {
             BaseKeymap::SublimeText => "Sublime Text",
             BaseKeymap::Zed => "Zed",
         }
+    }
+}
+
+/// How much decoration the interface draws, from most to least. Each level
+/// drops one more kind of effect: gradients first (the most decorative),
+/// then the shadows, glows and animations that also give depth and focus cues.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualEffects {
+    /// Gradients, shadows, glows and animations.
+    #[default]
+    Full,
+    /// Solid colors instead of gradients.
+    Reduced,
+    /// Also no shadows or glows, and changes are instant.
+    Minimal,
+}
+
+impl VisualEffects {
+    pub const ALL: [VisualEffects; 3] = [VisualEffects::Full, VisualEffects::Reduced, VisualEffects::Minimal];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            VisualEffects::Full => "full",
+            VisualEffects::Reduced => "reduced",
+            VisualEffects::Minimal => "minimal",
+        }
+    }
+
+    pub fn gradients(self) -> bool {
+        self == VisualEffects::Full
+    }
+
+    /// No shadows, glows or animations.
+    pub fn minimal(self) -> bool {
+        self == VisualEffects::Minimal
     }
 }
 
@@ -253,6 +292,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "trust_all_projects",
     "vim_mode",
     "icon_theme",
+    "visual_effects",
     "reduce_visual_effects",
 ];
 
@@ -342,6 +382,28 @@ impl Settings {
         Self::update(key, |_| None)
     }
 
+    /// The visual effects level in effect: `visual_effects`, else the older
+    /// `reduce_visual_effects` switch (on reads as Minimal), else Full.
+    pub fn visual_effects(&self) -> VisualEffects {
+        self.visual_effects.unwrap_or(if self.reduce_visual_effects == Some(true) {
+            VisualEffects::Minimal
+        } else {
+            VisualEffects::Full
+        })
+    }
+
+    /// Saves a visual effects level (Full, the default, by removing the key)
+    /// and drops the older `reduce_visual_effects` switch, which would
+    /// otherwise speak for it once `visual_effects` is gone.
+    pub fn set_visual_effects(level: VisualEffects) -> std::io::Result<()> {
+        Self::remove("reduce_visual_effects")?;
+        if level == VisualEffects::default() {
+            Self::remove("visual_effects")
+        } else {
+            Self::set("visual_effects", level.key().into())
+        }
+    }
+
     /// Rewrites one top-level key from its current value in the file (`None`
     /// when absent); returning `None` removes it. A file that doesn't parse is
     /// left alone, so a typo can't turn into lost settings.
@@ -394,7 +456,7 @@ impl Settings {
             "inlay_hints" => self.editor.inlay_hints.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
-            "reduce_visual_effects" => self.reduce_visual_effects.is_some(),
+            "visual_effects" => self.visual_effects.is_some() || self.reduce_visual_effects.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
@@ -624,9 +686,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
 
   // File icons from an extension's icon theme (Zed's format), by name.
   // "icon_theme": "Soft Charmed Icons",
-  // A plainer interface: solid colors instead of gradients, and no shadows
-  // or glows.
-  // "reduce_visual_effects": false,
+  // How much decoration the interface draws: "full", "reduced" (solid
+  // colors instead of gradients) or "minimal" (also no shadows, glows or
+  // animations).
+  // "visual_effects": "full",
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {
@@ -969,6 +1032,24 @@ mod tests {
         assert_eq!(Settings::parse(r#"{"theme": "a // b /* c"}"#).unwrap().theme.as_deref(), Some("a // b /* c"));
         assert!(Settings::parse("{ \"tab_size\": \"x\" }").is_err());
         assert!(Settings::parse(SETTINGS_TEMPLATE).unwrap() == Settings::default());
+    }
+
+    #[test]
+    fn reads_visual_effects_levels_and_the_older_switch() {
+        let level = |json: &str| Settings::parse(json).unwrap().visual_effects();
+        assert_eq!(level("{}"), VisualEffects::Full);
+        assert_eq!(level(r#"{"visual_effects": "reduced"}"#), VisualEffects::Reduced);
+        assert_eq!(level(r#"{"visual_effects": "minimal"}"#), VisualEffects::Minimal);
+        // The switch it replaced: on is Minimal, off is Full.
+        assert_eq!(level(r#"{"reduce_visual_effects": true}"#), VisualEffects::Minimal);
+        assert_eq!(level(r#"{"reduce_visual_effects": false}"#), VisualEffects::Full);
+        // A level wins over the older switch.
+        assert_eq!(level(r#"{"visual_effects": "reduced", "reduce_visual_effects": true}"#), VisualEffects::Reduced);
+        // Neither is reported as unknown.
+        assert!(Settings::unknown_keys(r#"{"visual_effects": "minimal", "reduce_visual_effects": true}"#).is_empty());
+        // Only Full draws gradients; only Minimal drops shadows, glows and animations.
+        assert!(VisualEffects::Full.gradients() && !VisualEffects::Reduced.gradients() && !VisualEffects::Minimal.gradients());
+        assert!(!VisualEffects::Full.minimal() && !VisualEffects::Reduced.minimal() && VisualEffects::Minimal.minimal());
     }
 
     #[test]

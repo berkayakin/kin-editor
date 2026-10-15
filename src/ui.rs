@@ -29,9 +29,9 @@ pub const ISLAND_INSET: f32 = 4.0;
 
 /// The chrome's background: the panel color, with an accent glow at the top
 /// that has faded out by `fade` (0–1) of the height; just the panel color
-/// with Reduce visual effects.
+/// below Full visual effects.
 pub fn chrome_bg(theme: &Theme, fade: f32) -> gpui::Background {
-    if theme.reduce_effects {
+    if !theme.gradients {
         return theme.panel.into();
     }
     let top = Hsla::from(theme.panel).blend(Hsla::from(theme.accent).alpha(0.07));
@@ -39,7 +39,7 @@ pub fn chrome_bg(theme: &Theme, fade: f32) -> gpui::Background {
 }
 
 /// A soft drop shadow; `depth` 1 for islands, 2 for popovers, 3 for modals.
-/// None with Reduce visual effects (borders separate the surfaces then).
+/// None with Minimal visual effects (borders separate the surfaces then).
 pub fn soft_shadow(theme: &Theme, depth: u8) -> Vec<gpui::BoxShadow> {
     if theme.reduce_effects {
         return Vec::new();
@@ -106,13 +106,13 @@ pub fn segment_on<E: Styled>(el: E, theme: &Theme) -> E {
 }
 
 /// A soft accent halo for focused fields and active controls; none with
-/// Reduce visual effects (their accent border still marks them).
+/// Minimal visual effects (their accent border still marks them).
 pub fn focus_glow(theme: &Theme) -> Vec<gpui::BoxShadow> {
     glow(theme, Hsla::from(theme.accent).alpha(0.22), 6., 1.)
 }
 
 /// A halo of `color` around an element, e.g. a status light; none with
-/// Reduce visual effects.
+/// Minimal visual effects.
 pub fn glow(theme: &Theme, color: Hsla, blur: f32, spread: f32) -> Vec<gpui::BoxShadow> {
     if theme.reduce_effects {
         return Vec::new();
@@ -436,14 +436,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reduced_effects_drop_gradients_shadows_and_glows() {
+    fn visual_effect_levels_drop_gradients_then_shadows_and_glows() {
         let mut theme = Theme::blank_for_tests();
         theme.panel = gpui::rgba(0x202020ff);
         theme.accent = gpui::rgba(0xff8000ff);
+        // Full.
         assert_ne!(chrome_bg(&theme, 0.5), gpui::Background::from(theme.panel));
         assert!(!soft_shadow(&theme, 1).is_empty() && !focus_glow(&theme).is_empty());
-        theme.reduce_effects = true;
+        // Reduced: solid, but shadows and glows stay.
+        theme.gradients = false;
         assert_eq!(chrome_bg(&theme, 0.5), gpui::Background::from(theme.panel));
+        assert!(!soft_shadow(&theme, 1).is_empty() && !focus_glow(&theme).is_empty());
+        // Minimal.
+        theme.reduce_effects = true;
         assert!(soft_shadow(&theme, 3).is_empty());
         assert!(focus_glow(&theme).is_empty());
         assert!(glow(&theme, theme.accent.into(), 4., 0.).is_empty());

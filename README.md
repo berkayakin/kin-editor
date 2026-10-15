@@ -641,7 +641,7 @@ are fine, and Kin keeps them when it changes a value itself.
 | `languages` | | per-language overrides of the nine above, by the name in the status bar |
 | `vim_mode` | `false` | Vim's modes and keys; see [Vim mode](#vim-mode) |
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
-| `reduce_visual_effects` | `false` | a plainer interface: solid colors instead of gradients, and no shadows or glows (Settings → Appearance) |
+| `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |

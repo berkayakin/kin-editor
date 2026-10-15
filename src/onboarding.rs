@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::{
     assets::{self, Icon},
     keymap,
-    settings::{self, AutoSave, BaseKeymap, Settings},
+    settings::{self, AutoSave, BaseKeymap, Settings, VisualEffects},
     theme::{self, Appearance, Theme, ThemeRegistry},
     ui::{Button, HoverFill, focus_glow, icon_el, kbd, switch},
     workspace::{FindAction, GoToFile, OpenSettings},
@@ -152,13 +152,17 @@ impl Onboarding {
             .child(option_rows(
                 vec![(
                     "Reduce visual effects",
-                    "A plainer interface: solid colors instead of gradients, and no shadows or glows.",
+                    "Solid colors, and no shadows, glows or animations. Settings has a level in between.",
+                    // On is the Minimal level (Settings → Appearance has Reduced too).
                     self.toggle(
                         "welcome-reduce-effects",
-                        Settings::get(cx).reduce_visual_effects == Some(true),
+                        Settings::get(cx).visual_effects() == VisualEffects::Minimal,
                         &current,
                         cx,
-                        |this, on, cx| this.set_or_default("reduce_visual_effects", json!(on), json!(false), cx),
+                        |this, on, cx| {
+                            let level = if on { VisualEffects::Minimal } else { VisualEffects::Full };
+                            this.write(Settings::set_visual_effects(level), cx);
+                        },
                     ),
                 )],
                 &current,

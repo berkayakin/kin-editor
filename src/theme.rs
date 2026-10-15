@@ -48,8 +48,11 @@ pub struct Theme {
     pub name: SharedString,
     pub appearance: Appearance,
     pub italic_comments: bool,
-    /// From the `reduce_visual_effects` setting (not theme files): solid
-    /// colors instead of gradients, and no shadows or glows.
+    /// From the `visual_effects` setting (not theme files): draw gradients
+    /// (Full only).
+    pub gradients: bool,
+    /// From the `visual_effects` setting: no shadows, glows or animations
+    /// (Minimal).
     pub reduce_effects: bool,
 
     pub ui_font: SharedString,
@@ -235,6 +238,7 @@ impl Theme {
             name: "".into(),
             appearance,
             italic_comments: true,
+            gradients: true,
             reduce_effects: false,
             ui_font: ".SystemUIFont".into(),
             mono_font: "Menlo".into(),
@@ -835,7 +839,9 @@ pub fn apply_fonts(cx: &mut App) {
     theme.mono_font = mono_font;
     theme.editor_font_size = size;
     theme.editor_line_height = (size * line_height).round();
-    theme.reduce_effects = settings.reduce_visual_effects == Some(true);
+    let effects = settings.visual_effects();
+    theme.gradients = effects.gradients();
+    theme.reduce_effects = effects.minimal();
     cx.set_global(theme);
     cx.refresh_windows();
 }
