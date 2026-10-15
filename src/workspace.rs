@@ -7501,26 +7501,9 @@ impl Workspace {
 
     fn render_problems(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let run_problems = self.run_problems_shown(cx);
+        let run_count = self.run_problems_shown(cx).len();
         let editor = self.active_editor().cloned();
-        let diagnostics = editor
-            .as_ref()
-            .map(|e| e.read(cx).doc.diagnostics.clone())
-            .unwrap_or_default();
-        let positions: Vec<(usize, usize)> = editor
-            .as_ref()
-            .map(|e| {
-                let doc = &e.read(cx).doc;
-                diagnostics
-                    .iter()
-                    .map(|d| {
-                        let row = doc.row_of(d.range.start);
-                        let col = doc.slice(doc.line_start(row)..d.range.start).chars().count();
-                        (row + 1, col + 1)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let diag_count = editor.as_ref().map_or(0, |e| e.read(cx).doc.diagnostics.len());
 
         let header = div()
             .flex()
@@ -7545,73 +7528,19 @@ impl Workspace {
                     .bg(theme.active)
                     .text_size(px(11.))
                     .text_color(theme.text_muted)
-                    .child((diagnostics.len() + run_problems.len()).to_string()),
+                    .child((diag_count + run_count).to_string()),
             )
             .child(div().flex_1())
             .child(self.icon_button("close-problems", Icon::X, false, cx, |ws, _, window, cx| {
                 ws.toggle_problems(&ToggleProblems, window, cx)
             }));
 
-        // A section per source when the last Run reported problems too.
-        let section = |id: SharedString, icon: Icon, title: String| {
-            div()
-                .id(id)
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .h(px(24.))
-                .px_3()
-                .text_size(px(11.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_dim)
-                .child(icon_el(icon, px(12.), theme.text_dim.into()))
-                .child(title)
-        };
-        let row = |id: SharedString, icon: Icon, color: Hsla, message: String| {
-            div()
-                .id(id)
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .h(px(26.))
-                .mx_1p5()
-                .px_2()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .hover_bg(theme.hover)
-                .child(icon_el(icon, px(14.), color))
-                .child(div().min_w_0().text_color(theme.text).truncate().child(message))
-        };
-        let run_rows: Vec<AnyElement> = self
-            .run_problems
-            .iter()
-            .filter(|_| !run_problems.is_empty())
-            .flat_map(|(name, _)| {
-                let title = section("run-problems".into(), Icon::Play, name.clone()).into_any_element();
-                let rows = run_problems.iter().enumerate().map(|(ix, p)| {
-                    let (icon, color) = severity_icon(p.severity, &theme);
-                    let place = match p.column {
-                        Some(column) => format!("{}:{}:{column}", self.display_rel(&p.path), p.line),
-                        None => format!("{}:{}", self.display_rel(&p.path), p.line),
-                    };
-                    let (path, line, column) = (p.path.clone(), p.line, p.column);
-                    row(SharedString::from(format!("run-problem-{ix}")), icon, color, p.message.clone())
-                        .on_click(cx.listener(move |ws, _, window, cx| ws.open_at(path.clone(), Some(line), column, window, cx)))
-                        .child(div().flex_1())
-                        .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.text_dim).child(place))
-                        .into_any_element()
-                });
-                std::iter::once(title).chain(rows).collect::<Vec<_>>()
-            })
-            .collect();
-        let file_title = (!run_rows.is_empty() && !diagnostics.is_empty())
-            .then(|| editor.as_ref().and_then(|e| e.read(cx).doc.path.as_deref().map(folder_name)))
-            .flatten()
-            .map(|name| section("file-problems".into(), Icon::File, name).into_any_element());
-
-        let list = if diagnostics.is_empty() && run_rows.is_empty() {
+        // Rows, top to bottom: the file's title when the last Run reported
+        // problems too, the file's problems, then the Run's title and its
+        // problems. Only the rows on screen are built.
+        let file_title = run_count > 0 && diag_count > 0;
+        let count = file_title as usize + diag_count + if run_count > 0 { 1 + run_count } else { 0 };
+        let list = if count == 0 {
             div()
                 .flex()
                 .items_center()
@@ -7622,37 +7551,82 @@ impl Workspace {
                 .child("No problems detected")
                 .into_any_element()
         } else {
-            div()
-                .id("problems-list")
-                .flex_1()
-                .overflow_y_scroll()
-                .py_1()
-                .children(file_title)
-                .children(diagnostics.into_iter().zip(positions).enumerate().map(|(ix, (d, (line, col)))| {
-                    let (icon, color) = severity_icon(d.severity, &theme);
-                    let target = d.range.start;
-                    let editor = editor.clone();
-                    // One row per problem: a multi-line message (Pyright's
-                    // details) reads as one line, like the inline hint.
-                    let message = d.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
-                    row(SharedString::from(format!("problem-{ix}")), icon, color, message)
-                        .on_click(move |_, window, cx| {
-                            if let Some(editor) = editor.as_ref() {
-                                editor.update(cx, |e, cx| e.go_to(target, window, cx));
+            uniform_list(
+                "problems-list",
+                count,
+                cx.processor(move |ws, range: std::ops::Range<usize>, _window, cx| {
+                    let theme = Theme::get(cx).clone();
+                    let editor = ws.active_editor().cloned();
+                    let run_problems: Vec<run::OutputProblem> = ws.run_problems_shown(cx).into_iter().cloned().collect();
+                    let run_name = ws.run_problems.as_ref().map(|(name, _)| name.clone()).unwrap_or_default();
+                    let mut rows = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let mut ix = ix;
+                        if file_title {
+                            if ix == 0 {
+                                let name = editor.as_ref().and_then(|e| e.read(cx).doc.path.as_deref().map(folder_name)).unwrap_or_default();
+                                rows.push(problem_section("file-problems".into(), Icon::File, name, &theme).into_any_element());
+                                continue;
                             }
-                        })
-                        .child(div().text_color(theme.text_dim).flex_shrink_0().child(SharedString::from(d.rule.to_string())))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_size(px(12.))
-                                .text_color(theme.text_dim)
-                                .child(format!("Ln {line}, Col {col}")),
-                        )
-                }))
-                .children(run_rows)
-                .into_any_element()
+                            ix -= 1;
+                        }
+                        let diagnostic = editor.as_ref().and_then(|e| {
+                            let doc = &e.read(cx).doc;
+                            let d = doc.diagnostics.get(ix)?;
+                            let row = doc.row_of(d.range.start);
+                            let col = doc.slice(doc.line_start(row)..d.range.start).chars().count();
+                            Some((d.clone(), row + 1, col + 1))
+                        });
+                        if let Some((d, line, col)) = diagnostic {
+                            let (icon, color) = severity_icon(d.severity, &theme);
+                            let target = d.range.start;
+                            let editor = editor.clone();
+                            // One row per problem: a multi-line message (Pyright's
+                            // details) reads as one line, like the inline hint.
+                            let message = d.message.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" · ");
+                            rows.push(
+                                problem_row(SharedString::from(format!("problem-{ix}")), icon, color, message, &theme)
+                                    .on_click(move |_, window, cx| {
+                                        if let Some(editor) = editor.as_ref() {
+                                            editor.update(cx, |e, cx| e.go_to(target, window, cx));
+                                        }
+                                    })
+                                    .child(div().text_color(theme.text_dim).flex_shrink_0().child(SharedString::from(d.rule.to_string())))
+                                    .child(div().flex_1())
+                                    .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.text_dim).child(format!("Ln {line}, Col {col}")))
+                                    .into_any_element(),
+                            );
+                            continue;
+                        }
+                        ix -= diag_count;
+                        if ix == 0 {
+                            rows.push(problem_section("run-problems".into(), Icon::Play, run_name.clone(), &theme).into_any_element());
+                            continue;
+                        }
+                        let Some(p) = run_problems.get(ix - 1) else {
+                            rows.push(div().into_any_element());
+                            continue;
+                        };
+                        let (icon, color) = severity_icon(p.severity, &theme);
+                        let place = match p.column {
+                            Some(column) => format!("{}:{}:{column}", ws.display_rel(&p.path), p.line),
+                            None => format!("{}:{}", ws.display_rel(&p.path), p.line),
+                        };
+                        let (path, line, column) = (p.path.clone(), p.line, p.column);
+                        rows.push(
+                            problem_row(SharedString::from(format!("run-problem-{ix}")), icon, color, p.message.clone(), &theme)
+                                .on_click(cx.listener(move |ws, _, window, cx| ws.open_at(path.clone(), Some(line), column, window, cx)))
+                                .child(div().flex_1())
+                                .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.text_dim).child(place))
+                                .into_any_element(),
+                        );
+                    }
+                    rows
+                }),
+            )
+            .flex_1()
+            .py_1()
+            .into_any_element()
         };
 
         island(&theme)
@@ -8350,6 +8324,42 @@ fn tree_children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
         .collect();
     children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
     children
+}
+
+/// A heading in the Problems panel (the file, the last Run).
+fn problem_section(id: SharedString, icon: Icon, title: String, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .h(px(26.))
+        .px_3()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_dim)
+        .child(icon_el(icon, px(12.), theme.text_dim.into()))
+        .child(title)
+}
+
+/// A problem in the Problems panel: severity icon and message; callers add
+/// where it is.
+fn problem_row(id: SharedString, icon: Icon, color: Hsla, message: String, theme: &Theme) -> crate::ui::Button {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(26.))
+        .mx_1p5()
+        .px_2()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .hover_bg(theme.hover)
+        .child(icon_el(icon, px(14.), color))
+        .child(div().min_w_0().text_color(theme.text).truncate().child(message))
 }
 
 /// A session to write, its unsaved texts still ropes (see `session_snapshot`).
