@@ -5,6 +5,7 @@
 //! the viewport rather than the file.
 
 use std::{
+    collections::HashMap,
     ops::{ControlFlow, Deref, DerefMut, Range},
     path::Path,
     sync::{LazyLock, Mutex},
@@ -849,6 +850,7 @@ fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'stati
     let Some(injections) = queries(language).and_then(|q| q.injections.as_ref()) else { return Vec::new() };
     let own = config(language);
     let mut out: Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> = Vec::new();
+    let mut found: HashMap<String, Option<&'static LangConfig>> = HashMap::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&injections.query, tree.root_node(), RopeProvider(rope));
     while let Some(m) = matches.next() {
@@ -858,7 +860,11 @@ fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'stati
                 matches!(p.key.as_ref(), "injection.language" | "language").then(|| p.value.as_deref().map(str::to_string)).flatten()
             })
         };
-        let Some(config) = named.or_else(set).and_then(|name| injected_config(&name)) else { continue };
+        // Looked up once per name: comments (JSDoc) and regexes match often,
+        // and are usually languages Kin doesn't have.
+        let Some(config) = named.or_else(set).and_then(|name| *found.entry(name).or_insert_with_key(|name| injected_config(name))) else {
+            continue;
+        };
         if own.is_some_and(|own| std::ptr::eq(own, config)) {
             continue;
         }
@@ -1089,6 +1095,18 @@ mod tests {
     }
 
     #[test]
+    fn grammars_injections_highlight_embedded_code() {
+        let html = highlights_of("a.html", "<style>body { color: red }</style>\n");
+        assert!(has(&html, "color", Highlight::Property), "{html:?}");
+        let md = highlights_of("a.md", "# Title\n\n```rust\nfn main() {}\n```\n");
+        assert!(has(&md, "fn", Highlight::Keyword), "{md:?}");
+        let php = highlights_of("a.php", "<p class=\"x\">hi</p>\n<?php echo 1; ?>\n");
+        assert!(has(&php, "p", Highlight::Tag) && has(&php, "echo", Highlight::Keyword), "{php:?}");
+        let js = highlights_of("a.js", "const s = html`<b>bold</b>`;\n");
+        assert!(has(&js, "b", Highlight::Tag), "{js:?}");
+    }
+
+    #[test]
     fn outline_queries_compile() {
         for language in ALL_HIGHLIGHTED {
             if language != Language::Html {
@@ -1209,3 +1227,4 @@ mod tests {
         assert!(has(&sh, "if", Highlight::Keyword), "{sh:?}");
     }
 }
+

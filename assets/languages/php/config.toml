@@ -7,3 +7,4 @@ block_comment = { start = "/*", end = "*/" }
 [queries]
 highlights = ["crate:php/highlights"]
 outline = ["crate:php/tags"]
+injections = ["crate:php/injections", "injections.scm"]

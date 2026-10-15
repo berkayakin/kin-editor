@@ -7,3 +7,4 @@ block_comment = { start = "/*", end = "*/" }
 [queries]
 highlights = ["crate:rust/highlights", "highlights.scm"]
 outline = ["crate:rust/tags", "outline.scm"]
+injections = ["crate:rust/injections"]

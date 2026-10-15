@@ -7,3 +7,4 @@ soft_wrap = true
 
 [queries]
 highlights = ["crate:markdown/highlights"]
+injections = ["crate:markdown/injections", "injections.scm"]

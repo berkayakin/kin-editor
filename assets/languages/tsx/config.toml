@@ -7,3 +7,4 @@ block_comment = { start = "/*", end = "*/" }
 [queries]
 highlights = ["crate:javascript/highlights", "crate:javascript/jsx", "crate:typescript/highlights", "highlights.scm"]
 outline = ["crate:javascript/tags", "crate:typescript/tags", "outline.scm"]
+injections = ["crate:javascript/injections"]
