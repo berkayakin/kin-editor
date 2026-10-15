@@ -396,7 +396,11 @@ impl LspStore {
                 }
                 Some((Ok((client, incoming)), c)) => (client, incoming, c),
             };
-            let name = command.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Shown in the status bar: "pyright", not "pyright.cmd" on Windows.
+            let program = &command.program;
+            let windows_ext = program.extension().is_some_and(|e| ["exe", "cmd", "bat"].iter().any(|w| e.eq_ignore_ascii_case(w)));
+            let name = if windows_ext { program.file_stem() } else { program.file_name() };
+            let name = name.map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let config = servers::config(spec, &command.program, &user);
             let initialization_options = config.initialization_options.clone();
             let started = this.update(cx, |s, cx| {
