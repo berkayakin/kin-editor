@@ -860,7 +860,7 @@ mod tests {
         );
         let found: Vec<(String, u32, Option<u32>, Severity, String)> = output_problems(&output, &dir)
             .into_iter()
-            .map(|p| (p.path.strip_prefix(&dir).unwrap().display().to_string(), p.line, p.column, p.severity, p.message))
+            .map(|p| (p.path.strip_prefix(&dir).unwrap().display().to_string().replace('\\', "/"), p.line, p.column, p.severity, p.message))
             .collect();
         let e = Severity::Error;
         assert_eq!(

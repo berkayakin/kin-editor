@@ -697,6 +697,7 @@ mod tests {
         assert_eq!(launch_arguments(&attach, Path::new("/p"), None, "lldb-dap")["pid"], 42);
     }
 
+    #[cfg(unix)]
     #[test]
     fn lists_processes() {
         let all = processes();

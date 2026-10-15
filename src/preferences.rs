@@ -470,6 +470,10 @@ pub struct Preferences {
     page: Page,
     search: Entity<Editor>,
     scroll: ScrollHandle,
+    /// Whether this frame's page scrolls in `body` (so `scroll` tracks it and
+    /// gets a scrollbar); the Keymap page scrolls on its own.
+    body_shown: Cell<bool>,
+    fonts_scroll: gpui::UniformListScrollHandle,
     menu: Option<Menu>,
     font_filter: Entity<Editor>,
     /// Monospaced fonts, found when the font menu first opens.
@@ -542,6 +546,8 @@ impl Preferences {
             page,
             search,
             scroll: ScrollHandle::new(),
+            body_shown: Cell::new(false),
+            fonts_scroll: gpui::UniformListScrollHandle::new(),
             menu: None,
             font_filter,
             fonts: None,
@@ -929,11 +935,21 @@ impl Render for Preferences {
         let words = self.query_words(cx);
         self.overlay = None;
 
+        self.body_shown.set(false);
         let content = if words.is_empty() {
             self.render_page(window, cx)
         } else {
             self.render_results(&words, window, cx)
         };
+        let content = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(content)
+            .when(self.body_shown.get(), |el| el.child(crate::ui::scrollbar("pref-body-scrollbar", &self.scroll, cx)));
 
         let panel = modal_panel(cx)
             .id("preferences")
@@ -1113,6 +1129,7 @@ impl Preferences {
 
     /// The scrolling area under the header.
     fn body(&self) -> Stateful<Div> {
+        self.body_shown.set(true);
         div()
             .id("pref-body")
             .flex()
@@ -1600,8 +1617,10 @@ impl Preferences {
                         .collect()
                 })
             })
+            .track_scroll(self.fonts_scroll.clone())
             .h(px((count.clamp(1, 8) * 26) as f32))
             .w_full();
+            let list = div().relative().child(list).child(crate::ui::list_scrollbar("pref-fonts-scrollbar", &self.fonts_scroll, cx));
             div()
                 .flex()
                 .flex_col()

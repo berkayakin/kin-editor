@@ -155,7 +155,7 @@ mod tests {
     use super::*;
 
     fn names(files: &[PathBuf], root: &Path) -> Vec<String> {
-        files.iter().map(|p| p.strip_prefix(root).unwrap().display().to_string()).collect()
+        files.iter().map(|p| p.strip_prefix(root).unwrap().display().to_string().replace('\\', "/")).collect()
     }
 
     #[test]

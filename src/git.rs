@@ -1687,10 +1687,11 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let _ = std::fs::remove_dir_all(&parent);
         std::fs::create_dir_all(&parent).unwrap();
         run(&remote, &["symbolic-ref", "HEAD", "refs/heads/feature"]).unwrap();
-        let url = format!("file://{}", remote.display());
+        let url = url::Url::from_file_path(&remote).unwrap().to_string();
         let job = start_clone(&parent, &url, "copy", true).unwrap();
         let cloned = job.wait().unwrap();
-        assert_eq!(std::fs::read_to_string(cloned.join("a.txt")).unwrap(), "one\ntwo\n");
+        // Windows runners check out with core.autocrlf.
+        assert_eq!(std::fs::read_to_string(cloned.join("a.txt")).unwrap().replace("\r\n", "\n"), "one\ntwo\n");
         // A failing clone reports git's error.
         let err = start_clone(&parent, "file:///nonexistent/kin.git", "nope", false).unwrap().wait().unwrap_err();
         assert!(!err.is_empty() && !parent.join("nope").exists(), "{err}");

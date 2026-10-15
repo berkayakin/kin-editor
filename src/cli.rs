@@ -95,7 +95,9 @@ mod tests {
         let dev = script(Path::new("/src/kin/target/release/kin"));
         assert!(dev.contains(r#"'/src/kin/target/release/kin' "$@""#), "{dev}");
         assert!(bundled.contains("[ \"$1\" = extension ] && exec"), "{bundled}");
-        let urls = vec!["file:///Users/a/My%20Project/".to_string(), "https://example.com".to_string()];
-        assert_eq!(paths_from_urls(&urls), vec![PathBuf::from("/Users/a/My Project/")]);
+        let drive = if cfg!(windows) { "C:" } else { "" };
+        let folder = format!("{}{drive}/Users/a/My%20Project/", if cfg!(windows) { "file:///" } else { "file://" });
+        let urls = vec![folder, "https://example.com".to_string()];
+        assert_eq!(paths_from_urls(&urls), vec![PathBuf::from(format!("{drive}/Users/a/My Project/"))]);
     }
 }

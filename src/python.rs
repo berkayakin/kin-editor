@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(label(&root.join("services/venv"), Some(&root)), "services/venv");
 
         let activate = activate_command(&root.join(".venv"), "/bin/zsh").unwrap();
-        assert!(activate.starts_with(" . '") && activate.ends_with("bin/activate'"), "{activate}");
+        assert!(activate.starts_with(" . '") && activate.ends_with(&format!("{}activate'", bin_dir(Path::new("")).join("").display())), "{activate}");
         // No activate.fish in this venv.
         assert_eq!(activate_command(&root.join(".venv"), "fish"), None);
         std::fs::remove_dir_all(&root).ok();

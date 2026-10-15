@@ -551,6 +551,9 @@ mod tests {
         assert_eq!(config(&ServerSpec { id: EXT.id, ..ext }, Path::new("/bin/x"), &user).settings, json!({ "x": { "a": 1, "b": 3 } }));
 
         // Another program, by any of the server's names.
+        if cfg!(windows) {
+            return;
+        }
         let user: HashMap<String, LspSettings> = [(
             "pyright".to_string(),
             LspSettings { binary: Some(LspBinary { path: Some("/bin/sh".into()), arguments: Some(vec!["-c".into()]) }), ..Default::default() },

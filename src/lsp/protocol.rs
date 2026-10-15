@@ -647,19 +647,27 @@ pub fn code_actions(value: &Value) -> Vec<CodeAction> {
 mod tests {
     use super::*;
 
+    /// `/rest` as a path and a file URI; on Windows under C:, since a URI
+    /// without a drive isn't a Windows path.
+    fn file(rest: &str) -> (PathBuf, String) {
+        let drive = if cfg!(windows) { "C:" } else { "" };
+        (PathBuf::from(format!("{drive}{rest}")), format!("file://{}{drive}{rest}", if cfg!(windows) { "/" } else { "" }))
+    }
+
     #[test]
     fn workspace_symbols_take_both_shapes() {
+        let (lib, lib_uri) = file("/p/src/lib.rs");
         let value = json!([
             { "name": "parse", "kind": 12, "containerName": "config",
-              "location": { "uri": "file:///p/src/config.rs", "range": { "start": { "line": 4, "character": 7 }, "end": { "line": 4, "character": 12 } } } },
+              "location": { "uri": file("/p/src/config.rs").1, "range": { "start": { "line": 4, "character": 7 }, "end": { "line": 4, "character": 12 } } } },
             // WorkspaceSymbol may point at a file only.
-            { "name": "Config", "kind": 23, "location": { "uri": "file:///p/src/lib.rs" } },
+            { "name": "Config", "kind": 23, "location": { "uri": lib_uri } },
         ]);
         let symbols = workspace_symbols(&value);
         assert_eq!(symbols.len(), 2);
         assert_eq!((symbols[0].0.as_str(), symbols[0].1.as_deref()), ("parse", Some("config")));
         assert_eq!(symbols[0].2.range.start, Position { line: 4, character: 7 });
-        assert_eq!(symbols[1].2.path, PathBuf::from("/p/src/lib.rs"));
+        assert_eq!(symbols[1].2.path, lib);
         assert_eq!(symbols[1].2.range, LspRange::default());
     }
 
@@ -681,10 +689,10 @@ mod tests {
 
     #[test]
     fn uris() {
-        let path = Path::new("/tmp/a b/é.rs");
-        let uri = path_to_uri(path);
-        assert_eq!(uri, "file:///tmp/a%20b/%C3%A9.rs");
-        assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
+        let (path, plain) = file("/tmp/a b/é.rs");
+        let uri = path_to_uri(&path);
+        assert_eq!(uri, plain.replace(' ', "%20").replace('é', "%C3%A9"));
+        assert_eq!(uri_to_path(&uri), Some(path));
     }
 
     #[test]
@@ -700,14 +708,15 @@ mod tests {
 
     #[test]
     fn parses_locations_and_edits() {
-        let link = json!([{ "targetUri": "file:///a.rs", "targetRange": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
+        let (a, a_uri) = file("/a.rs");
+        let link = json!([{ "targetUri": a_uri, "targetRange": {"start": {"line": 0, "character": 0}, "end": {"line": 5, "character": 1}},
             "targetSelectionRange": {"start": {"line": 1, "character": 3}, "end": {"line": 1, "character": 6}} }]);
         let locs = locations(&link);
-        assert_eq!(locs[0].path, PathBuf::from("/a.rs"));
+        assert_eq!(locs[0].path, a);
         assert_eq!(locs[0].range.start, Position { line: 1, character: 3 });
         assert!(locations(&Value::Null).is_empty());
 
-        let edit = json!({ "changes": { "file:///a.rs": [{ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x" }] } });
+        let edit = json!({ "changes": { a_uri: [{ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x" }] } });
         let files = workspace_edit(&edit);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1[0].new_text, "x");

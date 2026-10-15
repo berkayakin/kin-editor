@@ -315,10 +315,11 @@ impl Workspace {
             .children(binding_label(&FindAction, window).map(|k| kbd(k, cx)))
             .child("for any command");
 
-        div()
+        let page = div()
             .id("welcome")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.welcome_scroll)
             .bg(theme.background)
             .child(
                 div()
@@ -349,7 +350,8 @@ impl Workspace {
                             )
                             .child(tip),
                     ),
-            )
+            );
+        div().relative().size_full().child(page).child(crate::ui::scrollbar("welcome-scrollbar", &self.welcome_scroll, cx))
     }
 
     /// The welcome screen's Git card: repository state and actions, or a way

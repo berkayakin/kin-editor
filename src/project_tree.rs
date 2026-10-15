@@ -211,7 +211,7 @@ impl Render for ProjectTree {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let drop_on_root = self.drop_target.is_some() && self.drop_target == self.root;
-        uniform_list(
+        let list = uniform_list(
             "file-tree",
             self.entries.len(),
             cx.processor(move |tree, range: std::ops::Range<usize>, _window, cx| {
@@ -355,7 +355,8 @@ impl Render for ProjectTree {
                     cx.emit(TreeEvent::Menu { path: root, is_dir: true, position: ev.position });
                 }
             }),
-        )
+        );
+        div().relative().size_full().child(list).child(crate::ui::list_scrollbar("file-tree-scrollbar", &self.scroll, cx))
     }
 }
 

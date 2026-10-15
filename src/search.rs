@@ -241,7 +241,7 @@ mod tests {
             std::fs::write(dir.join(file), "").unwrap();
         }
         let names = |files: Vec<PathBuf>| -> Vec<String> {
-            files.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect()
+            files.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect()
         };
         assert_eq!(names(project_files(&dir)), [".gitignore", "config/partners.yml.example"]);
         std::fs::remove_dir_all(&dir).unwrap();

@@ -130,6 +130,7 @@ pub struct GitLog {
     loading: bool,
     error: Option<String>,
     scroll: UniformListScrollHandle,
+    details_scroll: gpui::ScrollHandle,
     focus_handle: FocusHandle,
     load_task: Option<Task<()>>,
     details_task: Option<Task<()>>,
@@ -155,6 +156,7 @@ impl GitLog {
             loading: false,
             error: None,
             scroll: UniformListScrollHandle::new(),
+            details_scroll: gpui::ScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             load_task: None,
             details_task: None,
@@ -323,7 +325,13 @@ impl GitLog {
 
     fn render_details(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let panel = div().id("log-details").w(px(380.)).flex_shrink_0().h_full().border_l_1().border_color(theme.border_subtle).overflow_y_scroll();
+        let panel = div()
+            .id("log-details")
+            .size_full()
+            .border_l_1()
+            .border_color(theme.border_subtle)
+            .overflow_y_scroll()
+            .track_scroll(&self.details_scroll);
         let entry = self.selected.and_then(|i| self.entries.get(i)).cloned();
         let (Some(entry), Some(details)) = (entry, self.details.as_ref()) else {
             return panel.child(div().p_3().text_color(theme.text_dim).child("Select a commit"));
@@ -568,7 +576,31 @@ impl Render for GitLog {
             .flex_col()
             .size_full()
             .child(header)
-            .child(div().flex().flex_1().min_h_0().child(list).child(self.render_details(cx)))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(list)
+                            .child(crate::ui::list_scrollbar("log-commits-scrollbar", &self.scroll, cx)),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w(px(380.))
+                            .flex_shrink_0()
+                            .h_full()
+                            .child(self.render_details(cx))
+                            .child(crate::ui::scrollbar("log-details-scrollbar", &self.details_scroll, cx)),
+                    ),
+            )
     }
 }
 
