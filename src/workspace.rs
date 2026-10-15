@@ -342,6 +342,8 @@ enum TabAction {
     SplitRight,
     SplitDown,
     SelectInTree,
+    /// From the tab strip's overflow menu.
+    Activate,
 }
 
 /// What a context menu item does.
@@ -419,6 +421,33 @@ const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 const TITLEBAR_HEIGHT: f32 = 40.0;
 const STATUSBAR_HEIGHT: f32 = 30.0;
 const TAB_HEIGHT: f32 = 38.0;
+/// The editor tabs' strip on the chrome above each pane; the pane's island
+/// starts 1px above its bottom, so the current tab covers the island's top
+/// border and joins it.
+const TAB_STRIP_HEIGHT: f32 = 38.0;
+/// Room above the tabs in their strip.
+const TAB_STRIP_TOP: f32 = 6.0;
+const TAB_RADIUS: f32 = 10.0;
+/// The concave corners joining the current tab to its island.
+const TAB_FOOT: f32 = 8.0;
+/// A tab strip's padding at each end: the island's corner radius plus a
+/// foot, so the end tabs' feet land on the island's straight edge.
+const TAB_STRIP_INSET: f32 = crate::ui::ISLAND_RADIUS + TAB_FOOT;
+/// Tab widths when they don't all fit (see `fit_tabs`).
+/// Below this, a name is too short to read: inactive tabs show only their icon.
+const TAB_NAMED_MIN: f32 = 96.0;
+const TAB_ACTIVE_MIN: f32 = 140.0;
+const TAB_ICON_WIDTH: f32 = 40.0;
+/// The "⋯ N" button listing the tabs that don't fit.
+const TAB_OVERFLOW_WIDTH: f32 = 48.0;
+/// A tab's padding, icon, gaps and close button, around its name.
+const TAB_CHROME: f32 = 63.0;
+/// The error dot and its gap, when the file has errors.
+const TAB_ERROR_DOT: f32 = 12.0;
+/// A compact tab's padding, icon and gap: no close button (see `TabSlot::Compact`).
+const TAB_COMPACT_CHROME: f32 = 39.0;
+/// Narrower than this, a compact tab couldn't show a character and "…": icon only.
+const TAB_COMPACT_MIN: f32 = 54.0;
 const TREE_ROW_HEIGHT: f32 = 26.0;
 
 
@@ -2290,6 +2319,10 @@ impl Workspace {
             TabAction::SelectInTree => {
                 self.activate_editor(editor, window, cx);
                 self.select_opened_file(&SelectOpenedFile, window, cx);
+                return;
+            }
+            TabAction::Activate => {
+                self.activate_editor(editor, window, cx);
                 return;
             }
             TabAction::SplitRight | TabAction::SplitDown => {
@@ -5905,87 +5938,83 @@ impl Workspace {
                 .into_any_element()
         };
 
-        island(&theme)
+        // Files and Commit are tabs on the chrome, like the editor's, the
+        // current one joined to the island.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
             .w(self.sidebar_width)
             .flex_shrink_0()
             .h_full()
-            .child(self.render_sidebar_switch(cx))
-            .children(header)
-            .child(body)
-            // Deferred so the grab area sits above the editor it overlaps.
-            .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx)))
+            .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
+            .child(
+                island(&theme)
+                    .flex_1()
+                    .min_h_0()
+                    .children(header)
+                    .child(body)
+                    // Deferred so the grab area sits above the editor it overlaps.
+                    .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx))),
+            )
+            // After the island, so the current tab paints over its top border.
+            .child(self.render_sidebar_tabs(cx))
     }
 
-    /// The sidebar's two views as a segmented switch across its top: a recessed
-    /// track (the chrome's color) with the current view raised, and as tall as
-    /// the tab bar so the two line up.
-    fn render_sidebar_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The sidebar's two views as tabs above its island, shaped like the
+    /// editor's (`tab_shape`), without close buttons.
+    fn render_sidebar_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let files_on = self.sidebar_mode == SidebarMode::Files;
         let changes = self.git_status.files.len();
-        let segment = |id: &'static str, icon: Icon, label: &'static str, on: bool| {
-            div()
+        let edge = Hsla::from(theme.border).alpha(0.75);
+        let tab = |id: &'static str, icon: Icon, label: &'static str, on: bool, after_active: bool| {
+            let tab = div()
                 .id(id)
+                .group(id)
                 .relative()
-                .flex_1()
-                .min_w_0()
-                .h(px(24.))
                 .flex()
+                .flex_shrink_0()
                 .items_center()
-                .justify_center()
-                .gap_2()
-                .px_2p5()
-                .rounded(px(7.))
-                .border_1()
-                .border_color(gpui::transparent_black())
+                .gap_1p5()
+                .h_full()
+                .px_3()
                 .cursor_pointer()
-                .text_size(px(12.5))
-                .font_weight(FontWeight::MEDIUM)
                 .text_color(if on { theme.text } else { theme.text_muted })
-                .when(on, |el| el.bg(theme.elevated).border_color(theme.border_subtle).shadow(soft_shadow(&theme, 1)))
-                .when(!on, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
+                .when(on, |el| el.font_weight(FontWeight::MEDIUM));
+            tab_shape(tab, on, after_active, false, id.into(), edge, &theme)
                 .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
-                .child(div().truncate().child(label))
+                .child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label))
         };
         div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TAB_STRIP_HEIGHT))
             .flex()
-            .items_center()
-            .flex_shrink_0()
-            .h(px(TAB_HEIGHT - ISLAND_INSET))
-            .pb(px(ISLAND_INSET))
-            // A little room before the list starts.
-            .mb(px(2.))
+            .items_end()
+            .pt(px(TAB_STRIP_TOP))
+            // Clear of the island's rounded corner, like the editor's tabs.
+            .pl(px(TAB_STRIP_INSET))
             .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .gap(px(2.))
-                    .p(px(2.))
-                    .rounded(px(10.))
-                    .bg(theme.panel)
-                    .border_1()
-                    .border_color(Hsla::from(theme.border).alpha(0.6))
-                    .child(
-                        segment("sidebar-files", Icon::Folder, "Files", files_on)
-                            .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
-                            .on_click(cx.listener(|ws, _, window, cx| ws.show_files(window, cx))),
-                    )
-                    .child(
-                        segment("sidebar-commit", Icon::GitBranch, "Commit", !files_on)
-                            // Uncommitted changes, so they show from the Files view too.
-                            .when(changes > 0, |el| {
-                                el.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(11.5))
-                                        .text_color(if files_on { theme.text_dim } else { theme.accent })
-                                        .child(changes.to_string()),
-                                )
-                            })
-                            .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx))
-                            .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
-                    ),
+                tab("sidebar-files", Icon::Folder, "Files", files_on, false)
+                    .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.show_files(window, cx))),
+            )
+            .child(
+                tab("sidebar-commit", Icon::GitBranch, "Commit", !files_on, files_on)
+                    // Uncommitted changes, so they show from the Files view too.
+                    .when(changes > 0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(if files_on { theme.text_dim } else { theme.accent })
+                                .child(changes.to_string()),
+                        )
+                    })
+                    .tooltip(|window, cx| status_tooltip("Commit", &ToggleCommit, window, cx))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
             )
     }
 
@@ -6058,34 +6087,100 @@ impl Workspace {
             .child(label)
     }
 
-    fn render_tab_bar(&self, pane_ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The pane's tabs, like a browser's: on the chrome above the pane's
+    /// island, the current one filled like the island and joined to it.
+    /// `edge` is the island's border color, which the current tab continues.
+    fn render_tab_bar(&self, pane_ix: usize, edge: Hsla, available: Option<f32>, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
+        // Each name's real width (in the current tab's medium weight, the wider
+        // one), so tabs are as wide as their names and add up exactly.
+        let font = gpui::Font { weight: FontWeight::MEDIUM, ..gpui::font(theme.ui_font.clone()) };
+        let name_widths: Vec<(f32, usize)> = pane
+            .tabs
+            .iter()
+            .map(|e| {
+                let name = e.read(cx).doc.file_name();
+                let len = name.chars().count();
+                let run = gpui::TextRun {
+                    len: name.len(),
+                    font: font.clone(),
+                    color: theme.text.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let width = window.text_system().shape_line(name.into(), px(theme.ui_font_size), &[run], None).width;
+                (f32::from(width), len.max(1))
+            })
+            .collect();
+        let naturals: Vec<f32> = pane
+            .tabs
+            .iter()
+            .zip(&name_widths)
+            .map(|(e, (w, _))| {
+                let errors = e.read(cx).doc.diagnostics.iter().any(|d| d.severity == Severity::Error);
+                (TAB_CHROME + w + if errors { TAB_ERROR_DOT } else { 0. }).ceil()
+            })
+            .collect();
+        let slots = fit_tabs(&naturals, pane.active, available.unwrap_or(f32::INFINITY));
+        let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i] != TabSlot::Hidden).collect();
+        let hidden: Vec<Entity<Editor>> =
+            (0..slots.len()).filter(|&i| slots[i] == TabSlot::Hidden).map(|i| pane.tabs[i].clone()).collect();
         div()
             .id(("tabs", pane_ix))
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TAB_STRIP_HEIGHT))
             .flex()
             .flex_row()
-            .items_center()
-            .gap(px(2.))
-            .flex_shrink_0()
-            .h(px(TAB_HEIGHT - ISLAND_INSET))
-            .w_full()
-            .pb(px(ISLAND_INSET))
-            .overflow_x_scroll()
+            .items_end()
+            .pt(px(TAB_STRIP_TOP))
+            // Clear of the island's rounded corners on both sides, so the first
+            // and last tabs' feet sit on its straight top edge.
+            .pl(px(TAB_STRIP_INSET))
+            .pr(px(TAB_STRIP_INSET))
+            // No scrolling, which would cut the current tab's shape at the edge:
+            // like a browser, tabs shrink to fit, down to their icon.
+            .overflow_hidden()
             // Dropping on the bar's empty part moves the tab to the end.
             .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
                 ws.move_tab(&dragged.editor, pane_ix, None, window, cx);
             }))
-            .children(pane.tabs.iter().enumerate().map(|(ix, editor)| {
+            .children(visible.iter().enumerate().map(|(pos, &ix)| {
+                let editor = &pane.tabs[ix];
+                let slot = slots[ix];
                 let e = editor.read(cx);
                 let active = ix == pane.active;
+                let next = visible.get(pos + 1).copied();
+                // Separators only between two tabs that sit on the chrome.
+                let separator = !active && next.is_some_and(|n| n != pane.active);
+                let after_active = pos > 0 && visible[pos - 1] == pane.active;
+                let icon_only = matches!(slot, TabSlot::Icon(_));
+                let compact = matches!(slot, TabSlot::Compact(_));
                 let pinned = self.pinned.contains(&editor.entity_id());
                 let dirty = e.doc.is_dirty();
                 let errors = e.doc.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
                 let icon = file_icon(e.doc.path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
                 let name = e.doc.file_name();
+                let shown_name = match slot {
+                    // Shortened only when the slot is narrower than the name needs,
+                    // by the name's own average character width.
+                    TabSlot::Fixed(w) if w < naturals[ix] => {
+                        let (text, len) = name_widths[ix];
+                        let room = w - (naturals[ix] - text);
+                        ellipsize(&name, (room / (text / len as f32)).max(1.) as usize)
+                    }
+                    TabSlot::Compact(w) if w - TAB_COMPACT_CHROME < name_widths[ix].0 => {
+                        let (text, len) = name_widths[ix];
+                        ellipsize(&name, ((w - TAB_COMPACT_CHROME) / (text / len as f32)).max(1.) as usize)
+                    }
+                    _ => name.clone(),
+                };
                 let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
                 let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
                 let (for_close, for_menu, for_drag, for_unpin) = (editor.clone(), editor.clone(), editor.clone(), editor.clone());
@@ -6096,20 +6191,20 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .h(px(28.))
-                    .pl_2p5()
-                    .pr_1()
+                    .h_full()
                     .flex_shrink_0()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(gpui::transparent_black())
-                    .cursor_pointer()
-                    // The current tab is raised; in the focused pane it's lit underneath.
-                    .when(active && focused_pane, |el| {
-                        el.bg(theme.elevated).border_color(theme.border_subtle).child(tab_glow(&theme))
+                    .map(|el| match slot {
+                        TabSlot::Natural => el.w(px(naturals[ix])).pl_3().pr_1p5(),
+                        TabSlot::Fixed(w) | TabSlot::Compact(w) => el.w(px(w)).pl_3().pr_1p5(),
+                        TabSlot::Icon(w) => el.w(px(w)).justify_center(),
+                        TabSlot::Hidden => el,
                     })
-                    .when(active && !focused_pane, |el| el.bg(theme.hover))
-                    .when(!active, |el| el.hover(|s| s.bg(theme.hover)))
+                    .cursor_pointer()
+                    .map(|el| tab_shape(el, active, after_active, separator, group.clone(), edge, &theme))
+                    .when(icon_only || compact, |el| {
+                        let name = name.clone();
+                        el.tooltip(move |_, cx| tooltip_view(name.clone(), cx))
+                    })
                     .on_click(cx.listener(move |ws, _, window, cx| ws.activate_in(pane_ix, ix, window, cx)))
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -6132,12 +6227,23 @@ impl Workspace {
                         ws.move_tab(&dragged.editor, pane_ix, Some(ix), window, cx);
                     }))
                     .child(icon)
-                    .child(div().text_color(name_color).when(active, |el| el.font_weight(FontWeight::MEDIUM)).child(name))
+                    .when(!icon_only, |el| el.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_color(name_color)
+                            .when(active, |el| el.font_weight(FontWeight::MEDIUM))
+                            .when(!active, |el| el.group_hover(group.clone(), |s| s.text_color(theme.text)))
+                            .child(shown_name),
+                    ))
                     // Files with errors get a small dot rather than a recolored name.
-                    .when(errors > 0, |el| el.child(div().size(px(6.)).rounded_full().bg(theme.error)))
-                    .child(
+                    .when(errors > 0 && !icon_only && !compact, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.error)))
+                    .when(!icon_only && !compact, |el| el.child(
                         div()
                             .id(SharedString::from(format!("close-{pane_ix}-{ix}")))
+                            .flex_shrink_0()
                             .size(px(18.))
                             .flex()
                             .items_center()
@@ -6178,8 +6284,55 @@ impl Workspace {
                                     )
                                 }
                             }),
-                    )
+                    ))
             }))
+            // The tabs that don't fit, in a menu.
+            .when(!hidden.is_empty(), |el| {
+                let count = hidden.len();
+                el.child(
+                    div()
+                        .id(("tabs-overflow", pane_ix))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .w(px(TAB_OVERFLOW_WIDTH - 8.))
+                        .h(px(24.))
+                        .ml_1()
+                        .mb(px(4.))
+                        .rounded(px(8.))
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                        .tooltip(move |_, cx| tooltip_view(format!("{count} more tab{}", plural(count)), cx))
+                        .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
+                            let entries = hidden.iter().map(|e| MenuEntry::item(e.read(cx).doc.file_name(), Icon::File)).collect();
+                            let actions = hidden.iter().map(|e| Some(MenuAction::Tab(TabAction::Activate, e.clone()))).collect();
+                            ws.show_context_menu(entries, actions, event.position(), None, window, cx);
+                        }))
+                        .child("⋯")
+                        .child(count.to_string()),
+                )
+            })
+    }
+
+    /// The room for a pane's tabs, from the panes' bounds in the last frame
+    /// (None before the first).
+    fn tab_strip_width(&self, pane_ix: usize) -> Option<f32> {
+        let total = f32::from(self.panes_bounds.get().size.width);
+        if total <= 0. {
+            return None;
+        }
+        let pane = match self.pane_axis {
+            PaneAxis::Row => {
+                let gaps = GAP * (self.panes.len() - 1) as f32;
+                (total - gaps) * self.pane_sizes.get(pane_ix).copied().unwrap_or(1.)
+            }
+            PaneAxis::Column => total,
+        };
+        Some(pane - 2. * TAB_STRIP_INSET)
     }
 
     /// The editor area: panes side by side or stacked, with dividers.
@@ -6214,7 +6367,11 @@ impl Workspace {
             island(Theme::get(cx))
                 .id("diff-layer")
                 .absolute()
-                .inset_0()
+                // Over the islands, under the tab strip: activating a tab closes it.
+                .top(px(TAB_STRIP_HEIGHT - 1.))
+                .left_0()
+                .right_0()
+                .bottom_0()
                 .occlude()
                 .child(div().size_full().overflow_hidden().child(view)),
         )
@@ -6243,16 +6400,17 @@ impl Workspace {
         };
         let multiple = self.panes.len() > 1;
         let drop_group = SharedString::from(format!("pane-drop-{pane_ix}"));
-        island(&theme)
+        // With splits, the pane that has the keyboard is outlined (its current tab too).
+        let edge: Hsla = if multiple && pane_ix == self.active_pane {
+            Hsla::from(theme.accent).alpha(0.35)
+        } else {
+            Hsla::from(theme.border).alpha(0.75)
+        };
+        let island = island(&theme)
+            .flex_1()
             .min_w_0()
             .min_h_0()
-            .map(|el| match self.pane_axis {
-                PaneAxis::Row => el.h_full().w(share),
-                PaneAxis::Column => el.w_full().h(share),
-            })
-            // With splits, the pane that has the keyboard is outlined.
-            .when(multiple && pane_ix == self.active_pane, |el| el.border_color(Hsla::from(theme.accent).alpha(0.35)))
-            .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, cx)))
+            .border_color(edge)
             .when_some(pane.tabs.get(pane.active).cloned(), |el, editor| el.children(self.render_breadcrumbs(&editor, cx)))
             .when(self.show_find && pane_ix == self.active_pane && !pane.tabs.is_empty(), |el| {
                 el.child(self.find_bar.clone())
@@ -6275,6 +6433,23 @@ impl Workspace {
                     }))
                     .child(content),
             )
+            .when(pane_ix + 1 < self.panes.len(), |el| el.child(self.resize_handle(Edge::Pane(pane_ix), cx)));
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .min_h_0()
+            .map(|el| match self.pane_axis {
+                PaneAxis::Row => el.h_full().w(share),
+                PaneAxis::Column => el.w_full().h(share),
+            })
+            // The tab strip's room on the chrome (kept without tabs too, so the
+            // island lines up with the sidebar's).
+            .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
+            .child(island)
+            // After the island, so the current tab paints over its top border.
+            .when(!pane.tabs.is_empty(), |el| el.child(self.render_tab_bar(pane_ix, edge, self.tab_strip_width(pane_ix), window, cx)))
             // Finder files dragged anywhere over the pane (tabs included) open in it.
             .group(drop_group.clone())
             .child(
@@ -6321,7 +6496,6 @@ impl Workspace {
                         ),
                     ),
             )
-            .when(pane_ix + 1 < self.panes.len(), |el| el.child(self.resize_handle(Edge::Pane(pane_ix), cx)))
             .into_any_element()
     }
 
@@ -7937,6 +8111,267 @@ fn tab_glow(theme: &Theme) -> impl IntoElement {
         .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(accent, 0.), gpui::linear_color_stop(clear, 1.))))
 }
 
+/// How a tab fits its strip.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TabSlot {
+    /// As wide as its name needs.
+    Natural,
+    /// This wide, the name shortened to fit.
+    Fixed(f32),
+    /// This wide, the icon and as much of the name as fits, without the
+    /// close button (it still closes with a middle click or its menu).
+    Compact(f32),
+    /// This wide, just the icon.
+    Icon(f32),
+    /// In the overflow menu.
+    Hidden,
+}
+
+/// Fits tabs whose names want `naturals` widths into `available`: as they
+/// are when they fit; else only the widest shrink, all to the same limit
+/// (short names stay whole); else the current tab keeps its name and the
+/// others show their icons; and when even those don't fit, the tabs farthest
+/// from the current one go to the overflow menu. The current tab is never
+/// hidden. Widths are whole points, so tab edges stay on pixels.
+fn fit_tabs(naturals: &[f32], active: usize, available: f32) -> Vec<TabSlot> {
+    let n = naturals.len();
+    if n == 0 || naturals.iter().sum::<f32>() <= available {
+        return vec![TabSlot::Natural; n];
+    }
+    let limit = shared_limit(naturals, available);
+    if limit >= TAB_NAMED_MIN {
+        return naturals.iter().map(|&w| if w <= limit { TabSlot::Natural } else { TabSlot::Fixed(limit) }).collect();
+    }
+    let active_width = naturals[active].clamp(TAB_ICON_WIDTH, TAB_ACTIVE_MIN).floor();
+    let others = (n - 1) as f32;
+    let mut slots = vec![TabSlot::Hidden; n];
+    slots[active] = TabSlot::Fixed(active_width);
+    // The others drop their close buttons and share what's left the same way,
+    // keeping as much of their names as fits.
+    let compact: Vec<f32> =
+        (0..n).filter(|&i| i != active).map(|i| naturals[i] - (TAB_CHROME - TAB_COMPACT_CHROME)).collect();
+    let compact_limit = shared_limit(&compact, available - active_width);
+    if n > 1 && compact_limit >= TAB_COMPACT_MIN {
+        for (ix, slot) in slots.iter_mut().enumerate() {
+            if ix != active {
+                let wanted = naturals[ix] - (TAB_CHROME - TAB_COMPACT_CHROME);
+                *slot = TabSlot::Compact(wanted.min(compact_limit).floor());
+            }
+        }
+        return slots;
+    }
+    if n == 1 || active_width + others * TAB_ICON_WIDTH <= available {
+        let width = ((available - active_width) / others.max(1.)).min(TAB_NAMED_MIN).floor();
+        for (ix, slot) in slots.iter_mut().enumerate() {
+            if ix != active {
+                *slot = TabSlot::Icon(width);
+            }
+        }
+        return slots;
+    }
+    // Room for this many icons beside the current tab and the overflow button,
+    // taken nearest the current tab first.
+    let room = ((available - active_width - TAB_OVERFLOW_WIDTH) / TAB_ICON_WIDTH).max(0.) as usize;
+    let mut shown = 0;
+    for distance in 1..n {
+        for ix in [active.checked_sub(distance), Some(active + distance)].into_iter().flatten() {
+            if ix < n && shown < room {
+                slots[ix] = TabSlot::Icon(TAB_ICON_WIDTH);
+                shown += 1;
+            }
+        }
+    }
+    slots
+}
+
+/// The widest any of `widths` may be so they add up to `available`: the
+/// narrowest keep their widths while what's left, shared by the rest, is still
+/// less than they want. Whole points; infinite when they all fit.
+fn shared_limit(widths: &[f32], available: f32) -> f32 {
+    let mut sorted = widths.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut remaining = available;
+    for (i, width) in sorted.iter().enumerate() {
+        let rest = (sorted.len() - i) as f32;
+        if width * rest > remaining {
+            return (remaining / rest).floor();
+        }
+        remaining -= width;
+    }
+    f32::INFINITY
+}
+
+/// A browser-like tab's shape, around a tab of `TAB_STRIP_HEIGHT - TAB_STRIP_TOP`
+/// on the chrome: the current one island-colored, rounded on top, outlined in
+/// the island's border color `edge` down to its feet, which join it to the
+/// island; the others plain, with a hairline after them (`separator`) and, on
+/// hover (`group`), the same shape, borderless, between the chrome's and the
+/// island's colors, stopping above the island's border.
+///
+/// Tabs paint left to right, so the hover shape of the tab right after the
+/// current one would cover the current tab's right foot: it repaints that
+/// foot on top (`after_active`).
+fn tab_shape(
+    el: Stateful<gpui::Div>,
+    active: bool,
+    after_active: bool,
+    separator: bool,
+    group: SharedString,
+    edge: Hsla,
+    theme: &Theme,
+) -> Stateful<gpui::Div> {
+    let island: Hsla = theme.background.into();
+    if active {
+        // Painted, not laid out: every edge comes from the same pixel-snapped
+        // coordinates, so the outline and the feet meet exactly wherever the
+        // tab lands (separate elements round to device pixels apart).
+        return el.child(
+            gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let s = window.scale_factor();
+                    let snap = |v: Pixels| px((f32::from(v) * s).round() / s);
+                    let (r, radius) = (px(TAB_FOOT), px(TAB_RADIUS));
+                    let left = snap(bounds.left() + r);
+                    let right = snap(bounds.right() - r);
+                    let (top, bottom) = (snap(bounds.top()), snap(bounds.bottom()));
+                    let corners = gpui::Corners { top_left: radius, top_right: radius, ..Default::default() };
+                    window.paint_quad(gpui::fill(Bounds::from_corners(point(left, top), point(right, bottom)), island).corner_radii(corners));
+                    window.paint_quad(
+                        gpui::quad(
+                            Bounds::from_corners(point(left, top), point(right, bottom - r)),
+                            corners,
+                            gpui::transparent_black(),
+                            gpui::Edges { top: px(1.), right: px(1.), bottom: px(0.), left: px(1.) },
+                            edge,
+                            Default::default(),
+                        ),
+                    );
+                    paint_tab_foot(window, left, bottom, true, island, Some(edge));
+                    paint_tab_foot(window, right, bottom, false, island, Some(edge));
+                },
+            )
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(-TAB_FOOT))
+            .right(px(-TAB_FOOT)),
+        );
+    }
+    let hover_fill = Hsla::from(theme.panel).blend(island.alpha(0.5));
+    el.child(
+        div()
+            .absolute()
+            .top_0()
+            .bottom(px(1.))
+            // 1px wider on the left, over the previous tab's separator.
+            .left(px(if after_active { 0. } else { -1. }))
+            .right_0()
+            .rounded_t(px(TAB_RADIUS))
+            .bg(hover_fill)
+            .invisible()
+            .group_hover(group.clone(), |s| s.visible())
+            .when(!after_active, |el| el.child(tab_foot(true, hover_fill, None)))
+            .child(tab_foot(false, hover_fill, None))
+            // The current tab's right foot, back on top, from the same snapped
+            // edge (this tab's left is the current tab's right).
+            .when(after_active, |el| {
+                el.child(
+                    gpui::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            let s = window.scale_factor();
+                            let snap = |v: Pixels| px((f32::from(v) * s).round() / s);
+                            let edge_x = snap(bounds.left() + px(TAB_FOOT));
+                            paint_tab_foot(window, edge_x, snap(bounds.bottom()), false, island, Some(edge));
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    // The hover shape stops 1px above the tab's bottom.
+                    .bottom(px(-1.))
+                    .left(px(-TAB_FOOT))
+                    .w(px(2. * TAB_FOOT)),
+                )
+            }),
+    )
+    .when(separator, |el| {
+        el.child(
+            div()
+                .absolute()
+                .right_0()
+                .top(px(9.))
+                .bottom(px(10.))
+                .w(px(1.))
+                .bg(theme.border)
+                .group_hover(group, |s| s.invisible()),
+        )
+    })
+}
+
+/// Paints a current tab's foot beside its side edge at `x` (the tab's left
+/// edge for the left foot, its right edge for the right one), down to `bottom`:
+/// the same shape as `tab_foot`, from snapped coordinates.
+fn paint_tab_foot(window: &mut Window, x: Pixels, bottom: Pixels, left: bool, fill: Hsla, edge: Option<Hsla>) {
+    let r = px(TAB_FOOT);
+    let one = px(1.);
+    // The square overlaps the tab's 1px border column.
+    let square_x = if left { x - r + one } else { x - one };
+    let square = Bounds { origin: point(square_x, bottom - r), size: size(r, r) };
+    let center = point(if left { square_x } else { square_x + r }, bottom - r);
+    let ring = |width: Pixels, color: Hsla| {
+        let outer = r - one + width;
+        gpui::quad(
+            Bounds { origin: point(center.x - outer, center.y - outer), size: size(outer * 2., outer * 2.) },
+            outer,
+            gpui::transparent_black(),
+            width,
+            color,
+            Default::default(),
+        )
+    };
+    window.with_content_mask(Some(gpui::ContentMask { bounds: square }), |window| {
+        window.paint_quad(ring(r, fill));
+        if let Some(edge) = edge {
+            window.paint_quad(ring(one, edge));
+        }
+    });
+}
+
+/// The concave corner joining the current tab to its island, like a browser
+/// tab's: a square beside the tab's bottom, island-colored except for a
+/// quarter circle at its corner away from the tab, with the island's border
+/// along the curve. GPUI can't clip to curves, so the shape is a thick ring
+/// around that circle, clipped to the square.
+///
+/// The square overlaps the tab's 1px border column and the curve's border runs
+/// from the tab's side border (radius `TAB_FOOT - 1` to `TAB_FOOT` around the
+/// corner) down to the island's top border row, so the lines meet exactly.
+fn tab_foot(left: bool, fill: Hsla, edge: Option<Hsla>) -> gpui::Div {
+    let r = TAB_FOOT;
+    let hole = r - 1.;
+    let ring = |width: f32, color: Hsla| {
+        let outer = hole + width;
+        // Centered on the square's top corner away from the tab.
+        div()
+            .absolute()
+            .top(px(-outer))
+            .left(px(if left { -outer } else { r - outer }))
+            .size(px(2. * outer))
+            .rounded_full()
+            .border(px(width))
+            .border_color(color)
+    };
+    div()
+        .absolute()
+        .bottom_0()
+        .size(px(r))
+        .overflow_hidden()
+        .map(|el| if left { el.left(px(1. - r)) } else { el.right(px(1. - r)) })
+        .child(ring(r, fill))
+        .when_some(edge, |el, edge| el.child(ring(1., edge)))
+}
+
 /// `text` cut to `max` characters with a trailing "…". GPUI's own truncation
 /// doesn't apply in the title bar: a flex row measures text at full width
 /// first, and the text keeps that measurement.
@@ -7945,7 +8380,8 @@ fn ellipsize(text: &str, max: usize) -> String {
         return text.to_string();
     }
     let kept: String = text.chars().take(max.saturating_sub(1)).collect();
-    format!("{}…", kept.trim_end())
+    // "git.…" would read as four dots.
+    format!("{}…", kept.trim_end().trim_end_matches('.'))
 }
 
 /// Search Everywhere's shortcut (double Shift works in every keymap).
@@ -8068,5 +8504,34 @@ mod tests {
         // A cut right after a space doesn't leave it before the ellipsis.
         assert_eq!(ellipsize("my long project", 4), "my…");
         assert_eq!(ellipsize("çok-uzun-isim", 5), "çok-…");
+        assert_eq!(ellipsize("git.rs", 5), "git…");
+    }
+
+    #[test]
+    fn tabs_fit_like_a_browser() {
+        use super::{TAB_ACTIVE_MIN, TAB_ICON_WIDTH, TabSlot::*, fit_tabs};
+        // They fit: as they are.
+        assert_eq!(fit_tabs(&[100., 120.], 0, 400.), vec![Natural, Natural]);
+        // Too wide: only the widest shrink, to a shared limit; short ones stay whole.
+        assert_eq!(fit_tabs(&[300., 300., 300.], 1, 600.), vec![Fixed(200.), Fixed(200.), Fixed(200.)]);
+        assert_eq!(fit_tabs(&[80., 300., 250.], 0, 500.), vec![Natural, Fixed(210.), Fixed(210.)]);
+        assert_eq!(fit_tabs(&[80., 300., 150.], 0, 500.), vec![Natural, Fixed(270.), Natural]);
+        // Crowded: the current tab keeps its name, the others drop their close
+        // buttons and keep what they can of theirs.
+        let slots = fit_tabs(&[150.; 6], 2, 500.);
+        assert_eq!(slots[2], Fixed(TAB_ACTIVE_MIN));
+        assert!(slots.iter().enumerate().all(|(i, s)| i == 2 || *s == Compact(72.)));
+        // A short name stays whole there.
+        assert_eq!(fit_tabs(&[90., 150., 150., 150.], 3, 360.)[0], Compact(66.));
+        // Not even ~3 characters: icons.
+        let slots = fit_tabs(&[150.; 8], 2, 450.);
+        assert!(slots.iter().enumerate().all(|(i, s)| i == 2 || matches!(s, Icon(_))));
+        // Too many even for icons: the farthest go to the menu, never the current one.
+        let slots = fit_tabs(&[150.; 20], 19, 400.);
+        assert_eq!(slots[19], Fixed(TAB_ACTIVE_MIN));
+        assert_eq!(slots[18], Icon(TAB_ICON_WIDTH));
+        assert_eq!(slots[0], Hidden);
+        let shown = slots.iter().filter(|s| **s != Hidden).count() as f32;
+        assert!(TAB_ACTIVE_MIN + (shown - 1.) * TAB_ICON_WIDTH + super::TAB_OVERFLOW_WIDTH <= 400.);
     }
 }
