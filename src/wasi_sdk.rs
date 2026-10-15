@@ -13,22 +13,22 @@ use std::{
 const VERSION: &str = "34.0";
 const TAG: &str = "wasi-sdk-34";
 
-/// This computer's release archive: its platform name, SHA-256 and size in MB.
-fn asset() -> Option<(&'static str, &'static str, u32)> {
+/// This computer's release archive: its platform name, SHA-256 and size.
+fn asset() -> Option<(&'static str, &'static str, u64)> {
     Some(match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("arm64-macos", "9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9", 180),
-        ("macos", "x86_64") => ("x86_64-macos", "87d27fa8adc68dee59bfbf2e22a6d34ef717c34d6bf1d8af2a56fc929d9ce0eb", 182),
-        ("linux", "x86_64") => ("x86_64-linux", "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4", 192),
-        ("linux", "aarch64") => ("arm64-linux", "f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971", 192),
-        ("windows", "x86_64") => ("x86_64-windows", "cccb5c323a9b34f0349a9b09e8804a0a7632c68c3310f4b5f437ed57d7e71d8f", 619),
-        ("windows", "aarch64") => ("arm64-windows", "45e1c71f3e965621e7b98ebe1d37b0e4b1f77f3e8072113ffb4534e67b1a4b7c", 620),
+        ("macos", "aarch64") => ("arm64-macos", "9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9", 180_322_002),
+        ("macos", "x86_64") => ("x86_64-macos", "87d27fa8adc68dee59bfbf2e22a6d34ef717c34d6bf1d8af2a56fc929d9ce0eb", 182_668_326),
+        ("linux", "x86_64") => ("x86_64-linux", "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4", 192_383_077),
+        ("linux", "aarch64") => ("arm64-linux", "f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971", 192_255_247),
+        ("windows", "x86_64") => ("x86_64-windows", "cccb5c323a9b34f0349a9b09e8804a0a7632c68c3310f4b5f437ed57d7e71d8f", 619_003_408),
+        ("windows", "aarch64") => ("arm64-windows", "45e1c71f3e965621e7b98ebe1d37b0e4b1f77f3e8072113ffb4534e67b1a4b7c", 620_307_231),
         _ => return None,
     })
 }
 
 /// The download's size in MB, for asking first; None where there's no build.
-pub fn download_mb() -> Option<u32> {
-    asset().map(|(_, _, mb)| mb)
+pub fn download_mb() -> Option<u64> {
+    asset().map(|(_, _, size)| size.div_ceil(1_000_000))
 }
 
 fn home() -> Option<PathBuf> {
@@ -62,12 +62,12 @@ pub fn install() -> Result<(), String> {
 }
 
 fn install_into(home: &Path) -> Result<(), String> {
-    let (platform, sha256, _) = asset().ok_or("wasi-sdk has no build for this computer")?;
+    let (platform, sha256, size) = asset().ok_or("wasi-sdk has no build for this computer")?;
     let parent = home.parent().ok_or("no folder for toolchains")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let name = format!("wasi-sdk-{VERSION}-{platform}.tar.gz");
     let temp = parent.join(format!("{name}.download"));
-    crate::updater::download(&format!("https://github.com/WebAssembly/wasi-sdk/releases/download/{TAG}/{name}"), &temp)?;
+    crate::updater::download(&format!("https://github.com/WebAssembly/wasi-sdk/releases/download/{TAG}/{name}"), &temp, "wasi-sdk", Some(size))?;
     if crate::updater::sha256_hex(&temp).as_deref() != Some(sha256) {
         std::fs::remove_file(&temp).ok();
         return Err(format!("{name} didn't match its checksum"));

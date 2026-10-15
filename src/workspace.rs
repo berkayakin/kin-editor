@@ -719,6 +719,23 @@ impl Workspace {
         let trust_observer = cx.observe_global::<crate::trust::TrustChanged>(|ws, cx| ws.trust_changed(cx));
         // Extensions load before the first window: it asks for what they wait for.
         cx.defer_in(window, |ws, window, cx| ws.offer_wasi_sdk(window, cx));
+        // Downloads run on other threads: redraw the status bar's progress
+        // while there are any, and once when they start or end.
+        cx.spawn_in(window, async move |this, cx| {
+            let mut seen = crate::downloads::generation();
+            loop {
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+                let generation = crate::downloads::generation();
+                if generation == seen && !crate::downloads::any() {
+                    continue;
+                }
+                seen = generation;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -2123,6 +2140,43 @@ impl Workspace {
         .detach();
     }
 
+    /// Downloads in progress: the first one's name and a bar (how many more
+    /// after it); each one's size, progress and speed in the tooltip, which
+    /// keeps up while it's shown.
+    fn render_downloads(&self, theme: &Theme) -> Option<AnyElement> {
+        let downloads = crate::downloads::active();
+        let first = downloads.first()?;
+        let mut label = first.label.clone();
+        if downloads.len() > 1 {
+            label.push_str(&format!(" +{}", downloads.len() - 1));
+        }
+        let track = Hsla::from(theme.text_muted).alpha(0.25);
+        // Without a percentage yet, a short stub shows it's started.
+        let fill = first.fraction.unwrap_or(0.04).max(0.04);
+        Some(
+            div()
+                .id("downloads")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(24.))
+                .px_2()
+                .text_color(theme.text_muted)
+                .child(icon_el(Icon::Download, px(13.), theme.accent.into()))
+                .child(label)
+                .child(
+                    div()
+                        .w(px(64.))
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(track)
+                        .child(div().h_full().rounded_full().bg(theme.accent).w(relative(fill))),
+                )
+                .tooltip(|_, cx| crate::ui::live_tooltip_view(crate::downloads::summary, cx))
+                .into_any_element(),
+        )
+    }
+
     fn restart_to_update(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = updater::restart(cx) {
             self.toast(ToastKind::Error, "Couldn't install the update", Some(err), cx);
@@ -3352,7 +3406,6 @@ impl Workspace {
             if rx.await != Ok(0) {
                 return;
             }
-            this.update(cx, |ws, cx| ws.toast(ToastKind::Info, "Downloading wasi-sdk…", None, cx)).ok();
             let result = cx.background_executor().spawn(async { crate::wasi_sdk::install() }).await;
             this.update(cx, |ws, cx| match result {
                 Ok(()) => {
@@ -8092,6 +8145,7 @@ impl Workspace {
                 )
             })
             .child(div().flex_1())
+            .when_some(self.render_downloads(&theme), |el, downloads| el.child(downloads))
             .when_some(updater::pending_version(cx).map(|v| format!("Kin {v} is downloaded")), |el, tip| {
                 el.child(
                     div()

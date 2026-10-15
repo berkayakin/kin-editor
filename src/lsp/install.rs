@@ -285,7 +285,7 @@ fn install_github(installer: &Installer, home: &Path, repo: &str, asset: &Asset)
     }
 
     let temp = home.join(format!("{asset}.download"));
-    crate::updater::download(url, &temp)?;
+    crate::updater::download(url, &temp, installer.command, found["size"].as_u64())?;
     // GitHub's digest, where the release has one.
     if let Some(expected) = found["digest"].as_str().and_then(|d| d.strip_prefix("sha256:"))
         && crate::updater::sha256_hex(&temp).as_deref() != Some(expected)
@@ -425,7 +425,7 @@ fn install_node() -> Result<(), String> {
     let home = servers_dir().ok_or("Kin has no config folder")?.join("node");
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let temp = home.join(format!("{name}.download"));
-    crate::updater::download(&format!("{base}/{name}"), &temp)?;
+    crate::updater::download(&format!("{base}/{name}"), &temp, "Node.js", None)?;
     if crate::updater::sha256_hex(&temp).as_deref() != Some(expected.as_str()) {
         std::fs::remove_file(&temp).ok();
         return Err("the Node.js download didn't match its checksum".into());

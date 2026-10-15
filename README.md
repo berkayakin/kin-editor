@@ -287,7 +287,9 @@ project's `node_modules/.bin` or venv, else one on your PATH (also the login she
 `~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kin is opened from the Dock).
 
 If none is installed, the status bar offers **Install <server>**: one click puts it in Kin's own
-folder (`~/.config/kin/servers/`) and starts it. rust-analyzer, taplo and marksman come from their
+folder (`~/.config/kin/servers/`) and starts it. While Kin downloads anything (a server, Node.js,
+wasi-sdk, an update), the status bar shows its progress; the tooltip lists each download's size,
+progress and speed. rust-analyzer, taplo and marksman come from their
 GitHub releases (checked against GitHub's SHA-256); vtsls, basedpyright, intelephense, the
 vscode-langservers (HTML, CSS, JSON), yaml-language-server and bash-language-server are npm
 packages, installed with your Node.js or, without one, a Node.js LTS Kin downloads once (checked

@@ -395,25 +395,48 @@ pub struct Tooltip(pub SharedString);
 
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
-        popover(theme)
-            // Block, not the popover's flex column: in a column GPUI sizes the
-            // box for one unwrapped line, and wrapped text spills out of it.
-            .block()
-            .max_w(px(420.))
-            .px_2()
-            .py_1()
-            .rounded(px(8.))
-            .text_size(px(12.))
-            .text_color(theme.text)
-            .font_family(theme.ui_font.clone())
-            .child(self.0.clone())
+        tooltip_box(Theme::get(cx)).child(self.0.clone())
     }
+}
+
+fn tooltip_box(theme: &Theme) -> Div {
+    popover(theme)
+        // Block, not the popover's flex column: in a column GPUI sizes the
+        // box for one unwrapped line, and wrapped text spills out of it.
+        .block()
+        .max_w(px(420.))
+        .px_2()
+        .py_1()
+        .rounded(px(8.))
+        .text_size(px(12.))
+        .text_color(theme.text)
+        .font_family(theme.ui_font.clone())
 }
 
 pub fn tooltip_view(text: impl Into<SharedString>, cx: &mut App) -> AnyView {
     let text = text.into();
     cx.new(|_| Tooltip(text)).into()
+}
+
+/// A tooltip whose text changes while it's shown (GPUI builds a tooltip's
+/// view once per hover): `text` is read again every quarter second.
+pub struct LiveTooltip {
+    text: fn() -> String,
+    tick: Option<gpui::Task<()>>,
+}
+
+impl Render for LiveTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tick = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+        tooltip_box(Theme::get(cx)).child((self.text)())
+    }
+}
+
+pub fn live_tooltip_view(text: fn() -> String, cx: &mut App) -> AnyView {
+    cx.new(|_| LiveTooltip { text, tick: None }).into()
 }
 
 /// The floating panel used by all modal popups: chrome, like the window

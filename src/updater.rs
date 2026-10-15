@@ -206,7 +206,7 @@ fn download_latest() -> Result<Option<(String, PathBuf)>, String> {
     if sha256_hex(&archive).as_deref() != Some(asset.sha256.as_str()) {
         let url = format!("https://github.com/{REPO}/releases/download/v{}/{}", manifest.version, asset.name);
         let partial = dir.join(format!("{}.part", asset.name));
-        download(&url, &partial)?;
+        download(&url, &partial, &format!("Kin {}", manifest.version), None)?;
         if sha256_hex(&partial).as_deref() != Some(asset.sha256.as_str()) {
             std::fs::remove_file(&partial).ok();
             return Err(format!("{} doesn't match the release's checksum.", asset.name));
@@ -270,14 +270,40 @@ pub(crate) fn fetch(url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-pub(crate) fn download(url: &str, to: &Path) -> Result<(), String> {
-    let output = curl()
-        .args(["--max-time", "900", "--output"])
+/// Downloads `url` to `to`, shown as `label` in the status bar while it
+/// runs (from curl's progress bar on stderr, which also carries errors).
+pub(crate) fn download(url: &str, to: &Path, label: &str, size: Option<u64>) -> Result<(), String> {
+    let mut child = command("curl")
+        .args(["--fail", "--show-error", "--location", "--proto", "=https", "--connect-timeout", "20"])
+        .args(["--progress-bar", "--max-time", "900", "--output"])
         .arg(to)
         .arg(url)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("couldn't run curl: {e}"))?;
-    if output.status.success() { Ok(()) } else { Err(curl_error(&output.stderr)) }
+    let tracker = crate::downloads::start(label, to, size);
+    let mut errors = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let (mut buffer, mut pending) = ([0u8; 1024], String::new());
+        while let Ok(n) = std::io::Read::read(&mut stderr, &mut buffer) {
+            if n == 0 {
+                break;
+            }
+            pending.push_str(&String::from_utf8_lossy(&buffer[..n]));
+            if let Some(fraction) = crate::downloads::parse_curl_progress(&pending) {
+                tracker.set_fraction(fraction);
+            }
+            // Keeps the unfinished segment; error lines are kept whole.
+            if let Some(end) = pending.rfind(['\r', '\n']) {
+                errors.extend(pending[..end].split(['\r', '\n']).filter(|l| l.starts_with("curl:")).map(|l| format!("{l}\n")));
+                pending.drain(..=end);
+            }
+        }
+        errors.push_str(&pending);
+    }
+    let status = child.wait().map_err(|e| format!("curl failed: {e}"))?;
+    if status.success() { Ok(()) } else { Err(curl_error(errors.as_bytes())) }
 }
 
 fn curl_error(stderr: &[u8]) -> String {

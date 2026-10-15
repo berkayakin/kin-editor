@@ -13,6 +13,7 @@ mod dap;
 mod debugger;
 mod diff_view;
 mod document;
+mod downloads;
 mod editor;
 mod extensions;
 mod editorconfig;
