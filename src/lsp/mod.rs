@@ -195,6 +195,11 @@ pub struct LspStore {
     diagnostics: HashMap<(PathBuf, ServerKey), Value>,
     /// Work-done progress per server, by token.
     progress: HashMap<ServerKey, HashMap<String, Progress>>,
+    /// Which start of each server is current: a server replaced by a
+    /// restart may still answer, start late or exit, and mustn't touch its
+    /// successor's state.
+    generations: HashMap<ServerKey, u64>,
+    next_generation: u64,
     /// Each started server's spec, program and the configuration it was
     /// given, to answer `workspace/configuration` and notice changes.
     configs: HashMap<ServerKey, (&'static servers::ServerSpec, PathBuf, servers::ServerConfig)>,
@@ -213,6 +218,8 @@ impl LspStore {
             diagnostics: HashMap::new(),
             progress: HashMap::new(),
             configs: HashMap::new(),
+            generations: HashMap::new(),
+            next_generation: 0,
             #[cfg(test)]
             test_specs: None,
             _tasks: Vec::new(),
@@ -313,6 +320,9 @@ impl LspStore {
         cx: &mut Context<Self>,
     ) {
         self.servers.insert(key.clone(), ServerState::Finding);
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        self.generations.insert(key.clone(), generation);
         cx.notify();
         let user = Settings::get(cx).lsp.clone();
         let task = cx.spawn(async move |this, cx| {
@@ -339,18 +349,27 @@ impl LspStore {
                     spawned
                 })
                 .await;
+            // Stopped or restarted meanwhile: this start is history.
+            let current = |s: &Self| s.generations.get(&key) == Some(&generation);
             let (client, incoming, command) = match spawned {
                 None => {
                     this.update(cx, |s, cx| {
-                        s.servers.insert(key.clone(), ServerState::Missing(spec));
-                        cx.notify();
+                        if current(s) {
+                            s.servers.insert(key.clone(), ServerState::Missing(spec));
+                            cx.notify();
+                        }
                     })
                     .ok();
                     return;
                 }
                 Some((Err(err), c)) => {
                     let message = format!("Couldn't start {}: {err}", c.program.display());
-                    this.update(cx, |s, cx| s.fail(&key, message, cx)).ok();
+                    this.update(cx, |s, cx| {
+                        if current(s) {
+                            s.fail(&key, message, cx);
+                        }
+                    })
+                    .ok();
                     return;
                 }
                 Some((Ok((client, incoming)), c)) => (client, incoming, c),
@@ -358,12 +377,19 @@ impl LspStore {
             let name = command.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let config = servers::config(spec, &command.program, &user);
             let initialization_options = config.initialization_options.clone();
-            this.update(cx, |s, cx| {
+            let started = this.update(cx, |s, cx| {
+                if !current(s) {
+                    return false;
+                }
                 s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec));
                 s.configs.insert(key.clone(), (spec, command.program.clone(), config));
-                s.listen(key.clone(), incoming, cx);
-            })
-            .ok();
+                s.listen(key.clone(), generation, incoming, cx);
+                true
+            });
+            if !started.unwrap_or(false) {
+                // Dropping the client stops the process.
+                return;
+            }
 
             let init = client.request("initialize", initialize_params(&key.root, initialization_options));
             let result = match init.await {
@@ -371,7 +397,12 @@ impl LspStore {
                 // An exit is reported (and explained) by `Closed`.
                 Err(err) if err.message == rpc::STOPPED => return,
                 Err(err) => {
-                    this.update(cx, |s, cx| s.fail(&key, format!("{name} failed to start: {err}"), cx)).ok();
+                    this.update(cx, |s, cx| {
+                        if current(s) {
+                            s.fail(&key, format!("{name} failed to start: {err}"), cx);
+                        }
+                    })
+                    .ok();
                     return;
                 }
             };
@@ -394,6 +425,9 @@ impl LspStore {
             };
             let server = Arc::new(Server { id: key.id.clone(), name, client, encoding, capabilities, sync });
             this.update(cx, |s, cx| {
+                if !current(s) {
+                    return;
+                }
                 s.servers.insert(key.clone(), ServerState::Running(server.clone()));
                 let waiting: Vec<PathBuf> =
                     s.documents.iter().filter(|(_, d)| d.has(&key) && !d.opened(&key)).map(|(p, _)| p.clone()).collect();
@@ -415,10 +449,16 @@ impl LspStore {
     }
 
     /// Handles what the server sends on its own until it exits.
-    fn listen(&mut self, key: ServerKey, mut incoming: futures::channel::mpsc::UnboundedReceiver<Incoming>, cx: &mut Context<Self>) {
+    fn listen(&mut self, key: ServerKey, generation: u64, mut incoming: futures::channel::mpsc::UnboundedReceiver<Incoming>, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |this, cx| {
             while let Some(message) = incoming.next().await {
-                if this.update(cx, |s, cx| s.handle(&key, message, cx)).is_err() {
+                let handled = this.update(cx, |s, cx| {
+                    // A replaced server's last words (its exit above all) are ignored.
+                    if s.generations.get(&key) == Some(&generation) {
+                        s.handle(&key, message, cx);
+                    }
+                });
+                if handled.is_err() {
                     break;
                 }
             }
@@ -766,6 +806,7 @@ impl LspStore {
             self.servers.remove(key);
             self.progress.remove(key);
             self.configs.remove(key);
+            self.generations.remove(key);
         }
         self.reregister(|d| keys.iter().any(|key| d.has(key)), cx);
     }
@@ -805,6 +846,7 @@ impl LspStore {
         let clients: Vec<Arc<Client>> = self.servers.keys().cloned().collect::<Vec<_>>().iter().filter_map(|k| self.client(k)).collect();
         self.servers.clear();
         self.configs.clear();
+        self.generations.clear();
         self.documents.clear();
         if !clients.is_empty() {
             std::thread::spawn(move || clients.iter().for_each(|c| c.shutdown()));

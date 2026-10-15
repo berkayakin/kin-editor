@@ -1142,6 +1142,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_restarted_server_outlives_its_predecessor(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.ts");
+        std::fs::write(&path, "x\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("restarted", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let ready = |cx: &mut TestAppContext| store.read_with(cx, |s, _| matches!(s.status(&path), Some(LspStatus::Ready(_))));
+        wait_for(cx, "the first server", ready);
+        store.update(cx, |s, cx| s.restart(&path, cx));
+        wait_for(cx, "the second server", ready);
+        // The first one exits after the restart; that's not the new one failing.
+        std::thread::sleep(Duration::from_millis(600));
+        cx.run_until_parked();
+        store.read_with(cx, |s, _| assert!(matches!(s.status(&path), Some(LspStatus::Ready(_))), "{:?}", s.status(&path)));
+        store.update(cx, |s, _| s.shutdown_all());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
     fn servers_get_their_settings(cx: &mut TestAppContext) {
         if crate::lsp::servers::which("python3").is_none() {
             return;
