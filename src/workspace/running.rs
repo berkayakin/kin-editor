@@ -95,7 +95,9 @@ impl Workspace {
         let subscription = cx.subscribe_in(&session, window, |ws, _, event: &DebugEvent, window, cx| ws.on_debug_event(event, window, cx));
         self.debug = Some((session, subscription));
         // Debug… offers the last one again; a process attached to may be gone.
+        // It's also the selected configuration (Run, the title bar's run widget), as in JetBrains.
         if !matches!(target.debug, Some(DebugSpec::Attach { .. })) {
+            self.last_run = Some(target.clone());
             self.last_debug = Some(target);
         }
         self.bottom = Some(BottomPanel::Debug);

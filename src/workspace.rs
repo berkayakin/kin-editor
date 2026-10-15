@@ -62,13 +62,13 @@ use crate::{
     theme::{self, Theme},
     preferences::{self, Preferences, PreferencesEvent},
     theme_picker::{ThemePicker, ThemePickerEvent},
-    transition::{self, TransitionExt, mix},
+    transition::{self, TransitionExt},
     ui::{Button, DragLabel, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
     updater,
 };
 
 use crate::ui::{
-    GAP, chrome_bg, dock, soft_shadow, file_icon, island, segment_on,
+    GAP, chrome_bg, soft_shadow, file_icon, island,
 };
 
 mod commands;
@@ -327,17 +327,6 @@ impl TerminalGroup {
     fn new(terminal: Entity<TerminalView>) -> Self {
         Self { tabs: vec![terminal], active: 0 }
     }
-}
-
-/// How much the title bar's command capsule shows, by window width.
-#[derive(Clone, Copy)]
-enum Capsule {
-    /// The folder, file and ⇧⇧ hint, this wide.
-    Full(f32),
-    /// Just the file, this wide.
-    Compact(f32),
-    /// A round search button.
-    Button,
 }
 
 /// Where `open_terminal` puts a new terminal.

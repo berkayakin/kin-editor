@@ -222,12 +222,6 @@ impl Workspace {
             );
         }
 
-        // Panel toggles sit in two small docks, like segmented controls.
-        let dock = || dock(&theme);
-        let toggle = |button: Button, on: bool| {
-            button.size(px(20.)).rounded(px(7.)).when(on, |el| segment_on(el, &theme))
-        };
-
         div()
             .flex()
             .flex_row()
@@ -239,25 +233,13 @@ impl Workspace {
             .px(px(GAP))
             .text_size(px(11.5))
             .text_color(theme.text_dim)
-            // Shows or hides the sidebar; its Files / Commit switch is inside it.
-            .child(
-                dock().child(
-                    toggle(
-                        self.icon_button("toggle-sidebar", Icon::PanelLeft, self.show_sidebar, cx, |ws, _, window, cx| {
-                            ws.set_sidebar_visible(!ws.show_sidebar, window, cx)
-                        }),
-                        self.show_sidebar,
-                    )
-                    .tooltip(|_, cx| tooltip_view("Toggle Sidebar", cx)),
-                ),
-            )
             .child(
                 div()
                     .id("diagnostic-counts")
                     .flex()
                     .items_center()
                     .gap_2()
-                    // Same size and rounding as the docks beside it.
+                    // Same size and rounding as the menus on the right.
                     .h(px(24.))
                     .px_2()
                     .rounded(px(9.))
@@ -303,56 +285,5 @@ impl Workspace {
                 )
             })
             .children(right)
-            .child(
-                dock()
-                    .ml_1()
-                    .when(self.repo.is_some(), |el| {
-                        el.child(
-                            toggle(
-                                self.icon_button("toggle-git-log", Icon::GitCommit, self.shows(BottomPanel::GitLog), cx, |ws, _, window, cx| {
-                                    ws.toggle_git_log(&ToggleGitLog, window, cx)
-                                }),
-                                self.shows(BottomPanel::GitLog),
-                            )
-                            .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
-                        )
-                    })
-                    .when(self.debug.is_some(), |el| {
-                        el.child(
-                            toggle(
-                                self.icon_button("toggle-debug", Icon::Bug, self.shows(BottomPanel::Debug), cx, |ws, _, window, cx| {
-                                    ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
-                                }),
-                                self.shows(BottomPanel::Debug),
-                            )
-                            .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
-                        )
-                    })
-                    .child(
-                        toggle(
-                            self.icon_button("toggle-terminal", Icon::Terminal, self.shows(BottomPanel::Terminal), cx, |ws, _, window, cx| {
-                                ws.toggle_terminal(&ToggleTerminal, window, cx)
-                            }),
-                            self.shows(BottomPanel::Terminal),
-                        )
-                        .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
-                    )
-                    .child(
-                        toggle(
-                            self.icon_button("toggle-problems", Icon::PanelBottom, self.shows(BottomPanel::Problems), cx, |ws, _, window, cx| {
-                                ws.toggle_problems(&ToggleProblems, window, cx)
-                            }),
-                            self.shows(BottomPanel::Problems),
-                        )
-                        .tooltip(|window, cx| status_tooltip("Toggle Problems", &ToggleProblems, window, cx)),
-                    ),
-            )
-            // Windows and Linux have no app menu, so Settings needs a way in.
-            .child({
-                let on = matches!(self.modals.current, Some(Modal::Preferences(_)));
-                toggle(self.icon_button("open-settings", Icon::Settings, on, cx, |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx)), on)
-                    .size(px(24.))
-                    .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))
-            })
     }
 }

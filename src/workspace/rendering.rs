@@ -58,31 +58,6 @@ impl Workspace {
         )
     }
 
-    pub(super) fn icon_button(
-        &self,
-        id: &'static str,
-        icon: Icon,
-        active: bool,
-        cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Button {
-        let theme = Theme::get(cx);
-        let color = if active { theme.text } else { theme.text_dim };
-        div()
-            .id(id)
-            .size(px(26.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .hover_bg(theme.hover)
-            .active(|s| s.bg(theme.active))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(on_click))
-            .child(icon_el(icon, px(15.), color.into()))
-    }
-
     /// An invisible grab area filling the gap after an island; only the
     /// cursor shows it.
     pub(super) fn resize_handle(&self, edge: Edge, cx: &mut Context<Self>) -> impl IntoElement {

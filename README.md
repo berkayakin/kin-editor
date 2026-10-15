@@ -56,9 +56,9 @@ platform-native text rendering (CoreText / DirectWrite).
   (click the percentage to reset) or ⌘/Ctrl + scroll
 - Find/Replace bar with case, whole-word and regex options; Find/Replace in Files with preview
   (searches unsaved buffers too, honors .gitignore)
-- Search Everywhere (double Shift), fuzzy Go to File (git-ignored files included, ignored folders
-  skipped), Recent Files, Find Action, Go to Line, and File Structure: the current file's functions,
-  classes, headings, selectors or keys
+- Search Everywhere (double Shift, or the magnifier at the top right), fuzzy Go to File
+  (git-ignored files included, ignored folders skipped), Recent Files, Find Action, Go to Line,
+  and File Structure: the current file's functions, classes, headings, selectors or keys
 - Breadcrumbs under the tabs (folders, file, then the definitions around the caret; click one to go
   there) and sticky scroll: the header lines of the functions and classes you've scrolled into stay
   pinned at the top of the editor (up to four; click one to jump to it)
@@ -391,7 +391,7 @@ Others / Close All. The panes, their tabs, sizes and pins come back with the pro
 
 ## Terminal
 
-**Terminal** (⌥F12 / Alt+F12, or the status bar button) opens a shell in the project folder in
+**Terminal** (⌥F12 / Alt+F12, or its button at the top right) opens a shell in the project folder in
 the bottom panel, which it shares with Problems. Press it again to jump between the terminal and
 the editor. Each **+** tab is its own shell; a tab closes when its shell exits.
 
@@ -457,7 +457,9 @@ A ▶ in the gutter marks what can run in the file; click it to run that one thi
 **Run…** (⌃⌥R / Alt+Shift+F10) lists the last run first, then your `run_configurations`, the
 project's commands (cargo run/test/build and binaries, `package.json` scripts with its package
 manager, go, Makefile targets, pytest) and the current file's tests. **Run** (⌃R / Shift+F10)
-repeats the last one, **Stop** (⌘F2 / Ctrl+F2) interrupts it.
+repeats the last one (run or debugged), **Stop** (⌘F2 / Ctrl+F2) interrupts it. The title bar's
+top right has the same: the last configuration (click it for Run…), Run, Debug and, while
+something runs, Stop, next to the sidebar and bottom panel toggles.
 
 Each run gets a terminal tab named after it, which stays open with the exit code when it ends and
 shows ▶ while running, ✓ on success and ✕ on failure. Running the same thing again reuses its tab.
@@ -506,7 +508,7 @@ and Zed use):
 - **Attach to Process…** (⌥⇧F5 / Ctrl+Alt+F5, or the Run menu) lists your running processes (search
   by name, command line or PID) and debugs the one you pick: Node with js-debug, Python with debugpy,
   Go with Delve, anything else (Rust, C, C++) with lldb-dap. Stop detaches and leaves it running.
-- **The Debug panel** (bottom area; the bug button in the status bar brings it back) shows the
+- **The Debug panel** (bottom area; the bug button at the top right brings it back) shows the
   stepping toolbar, the paused thread's frames (click one to see its line and variables), variables
   you can expand, watch expressions, and a console with the program's output that also evaluates
   expressions in the selected frame. The line the program is paused on is highlighted.
@@ -668,7 +670,7 @@ the keymap to start from (each shown with a few of its shortcuts) and editor bas
 size, auto-save, reformat on save and soft wrap. Its choices go to `settings.json` like any other.
 Open it again any time from the Kin menu or Find Action (**Welcome Setup**).
 
-**Settings…** (⌘, / Ctrl+Alt+S, or the gear at the right of the status bar) opens the Settings
+**Settings…** (⌘, / Ctrl+Alt+S, or the gear at the top right) opens the Settings
 dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
 wrapping), Saving, Languages (per-language options, language server and formatter),
 [Extensions](#extensions), Keymap, Terminal & Run and Updates. The search field looks through all of them; with it focused, ↑/↓ switch
@@ -784,7 +786,7 @@ message instead of hanging; use an SSH agent or a credential helper.
   (Find Action → Toggle Inline Git Blame).
 - **File tree:** changed files are colored with a status letter; folders containing
   changes are tinted.
-- **Commit panel** (⌘K / ⌘0, or the Commit button at the left of the status bar, which shows the
+- **Commit panel** (⌘K / ⌘0, or the Commit tab above the sidebar, whose tooltip shows the
   number of changes): the branch with fetch, pull and push at the top, then staged and unstaged
   changes with stage, unstage, open and roll back on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
   staged, everything is committed), or use **Commit & Push**. **Amend** starts from the
@@ -804,7 +806,7 @@ message instead of hanging; use an SSH agent or a credential helper.
   on its first line (also in the right-click menu and Find Action). Mark a file resolved with
   ✓ on hover (Kin asks if markers remain), then **Commit Merge** / **Continue**. The merge
   message is filled in, and committing is blocked while conflicts remain.
-- **Log** (⌘9 / Alt+9, or the status bar button): commits of all branches (toggle) with a branch
+- **Log** (⌘9 / Alt+9, or its button at the top right): commits of all branches (toggle) with a branch
   graph, branch and tag labels, and a filter by message, author, hash or branch. Select a commit
   for its message, author, date, hash (copy) and changed files; click a file for its diff.
   **Show History** (editor right-click menu, Git menu) lists one file's commits, following renames.

@@ -1,21 +1,15 @@
-//! The title bar: project and branch chips, the command capsule, window controls.
+//! The title bar: project and branch chips, the run widget, panel toggles, search and settings, window controls.
 
 use super::*;
+use gpui::svg;
 
 impl Workspace {
     pub(super) fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mac = cfg!(target_os = "macos");
+        let theme = Theme::get(cx).clone();
         let width = f32::from(window.viewport_size().width);
         // Long project and branch names are cut shorter in narrow windows.
         let narrow = width < 900.;
-        // The capsule gives up its extras as the window narrows, then becomes
-        // a round search button.
-        let capsule = if width < 720. {
-            Capsule::Button
-        } else {
-            let w = (width * 0.36).clamp(240., 460.);
-            if w < 360. { Capsule::Compact(w) } else { Capsule::Full(w) }
-        };
         div()
             .id("titlebar")
             .flex()
@@ -40,143 +34,226 @@ impl Workspace {
             // GPUI picks the first control area under the pointer, and a parent's
             // comes before its children's (the window buttons).
             //
-            // Two sides that share the space around the capsule equally keep it
-            // centered; the left one never gets less than its chips need (its
-            // minimum is their width), so when they need more the capsule moves
-            // right, and shrinks, instead of covering them.
+            // Room for the traffic lights, which macOS moves out of the window in full screen.
             .child(
                 div()
-                    .flex()
-                    .flex_1()
-                    .flex_basis(px(0.))
                     .h_full()
-                    .items_center()
-                    // Room for the traffic lights, which macOS moves out of the window in full screen.
-                    .child(
-                        div()
-                            .h_full()
-                            .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
-                            .flex_shrink_0()
-                            .window_control_area(WindowControlArea::Drag),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap_1()
-                            .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
-                            .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
-                            .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
-                    )
-                    .child(div().flex_1().min_w(px(GAP)).h_full().window_control_area(WindowControlArea::Drag)),
+                    .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
+                    .flex_shrink_0()
+                    .window_control_area(WindowControlArea::Drag),
             )
-            .child(self.render_command_capsule(capsule, cx))
+            // The chips give way (their names cut) before the tools would.
             .child(
                 div()
                     .flex()
-                    .flex_1()
-                    .flex_basis(px(0.))
                     .min_w_0()
-                    .h_full()
-                    .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
-                    .when(!mac, |el| el.child(self.render_window_controls(cx))),
+                    .overflow_hidden()
+                    .items_center()
+                    .gap_1()
+                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
+                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
+                    .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
             )
+            .child(div().flex_1().min_w(px(GAP)).h_full().window_control_area(WindowControlArea::Drag))
+            .child(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .child(self.render_run_widget(width >= 820., window, cx))
+                    .child(separator(&theme))
+                    .child(self.render_panel_dock(window, cx))
+                    .child(separator(&theme))
+                    .child(self.render_search_button(window, cx))
+                    .child(self.render_settings_button(window, cx)),
+            )
+            .map(|el| match mac {
+                true => el.child(div().w(px(GAP + 2.)).h_full().flex_shrink_0().window_control_area(WindowControlArea::Drag)),
+                false => el.child(div().w(px(GAP)).h_full().flex_shrink_0()).child(self.render_window_controls(cx)),
+            })
     }
 
-    /// The title bar's center: the current file, and a way into Search
-    /// Everywhere (which it opens), like a command palette's field.
-    pub(super) fn render_command_capsule(&self, capsule: Capsule, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The selected run configuration (the last one launched, run or
+    /// debugged) with Run, Debug and, while something runs, Stop; like
+    /// JetBrains' run widget.
+    pub(super) fn render_run_widget(&self, labeled: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let (edge, lit) = (Hsla::from(theme.border), Hsla::from(theme.accent).alpha(0.5));
-        let hover = move |el: Stateful<Div>, t| el.border_color(mix(edge, lit, t));
-        let base = div()
-            .id("command-capsule")
+        let selected = self.last_run.clone();
+        let terminals = self.all_terminals(cx);
+        let running_selected = selected.as_ref().is_some_and(|target| {
+            terminals.iter().any(|t| {
+                t.read(cx).run().is_some_and(|(r, s)| *s == RunState::Running && r.name == target.name && r.command == target.command)
+            })
+        });
+        let running = self.debug.as_ref().is_some_and(|(s, _)| s.read(cx).is_active())
+            || terminals.iter().any(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running));
+        let debuggable = selected.as_ref().is_some_and(|t| t.debug.is_some());
+
+        let run_tip = match (&selected, running_selected) {
+            (Some(t), true) => format!("Rerun {}", t.name.trim_start_matches("Run ")),
+            (Some(t), false) => t.name.clone(),
+            (None, _) => "Run…".into(),
+        };
+
+        let debug_tip = match &selected {
+            Some(t) if debuggable => format!("Debug {}", t.name.trim_start_matches("Run ").trim_start_matches("Test ")),
+            _ => "Debug…".into(),
+        };
+        let with_keys = |label: String, action: &dyn gpui::Action| match binding_label(action, window) {
+            Some(keys) => format!("{label} ({keys})"),
+            None => label,
+        };
+        let (run_tip, debug_tip, stop_tip) = (with_keys(run_tip, &Rerun), with_keys(debug_tip, &DebugConfiguration), with_keys("Stop".into(), &StopRun));
+
+        // Plain icons, no fills or shadows: Run and Stop keep their colors
+        // (what they do), the rest light up on hover.
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .when_some(selected.filter(|_| labeled), |el, target| {
+                el.child(
+                    div()
+                        .id("run-configuration")
+                        .group("run-configuration")
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .h(px(24.))
+                        .pl_1()
+                        .pr_1p5()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.text_color(theme.text))
+                        .tooltip(|window, cx| status_tooltip("Run Configuration…", &RunConfiguration, window, cx))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|ws, _, window, cx| ws.run_configuration(&RunConfiguration, window, cx)))
+                        .child(ellipsize(&target.name, 26))
+                        .child(
+                            svg()
+                                .path(Icon::ChevronDown.path())
+                                .size(px(12.))
+                                .flex_shrink_0()
+                                .text_color(theme.text_dim)
+                                .group_hover("run-configuration", |s| s.text_color(theme.text)),
+                        ),
+                )
+            })
+            .child(
+                self.bar_button("run", if running_selected { Icon::Refresh } else { Icon::Play }, theme.success.into(), None, cx, |ws, _, window, cx| {
+                    ws.rerun(&Rerun, window, cx)
+                })
+                .tooltip(move |_, cx| tooltip_view(run_tip.clone(), cx)),
+            )
+            .child(
+                self.bar_button("debug", Icon::Bug, theme.text_dim.into(), Some(theme.text.into()), cx, |ws, _, window, cx| match ws.last_run.clone() {
+                    Some(target) if target.debug.is_some() => ws.debug_target(target, window, cx),
+                    _ => ws.debug_configuration(&DebugConfiguration, window, cx),
+                })
+                .tooltip(move |_, cx| tooltip_view(debug_tip.clone(), cx)),
+            )
+            .when(running, |el| {
+                el.child(
+                    self.bar_button("stop", Icon::Stop, theme.error.into(), None, cx, |ws, _, window, cx| ws.stop_run(&StopRun, window, cx))
+                        .tooltip(move |_, cx| tooltip_view(stop_tip.clone(), cx)),
+                )
+            })
+    }
+
+    /// Show/hide toggles for the sidebar and the bottom panels: an open
+    /// one's icon takes the accent color.
+    pub(super) fn render_panel_dock(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let toggle = |id, icon, on: bool, cx: &mut Context<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let (rest, hover) = if on { (theme.accent, None) } else { (theme.text_dim, Some(theme.text.into())) };
+            self.bar_button(id, icon, rest.into(), hover, cx, move |ws, _, window, cx| f(ws, window, cx))
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.))
+            .child(
+                toggle("toggle-sidebar", Icon::PanelLeft, self.show_sidebar, cx, |ws, window, cx| ws.set_sidebar_visible(!ws.show_sidebar, window, cx))
+                    .tooltip(|_, cx| tooltip_view("Toggle Sidebar", cx)),
+            )
+            .child(
+                toggle("toggle-terminal", Icon::Terminal, self.shows(BottomPanel::Terminal), cx, |ws, window, cx| {
+                    ws.toggle_terminal(&ToggleTerminal, window, cx)
+                })
+                .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
+            )
+            .child(
+                toggle("toggle-problems", Icon::PanelBottom, self.shows(BottomPanel::Problems), cx, |ws, window, cx| {
+                    ws.toggle_problems(&ToggleProblems, window, cx)
+                })
+                .tooltip(|window, cx| status_tooltip("Problems", &ToggleProblems, window, cx)),
+            )
+            .when(self.repo.is_some(), |el| {
+                el.child(
+                    toggle("toggle-git-log", Icon::GitCommit, self.shows(BottomPanel::GitLog), cx, |ws, window, cx| {
+                        ws.toggle_git_log(&ToggleGitLog, window, cx)
+                    })
+                    .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
+                )
+            })
+            .when(self.debug.is_some(), |el| {
+                el.child(
+                    toggle("toggle-debug", Icon::Bug, self.shows(BottomPanel::Debug), cx, |ws, window, cx| {
+                        ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
+                    })
+                    .tooltip(|window, cx| status_tooltip("Debug", &ToggleDebugPanel, window, cx)),
+                )
+            })
+    }
+
+    /// Opens Search Everywhere, like JetBrains' magnifier.
+    pub(super) fn render_search_button(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        self.bar_button("search-everywhere", Icon::Search, theme.text_dim.into(), Some(theme.text.into()), cx, |ws, _, window, cx| {
+            ws.search_everywhere(&SearchEverywhere, window, cx)
+        })
+        .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
+    }
+
+    /// Windows and Linux have no app menu, so Settings needs a way in.
+    pub(super) fn render_settings_button(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let on = matches!(self.modals.current, Some(Modal::Preferences(_)));
+        let (rest, hover) = if on { (theme.accent, None) } else { (theme.text_dim, Some(theme.text.into())) };
+        self.bar_button("open-settings", Icon::Settings, rest.into(), hover, cx, |ws, _, window, cx| ws.open_settings(&OpenSettings, window, cx))
+            .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))
+    }
+
+    /// A title bar icon button: just the icon, `color` at rest and `hover`
+    /// under the mouse (`None` = the same color, a little brighter for being
+    /// full strength: at rest it's slightly faded).
+    fn bar_button(
+        &self,
+        id: &'static str,
+        icon: Icon,
+        color: Hsla,
+        hover: Option<Hsla>,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let (rest, hover) = match hover {
+            Some(hover) => (color, hover),
+            None => (color.alpha(color.a * 0.8), color),
+        };
+        div()
+            .id(id)
+            .group(id)
+            .size(px(26.))
             .flex()
             .flex_shrink_0()
             .items_center()
-            .h(px(28.))
-            .rounded(px(14.))
-            // Set off the chrome by its fill (the elevated color) and a
-            // full-strength edge, so it reads in dark themes too. No shadow:
-            // those mark the main areas (islands, popovers), not controls.
-            .bg(theme.elevated)
-            .border_1()
+            .justify_center()
             .cursor_pointer()
-            .text_size(px(12.5))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)));
-        let width = match capsule {
-            Capsule::Button => {
-                return base
-                    .w(px(28.))
-                    .justify_center()
-                    .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
-                    .child(icon_el(Icon::Search, px(13.), theme.text_muted.into()))
-                    .with_hover_transition("command-capsule-hover", transition::FOCUS, hover)
-                    .into_any_element();
-            }
-            Capsule::Compact(w) | Capsule::Full(w) => w,
-        };
-        let full = matches!(capsule, Capsule::Full(_));
-        let file = self.active_editor().map(|e| {
-            let doc = e.read(cx).doc.read(cx);
-            (doc.path.clone(), doc.file_name(), doc.is_dirty())
-        });
-        // The folder only when there's room for it.
-        let folder = file.as_ref().filter(|_| full).and_then(|(path, _, _)| path.as_deref()).and_then(|path| {
-            let rel = self.display_rel(path);
-            let (dir, _) = rel.rsplit_once(['/', '\\'])?;
-            Some(format!("{dir}/"))
-        });
-        base.gap_2()
-            .w(px(width))
-            // Gives way to the chips beside it before they'd be cut.
-            .flex_shrink()
-            .min_w(px(160.))
-            .pl_2p5()
-            .pr(px(if full { 4. } else { 10. }))
-            .child(icon_el(Icon::Search, px(13.), theme.text_muted.into()))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .items_center()
-                    .justify_center()
-                    .gap_1p5()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .map(|el| match file {
-                        Some((path, name, dirty)) => el
-                            .when_some(path.as_deref().map(|p| file_icon(p, px(13.), &theme)), |el, icon| el.child(icon))
-                            .child(
-                                div()
-                                    .flex()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .when_some(folder, |el, f| el.child(div().flex_shrink().truncate().text_color(theme.text_muted).child(f)))
-                                    .child(div().min_w_0().truncate().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(name)),
-                            )
-                            .when(dirty, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.accent))),
-                        None => el.text_color(theme.text_muted).child(div().truncate().child("Search Everywhere")),
-                    }),
-            )
-            .when(full, |el| {
-                el.child(
-                    div()
-                        .flex_shrink_0()
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded(px(10.))
-                        .bg(theme.active)
-                        .text_size(px(11.))
-                        .text_color(theme.text_muted)
-                        .child(double_shift_label()),
-                )
-            })
-            .with_hover_transition("command-capsule-hover", transition::FOCUS, hover)
-            .into_any_element()
+            .on_click(cx.listener(on_click))
+            .child(svg().path(icon.path()).size(px(15.)).flex_shrink_0().text_color(rest).group_hover(id, move |s| s.text_color(hover)))
     }
 
     /// The open project: a tinted monogram and its folder name. Clicking
@@ -269,10 +346,11 @@ impl Workspace {
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap_1()
-            .h(px(22.))
-            .px_1p5()
-            .rounded(px(6.))
+            .gap_1p5()
+            // A pill like the branch chip beside it: it's a button too.
+            .h(px(24.))
+            .px_2()
+            .rounded(px(12.))
             .cursor_pointer()
             .text_size(px(12.))
             .text_color(theme.warning)
@@ -280,7 +358,7 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.open_trust_dialog(window, cx)))
             .tooltip(|_, cx| tooltip_view("Language servers, formatters and project tools are off until you trust this folder", cx))
-            .child(icon_el(Icon::ShieldAlert, px(13.), theme.warning.into()))
+            .child(icon_el(Icon::ShieldAlert, px(12.), theme.warning.into()))
             .child("Restricted Mode")
     }
 
@@ -336,8 +414,12 @@ impl Workspace {
     }
 }
 
-/// An on/off pill like a native switch.
 /// A stable tint per project name for its monogram.
+/// A short hairline between groups of title bar buttons.
+fn separator(theme: &Theme) -> Div {
+    div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(theme.border)
+}
+
 pub(super) fn monogram_color(name: &str, theme: &Theme) -> Hsla {
     let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
