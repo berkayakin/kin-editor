@@ -193,12 +193,12 @@ impl Workspace {
     /// all, since GPUI doesn't redraw by itself when one is cancelled.
     pub(super) fn clear_drag_state(&mut self, cx: &mut Context<Self>) {
         // The drop overlays are drag_over styles: they only need a redraw.
-        self.tree_drop = None;
+        self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
         cx.notify();
     }
 
     pub(super) fn on_root_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.tree_drop.is_some() {
+        if self.tree.read(cx).has_drop_target() {
             self.clear_drag_state(cx);
         }
         if self.resizing.take().is_some() {
@@ -226,9 +226,14 @@ impl Render for Workspace {
         self.load_shown_tabs(cx);
         self.update_window_title(window, cx);
         // A drag that ended without a drop (Escape, left the window) leaves no highlight.
-        if !cx.has_active_drag() {
-            self.tree_drop = None;
+        if !cx.has_active_drag() && self.tree.read(cx).has_drop_target() {
+            self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
         }
+        // How the tree's rows look: Git changes, the open file, a menu's row.
+        let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
+        let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
+        let git_paths = self.git_paths.clone();
+        self.tree.update(cx, |t, cx| t.decorate(git_paths, active_path, menu_target, cx));
         let theme = Theme::get(cx).clone();
         let modal = self.render_modal(window, cx);
         let toasts = self.render_toasts(cx);

@@ -272,7 +272,7 @@ impl Workspace {
                         Some(old) => ws.lsp.update(cx, |s, cx| s.moved(old, &editor, cx)),
                         None => ws.lsp.update(cx, |s, cx| s.register(&editor, cx)),
                     }
-                    ws.rebuild_tree();
+                    ws.tree.update(cx, |t, cx| t.rebuild(cx));
                     cx.notify();
                 })
                 .ok();

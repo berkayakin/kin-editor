@@ -391,6 +391,22 @@ pub fn shortcut_label(keys: &str) -> String {
     }
 }
 
+/// What a drag (a tab, a tree row) shows under the pointer.
+pub struct DragLabel(pub SharedString);
+
+impl Render for DragLabel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        popover(theme)
+            .px_3()
+            .py_1()
+            .rounded(px(14.))
+            .text_size(px(theme.ui_font_size))
+            .text_color(theme.text)
+            .child(self.0.clone())
+    }
+}
+
 pub struct Tooltip(pub SharedString);
 
 impl Render for Tooltip {

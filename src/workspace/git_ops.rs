@@ -133,7 +133,7 @@ impl Workspace {
         for editor in self.tabs.clone() {
             editor.update(cx, |e, cx| e.reload_if_changed(cx));
         }
-        self.rebuild_tree();
+        self.tree.update(cx, |t, cx| t.rebuild(cx));
     }
 
     pub(super) fn run_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {

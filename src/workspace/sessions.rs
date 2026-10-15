@@ -79,7 +79,7 @@ impl Workspace {
             active: pane_active,
         });
         let mut expanded: Vec<PathBuf> =
-            self.expanded.iter().filter_map(|p| p.strip_prefix(&root).ok()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect();
+            self.tree.read(cx).expanded().iter().filter_map(|p| p.strip_prefix(&root).ok()).filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).collect();
         expanded.sort();
         let mut breakpoints: Vec<FileBreakpoints> = self
             .all_breakpoints(cx)

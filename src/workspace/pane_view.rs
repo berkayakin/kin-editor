@@ -97,7 +97,7 @@ impl Workspace {
                         }),
                     )
                     .on_drag(DraggedTab { editor: for_drag, name: name.clone().into() }, |tab, _, _, cx| {
-                        cx.new(|_| DraggedTabView(tab.name.clone()))
+                        cx.new(|_| DragLabel(tab.name.clone()))
                     })
                     // A drop lands before this tab; the accent edge shows where.
                     .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(accent))

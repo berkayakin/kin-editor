@@ -10,17 +10,15 @@ impl Workspace {
             list.retain(|p| p != &root);
             list.insert(0, root.clone());
         });
-        self.expanded.clear();
-        self.expanded.insert(root.clone());
-        // The folders that were open last time, if they still exist.
         self.breakpoints.clear();
         self.problems.update(cx, |p, cx| {
             p.set_run(None, cx);
             p.set_root(Some(root.clone()), cx);
         });
         let mut session = ProjectSession::load(&root);
+        // The folders that were open last time, if they still exist.
+        let expanded: Vec<PathBuf> = session.iter().flat_map(|s| s.expanded.iter().map(|p| root.join(p))).filter(|p| p.is_dir()).collect();
         if let Some(session) = &mut session {
-            self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
             self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
             // The project's own terminal panel, unless this window has shells already.
             if let Some(terminals) = session.terminals.take()
@@ -38,9 +36,9 @@ impl Workspace {
         let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
         crate::python::set_choice(&root, venv);
         self.venv_shown.take();
-        self.root = Some(root);
+        self.root = Some(root.clone());
         self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
-        self.rebuild_tree();
+        self.tree.update(cx, |t, cx| t.set_root(Some(root), expanded, cx));
         self.refresh_file_index(cx);
         self.start_watching(cx);
         if let Some(root) = self.root.clone() {
@@ -263,34 +261,3 @@ pub(super) fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore
     builder.build().ok()
 }
 
-
-/// A folder's entries for the file tree, folders first: (path, is a folder,
-/// is a link to a folder this one is inside, name).
-pub(super) fn tree_children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
-    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut here: Option<Option<PathBuf>> = None;
-    let mut children: Vec<(PathBuf, bool, bool, String)> = read
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if matches!(name.as_str(), ".git" | ".DS_Store" | "target") {
-                return None;
-            }
-            let file_type = e.file_type().ok()?;
-            let path = e.path();
-            // A link to a folder is a folder; one to a folder around it
-            // would expand forever, so it doesn't.
-            let (is_dir, cycle) = if file_type.is_symlink() {
-                let target = std::fs::canonicalize(&path).ok().filter(|t| t.is_dir());
-                let here = here.get_or_insert_with(|| std::fs::canonicalize(dir).ok());
-                let cycle = target.as_ref().zip(here.as_ref()).is_some_and(|(t, h)| h.starts_with(t));
-                (target.is_some(), cycle)
-            } else {
-                (file_type.is_dir(), false)
-            };
-            Some((path, is_dir, cycle, name))
-        })
-        .collect();
-    children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
-    children
-}

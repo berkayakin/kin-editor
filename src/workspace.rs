@@ -9,12 +9,12 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, AnyView, App, Bounds, ClickEvent, Context, Div, Entity, EntityId, FocusHandle, Focusable, FontWeight, Hsla,
     CursorStyle, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, PromptLevel, Render,
-    SharedString, Stateful, StyleRefinement, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
+    SharedString, Stateful, StyleRefinement, Subscription, Task, TitlebarOptions, Window,
     WindowBounds, WindowControlArea, WindowHandle, WindowOptions, actions, div, img, point,
-    prelude::*, px, relative, rgb, size, uniform_list,
+    prelude::*, px, relative, rgb, size,
 };
 
 use crate::{
@@ -37,8 +37,9 @@ use crate::{
         EditorLspEvent, EditorRunEvent, GitFile, Unloaded,
     },
     git::{self, Change, FileStatus, RepoStatus},
-    git_panel::{GitOp, GitPanel, GitPanelEvent, change_color},
+    git_panel::{GitOp, GitPanel, GitPanelEvent},
     problems_panel::{ProblemsEvent, ProblemsPanel},
+    project_tree::{ProjectTree, TreeEvent},
     find_bar::{FindBar, FindBarEvent},
     keymap,
     lint::Severity,
@@ -61,12 +62,12 @@ use crate::{
     preferences::{self, Preferences, PreferencesEvent},
     theme_picker::{ThemePicker, ThemePickerEvent},
     transition::{self, TransitionExt, mix},
-    ui::{Button, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
+    ui::{Button, DragLabel, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
     updater,
 };
 
 use crate::ui::{
-    GAP, chrome_bg, dock, soft_shadow, file_icon, folder_icon, island, popover, segment_on, selected_edge,
+    GAP, chrome_bg, dock, soft_shadow, file_icon, island, segment_on,
 };
 
 mod commands;
@@ -352,28 +353,6 @@ struct DraggedTab {
     name: SharedString,
 }
 
-/// A file tree entry being dragged onto a folder.
-#[derive(Clone)]
-struct DraggedEntry {
-    path: PathBuf,
-    name: SharedString,
-}
-
-/// What the drag shows under the pointer.
-struct DraggedTabView(SharedString);
-
-impl Render for DraggedTabView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
-        popover(theme)
-            .px_3()
-            .py_1()
-            .rounded(px(14.))
-            .text_size(px(theme.ui_font_size))
-            .text_color(theme.text)
-            .child(self.0.clone())
-    }
-}
 
 /// Tab context menu commands.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -525,26 +504,13 @@ const TAB_ERROR_DOT: f32 = 12.0;
 const TAB_COMPACT_CHROME: f32 = 39.0;
 /// Narrower than this, a compact tab couldn't show a character and "…": icon only.
 const TAB_COMPACT_MIN: f32 = 54.0;
-const TREE_ROW_HEIGHT: f32 = 26.0;
 
 
-#[derive(Clone)]
-struct TreeEntry {
-    path: PathBuf,
-    name: SharedString,
-    depth: usize,
-    is_dir: bool,
-}
 
 pub struct Workspace {
     focus_handle: FocusHandle,
-    /// The file tree's, so ⌘Z there undoes file operations.
-    tree_focus: FocusHandle,
     file_history: crate::file_history::FileHistory,
     root: Option<PathBuf>,
-    expanded: HashSet<PathBuf>,
-    entries: Vec<TreeEntry>,
-    tree_scroll: UniformListScrollHandle,
     /// Every open editor, in any pane (for saving, searching, sessions).
     tabs: Vec<Entity<Editor>>,
     panes: Vec<Pane>,
@@ -573,8 +539,6 @@ pub struct Workspace {
     saved_terminals: Option<TerminalLayout>,
     /// The terminal panel's bounds in the last frame, to fit its groups' tabs.
     terminal_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
-    /// While dragging over the tree: the folder a drop would go into.
-    tree_drop: Option<PathBuf>,
 
     /// For Rerun.
     last_run: Option<RunTarget>,
@@ -605,6 +569,8 @@ pub struct Workspace {
     last_shift_tap: Option<Instant>,
     sidebar_mode: SidebarMode,
     git_panel: Entity<GitPanel>,
+    /// The Files view.
+    tree: Entity<ProjectTree>,
     /// The active file's problems and the last Run's.
     problems: Entity<ProblemsPanel>,
     git_log: Entity<GitLog>,
@@ -692,6 +658,15 @@ impl Workspace {
             GitPanelEvent::Run(op) => ws.run_git(op.clone(), window, cx),
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
+        });
+        let tree = cx.new(ProjectTree::new);
+        let tree_subscription = cx.subscribe_in(&tree, window, |ws, _, event: &TreeEvent, window, cx| match event {
+            TreeEvent::Open(path) => ws.open_path(path.clone(), window, cx),
+            TreeEvent::Menu { path, is_dir, position } => ws.open_tree_menu(path.clone(), *is_dir, *position, window, cx),
+            TreeEvent::Move { from, into } => ws.move_entry(from.clone(), into.clone(), cx),
+            TreeEvent::CopyIn { paths, into } => ws.drop_into_tree(paths.clone(), into.clone(), window, cx),
+            TreeEvent::History { redo } => ws.step_file_history(*redo, window, cx),
+            TreeEvent::Toggled => ws.schedule_session_save(cx),
         });
         let problems = cx.new(|_| ProblemsPanel::new());
         let problems_subscription = cx.subscribe_in(&problems, window, |ws, _, event: &ProblemsEvent, window, cx| match event {
@@ -811,12 +786,8 @@ impl Workspace {
         .detach();
         let mut this = Self {
             focus_handle,
-            tree_focus: cx.focus_handle(),
             file_history: Default::default(),
             root: None,
-            expanded: HashSet::new(),
-            entries: Vec::new(),
-            tree_scroll: UniformListScrollHandle::new(),
             tabs: Vec::new(),
             panes: vec![Pane::new()],
             active_pane: 0,
@@ -843,7 +814,6 @@ impl Workspace {
             active_group: 0,
             saved_terminals: None,
             terminal_bounds: Default::default(),
-            tree_drop: None,
 
             last_run: None,
             debug: None,
@@ -867,6 +837,7 @@ impl Workspace {
             last_shift_tap: None,
             sidebar_mode: if state.sidebar_mode.as_deref() == Some("commit") { SidebarMode::Commit } else { SidebarMode::Files },
             git_panel,
+            tree,
             problems,
             git_log,
             diff_return: None,
@@ -904,6 +875,7 @@ impl Workspace {
                 git_subscription,
                 log_subscription,
                 problems_subscription,
+                tree_subscription,
                 activation,
                 quit,
                 settings_observer,
@@ -1229,7 +1201,8 @@ fn ellipsize(text: &str, max: usize) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{ellipsize, tree_children};
+    use super::ellipsize;
+    use crate::project_tree::children as tree_children;
 
     #[cfg(unix)]
     #[test]

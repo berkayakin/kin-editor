@@ -47,7 +47,7 @@ impl Workspace {
                 GitPath::Metadata => git = true,
                 GitPath::Internal => {}
                 GitPath::WorkTree => {
-                    if change.structural && change.path.parent().is_some_and(|p| self.expanded.contains(p)) {
+                    if change.structural && change.path.parent().is_some_and(|p| self.tree.read(cx).is_expanded(p)) {
                         tree = true;
                     }
                     if watcher::in_heavy_folder(&root, &change.path) || !change.path.starts_with(&root) {
@@ -68,7 +68,7 @@ impl Workspace {
             }
         }
         if tree {
-            self.rebuild_tree();
+            self.tree.update(cx, |t, cx| t.rebuild(cx));
             cx.notify();
         }
         if index {
@@ -100,42 +100,5 @@ impl Workspace {
             })
             .ok();
         }));
-    }
-
-    pub(super) fn rebuild_tree(&mut self) {
-        self.entries.clear();
-        if let Some(root) = self.root.clone() {
-            self.push_children(&root, 0);
-        }
-    }
-
-    pub(super) fn push_children(&mut self, dir: &Path, depth: usize) {
-        for (path, is_dir, cycle, name) in tree_children(dir) {
-            let expanded = is_dir && !cycle && self.expanded.contains(&path);
-            self.entries.push(TreeEntry {
-                path: path.clone(),
-                name: name.into(),
-                depth,
-                is_dir,
-            });
-            if expanded {
-                self.push_children(&path, depth + 1);
-            }
-        }
-    }
-
-    pub(super) fn click_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.entries.get(ix).cloned() else { return };
-        // Never `open_path` a folder: that opens it as the project.
-        if entry.is_dir || entry.path.is_dir() {
-            if !self.expanded.remove(&entry.path) {
-                self.expanded.insert(entry.path);
-            }
-            self.rebuild_tree();
-            self.schedule_session_save(cx);
-            cx.notify();
-        } else {
-            self.open_path(entry.path, window, cx);
-        }
     }
 }

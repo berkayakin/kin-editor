@@ -36,6 +36,7 @@ mod onboarding;
 mod picker;
 mod preview;
 mod problems_panel;
+mod project_tree;
 mod process;
 mod trust;
 mod trust_dialog;

@@ -161,8 +161,7 @@ impl Workspace {
             TreeAction::Reveal(path) => cx.reveal_path(&path),
             TreeAction::FindInFolder(dir) => self.open_project_search_in(Some(dir), false, window, cx),
             TreeAction::CollapseAll => {
-                self.expanded.retain(|p| Some(p) == self.root.as_ref());
-                self.rebuild_tree();
+                self.tree.update(cx, |t, cx| t.collapse_all(cx));
                 self.schedule_session_save(cx);
                 cx.notify();
             }
@@ -205,7 +204,7 @@ impl Workspace {
                     ws.close_modal(window, cx);
                     // So ⌘Z undoes it.
                     if in_tree {
-                        window.focus(&ws.tree_focus);
+                        window.focus(&ws.tree.focus_handle(cx));
                     }
                 }
                 Err(err) => dialog.update(cx, |d, cx| d.set_error(err, cx)),
@@ -314,7 +313,7 @@ impl Workspace {
                 }
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
                 self.file_history.record(format!("New File “{name}”"), crate::file_history::Change::Created(created));
-                self.reveal_in_tree(&path);
+                self.reveal_in_tree(&path, cx);
                 self.after_fs_change(cx);
                 self.open_path(path, window, cx);
             }
@@ -326,8 +325,8 @@ impl Workspace {
                 let created = crate::file_history::topmost_new(&path);
                 std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
                 self.file_history.record(format!("New Folder “{name}”"), crate::file_history::Change::Created(created));
-                self.reveal_in_tree(&path);
-                self.expanded.insert(path);
+                self.reveal_in_tree(&path, cx);
+                self.tree.update(cx, |t, _| t.expand(path));
                 self.after_fs_change(cx);
             }
             PendingInput::Rename(old) => {
@@ -353,7 +352,7 @@ impl Workspace {
                 };
                 self.file_history.record(format!("Rename “{old_name}”"), change);
                 self.moved(&old, &new, cx);
-                self.reveal_in_tree(&new);
+                self.reveal_in_tree(&new, cx);
                 self.after_fs_change(cx);
             }
             // Handled before the name checks above.
@@ -402,7 +401,7 @@ impl Workspace {
             Ok(done) => done.visit(&mut |change| match change {
                 Change::Renamed { from, to } => {
                     self.moved(from, to, cx);
-                    self.reveal_in_tree(to);
+                    self.reveal_in_tree(to, cx);
                 }
                 Change::Trashed(trashed) => {
                     let path = &trashed.original;
@@ -411,10 +410,10 @@ impl Workspace {
                             self.remove_tab(&editor, window, cx);
                         }
                     }
-                    self.expanded.retain(|p| !p.starts_with(path));
+                    self.tree.update(cx, |t, _| t.forget(path));
                     self.recent.retain(|p| !p.starts_with(path));
                 }
-                Change::Created(path) | Change::Restored(path) => self.reveal_in_tree(path),
+                Change::Created(path) | Change::Restored(path) => self.reveal_in_tree(path, cx),
                 Change::Batch(_) => {}
             }),
             Err(err) => {
@@ -422,7 +421,7 @@ impl Workspace {
                 self.toast(ToastKind::Error, format!("Couldn't {verb} {label}"), Some(err.to_string()), cx);
             }
         }
-        window.focus(&self.tree_focus);
+        window.focus(&self.tree.focus_handle(cx));
         self.after_fs_change(cx);
         self.schedule_session_save(cx);
     }
@@ -438,7 +437,7 @@ impl Workspace {
                 self.load_diff_base(&editor, cx);
             }
         }
-        self.expanded = self.expanded.iter().map(|p| remap(p).unwrap_or_else(|| p.clone())).collect();
+        self.tree.update(cx, |t, _| t.remap(remap));
         for p in &mut self.recent {
             if let Some(m) = remap(p) {
                 *p = m;
@@ -467,24 +466,18 @@ impl Workspace {
         let label = format!("Move “{}”", name.to_string_lossy());
         self.file_history.record(label, crate::file_history::Change::Renamed { from: from.clone(), to: to.clone() });
         self.moved(&from, &to, cx);
-        self.expanded.insert(dir);
-        self.reveal_in_tree(&to);
+        self.tree.update(cx, |t, _| t.expand(dir));
+        self.reveal_in_tree(&to, cx);
         self.after_fs_change(cx);
         self.schedule_session_save(cx);
     }
 
-    pub(super) fn set_tree_drop(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
-        if self.tree_drop != target {
-            self.tree_drop = target;
-            cx.notify();
-        }
-    }
 
 
     /// Finder files dropped on the tree: copied into `dir` (under a free
     /// name if taken); then, like JetBrains, an offer to add them to Git.
     pub(super) fn drop_into_tree(&mut self, paths: Vec<PathBuf>, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.tree_drop = None;
+        self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
         let mut added = Vec::new();
         let mut problems = Vec::new();
         for source in paths {
@@ -508,9 +501,9 @@ impl Workspace {
         };
         let created = added.iter().cloned().map(crate::file_history::Change::Created).collect();
         self.file_history.record(label, crate::file_history::Change::Batch(created));
-        window.focus(&self.tree_focus);
-        self.expanded.insert(dir.clone());
-        self.reveal_in_tree(&first);
+        window.focus(&self.tree.focus_handle(cx));
+        self.tree.update(cx, |t, _| t.expand(dir.clone()));
+        self.reveal_in_tree(&first, cx);
         self.after_fs_change(cx);
         self.schedule_session_save(cx);
         let Some(repo) = self.repo.clone().filter(|r| added.iter().all(|p| p.starts_with(r))) else { return };
@@ -590,29 +583,19 @@ impl Workspace {
         }
         self.show_sidebar = true;
         self.sidebar_mode = SidebarMode::Files;
-        self.reveal_in_tree(&path);
-        self.rebuild_tree();
-        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
-            self.tree_scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
-        }
+        self.tree.update(cx, |t, cx| t.reveal_and_scroll(&path, cx));
         self.save_state();
         self.schedule_session_save(cx);
         cx.notify();
     }
 
     /// Expands the folders above `path` so it's visible in the tree.
-    pub(super) fn reveal_in_tree(&mut self, path: &Path) {
-        let Some(root) = self.root.clone() else { return };
-        for dir in path.ancestors().skip(1) {
-            if !dir.starts_with(&root) {
-                break;
-            }
-            self.expanded.insert(dir.to_path_buf());
-        }
+    pub(super) fn reveal_in_tree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.tree.update(cx, |t, _| t.reveal(path));
     }
 
     pub(super) fn after_fs_change(&mut self, cx: &mut Context<Self>) {
-        self.rebuild_tree();
+        self.tree.update(cx, |t, cx| t.rebuild(cx));
         self.refresh_file_index(cx);
         self.refresh_git(cx);
         cx.notify();
@@ -669,13 +652,13 @@ impl Workspace {
                 Ok(trashed) => {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ws.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
-                    window.focus(&ws.tree_focus);
+                    window.focus(&ws.tree.focus_handle(cx));
                     for editor in ws.tabs.clone() {
                         if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(&path)) {
                             ws.remove_tab(&editor, window, cx);
                         }
                     }
-                    ws.expanded.retain(|p| !p.starts_with(&path));
+                    ws.tree.update(cx, |t, _| t.forget(&path));
                     ws.recent.retain(|p| !p.starts_with(&path));
                     ws.after_fs_change(cx);
                 }
