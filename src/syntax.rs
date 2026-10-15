@@ -707,17 +707,27 @@ impl Syntax {
 
     /// Whether a line break at `offset` (on `row`) should indent the next
     /// line, by the language's `indents.scm`: an `@indent` node starts on
-    /// this row and goes on past the caret. None without such a query.
+    /// this row and goes on past the caret. With an `@start` in the match
+    /// (`then`, a `:`), that token is on this row before the caret instead.
+    /// None without such a query.
     pub fn indent_after(&self, rope: &Rope, offset: usize, row: usize) -> Option<bool> {
         let query = queries(self.language)?.indents.as_ref()?;
         let tree = self.tree.as_ref()?;
         let indent = query.capture_index_for_name("indent")?;
+        let start = query.capture_index_for_name("start");
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(offset.saturating_sub(1)..offset + 1);
-        let mut captures = cursor.captures(query, tree.root_node(), RopeProvider(rope));
-        while let Some((m, ix)) = captures.next() {
-            let c = m.captures[*ix];
-            if c.index == indent && c.node.start_position().row == row && c.node.start_byte() < offset && c.node.end_byte() > offset {
+        let mut matches = cursor.matches(query, tree.root_node(), RopeProvider(rope));
+        while let Some(m) = matches.next() {
+            let Some(node) = m.captures.iter().find(|c| c.index == indent).map(|c| c.node) else { continue };
+            if node.end_byte() <= offset {
+                continue;
+            }
+            let opens = match m.captures.iter().find(|c| Some(c.index) == start) {
+                Some(c) => c.node.start_position().row == row && c.node.end_byte() <= offset,
+                None => node.start_position().row == row && node.start_byte() < offset,
+            };
+            if opens {
                 return Some(true);
             }
         }
@@ -725,26 +735,56 @@ impl Syntax {
     }
 
     /// A function, class or comment around `offset` from `textobjects.scm`
-    /// (`@function.around`, `@class.inside` …), the smallest one.
+    /// (`@function.around`, `@class.inside` …). An `inside` can be several
+    /// nodes, a body's statements or an enum's variants: it spans them all,
+    /// without the white space at its ends. The innermost object whose
+    /// `around` holds `offset` wins, so `inside` works from a function's
+    /// first line or between its statements too.
     pub fn text_object(&self, rope: &Rope, offset: usize, object: &str, around: bool) -> Option<Range<usize>> {
         let query = queries(self.language)?.textobjects.as_ref()?;
         let tree = self.tree.as_ref()?;
-        let find = |kind: &str| -> Option<Range<usize>> {
-            let index = query.capture_index_for_name(&format!("{object}.{kind}"))?;
-            let mut cursor = QueryCursor::new();
-            cursor.set_byte_range(offset..offset + 1);
-            let mut best: Option<Range<usize>> = None;
-            let mut captures = cursor.captures(query, tree.root_node(), RopeProvider(rope));
-            while let Some((m, ix)) = captures.next() {
-                let c = m.captures[*ix];
-                let r = c.node.byte_range();
-                if c.index == index && r.start <= offset && offset < r.end.max(r.start + 1) && best.as_ref().is_none_or(|b| r.len() < b.len()) {
-                    best = Some(r);
+        let outer = query.capture_index_for_name(&format!("{object}.around"));
+        let inner = query.capture_index_for_name(&format!("{object}.inside"));
+        if outer.is_none() && inner.is_none() {
+            return None;
+        }
+        let join = |a: Option<Range<usize>>, b: Range<usize>| a.map_or(b.clone(), |a| a.start.min(b.start)..a.end.max(b.end));
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(offset..offset + 1);
+        let mut matches = cursor.matches(query, tree.root_node(), RopeProvider(rope));
+        // Per pattern and `around` node, the extent of `inside`: separators
+        // between the nodes split one capture into several matches.
+        let mut objects: Vec<(usize, Option<Range<usize>>, Option<Range<usize>>)> = Vec::new();
+        while let Some(m) = matches.next() {
+            let (mut inside, mut outside) = (None, None);
+            for c in m.captures {
+                if Some(c.index) == inner {
+                    inside = Some(join(inside, c.node.byte_range()));
+                } else if Some(c.index) == outer {
+                    outside = Some(join(outside, c.node.byte_range()));
                 }
             }
-            best
+            match objects.iter_mut().find(|o| outside.is_some() && o.0 == m.pattern_index && o.2 == outside) {
+                Some(o) => o.1 = inside.into_iter().chain(o.1.clone()).reduce(|a, b| join(Some(a), b)),
+                None if inside.is_some() || outside.is_some() => objects.push((m.pattern_index, inside, outside)),
+                None => {}
+            }
+        }
+        // The smallest inside wins, then the biggest around: a decorated
+        // function over the same function undecorated.
+        let size = |(_, i, a): &(usize, Option<Range<usize>>, Option<Range<usize>>)| {
+            (i.as_ref().or(a.as_ref()).map_or(0, |r| r.len()), usize::MAX - a.as_ref().map_or(0, |r| r.len()))
         };
-        if around { find("around") } else { find("inside").or_else(|| find("around")) }
+        let (_, inside, outside) = objects
+            .into_iter()
+            .filter(|o| !around || o.2.is_some())
+            .filter(|o| o.2.as_ref().or(o.1.as_ref()).is_some_and(|r| r.start <= offset && offset < r.end.max(r.start + 1)))
+            .min_by_key(size)?;
+        let range = if around { outside? } else { inside.or(outside)? };
+        let text = rope.byte_slice(range.clone()).to_string();
+        let start = range.start + text.len() - text.trim_start().len();
+        let end = range.end - (text.len() - text.trim_end().len());
+        Some(if start < end { start..end } else { range })
     }
 
     /// The smallest syntax node that strictly contains `range`, for
@@ -1250,7 +1290,7 @@ mod tests {
 
     #[test]
     fn matches_brackets_outside_strings() {
-        let src = "fn f(a: [u8; 2]) { let s = \"(\"; }\n";
+        let src = "fn f(a: [u8; 2]) { let s = \"a(\"; }\n";
         let rope = Rope::from_str(src);
         let syntax = Syntax::new(Language::Rust, &rope);
         let at = |c: char, nth: usize| src.match_indices(c).nth(nth).unwrap().0;
@@ -1310,6 +1350,91 @@ mod tests {
         assert!(has(&sh, "# hi", Highlight::Comment), "{sh:?}");
         assert!(has(&sh, "if", Highlight::Keyword), "{sh:?}");
     }
+
+    #[test]
+    fn rust_text_objects() {
+        let src = "impl P {\n    fn new() -> Self {\n        let a = 1;\n‸        P { x: a }\n    }\n}\n";
+        assert_eq!(object("a.rs", src, "function", false).as_deref(), Some("let a = 1;\n        P { x: a }"));
+        assert_eq!(object("a.rs", src, "function", true).as_deref(), Some("fn new() -> Self {\n        let a = 1;\n        P { x: a }\n    }"));
+        assert_eq!(object("a.rs", src, "class", false).as_deref(), Some("fn new() -> Self {\n        let a = 1;\n        P { x: a }\n    }"));
+        assert!(object("a.rs", src, "class", true).is_some_and(|s| s.starts_with("impl P {") && s.ends_with('}')));
+        // From the signature too; a closure inside is its own function.
+        let src = "fn f‸() { let g = |x| x + 1; }\n";
+        assert_eq!(object("a.rs", src, "function", false).as_deref(), Some("let g = |x| x + 1;"));
+        let src = "fn f() { let g = |x| x ‸+ 1; }\n";
+        assert_eq!(object("a.rs", src, "function", false).as_deref(), Some("x + 1"));
+        assert_eq!(object("a.rs", src, "function", true).as_deref(), Some("|x| x + 1"));
+        // An empty body has no inside: the whole closure.
+        assert_eq!(object("a.rs", "fn f() { let g = || {‸}; }\n", "function", false).as_deref(), Some("|| {}"));
+        let src = "enum E {\n    A,‸\n    B,\n}\n";
+        assert_eq!(object("a.rs", src, "class", false).as_deref(), Some("A,\n    B"));
+    }
+
+    #[test]
+    fn go_text_objects() {
+        let src = "package p\n\ntype P struct {\n\tX ‸int\n}\n\nfunc (p P) Get() int {\n\treturn p.X\n}\n";
+        assert_eq!(object("a.go", src, "class", false).as_deref(), Some("X int"));
+        assert_eq!(object("a.go", src, "class", true).as_deref(), Some("type P struct {\n\tX int\n}"));
+        let src = "package p\n\nfunc (p P) Get() int {\n\tx := 1\n\treturn ‸x\n}\n";
+        assert_eq!(object("a.go", src, "function", false).as_deref(), Some("x := 1\n\treturn x"));
+        assert_eq!(object("a.go", src, "function", true).as_deref(), Some("func (p P) Get() int {\n\tx := 1\n\treturn x\n}"));
+    }
+
+    #[test]
+    fn rust_and_go_indent_after_openers() {
+        assert!(indents("a.rs", "fn f() {‸\n}\n"));
+        assert!(indents("a.rs", "fn f() {\n    foo(a,‸\n        b);\n}\n"));
+        assert!(indents("a.rs", "fn f() {\n    match x {\n        Some(y) =>‸\n            y,\n        None => 0,\n    }\n}\n"));
+        assert!(indents("a.rs", "fn f<T>()\nwhere‸\n    T: Copy,\n{\n}\n"));
+        assert!(!indents("a.rs", "fn f() {\n    let a = 1;‸\n}\n"));
+        assert!(!indents("a.rs", "fn f() {}‸\n"));
+        assert!(indents("a.go", "package p\n\nfunc f() {‸\n}\n"));
+        assert!(indents("a.go", "package p\n\nfunc f() {\n\tswitch x {\n\tcase 1:‸\n\t\tg()\n\t}\n}\n"));
+        assert!(indents("a.go", "package p\n\nconst (‸\n\tA = 1\n)\n"));
+        assert!(!indents("a.go", "package p\n\nfunc f() {\n\tg()‸\n}\n"));
+    }
+
+    #[test]
+    fn rust_and_go_pair_quotes_and_angle_brackets() {
+        let at = |text: &str, n: usize| (text.to_string(), n);
+        assert_eq!(pair("a.rs", "type V = Vec‸<u8>;\n"), Some((at("<", 12), at(">", 15))));
+        assert_eq!(pair("a.rs", "const S: &str = ‸\"ab\";\n"), Some((at("\"", 16), at("\"", 19))));
+        assert_eq!(pair("a.rs", "const S: &str = \"ab\"‸;\n"), Some((at("\"", 19), at("\"", 16))));
+        assert_eq!(pair("a.rs", "fn f() { let g = ‸|a| a; }\n"), Some((at("|", 17), at("|", 19))));
+        // Brackets still pair by the grammar's tokens.
+        assert_eq!(pair("a.rs", "fn f‸() {}\n"), Some((at("(", 4), at(")", 5))));
+        assert_eq!(pair("a.go", "package p\n\nvar s = ‸`a`\n"), Some((at("`", 19), at("`", 21))));
+        assert_eq!(pair("a.go", "package p\n\nvar s = ‸\"a\"\n"), Some((at("\"", 19), at("\"", 21))));
+    }
+
+    /// `src` without its `‸`, and the offset the `‸` marks.
+    fn caret(src: &str) -> (String, usize) {
+        (src.replacen('‸', "", 1), src.find('‸').expect("a ‸ in the source"))
+    }
+
+    fn parsed(path: &str, src: &str) -> (String, usize, Rope, Syntax) {
+        let (src, at) = caret(src);
+        let rope = Rope::from_str(&src);
+        let syntax = Syntax::new(Language::from_path(Path::new(path)), &rope);
+        (src, at, rope, syntax)
+    }
+
+    /// The text of the `object` text object at the caret.
+    fn object(path: &str, src: &str, object: &str, around: bool) -> Option<String> {
+        let (src, at, rope, syntax) = parsed(path, src);
+        syntax.text_object(&rope, at, object, around).map(|r| src[r].to_string())
+    }
+
+    /// Whether `indents.scm` indents the line after a line break at the caret.
+    fn indents(path: &str, src: &str) -> bool {
+        let (_, at, rope, syntax) = parsed(path, src);
+        syntax.indent_after(&rope, at, rope.byte_to_line(at)).expect("an indents.scm")
+    }
+
+    /// The bracket pair at the caret: both ends' text and offset.
+    fn pair(path: &str, src: &str) -> Option<((String, usize), (String, usize))> {
+        let (src, at, rope, syntax) = parsed(path, src);
+        let (a, b) = syntax.bracket_pair(&rope, at)?;
+        Some(((src[a.clone()].to_string(), a.start), (src[b.clone()].to_string(), b.start)))
+    }
 }
-
-
