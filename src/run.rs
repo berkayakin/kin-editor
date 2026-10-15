@@ -657,11 +657,13 @@ pub fn output_problems(output: &str, cwd: &Path) -> Vec<OutputProblem> {
             continue;
         }
         let indented = line.starts_with([' ', '\t']);
-        if !indented && !line.trim().is_empty() && !line.starts_with("Traceback") {
-            if let Some((path, at)) = python.take() {
-                add(path, at, None, Severity::Error, line);
-                continue;
-            }
+        if !indented
+            && !line.trim().is_empty()
+            && !line.starts_with("Traceback")
+            && let Some((path, at)) = python.take()
+        {
+            add(path, at, None, Severity::Error, line);
+            continue;
         }
         if JS_ERROR.is_match(line) {
             js = Some(line);

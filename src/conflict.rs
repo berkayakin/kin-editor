@@ -53,7 +53,7 @@ impl Resolution {
     }
 }
 
-fn marker<'a>(line: &'a str, mark: char) -> Option<&'a str> {
+fn marker(line: &str, mark: char) -> Option<&str> {
     let line = line.trim_end_matches(['\n', '\r']);
     let rest = line.strip_prefix(&*mark.to_string().repeat(7))?;
     // Exactly seven: `========` is a Markdown underline, not a marker.

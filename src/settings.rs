@@ -1005,12 +1005,10 @@ pub fn remove_top_level_key(text: &str, key: &str) -> String {
 /// document, leaving the rest of the text untouched.
 pub fn set_top_level_key(text: &str, key: &str, value: &str) -> String {
     let bytes = text.as_bytes();
-    let Some(open) = (|| {
-        let i = skip_trivia(text, 0);
-        (bytes.get(i) == Some(&b'{')).then_some(i)
-    })() else {
+    let open = skip_trivia(text, 0);
+    if bytes.get(open) != Some(&b'{') {
         return format!("{{\n  {}: {value}\n}}\n", serde_json::Value::from(key));
-    };
+    }
     let mut i = open + 1;
     let mut last_value_end = None;
     loop {

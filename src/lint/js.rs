@@ -296,7 +296,7 @@ fn diagnostic_span(d: &OxcDiagnostic) -> Span {
         .iter()
         .find(|l| l.primary())
         .or_else(|| d.labels.as_slice().first())
-        .map(|l| Span::new(l.offset() as u32, l.offset() as u32 + l.len()))
+        .map(|l| Span::new(l.offset(), l.offset() + l.len()))
         .unwrap_or_default()
 }
 

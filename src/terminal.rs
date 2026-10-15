@@ -170,6 +170,8 @@ impl TerminalView {
         });
         // A Run tab must show everything the program printed before it exited.
         let drain_on_exit = run.is_some();
+        // Windows has more options.
+        #[allow(clippy::needless_update)]
         let options = tty::Options { shell, working_directory: Some(cwd.clone()), drain_on_exit, env, ..Default::default() };
         let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
         let pty = tty::new(&options, window_size, 0)?;

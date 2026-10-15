@@ -346,9 +346,9 @@ pub fn shortcut_label(keys: &str) -> String {
         };
         return format!("{mods}{key}");
     }
-    let tokens: Vec<&str> = if keys.ends_with("--") {
+    let tokens: Vec<&str> = if let Some(rest) = keys.strip_suffix("--") {
         // A binding on the '-' key itself.
-        let mut t: Vec<&str> = keys[..keys.len() - 2].split('-').collect();
+        let mut t: Vec<&str> = rest.split('-').collect();
         t.push("-");
         t
     } else {

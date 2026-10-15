@@ -1537,9 +1537,8 @@ impl Preferences {
         let list = open.then(|| {
             let filter = self.font_filter.read(cx).text().to_lowercase();
             let mut rows: Vec<Option<SharedString>> = vec![None];
-            match &self.fonts {
-                Some(fonts) => rows.extend(fonts.iter().filter(|f| f.to_lowercase().contains(&filter)).cloned().map(Some)),
-                None => {}
+            if let Some(fonts) = &self.fonts {
+                rows.extend(fonts.iter().filter(|f| f.to_lowercase().contains(&filter)).cloned().map(Some));
             }
             if !filter.is_empty() {
                 rows.retain(Option::is_some);
@@ -1689,7 +1688,7 @@ impl Preferences {
                 continue;
             }
             let mut cards: Vec<AnyElement> = cards.into_iter().map(|(_, c)| c).collect();
-            while cards.len() % PER_ROW != 0 {
+            while !cards.len().is_multiple_of(PER_ROW) {
                 cards.push(div().into_any_element());
             }
             let mut rows = Vec::new();

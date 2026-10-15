@@ -82,3 +82,15 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[lints.clippy]
+# Requests and prompts started for their effect, their answers not needed.
+let_underscore_future = "allow"
+type_complexity = "allow"
+# One-range vectors are meant (folds, ranges to select).
+single_range_in_vec_init = "allow"
+# `from_utf16` converts an IME offset, taking the document from `self`.
+wrong_self_convention = "allow"
+needless_range_loop = "allow"
+# GPUI entities are single-threaded; their `Arc`s are shared within the app.
+arc_with_non_send_sync = "allow"

@@ -1796,7 +1796,7 @@ impl Editor {
     fn move_lines(&mut self, up: bool, cx: &mut Context<Self>) {
         let blocks = self.selected_row_blocks();
         let last_row = self.doc.line_count() - 1;
-        if (up && blocks.first().is_some_and(|b| b.start == 0)) || (!up && blocks.last().is_some_and(|b| b.end - 1 >= last_row)) {
+        if (up && blocks.first().is_some_and(|b| b.start == 0)) || (!up && blocks.last().is_some_and(|b| b.end > last_row)) {
             return;
         }
         let mut edits = Vec::new();
@@ -3247,9 +3247,9 @@ fn detect_indent(doc: &Document) -> Option<String> {
         } else {
             let n = t.len() - t.trim_start_matches(' ').len();
             if n > 0 && !t.trim().is_empty() {
-                if n % 4 == 0 {
+                if n.is_multiple_of(4) {
                     spaces4 += 1;
-                } else if n % 2 == 0 {
+                } else if n.is_multiple_of(2) {
                     spaces2 += 1;
                 }
             }

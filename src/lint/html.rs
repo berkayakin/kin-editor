@@ -279,10 +279,10 @@ pub fn lint(src: &str) -> Vec<Diagnostic> {
         }
     }
 
-    if let Some(html) = html_tag {
-        if !seen_doctype {
-            diag(html.start.saturating_sub(1)..html.end, Severity::Info, "Missing <!DOCTYPE html>".into(), "doctype");
-        }
+    if let Some(html) = html_tag
+        && !seen_doctype
+    {
+        diag(html.start.saturating_sub(1)..html.end, Severity::Info, "Missing <!DOCTYPE html>".into(), "doctype");
     }
     if let Some(head) = head_tag
         && !has_title

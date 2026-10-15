@@ -306,7 +306,7 @@ impl Document {
     /// Replaces all text, as when the file changed on disk. Returns whether
     /// anything changed; undo history goes since it no longer applies.
     fn replace_all(&mut self, text: String) -> bool {
-        if text == self.rope.to_string() {
+        if self.rope == text.as_str() {
             return false;
         }
         // Breakpoints keep their line numbers across a reload.

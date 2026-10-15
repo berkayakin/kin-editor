@@ -533,7 +533,7 @@ fn option_rows(rows: Vec<(&str, &str, AnyElement)>, theme: &Theme) -> AnyElement
 }
 
 fn grid(mut cells: Vec<AnyElement>, columns: usize, gap: gpui::Pixels) -> gpui::Div {
-    while cells.len() % columns != 0 {
+    while !cells.len().is_multiple_of(columns) {
         cells.push(div().into_any_element());
     }
     let mut rows = Vec::new();

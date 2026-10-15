@@ -2105,11 +2105,12 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| match answer {
                 0 => {
                     for editor in ws.tabs.clone() {
-                        if editor.read(cx).doc.is_dirty() && editor.read(cx).doc.path.is_some() {
-                            if let Err(err) = editor.update(cx, |e, cx| e.save(cx)) {
-                                let name = editor.read(cx).doc.file_name();
-                                ws.toast(ToastKind::Error, format!("Couldn't save {name}"), Some(err.to_string()), cx);
-                            }
+                        if editor.read(cx).doc.is_dirty()
+                            && editor.read(cx).doc.path.is_some()
+                            && let Err(err) = editor.update(cx, |e, cx| e.save(cx))
+                        {
+                            let name = editor.read(cx).doc.file_name();
+                            ws.toast(ToastKind::Error, format!("Couldn't save {name}"), Some(err.to_string()), cx);
                         }
                     }
                     // Untitled files need a name first; show the first one.
@@ -3178,7 +3179,7 @@ impl Workspace {
             let cwd = target.cwd.clone();
             let problems = cx.background_executor().spawn(async move { run::output_problems(&output, &cwd) }).await;
             ws.update(cx, |ws, cx| {
-                ws.run_problems = (!problems.is_empty()).then(|| (target.name, problems));
+                ws.run_problems = (!problems.is_empty()).then_some((target.name, problems));
                 cx.notify();
             })
             .ok();

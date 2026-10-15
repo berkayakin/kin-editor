@@ -416,7 +416,7 @@ impl Render for DiffView {
                     .truncate()
                     .px_1p5()
                     .rounded(px(4.))
-                    .bg(Hsla::from(change_color(&theme, change)).alpha(0.15))
+                    .bg(change_color(&theme, change).alpha(0.15))
                     .text_size(px(11.))
                     .text_color(change_color(&theme, change))
                     .child(badge),
