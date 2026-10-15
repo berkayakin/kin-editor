@@ -6,7 +6,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, Task, Window, div, prelude::*, px,
+    IntoElement, Render, SharedString, Task, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -379,7 +379,8 @@ impl GitPanel {
             .flex()
             .items_center()
             .gap_1()
-            .h(px(28.))
+            // As tall as a file row: the list draws rows of one height.
+            .h(px(26.))
             .px_3()
             .text_size(px(11.))
             .font_weight(FontWeight::SEMIBOLD)
@@ -596,35 +597,59 @@ impl Render for GitPanel {
                 .into_any_element();
         }
 
-        let staged: Vec<FileStatus> = self.status.staged().cloned().collect();
-        let unstaged: Vec<FileStatus> = self.status.unstaged().cloned().collect();
-        let unstaged_rels: Vec<String> = unstaged.iter().map(|f| f.rel.clone()).collect();
-        let staged_rels: Vec<String> = staged.iter().map(|f| f.rel.clone()).collect();
-
-        let mut list = div().id("git-changes").flex_1().min_h_0().overflow_y_scroll().pb_2();
-        if staged.is_empty() && unstaged.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_3()
-                    .text_color(theme.text_dim)
-                    .child(icon_el(Icon::CircleCheck, px(15.), theme.success.into()))
-                    .child("No changes"),
-            );
+        let (staged_count, unstaged_count) = (self.status.staged().count(), self.status.unstaged().count());
+        let list = if staged_count == 0 && unstaged_count == 0 {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .p_3()
+                        .text_color(theme.text_dim)
+                        .child(icon_el(Icon::CircleCheck, px(15.), theme.success.into()))
+                        .child("No changes"),
+                )
+                .into_any_element()
         } else {
-            if !staged.is_empty() {
-                list = list
-                    .child(self.section_header("unstage-all", "Staged", staged.len(), Some((Icon::Minus, "Unstage All", GitOp::Unstage(staged_rels))), cx))
-                    .children(staged.iter().enumerate().map(|(i, f)| self.render_file(f, true, i, cx).into_any_element()));
-            }
-            if !unstaged.is_empty() {
-                list = list
-                    .child(self.section_header("stage-all", "Changes", unstaged.len(), Some((Icon::Plus, "Stage All", GitOp::Stage(unstaged_rels))), cx))
-                    .children(unstaged.iter().enumerate().map(|(i, f)| self.render_file(f, false, i, cx).into_any_element()));
-            }
-        }
+            // A heading and the files of each non-empty section; only the
+            // rows on screen are built.
+            let section = |n: usize| if n == 0 { 0 } else { 1 + n };
+            uniform_list(
+                "git-changes",
+                section(staged_count) + section(unstaged_count),
+                cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let staged: Vec<&FileStatus> = this.status.staged().collect();
+                    let unstaged: Vec<&FileStatus> = this.status.unstaged().collect();
+                    let staged_rows = section(staged.len());
+                    range
+                        .map(|ix| {
+                            let (files, is_staged, ix) = if ix < staged_rows { (&staged, true, ix) } else { (&unstaged, false, ix - staged_rows) };
+                            match (ix, is_staged) {
+                                (0, true) => {
+                                    let rels = files.iter().map(|f| f.rel.clone()).collect();
+                                    this.section_header("unstage-all", "Staged", files.len(), Some((Icon::Minus, "Unstage All", GitOp::Unstage(rels))), cx).into_any_element()
+                                }
+                                (0, false) => {
+                                    let rels = files.iter().map(|f| f.rel.clone()).collect();
+                                    this.section_header("stage-all", "Changes", files.len(), Some((Icon::Plus, "Stage All", GitOp::Stage(rels))), cx).into_any_element()
+                                }
+                                (ix, _) => match files.get(ix - 1) {
+                                    Some(file) => this.render_file(file, is_staged, ix - 1, cx).into_any_element(),
+                                    None => div().into_any_element(),
+                                },
+                            }
+                        })
+                        .collect()
+                }),
+            )
+            .flex_1()
+            .min_h_0()
+            .pb_2()
+            .into_any_element()
+        };
 
         root
             .when_some(self.status.state, |el, state| el.child(self.render_state_banner(state, cx)))
