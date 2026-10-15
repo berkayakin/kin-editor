@@ -11,6 +11,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::encoding::TextEncoding;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Change {
     Added,
@@ -146,12 +148,17 @@ fn command(root: &Path) -> Command {
 
 /// Runs git and returns stdout, or the most useful line of stderr.
 pub fn run(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_bytes(root, args).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Runs git and returns stdout as it is (file contents in any encoding).
+fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = command(root)
         .args(args)
         .output()
         .map_err(|e| format!("couldn't run git: {e}"))?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     } else {
         Err(error_text(&output.stderr, &output.stdout))
     }
@@ -319,6 +326,52 @@ pub fn head_text(root: &Path, rel: &str) -> Option<String> {
 /// A file's contents in the index (staging area).
 pub fn index_text(root: &Path, rel: &str) -> Option<String> {
     run(root, &["show", &format!(":{rel}")]).ok()
+}
+
+/// A file's bytes at HEAD.
+pub fn head_blob(root: &Path, rel: &str) -> Option<Vec<u8>> {
+    run_bytes(root, &["show", &format!("HEAD:{rel}")]).ok()
+}
+
+/// A file's bytes in the index.
+pub fn index_blob(root: &Path, rel: &str) -> Option<Vec<u8>> {
+    run_bytes(root, &["show", &format!(":{rel}")]).ok()
+}
+
+/// A file's text as an editor holds it (decoded, LF line ends), and how to
+/// write text back the same way.
+pub struct BlobText {
+    pub text: String,
+    encoding: TextEncoding,
+    crlf: bool,
+}
+
+impl BlobText {
+    /// Decodes `bytes`; `hint` is the encoding the editor uses for the file.
+    pub fn new(bytes: &[u8], hint: Option<TextEncoding>) -> Self {
+        let (text, encoding) = crate::encoding::decode(bytes, hint);
+        let crlf = text.contains("\r\n");
+        let text = if crlf { text.replace("\r\n", "\n") } else { text };
+        BlobText { text, encoding, crlf }
+    }
+
+    /// `text` (with LF line ends) in this blob's line ends and encoding.
+    fn encode(&self, text: &str) -> Result<Vec<u8>, String> {
+        let text = if self.crlf { text.replace('\n', "\r\n") } else { text.to_string() };
+        crate::encoding::encode(&text, self.encoding)
+    }
+}
+
+/// The index version of `rel` to stage lines into; a file new to the index
+/// takes the working copy's line ends and encoding.
+fn index_blob_text(root: &Path, rel: &str) -> BlobText {
+    match index_blob(root, rel) {
+        Some(bytes) => BlobText::new(&bytes, None),
+        None => {
+            let style = BlobText::new(&std::fs::read(root.join(rel)).unwrap_or_default(), None);
+            BlobText { text: String::new(), ..style }
+        }
+    }
 }
 
 pub fn stage(root: &Path, rels: &[String]) -> Result<(), String> {
@@ -996,34 +1049,37 @@ pub fn map_rows_to_base(base: &str, target: &str, rows: Range<usize>) -> Range<u
 /// Stages the changes in `current` (the working copy or an editor's text)
 /// that touch `rows` of it, leaving the file's other changes unstaged.
 pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) -> Result<(), String> {
-    let index = index_text(root, rel).unwrap_or_default();
-    let staged = apply_hunks(&index, current, |h| rows_touch(&h.new_rows, &rows));
-    write_index(root, rel, &staged)
+    // Compared with LF line ends, as editors hold text; written back in the
+    // index's own line ends and encoding, so only the picked lines change.
+    let index = index_blob_text(root, rel);
+    let staged = apply_hunks(&index.text, &current.replace("\r\n", "\n"), |h| rows_touch(&h.new_rows, &rows));
+    write_index(root, rel, &index.encode(&staged)?)
 }
 
 /// Unstages the staged changes touching `rows` of the index version.
 /// `current` maps rows of an editor's text to the index first.
 pub fn unstage_lines(root: &Path, rel: &str, current: Option<&str>, rows: Range<usize>) -> Result<(), String> {
-    let index = index_text(root, rel).unwrap_or_default();
+    let index = index_blob_text(root, rel);
     let rows = match current {
-        Some(current) => map_rows_to_base(&index, current, rows),
+        Some(current) => map_rows_to_base(&index.text, &current.replace("\r\n", "\n"), rows),
         None => rows,
     };
-    let Some(head) = head_text(root, rel) else {
+    let Some(head) = head_blob(root, rel) else {
         // Not in HEAD: unstaging part of a new file isn't meaningful.
         return unstage(root, &[rel.to_string()], has_head(root));
     };
-    let unstaged = apply_hunks(&index, &head, |h| rows_touch(&h.old_rows, &rows));
-    write_index(root, rel, &unstaged)
+    let head = BlobText::new(&head, Some(index.encoding)).text;
+    let unstaged = apply_hunks(&index.text, &head, |h| rows_touch(&h.old_rows, &rows));
+    write_index(root, rel, &index.encode(&unstaged)?)
 }
 
 fn has_head(root: &Path) -> bool {
     run(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok()
 }
 
-/// Puts `text` in the index as `rel`, keeping its file mode.
-fn write_index(root: &Path, rel: &str, text: &str) -> Result<(), String> {
-    let sha = run_with_stdin(root, &["hash-object", "-w", "--stdin", "--path", rel], text.as_bytes())?;
+/// Puts `contents` in the index as `rel`, keeping its file mode.
+fn write_index(root: &Path, rel: &str, contents: &[u8]) -> Result<(), String> {
+    let sha = run_with_stdin(root, &["hash-object", "-w", "--stdin", "--path", rel], contents)?;
     let mode = run(root, &["ls-files", "--stage", "--", rel])
         .ok()
         .and_then(|out| out.split_whitespace().next().map(str::to_string))
@@ -1431,6 +1487,51 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let files = parse_name_status("M\0src/a.rs\0R087\0old.rs\0new.rs\0A\0b.txt\0");
         assert_eq!(files[1], CommitFile { change: Change::Renamed, rel: "new.rs".into(), old_rel: Some("old.rs".into()) });
         assert_eq!((files[0].change, files[2].change), (Change::Modified, Change::Added));
+    }
+
+    #[test]
+    fn staging_lines_keeps_crlf_and_the_encoding() {
+        if !is_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kin-git-crlf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com"), ("core.autocrlf", "false")] {
+            run(&dir, &["config", k, v]).unwrap();
+        }
+        let root = discover(&dir).unwrap();
+        // CRLF line ends and a Windows-1252 "é" (0xE9) on every line.
+        let file = |two: &str, five: &str| -> Vec<u8> {
+            (1..=6)
+                .flat_map(|i| {
+                    let mut line = match i {
+                        2 => two.to_string(),
+                        5 => five.to_string(),
+                        _ => format!("line {i}"),
+                    }
+                    .into_bytes();
+                    line.extend([b' ', 0xE9, b'\r', b'\n']);
+                    line
+                })
+                .collect()
+        };
+        let lines = file("line 2", "line 5");
+        std::fs::write(dir.join("w.txt"), &lines).unwrap();
+        stage(&root, &["w.txt".into()]).unwrap();
+        commit(&root, "first", false).unwrap();
+
+        // The editor's view: decoded, LF; it matches HEAD where unchanged.
+        let head = BlobText::new(&head_blob(&root, "w.txt").unwrap(), None);
+        assert_eq!(head.text, (1..=6).map(|i| format!("line {i} \u{e9}\n")).collect::<String>());
+        // Two changes; staging the second changes only its line in the index.
+        let edited = head.text.replace("line 2 ", "line two ").replace("line 5 ", "line five ");
+        stage_lines(&root, "w.txt", &edited, 4..5).unwrap();
+        assert_eq!(index_blob(&root, "w.txt").unwrap(), file("line 2", "line five"));
+        unstage_lines(&root, "w.txt", Some(&edited), 4..5).unwrap();
+        assert_eq!(index_blob(&root, "w.txt").unwrap(), lines);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

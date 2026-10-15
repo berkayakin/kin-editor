@@ -2654,11 +2654,16 @@ impl Workspace {
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let git_file = GitFile { root: repo.clone(), rel: rel.clone(), user_name: self.git_user.clone() };
+        // Compared as the editor holds the file: decoded like it, LF line ends.
+        let encoding = editor.read(cx).doc.encoding;
         let editor = editor.downgrade();
         cx.spawn(async move |_, cx| {
             let (base, index) = cx
                 .background_executor()
-                .spawn(async move { (git::head_text(&repo, &rel), git::index_text(&repo, &rel)) })
+                .spawn(async move {
+                    let text = |bytes: Option<Vec<u8>>| bytes.map(|b| git::BlobText::new(&b, Some(encoding)).text);
+                    (text(git::head_blob(&repo, &rel)), text(git::index_blob(&repo, &rel)))
+                })
                 .await;
             editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, index, cx)).ok();
         })
