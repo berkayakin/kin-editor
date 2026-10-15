@@ -117,6 +117,8 @@ pub struct Document {
     /// Line breakpoints with the offsets their lines start at (sorted), so
     /// they stay on their lines as text is edited above them.
     breakpoints: Vec<(usize, Breakpoint)>,
+    /// Where the line a debug session is paused on starts.
+    debug_line: Option<usize>,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// The language server's inlay hints (sorted); they follow edits until
@@ -194,6 +196,7 @@ impl Document {
             lsp_changes: LspChanges::default(),
             folds: Vec::new(),
             breakpoints: Vec::new(),
+            debug_line: None,
             snippet: None,
             inlay_hints: Vec::new(),
             disk_mtime: None,
@@ -309,10 +312,11 @@ impl Document {
         if self.rope == text.as_str() {
             return false;
         }
-        // Breakpoints keep their line numbers across a reload.
-        let breakpoints = self.breakpoints();
+        // Breakpoints and the debug line keep their line numbers across a reload.
+        let (breakpoints, debug_row) = (self.breakpoints(), self.debug_row());
         self.rope = Rope::from_str(&text);
         self.set_breakpoints(&breakpoints);
+        self.set_debug_row(debug_row);
         self.syntax = Syntax::new(self.language, &self.rope);
         self.lsp_changes.mark_full();
         self.folds.clear();
@@ -485,6 +489,11 @@ impl Document {
             self.raw_replace(g.range.clone(), &g.text);
             records.push(EditRecord { start: g.range.start, old, new: g.text.clone() });
         }
+        // Tracked positions move once for all of them.
+        let patch = Patch::new(
+            groups.iter().filter(|g| !(g.range.is_empty() && g.text.is_empty())).map(|g| (g.range.clone(), g.text.len())).collect(),
+        );
+        self.shift_tracked(&patch);
 
         // Compute post-edit ranges by accumulating deltas front to back.
         let mut result = vec![0..0; count];
@@ -563,7 +572,9 @@ impl Document {
     pub fn undo(&mut self) -> Option<Vec<Selection>> {
         let t = self.undo_stack.pop()?;
         for rec in t.edits.iter().rev() {
-            self.raw_replace(rec.start..rec.start + rec.new.len(), &rec.old);
+            let range = rec.start..rec.start + rec.new.len();
+            self.raw_replace(range.clone(), &rec.old);
+            self.shift_tracked(&Patch::new(vec![(range, rec.old.len())]));
         }
         self.syntax.reparse(&self.rope);
         self.version += 1;
@@ -575,7 +586,9 @@ impl Document {
     pub fn redo(&mut self) -> Option<Vec<Selection>> {
         let t = self.redo_stack.pop()?;
         for rec in &t.edits {
-            self.raw_replace(rec.start..rec.start + rec.old.len(), &rec.new);
+            let range = rec.start..rec.start + rec.old.len();
+            self.raw_replace(range.clone(), &rec.new);
+            self.shift_tracked(&Patch::new(vec![(range, rec.new.len())]));
         }
         self.syntax.reparse(&self.rope);
         self.version += 1;
@@ -592,15 +605,29 @@ impl Document {
         self.rope.remove(s..e);
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
-        self.shift_folds(&range, text.len());
-        self.shift_breakpoints(&range, text.len());
+    }
+
+    /// Moves what follows the text (folds, breakpoints, the debug line, a
+    /// snippet's stops, inlay hints, diagnostics) across a transaction's
+    /// edits, once for all of them. Runs after the rope changed.
+    fn shift_tracked(&mut self, patch: &Patch) {
+        if patch.edits.is_empty() {
+            return;
+        }
+        self.shift_folds(patch);
+        self.shift_breakpoints(patch);
+        self.debug_line = self.debug_line.and_then(|offset| self.shift_line(offset, patch));
         if let Some(snippet) = &mut self.snippet
-            && !snippet.shift(&range, text.len())
+            && !snippet.shift(patch)
         {
             self.snippet = None;
         }
-        self.shift_inlay_hints(&range, text.len());
-        self.shift_diagnostics(range, text.len());
+        self.shift_inlay_hints(patch);
+        // The merged list too: shifting keeps its order, so it needn't be
+        // built and sorted again.
+        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.lsp_diagnostics, &mut self.diagnostics] {
+            shift_diagnostics(list, patch);
+        }
     }
 
     pub fn inlay_hints(&self) -> &[InlayHint] {
@@ -615,18 +642,18 @@ impl Document {
     /// Hints after an edit move with the text; ones inside replaced text go.
     /// A hint where text is inserted stays after it (a type after a name
     /// being typed).
-    fn shift_inlay_hints(&mut self, range: &Range<usize>, new_len: usize) {
-        if self.inlay_hints.is_empty() {
-            return;
-        }
-        let delta = new_len as isize - range.len() as isize;
+    fn shift_inlay_hints(&mut self, patch: &Patch) {
         self.inlay_hints.retain_mut(|h| {
-            if h.offset > range.start && h.offset < range.end {
-                return false;
+            let (mut delta, near) = patch.around(h.offset..h.offset);
+            for (range, new_len) in near {
+                if h.offset > range.start && h.offset < range.end {
+                    return false;
+                }
+                if h.offset >= range.end {
+                    delta += Patch::change(range, *new_len);
+                }
             }
-            if h.offset >= range.end {
-                h.offset = (h.offset as isize + delta) as usize;
-            }
+            h.offset = moved(h.offset, delta);
             true
         });
     }
@@ -717,37 +744,61 @@ impl Document {
     /// Breakpoints follow their line's text: an edit before a line moves
     /// it, one that removes the line's start removes it. (Runs after the
     /// rope changed, so lines can be looked up again.)
-    fn shift_breakpoints(&mut self, range: &Range<usize>, new_len: usize) {
+    fn shift_breakpoints(&mut self, patch: &Patch) {
         if self.breakpoints.is_empty() {
             return;
         }
-        let delta = new_len as isize - range.len() as isize;
         let mut moved = Vec::with_capacity(self.breakpoints.len());
         for (offset, breakpoint) in std::mem::take(&mut self.breakpoints) {
-            if range.start < offset && offset <= range.end {
-                continue;
+            if let Some(start) = self.shift_line(offset, patch) {
+                moved.push((start, Breakpoint { row: self.row_of(start), ..breakpoint }));
             }
-            let offset = if offset >= range.end { (offset as isize + delta) as usize } else { offset };
-            // Typing at the start of a line leaves it where it is; a new
-            // line inserted there pushes it down.
-            let row = self.row_of(offset.min(self.rope.len_bytes()));
-            moved.push((self.line_start(row), Breakpoint { row, ..breakpoint }));
         }
         moved.dedup_by_key(|(start, _)| *start);
         self.breakpoints = moved;
     }
 
-    /// Folds move with edits before them; an edit touching one opens it.
-    fn shift_folds(&mut self, range: &Range<usize>, new_len: usize) {
-        let delta = new_len as isize - range.len() as isize;
-        self.folds.retain_mut(|f| {
-            if range.end < f.start {
-                f.start = (f.start as isize + delta) as usize;
-                f.end = (f.end as isize + delta) as usize;
-                true
-            } else {
-                range.start > f.end
+    /// Where the line starting at `offset` starts after `patch`; None when
+    /// the edits removed its start (joined it with the line above).
+    fn shift_line(&self, offset: usize, patch: &Patch) -> Option<usize> {
+        let (mut delta, near) = patch.around(offset..offset);
+        for (range, new_len) in near {
+            if range.start < offset && offset <= range.end {
+                return None;
             }
+            if offset >= range.end {
+                delta += Patch::change(range, *new_len);
+            }
+        }
+        // Typing at the start of a line leaves it where it is; a new line
+        // inserted there pushes it down.
+        let row = self.row_of(moved(offset, delta).min(self.rope.len_bytes()));
+        Some(self.line_start(row))
+    }
+
+    /// The row a debug session is paused on, following edits.
+    pub fn debug_row(&self) -> Option<usize> {
+        self.debug_line.map(|offset| self.row_of(offset))
+    }
+
+    /// Highlights `row` as where a debug session is paused (None: running).
+    pub fn set_debug_row(&mut self, row: Option<usize>) {
+        self.debug_line = row.filter(|&r| r < self.line_count()).map(|r| self.line_start(r));
+    }
+
+    /// Folds move with edits before them; an edit touching one opens it.
+    fn shift_folds(&mut self, patch: &Patch) {
+        self.folds.retain_mut(|f| {
+            let (mut delta, near) = patch.around(f.clone());
+            for (range, new_len) in near {
+                if range.end < f.start {
+                    delta += Patch::change(range, *new_len);
+                } else if range.start <= f.end {
+                    return false;
+                }
+            }
+            *f = moved(f.start, delta)..moved(f.end, delta);
+            true
         });
     }
 
@@ -767,14 +818,6 @@ impl Document {
             .collect();
         self.diagnostics
             .sort_by_key(|d| (d.range.start, d.severity));
-    }
-
-    /// Keeps stale diagnostics roughly in place until the next lint finishes.
-    fn shift_diagnostics(&mut self, range: Range<usize>, new_len: usize) {
-        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.lsp_diagnostics] {
-            shift(list, &range, new_len);
-        }
-        self.merge_diagnostics();
     }
 }
 
@@ -840,18 +883,61 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn shift(diagnostics: &mut Vec<Diagnostic>, range: &Range<usize>, new_len: usize) {
-    let delta = new_len as isize - range.len() as isize;
-    diagnostics.retain_mut(|d| {
-        if d.range.end <= range.start {
-            true
-        } else if d.range.start >= range.end {
-            d.range.start = (d.range.start as isize + delta) as usize;
-            d.range.end = (d.range.end as isize + delta) as usize;
-            true
-        } else {
-            false
+/// One transaction's edits, for moving tracked positions: the replaced
+/// ranges (sorted, not overlapping, in the text before the edits) with the
+/// length of their new text.
+pub struct Patch {
+    edits: Vec<(Range<usize>, usize)>,
+    /// `before[i]`: the length change of `edits[..i]`.
+    before: Vec<isize>,
+}
+
+impl Patch {
+    pub fn new(edits: Vec<(Range<usize>, usize)>) -> Self {
+        let mut before = Vec::with_capacity(edits.len() + 1);
+        let mut total = 0;
+        before.push(0);
+        for (range, new_len) in &edits {
+            total += Patch::change(range, *new_len);
+            before.push(total);
         }
+        Patch { edits, before }
+    }
+
+    pub fn change(range: &Range<usize>, new_len: usize) -> isize {
+        new_len as isize - range.len() as isize
+    }
+
+    /// For something spanning `span`: the length change of the edits that
+    /// end before it starts (they move it), and the edits touching or
+    /// overlapping it, which each list judges by its own rule (a few at most).
+    pub fn around(&self, span: Range<usize>) -> (isize, &[(Range<usize>, usize)]) {
+        let first = self.edits.partition_point(|(range, _)| range.end < span.start);
+        let last = first + self.edits[first..].partition_point(|(range, _)| range.start <= span.end);
+        (self.before[first], &self.edits[first..last])
+    }
+}
+
+fn moved(offset: usize, delta: isize) -> usize {
+    (offset as isize + delta).max(0) as usize
+}
+
+/// Diagnostics keep roughly in place until the next lint: ones before or
+/// after the edits move, ones they touch go.
+fn shift_diagnostics(diagnostics: &mut Vec<Diagnostic>, patch: &Patch) {
+    diagnostics.retain_mut(|d| {
+        let (mut delta, near) = patch.around(d.range.clone());
+        for (range, new_len) in near {
+            if d.range.end <= range.start {
+                // The edit is after it (an empty one stays put at an insertion).
+            } else if d.range.start >= range.end {
+                delta += Patch::change(range, *new_len);
+            } else {
+                return false;
+            }
+        }
+        d.range = moved(d.range.start, delta)..moved(d.range.end, delta);
+        true
     });
 }
 
@@ -879,6 +965,68 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn one_transaction_moves_things_like_its_edits_one_by_one() {
+        let text = "fn a() {\n    one\n}\nfn b() {\n    two\n}\nlast line\n";
+        let setup = || {
+            let mut doc = Document::from_text(text.into(), None);
+            let diagnostic = |range: Range<usize>| Diagnostic {
+                range,
+                severity: crate::lint::Severity::Warning,
+                message: "m".into(),
+                rule: "r".into(),
+            };
+            doc.set_builtin_diagnostics(vec![diagnostic(13..16), diagnostic(31..34), diagnostic(39..39)]);
+            doc.set_lsp_diagnostics(vec![diagnostic(3..4), diagnostic(42..46)]);
+            let hint = |offset| InlayHint { offset, label: ": T".into(), pad_left: false, pad_right: false };
+            doc.set_inlay_hints(vec![hint(4), hint(16), hint(34)]);
+            doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(4), Breakpoint::at(6)]);
+            doc.set_debug_row(Some(4));
+            doc.fold_rows(4, 5);
+            doc
+        };
+        let snapshot = |doc: &Document| {
+            (
+                doc.rope().to_string(),
+                doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(),
+                doc.inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>(),
+                doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(),
+                doc.debug_row(),
+                doc.folds().to_vec(),
+            )
+        };
+        // Multi-caret edits: a new line at a line start, typing in a
+        // diagnostic, deleting a hint's text, an insertion at the end.
+        let edit_sets: [Vec<(Range<usize>, &str)>; 3] = [
+            vec![(0..0, "// x\n"), (13..13, "z"), (27..27, "\n")],
+            vec![(12..16, ""), (31..34, "three"), (46..46, "!")],
+            vec![(9..9, "\n\n"), (22..23, ""), (39..39, "x")],
+        ];
+        for edits in edit_sets {
+            let mut together = setup();
+            together.edit(edits.iter().map(|(r, t)| (r.clone(), t.to_string())).collect(), &[], EditKind::Other);
+            let mut one_by_one = setup();
+            for (range, text) in edits.iter().rev() {
+                one_by_one.edit(vec![(range.clone(), text.to_string())], &[], EditKind::Other);
+            }
+            assert_eq!(snapshot(&together), snapshot(&one_by_one), "{edits:?}");
+            // The merged list was moved in place, and matches merging again.
+            let merged = together.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>();
+            together.merge_diagnostics();
+            assert_eq!(merged, together.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn the_debug_line_follows_edits() {
+        let mut doc = Document::from_text("a\nb\nc\n".into(), None);
+        doc.set_debug_row(Some(1));
+        doc.edit(vec![(0..0, "new\n".into())], &[], EditKind::Other);
+        assert_eq!(doc.debug_row(), Some(2));
+        doc.undo();
+        assert_eq!(doc.debug_row(), Some(1));
+    }
 
     #[test]
     fn breakpoints_follow_their_lines() {

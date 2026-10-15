@@ -160,8 +160,8 @@ impl Editor {
 
     /// Highlights the line a debug session paused on (None: running or done).
     pub fn set_debug_line(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
-        if self.debug_line != row {
-            self.debug_line = row;
+        if self.doc.debug_row() != row {
+            self.doc.set_debug_row(row);
             cx.notify();
         }
     }

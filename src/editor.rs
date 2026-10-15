@@ -300,8 +300,6 @@ pub struct Editor {
     gutter_hovered: bool,
     /// Runnable targets for a version and path (gutter ▶).
     run_targets: derived::Derived<(u64, Option<std::path::PathBuf>, crate::syntax::Language), Vec<crate::run::RunTarget>>,
-    /// The row a debug session is paused on (highlighted).
-    debug_line: Option<usize>,
     /// Format, dimensions and size of an image document (read on first show).
     image_info: Option<crate::preview::ImageInfo>,
     /// Merge conflicts for a version.
@@ -370,7 +368,6 @@ impl Editor {
             sticky_rows: Vec::new(),
             gutter_hovered: false,
             run_targets: derived::Derived::new(),
-            debug_line: None,
             conflicts: derived::Derived::new(),
             conflict_hits: Vec::new(),
             image_info: None,
@@ -2486,6 +2483,7 @@ impl Editor {
         let run_rows: Vec<usize> =
             if single { Vec::new() } else { self.shown_run_targets(cx).iter().filter_map(|t| t.row).collect() };
         let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
+        let debug_row = self.doc.debug_row();
         self.conflict_hits.clear();
         let highlights = self.doc.syntax().highlights(self.doc.rope(), range_start..range_end);
         let diagnostics: Vec<&lint::Diagnostic> = self
@@ -2669,7 +2667,7 @@ impl Editor {
                 };
 
                 // The line a debug session is paused on.
-                if self.debug_line == Some(row) && !single {
+                if debug_row == Some(row) && !single {
                     frame.backgrounds.push(fill(
                         Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)),
                         Hsla::from(theme.warning).alpha(0.16),
@@ -2892,7 +2890,7 @@ impl Editor {
                 // Gutter: line number and diagnostic dot, on the line's first row.
                 if first_seg {
                     let number = SharedString::from((row + 1).to_string());
-                    let number_color = if self.debug_line == Some(row) {
+                    let number_color = if debug_row == Some(row) {
                         theme.warning
                     } else if is_cursor_row {
                         theme.line_number_active

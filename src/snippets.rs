@@ -8,7 +8,7 @@ use std::{ops::Range, path::PathBuf};
 
 use serde_json::Value;
 
-use crate::{settings::strip_jsonc, syntax::Language, theme::config_dir};
+use crate::{document::Patch, settings::strip_jsonc, syntax::Language, theme::config_dir};
 
 /// The tab stops of a snippet being filled in, in Tab order; the last is
 /// where it ends (`$0`). A stop typed in several places lists them all, and
@@ -23,19 +23,24 @@ impl SnippetStops {
     /// Follows an edit replacing `range` with `new_len` bytes. The current
     /// stop grows with typing in it; an edit cutting across a stop ends the
     /// snippet (returns false).
-    pub fn shift(&mut self, range: &Range<usize>, new_len: usize) -> bool {
-        let delta = new_len as isize - range.len() as isize;
-        let move_by = |offset: &mut usize| *offset = (*offset as isize + delta) as usize;
+    pub fn shift(&mut self, patch: &Patch) -> bool {
+        let move_by = |offset: usize, delta: isize| (offset as isize + delta) as usize;
         for (ix, stop) in self.stops.iter_mut().enumerate() {
             for r in stop {
-                if ix == self.current && range.start >= r.start && range.end <= r.end {
-                    move_by(&mut r.end);
-                } else if range.end <= r.start {
-                    move_by(&mut r.start);
-                    move_by(&mut r.end);
-                } else if range.start < r.end {
-                    return false;
+                let (mut start, near) = patch.around(r.clone());
+                let mut end = start;
+                for (range, new_len) in near {
+                    let delta = Patch::change(range, *new_len);
+                    if ix == self.current && range.start >= r.start && range.end <= r.end {
+                        end += delta;
+                    } else if range.end <= r.start {
+                        start += delta;
+                        end += delta;
+                    } else if range.start < r.end {
+                        return false;
+                    }
                 }
+                *r = move_by(r.start, start)..move_by(r.end, end);
             }
         }
         true
@@ -171,13 +176,13 @@ mod tests {
         // "foo(a, b)": $1 = a at 4..5, $2 = b at 7..8, $0 at 9.
         let mut s = SnippetStops { stops: vec![vec![4..5], vec![7..8], vec![9..9]], current: 0 };
         // Typing "xyz" over the selected `a`.
-        assert!(s.shift(&(4..5), 3));
+        assert!(s.shift(&Patch::new(vec![(4..5, 3)])));
         assert_eq!(s.stops, vec![vec![4..7], vec![9..10], vec![11..11]]);
         // Typing at the end of the current stop grows it; later stops move.
-        assert!(s.shift(&(7..7), 1));
+        assert!(s.shift(&Patch::new(vec![(7..7, 1)])));
         assert_eq!(s.stops, vec![vec![4..8], vec![10..11], vec![12..12]]);
         // An edit across stops ends the snippet.
-        assert!(!s.shift(&(5..11), 0));
+        assert!(!s.shift(&Patch::new(vec![(5..11, 0)])));
     }
 
     #[test]
@@ -185,8 +190,8 @@ mod tests {
         // `$1 = $1;` with both empty at 0 and 3.
         let mut s = SnippetStops { stops: vec![vec![0..0, 3..3], vec![4..4]], current: 0 };
         // Typing `x` in both places, the later one first (as multi-cursor edits apply).
-        assert!(s.shift(&(3..3), 1));
-        assert!(s.shift(&(0..0), 1));
+        assert!(s.shift(&Patch::new(vec![(3..3, 1)])));
+        assert!(s.shift(&Patch::new(vec![(0..0, 1)])));
         assert_eq!(s.stops, vec![vec![0..1, 4..5], vec![6..6]]);
     }
 
