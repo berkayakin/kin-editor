@@ -26,6 +26,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{LazyLock, Mutex, OnceLock, RwLock},
+    time::SystemTime,
 };
 
 use gpui::{App, Global};
@@ -144,7 +145,6 @@ pub struct LanguageDef {
     pub hard_tabs: Option<bool>,
     /// A command reading the file on stdin and writing it formatted.
     pub formatter: Option<Vec<String>>,
-    pub server: Option<&'static ServerSpec>,
     extension: String,
     grammar: Option<Grammar>,
     highlights: String,
@@ -429,12 +429,14 @@ fn load() -> Vec<(String, Grammar)> {
         .unwrap_or_default();
     dirs.sort();
 
+    let mut cache = READ_CACHE.lock().unwrap();
     let mut extensions = Vec::new();
-    let mut defs: Vec<LanguageDef> = Vec::new();
+    let mut defs: Vec<&'static LanguageDef> = Vec::new();
     let mut servers: HashMap<String, Vec<&'static ServerSpec>> = HashMap::new();
     let mut jobs = Vec::new();
-    for dir in dirs {
-        let (info, languages, ext_servers, grammars) = read_extension(&dir);
+    for dir in &dirs {
+        let (mut info, languages, ext_servers, grammars) = read_cached(&mut cache, dir);
+        info.building.clear();
         for grammar in grammars.values() {
             if needs_build(grammar) && !BUILDING.lock().unwrap().contains(&grammar.library) {
                 jobs.push((info.id.clone(), grammar.clone()));
@@ -446,6 +448,8 @@ fn load() -> Vec<(String, Grammar)> {
         defs.extend(languages);
         extensions.push(info);
     }
+    cache.retain(|dir, _| dirs.contains(dir));
+    drop(cache);
     for (id, grammar) in &jobs {
         if let Some(info) = extensions.iter_mut().find(|e| &e.id == id) {
             info.building.push(grammar.name.clone());
@@ -454,9 +458,7 @@ fn load() -> Vec<(String, Grammar)> {
 
     let mut registry = REGISTRY.write().unwrap();
     let mut slots: Vec<Option<&'static LanguageDef>> = vec![None; registry.languages.len()];
-    for mut def in defs {
-        def.server = servers.get(def.name).and_then(|s| s.first().copied()).or(def.server);
-        let def: &'static LanguageDef = Box::leak(Box::new(def));
+    for def in defs {
         // A language keeps its index; an old one with the same name is replaced.
         let old = registry.languages.iter().position(|l| l.is_some_and(|l| l.name == def.name));
         match old {
@@ -475,6 +477,63 @@ fn load() -> Vec<(String, Grammar)> {
 }
 
 type Read = (ExtensionInfo, Vec<LanguageDef>, HashMap<String, &'static ServerSpec>, HashMap<String, Grammar>);
+
+/// An extension as read, with its languages leaked (`&'static`, like
+/// everything an extension declares).
+type Leaked = (ExtensionInfo, Vec<&'static LanguageDef>, HashMap<String, &'static ServerSpec>, HashMap<String, Grammar>);
+
+struct Cached {
+    stamp: Vec<(PathBuf, Option<SystemTime>)>,
+    read: Leaked,
+}
+
+/// Each extension folder as last read. A reload (after every grammar
+/// build) reuses what didn't change instead of leaking it again, along with
+/// the queries its languages compiled.
+static READ_CACHE: LazyLock<Mutex<HashMap<PathBuf, Cached>>> = LazyLock::new(Default::default);
+
+/// The extension in `dir`, read again only if its files changed.
+fn read_cached(cache: &mut HashMap<PathBuf, Cached>, dir: &Path) -> Leaked {
+    let stamp = stamp(dir);
+    let read = match cache.get(dir) {
+        // Unchanged: the same definitions (and their compiled queries),
+        // with the problems found since.
+        Some(cached) if cached.stamp == stamp => {
+            let mut read = cached.read.clone();
+            if let Some(info) = REGISTRY.read().unwrap().extensions.iter().find(|e| e.path == dir) {
+                read.0.problems = info.problems.clone();
+            }
+            read
+        }
+        _ => {
+            let (info, languages, servers, grammars) = read_extension(dir);
+            let languages = languages.into_iter().map(|def| &*Box::leak(Box::new(def))).collect();
+            (info, languages, servers, grammars)
+        }
+    };
+    cache.insert(dir.to_path_buf(), Cached { stamp, read: read.clone() });
+    read
+}
+
+/// When the files an extension's definitions come from last changed: its
+/// manifest, its languages' files and its built grammars.
+fn stamp(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let files = |dir: PathBuf| -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        files.sort();
+        files
+    };
+    let mut paths = vec![dir.join("extension.toml")];
+    for language in files(dir.join("languages")) {
+        paths.extend(files(language));
+    }
+    paths.extend(files(dir.join("grammars")).into_iter().filter(|p| p.is_file()));
+    paths.into_iter().map(|p| {
+        let time = modified(&p);
+        (p, time)
+    }).collect()
+}
 
 /// One extension's manifest, languages, servers and grammars.
 fn read_extension(dir: &Path) -> Read {
@@ -655,7 +714,6 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
         tab_size: config.get("tab_size").and_then(Value::as_integer).map(|n| n.clamp(1, 16) as usize),
         hard_tabs: config.get("hard_tabs").and_then(Value::as_bool),
         formatter,
-        server: None,
         extension: extension.to_string(),
         highlights: query("highlights.scm", "highlights.scm").unwrap_or_default(),
         outline: query("outline.scm", "tags.scm"),
@@ -1019,6 +1077,22 @@ formatter = ["gleam", "format", "--stdin"]
         let grammar = &grammars["gleam"];
         assert_eq!((grammar.repository.as_deref(), grammar.rev.as_deref()), (Some("https://example.com/tree-sitter-gleam"), Some("abc123")));
         assert!(grammar.src.ends_with("grammars/gleam/src"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reload_reuses_unchanged_extensions() {
+        let dir = temp_dir("cache");
+        write(dir.join("extension.toml"), "id = \"x\"\nname = \"X\"\n");
+        write(dir.join("languages/x/config.toml"), "name = \"X Lang\"\npath_suffixes = [\"xl\"]\n");
+        let mut cache = HashMap::new();
+        let first = read_cached(&mut cache, &dir).1[0];
+        assert!(std::ptr::eq(first, read_cached(&mut cache, &dir).1[0]));
+        // A changed file is read again.
+        let config = dir.join("languages/x/config.toml");
+        let later = std::fs::metadata(&config).unwrap().modified().unwrap() + std::time::Duration::from_secs(2);
+        std::fs::File::options().write(true).open(&config).unwrap().set_modified(later).unwrap();
+        assert!(!std::ptr::eq(first, read_cached(&mut cache, &dir).1[0]));
         std::fs::remove_dir_all(&dir).ok();
     }
 
