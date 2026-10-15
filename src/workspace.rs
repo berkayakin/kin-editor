@@ -5860,8 +5860,8 @@ impl Workspace {
     }
 
     /// The sidebar's two views as a segmented switch across its top: a recessed
-    /// track (the chrome's color) with the current view raised like the current
-    /// tab beside it, and as tall as the tab bar so the two line up.
+    /// track (the chrome's color) with the current view raised, and as tall as
+    /// the tab bar so the two line up.
     fn render_sidebar_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let files_on = self.sidebar_mode == SidebarMode::Files;
@@ -5885,12 +5885,7 @@ impl Workspace {
                 .text_size(px(12.5))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(if on { theme.text } else { theme.text_muted })
-                .when(on, |el| {
-                    el.bg(theme.elevated)
-                        .border_color(theme.border_subtle)
-                        .shadow(soft_shadow(&theme, 1))
-                        .child(tab_glow(&theme))
-                })
+                .when(on, |el| el.bg(theme.elevated).border_color(theme.border_subtle).shadow(soft_shadow(&theme, 1)))
                 .when(!on, |el| el.hover(|s| s.bg(theme.hover).text_color(theme.text)))
                 .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
                 .child(div().truncate().child(label))
