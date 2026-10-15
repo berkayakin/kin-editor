@@ -222,6 +222,17 @@ mod tests {
     }
 
     #[gpui::test]
+    fn both_editors_of_a_restored_split_get_the_files_settings(cx: &mut TestAppContext) {
+        let path = temp_file("indent.rs", b"fn a() {\n    b();\n}\n");
+        let first = cx.new(|cx| Editor::new_unloaded(Some(path.clone()), unloaded(0, Some("// edit\nfn a() {\n    b();\n}\n")), cx));
+        let second = cx.new(|cx| Editor::view_of(&first, cx));
+        first.update(cx, |e, cx| e.load(cx)).unwrap();
+        cx.run_until_parked();
+        first.read_with(cx, |e, _| assert_eq!(e.indent_label(), "Spaces: 4"));
+        second.read_with(cx, |e, _| assert_eq!(e.indent_label(), "Spaces: 4"));
+    }
+
+    #[gpui::test]
     fn a_missing_file_fails_unless_there_is_unsaved_text(cx: &mut TestAppContext) {
         let gone = std::env::temp_dir().join("kin-unloaded-missing/nothing.txt");
         let editor = cx.new(|cx| Editor::new_unloaded(Some(gone.clone()), unloaded(0, None), cx));

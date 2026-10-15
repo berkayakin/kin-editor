@@ -1,0 +1,293 @@
+//! The file tree: listing, expanding, revealing, and its right-click menu.
+
+use super::*;
+
+impl Workspace {
+    // ---- File tree --------------------------------------------------------------
+
+    pub fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_recent_projects(|list| {
+            list.retain(|p| p != &root);
+            list.insert(0, root.clone());
+        });
+        self.expanded.clear();
+        self.expanded.insert(root.clone());
+        // The folders that were open last time, if they still exist.
+        self.breakpoints.clear();
+        self.run_problems = None;
+        let mut session = ProjectSession::load(&root);
+        if let Some(session) = &mut session {
+            self.expanded.extend(session.expanded.iter().map(|p| root.join(p)).filter(|p| p.is_dir()));
+            self.breakpoints = session.breakpoints.iter().map(|b| (root.join(&b.path), b.breakpoints.clone())).collect();
+            // The project's own terminal panel, unless this window has shells already.
+            if let Some(terminals) = session.terminals.take()
+                && self.terminal_groups.is_empty()
+            {
+                self.show_terminal = terminals.open;
+                if terminals.open {
+                    self.show_problems = false;
+                    self.show_git_log = false;
+                }
+                self.saved_terminals = Some(terminals);
+            }
+        }
+        // Before any tab's language server starts.
+        let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
+        crate::python::set_choice(&root, venv);
+        self.venv_shown.take();
+        self.root = Some(root);
+        self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
+        self.rebuild_tree();
+        self.refresh_file_index(cx);
+        self.start_watching(cx);
+        if let Some(root) = self.root.clone() {
+            self.detect_repo(root, cx);
+        }
+        self.save_state();
+        let root = self.root.clone();
+        self.lsp.update(cx, |s, _| s.set_root(root));
+        if self.tabs.is_empty() {
+            self.restore_session(window, cx);
+        }
+        self.start_terminal_panel(window, cx);
+        if self.restricted(cx) && self.modal.is_none() {
+            self.open_trust_dialog(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reopens the folder from the previous session, if it still exists.
+    pub fn restore_last_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = SessionState::load().last_root.filter(|r| r.is_dir()) else {
+            return;
+        };
+        self.set_root(root, window, cx);
+    }
+}
+
+impl Workspace {
+    // ---- File tree context menu --------------------------------------------------
+
+    pub(super) fn open_tree_menu(&mut self, path: PathBuf, is_dir: bool, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        let mut actions: Vec<Option<MenuAction>> = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<TreeAction>| {
+            entries.push(entry);
+            actions.push(action.map(MenuAction::Tree));
+        };
+        let dir = if is_dir { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone()) };
+        let is_root = self.root.as_deref() == Some(path.as_path());
+
+        let undo = self.file_history.undo_label().map(|l| format!("Undo {l}"));
+        let redo = self.file_history.redo_label().map(|l| format!("Redo {l}"));
+        let binding = |action: &dyn gpui::Action| crate::ui::binding_label(action, window);
+        if let Some(label) = undo {
+            add(MenuEntry::item(label, Icon::Undo).shortcut(binding(&UndoFileChange)), Some(TreeAction::UndoFileChange));
+        }
+        if let Some(label) = redo {
+            add(MenuEntry::item(label, Icon::Redo).shortcut(binding(&RedoFileChange)), Some(TreeAction::RedoFileChange));
+        }
+        if self.file_history.undo_label().is_some() || self.file_history.redo_label().is_some() {
+            add(MenuEntry::Separator, None);
+        }
+        add(MenuEntry::item("New File…", Icon::FilePlus), Some(TreeAction::NewFile(dir.clone())));
+        add(MenuEntry::item("New Folder…", Icon::FolderPlus), Some(TreeAction::NewFolder(dir.clone())));
+        add(MenuEntry::Separator, None);
+        if !is_dir {
+            add(MenuEntry::item("Open", Icon::File), Some(TreeAction::Open(path.clone())));
+        }
+        if !is_root {
+            add(MenuEntry::item("Rename…", Icon::Pencil), Some(TreeAction::Rename(path.clone())));
+        }
+        if !is_dir {
+            add(MenuEntry::item("Duplicate", Icon::Copy), Some(TreeAction::Duplicate(path.clone())));
+        }
+        add(MenuEntry::item("Copy Path", Icon::Clipboard), Some(TreeAction::CopyPath(path.clone())));
+        if !is_root {
+            add(MenuEntry::item("Copy Relative Path", Icon::Clipboard), Some(TreeAction::CopyRelativePath(path.clone())));
+        }
+        add(MenuEntry::item(reveal_label(), Icon::FolderOpen), Some(TreeAction::Reveal(path.clone())));
+        if is_dir {
+            add(MenuEntry::item("Find in Folder…", Icon::TextSearch), Some(TreeAction::FindInFolder(path.clone())));
+            add(MenuEntry::item("Collapse All", Icon::ChevronsDownUp), Some(TreeAction::CollapseAll));
+        }
+
+        // Git actions for this file, or every changed file inside this folder.
+        if let Some(repo) = self.repo.clone().filter(|r| path.starts_with(r)) {
+            let files: Vec<FileStatus> = self
+                .git_status
+                .files
+                .iter()
+                .filter(|f| if is_dir { f.path.starts_with(&path) } else { f.path == path })
+                .cloned()
+                .collect();
+            let unstaged: Vec<FileStatus> = files.iter().filter(|f| f.unstaged.is_some()).cloned().collect();
+            let staged: Vec<FileStatus> = files.iter().filter(|f| f.staged.is_some()).cloned().collect();
+            let rel = path.strip_prefix(&repo).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            let suffix = if is_dir { " All in Folder" } else { "" };
+            let mut git_entries: Vec<(MenuEntry, TreeAction)> = Vec::new();
+            if !unstaged.is_empty() {
+                git_entries.push((
+                    MenuEntry::item(format!("Stage{suffix}"), Icon::Plus),
+                    TreeAction::Git(GitOp::Stage(unstaged.iter().map(|f| f.rel.clone()).collect())),
+                ));
+            }
+            if !staged.is_empty() {
+                git_entries.push((
+                    MenuEntry::item(format!("Unstage{suffix}"), Icon::Minus),
+                    TreeAction::Git(GitOp::Unstage(staged.iter().map(|f| f.rel.clone()).collect())),
+                ));
+            }
+            if !is_dir && let Some(f) = files.first() {
+                git_entries.push((MenuEntry::item("Show Diff", Icon::GitCompare), TreeAction::ShowDiff(f.clone(), f.unstaged.is_none())));
+            }
+            if !unstaged.is_empty() {
+                git_entries.push((
+                    MenuEntry::item(format!("Rollback{suffix}…"), Icon::Undo).danger(),
+                    TreeAction::Git(GitOp::Discard(unstaged)),
+                ));
+            }
+            if !rel.is_empty() && !rel.starts_with(".git") {
+                git_entries.push((MenuEntry::item("Add to .gitignore", Icon::EyeOff), TreeAction::AddToGitignore(rel)));
+            }
+            if !git_entries.is_empty() {
+                add(MenuEntry::Separator, None);
+                add(MenuEntry::Header("Git".into()), None);
+                for (entry, action) in git_entries {
+                    add(entry, Some(action));
+                }
+            }
+        }
+
+        if !is_root {
+            add(MenuEntry::Separator, None);
+            add(MenuEntry::item(if cfg!(windows) { "Move to Recycle Bin" } else { "Move to Trash" }, Icon::Trash).danger(), Some(TreeAction::Delete(path.clone())));
+        }
+
+        self.show_context_menu(entries, actions, position, Some(path), window, cx);
+    }
+
+    pub(super) fn show_context_menu(
+        &mut self,
+        entries: Vec<MenuEntry>,
+        actions: Vec<Option<MenuAction>>,
+        position: gpui::Point<Pixels>,
+        target: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = cx.new(|cx| ContextMenu::new(entries, window, cx));
+        let subscription = cx.subscribe_in(&menu, window, |ws, _, event: &ContextMenuEvent, window, cx| match event {
+            ContextMenuEvent::Chose(ix) => {
+                let action = ws.context_menu.as_ref().and_then(|m| m.actions.get(*ix).cloned().flatten());
+                // Closing refocuses the editor, so editor actions reach it.
+                ws.close_context_menu(window, cx);
+                match action {
+                    Some(MenuAction::Tree(action)) => ws.run_tree_action(action, window, cx),
+                    Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
+                    Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
+                    Some(MenuAction::Tab(action, editor)) => ws.run_tab_action(action, &editor, window, cx),
+                    Some(MenuAction::LineEndings(crlf, editor)) => editor.update(cx, |e, cx| {
+                        e.doc.as_mut(cx).set_crlf(crlf);
+                        cx.emit(EditorEvent::Edited);
+                        cx.notify();
+                    }),
+                    Some(MenuAction::Encoding(encoding, editor)) => ws.choose_encoding(encoding, editor, window, cx),
+                    Some(MenuAction::Launch(target, true)) => ws.debug_target(target, window, cx),
+                    Some(MenuAction::Launch(target, false)) => ws.run_target(target, window, cx),
+                    Some(MenuAction::Breakpoint(BreakpointEdit::Toggle, editor, row)) => editor.update(cx, |e, cx| e.toggle_breakpoint_at(row, cx)),
+                    Some(MenuAction::Breakpoint(edit, editor, row)) => ws.edit_breakpoint(edit, editor, row, window, cx),
+                    Some(MenuAction::Venv(choice)) => ws.set_venv(choice, cx),
+                    Some(MenuAction::ChooseVenv) => ws.choose_venv_folder(window, cx),
+                    Some(MenuAction::Terminal(terminal)) => {
+                        if let Some((g, ix)) = ws.terminal_position(&terminal) {
+                            ws.activate_terminal(g, ix, window, cx);
+                        }
+                    }
+                    Some(MenuAction::TerminalTab(action, terminal)) => ws.run_terminal_tab_action(action, terminal, window, cx),
+                    None => {}
+                }
+            }
+            ContextMenuEvent::Dismissed => ws.close_context_menu(window, cx),
+        });
+        self.context_menu = Some(OpenContextMenu { menu, position, actions, target, _subscription: subscription });
+        cx.notify();
+    }
+}
+
+
+
+/// Copies a file or folder into `dir`, as "name copy" when the name is
+/// taken. Returns where it went.
+pub(super) fn copy_into(source: &Path, dir: &Path) -> std::io::Result<PathBuf> {
+    let name = source.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let mut target = dir.join(name);
+    if target.exists() {
+        let path = Path::new(name);
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().filter(|_| !source.is_dir()).map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let stem = if source.is_dir() { name.to_string_lossy().into_owned() } else { stem };
+        target = (1..1000)
+            .map(|n| dir.join(if n == 1 { format!("{stem} copy{ext}") } else { format!("{stem} copy {n}{ext}") }))
+            .find(|p| !p.exists())
+            .ok_or_else(|| std::io::Error::other("no free name"))?;
+    }
+    copy_recursive(source, &target)?;
+    Ok(target)
+}
+
+
+pub(super) fn copy_recursive(source: &Path, target: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(source, target).map(|_| ())
+    }
+}
+
+
+/// The project's .gitignore and .git/info/exclude.
+pub(super) fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.add(root.join(".gitignore"));
+    builder.add(root.join(".git/info/exclude"));
+    builder.build().ok()
+}
+
+
+/// A folder's entries for the file tree, folders first: (path, is a folder,
+/// is a link to a folder this one is inside, name).
+pub(super) fn tree_children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
+    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut here: Option<Option<PathBuf>> = None;
+    let mut children: Vec<(PathBuf, bool, bool, String)> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if matches!(name.as_str(), ".git" | ".DS_Store" | "target") {
+                return None;
+            }
+            let file_type = e.file_type().ok()?;
+            let path = e.path();
+            // A link to a folder is a folder; one to a folder around it
+            // would expand forever, so it doesn't.
+            let (is_dir, cycle) = if file_type.is_symlink() {
+                let target = std::fs::canonicalize(&path).ok().filter(|t| t.is_dir());
+                let here = here.get_or_insert_with(|| std::fs::canonicalize(dir).ok());
+                let cycle = target.as_ref().zip(here.as_ref()).is_some_and(|(t, h)| h.starts_with(t));
+                (target.is_some(), cycle)
+            } else {
+                (file_type.is_dir(), false)
+            };
+            Some((path, is_dir, cycle, name))
+        })
+        .collect();
+    children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
+    children
+}

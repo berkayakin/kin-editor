@@ -1,0 +1,368 @@
+//! Terminal tabs and groups in the bottom panel.
+
+use super::*;
+
+impl Workspace {
+    // ---- Terminal -------------------------------------------------------------------
+
+    /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
+    pub(super) fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.all_terminals().any(|t| t.focus_handle(cx).contains_focused(window, cx));
+        if self.show_terminal && focused {
+            self.show_terminal = false;
+            self.focus_active(window, cx);
+        } else {
+            self.show_terminal = true;
+            self.show_problems = false;
+            self.show_git_log = false;
+            self.show_debug = false;
+            if self.terminal_groups.is_empty() && !self.restore_terminals(window, cx) {
+                self.new_terminal(&NewTerminal, window, cx);
+            } else {
+                self.focus_terminal(window, cx);
+            }
+        }
+        self.save_state();
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// Git log in the bottom panel (⌘9 / Alt+9); again hides it.
+    pub(super) fn toggle_git_log(&mut self, _: &ToggleGitLog, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_git_log {
+            self.show_git_log = false;
+            self.focus_active(window, cx);
+        } else {
+            self.git_log.update(cx, |l, cx| l.show_path(None, cx));
+            self.open_git_log(window, cx);
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The active file's commits (Git → Show History).
+    pub(super) fn show_file_history(&mut self, _: &ShowFileHistory, window: &mut Window, cx: &mut Context<Self>) {
+        let rel = self.active_editor().and_then(|e| {
+            let path = e.read(cx).doc.read(cx).path.clone()?;
+            Some(path.strip_prefix(self.repo.as_ref()?).ok()?.to_string_lossy().replace('\\', "/"))
+        });
+        let Some(rel) = rel else {
+            self.toast(ToastKind::Info, "This file isn't in a Git repository", None, cx);
+            return;
+        };
+        self.git_log.update(cx, |l, cx| l.show_path(Some(rel), cx));
+        self.open_git_log(window, cx);
+        self.save_state();
+        cx.notify();
+    }
+
+    pub(super) fn open_git_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.toast(ToastKind::Info, "Not a Git repository", None, cx);
+            return;
+        }
+        self.show_git_log = true;
+        self.show_problems = false;
+        self.show_terminal = false;
+        self.show_debug = false;
+        self.git_log.update(cx, |l, cx| l.reload(cx));
+        self.git_log.read(cx).focus_filter(window, cx);
+    }
+
+    pub(super) fn render_git_log_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        island(&theme)
+            .h(self.problems_height)
+            .flex_shrink_0()
+            .child(cached(&self.git_log))
+            .child(self.resize_handle(Edge::Problems, cx))
+    }
+
+    /// After `open_window`'s setup: start the shell for a terminal panel that
+    /// was open last time, now that the project (its folder) is known.
+    pub(super) fn window_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_terminal_panel(window, cx);
+    }
+
+    /// Starts the shells of a terminal panel that shows without any (it was
+    /// open last time): the project's saved ones, else a new one.
+    pub(super) fn start_terminal_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_terminal || !self.terminal_groups.is_empty() {
+            return;
+        }
+        let focused = self.active_editor().cloned();
+        if !self.restore_terminals(window, cx) {
+            self.new_terminal(&NewTerminal, window, cx);
+        }
+        // Keep the editor focused, as it was before quitting.
+        if let Some(editor) = focused {
+            window.focus(&editor.focus_handle(cx));
+        }
+    }
+
+    /// Reopens the project's shells from last time, in their groups, folders
+    /// and with their names. False when there were none to open.
+    pub(super) fn restore_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.terminal_groups.is_empty() {
+            return false;
+        }
+        let Some(layout) = self.saved_terminals.take() else { return false };
+        let fallback = self.terminal_cwd(cx);
+        for saved in layout.groups {
+            let group = self.terminal_groups.len();
+            for tab in saved.tabs {
+                let cwd = tab.cwd.filter(|d| d.is_dir()).unwrap_or_else(|| fallback.clone());
+                // Into this group, which the first shell creates.
+                self.open_terminal(cwd, None, TerminalPlace::Tab { group, ix: None }, false, window, cx);
+                if let Some(name) = tab.name
+                    && let Some(terminal) = self.terminal_groups.get(group).and_then(|g| g.tabs.last()).cloned()
+                {
+                    terminal.update(cx, |t, cx| t.set_custom_title(Some(name), cx));
+                }
+            }
+            if let Some(g) = self.terminal_groups.get_mut(group) {
+                g.active = saved.active.min(g.tabs.len() - 1);
+            }
+        }
+        self.active_group = layout.active.min(self.terminal_groups.len().saturating_sub(1));
+        !self.terminal_groups.is_empty()
+    }
+
+    pub(super) fn focus_terminal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.active_terminal() {
+            window.focus(&terminal.focus_handle(cx));
+        }
+    }
+
+    /// The current tab of the current group.
+    pub(super) fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
+        let group = self.terminal_groups.get(self.active_group)?;
+        group.tabs.get(group.active)
+    }
+
+    pub(super) fn all_terminals(&self) -> impl Iterator<Item = &Entity<TerminalView>> {
+        self.terminal_groups.iter().flat_map(|g| g.tabs.iter())
+    }
+
+    /// (group, tab) of a terminal.
+    pub(super) fn terminal_position(&self, terminal: &Entity<TerminalView>) -> Option<(usize, usize)> {
+        self.terminal_groups.iter().enumerate().find_map(|(g, group)| group.tabs.iter().position(|t| t == terminal).map(|ix| (g, ix)))
+    }
+
+    /// Where a new shell starts: the project folder (or the current file's).
+    pub(super) fn terminal_cwd(&self, cx: &App) -> PathBuf {
+        self.root
+            .clone()
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.as_deref()?.parent().map(Path::to_path_buf)))
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
+    /// Starts a shell in a new tab of the current group.
+    pub(super) fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        // The project's shells from last time come back first.
+        self.restore_terminals(window, cx);
+        let cwd = self.terminal_cwd(cx);
+        self.open_terminal(cwd, None, TerminalPlace::Tab { group: self.active_group, ix: None }, true, window, cx);
+    }
+
+    /// Makes a tab current, and its group the one with the keyboard.
+    pub(super) fn activate_terminal(&mut self, group: usize, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(g) = self.terminal_groups.get_mut(group) else { return };
+        g.active = ix.min(g.tabs.len().saturating_sub(1));
+        self.active_group = group;
+        self.focus_terminal(window, cx);
+        self.schedule_session_save(cx);
+        cx.notify();
+    }
+
+    /// A Run tab finished: what its output reports goes to Problems (a run
+    /// without problems clears the last one's).
+    pub(super) fn collect_run_problems(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
+        let Some((target, _)) = terminal.read(cx).run().cloned() else { return };
+        let output = terminal.read(cx).output_text();
+        let task = cx.spawn(async move |ws, cx| {
+            let cwd = target.cwd.clone();
+            let problems = cx.background_executor().spawn(async move { run::output_problems(&output, &cwd) }).await;
+            ws.update(cx, |ws, cx| {
+                ws.run_problems = (!problems.is_empty()).then_some((target.name, problems));
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+        cx.notify();
+    }
+
+    /// Open files may have a language now, or one with a grammar.
+    /// The folder trust decides about: the project, else the active file's.
+    pub(super) fn trust_folder(&self, cx: &App) -> Option<PathBuf> {
+        self.root.clone().or_else(|| self.active_editor()?.read(cx).doc.read(cx).path.as_deref()?.parent().map(Path::to_path_buf))
+    }
+
+    pub(super) fn restricted(&self, cx: &App) -> bool {
+        self.trust_folder(cx).is_some_and(|f| !crate::trust::is_trusted(&f))
+    }
+
+    pub(super) fn project_trust(&mut self, _: &ProjectTrust, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_trust_dialog(window, cx);
+    }
+
+    pub(super) fn open_trust_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.trust_folder(cx) else {
+            self.toast(ToastKind::Info, "Open a folder to trust it", None, cx);
+            return;
+        };
+        self.close_modal(window, cx);
+        let dialog = cx.new(|cx| crate::trust_dialog::TrustDialog::new(folder, window, cx));
+        self.modal_subscription = Some(cx.subscribe_in(&dialog, window, |ws, _, event: &crate::trust_dialog::TrustDialogEvent, window, cx| {
+            use crate::trust_dialog::TrustDialogEvent;
+            match event {
+                TrustDialogEvent::Trust(folder) => {
+                    ws.close_modal(window, cx);
+                    crate::trust::trust(folder, cx);
+                }
+                TrustDialogEvent::Untrust(folder) => {
+                    ws.close_modal(window, cx);
+                    crate::trust::untrust(folder, cx);
+                }
+                TrustDialogEvent::Dismissed => ws.close_modal(window, cx),
+            }
+        }));
+        self.modal = Some(Modal::Trust(dialog));
+        cx.notify();
+    }
+
+    /// Starts what trust allows, or stops it.
+    pub(super) fn trust_changed(&mut self, cx: &mut Context<Self>) {
+        if self.restricted(cx) {
+            self.lsp.update(cx, |s, _| s.shutdown_all());
+        }
+        for editor in self.tabs.clone() {
+            editor.update(cx, |e, cx| e.trust_changed(cx));
+            // Starts its server when trusted now.
+            self.lsp.update(cx, |s, cx| s.register(&editor, cx));
+        }
+        self.refresh_git(cx);
+        cx.notify();
+    }
+
+    pub(super) fn extensions_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for editor in self.tabs.clone() {
+            if editor.update(cx, |e, cx| e.refresh_language(cx)) {
+                self.lsp.update(cx, |s, cx| s.register(&editor, cx));
+            }
+        }
+        if let Some(message) = cx.global::<extensions::ExtensionsChanged>().message.clone() {
+            self.toast(ToastKind::Info, message, None, cx);
+        }
+        self.offer_wasi_sdk(window, cx);
+        cx.notify();
+    }
+
+    /// Grammars are waiting for the WebAssembly toolchain: asks to download
+    /// it, once per reload of the extensions (in one window).
+    pub(super) fn offer_wasi_sdk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let waiting = extensions::waiting_for_toolchain();
+        let generation = cx.global::<extensions::ExtensionsChanged>().generation;
+        let Some(mb) = crate::wasi_sdk::download_mb() else { return };
+        if waiting.is_empty() || crate::wasi_sdk::installing() || ASKED.swap(generation, std::sync::atomic::Ordering::SeqCst) == generation {
+            return;
+        }
+        let detail = format!(
+            "Extensions' grammars ({}) are compiled to WebAssembly, which runs them sandboxed. The compiler, wasi-sdk, is a {mb} MB download (about 170 MB on disk, in Kin's config folder).",
+            waiting.join(", ")
+        );
+        let rx = window.prompt(PromptLevel::Info, "Download the WebAssembly toolchain?", Some(&detail), &["Download", "Not Now"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if rx.await != Ok(0) {
+                return;
+            }
+            let result = cx.background_executor().spawn(async { crate::wasi_sdk::install() }).await;
+            this.update(cx, |ws, cx| match result {
+                Ok(()) => {
+                    ws.toast(ToastKind::Success, "wasi-sdk installed; building grammars", None, cx);
+                    extensions::reload(cx);
+                }
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't install wasi-sdk", Some(err), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The last Run's problems, without the ones the active file shows
+    /// already (its language server reports the same compiler errors).
+    pub(super) fn run_problems_shown(&self, cx: &App) -> Vec<&run::OutputProblem> {
+        let Some((_, problems)) = &self.run_problems else { return Vec::new() };
+        let doc = self.active_editor().map(|e| e.read(cx).doc.read(cx));
+        let known = |p: &run::OutputProblem| {
+            doc.is_some_and(|doc| {
+                doc.path.as_deref() == Some(p.path.as_path())
+                    && doc.diagnostics.iter().any(|d| d.severity == p.severity && doc.row_of(d.range.start) + 1 == p.line as usize)
+            })
+        };
+        problems.iter().filter(|p| !known(p)).collect()
+    }
+
+    /// Adds a terminal where `place` says. A Run tab stays open when its
+    /// program ends, showing how it went.
+    pub(super) fn open_terminal(
+        &mut self,
+        cwd: PathBuf,
+        run: Option<RunTarget>,
+        place: TerminalPlace,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match TerminalView::create(cwd, run, cx) {
+            Ok(terminal) => {
+                self._subscriptions.push(cx.subscribe_in(&terminal, window, |ws, terminal, event: &TerminalEvent, window, cx| match event {
+                    TerminalEvent::TitleChanged => cx.notify(),
+                    TerminalEvent::Exited if terminal.read(cx).run().is_some() => ws.collect_run_problems(terminal, cx),
+                    TerminalEvent::Exited => ws.remove_terminal(terminal, window, cx),
+                    TerminalEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
+                }));
+                let (group, ix) = match place {
+                    TerminalPlace::Tab { group, ix } if group < self.terminal_groups.len() => {
+                        let tabs = &mut self.terminal_groups[group].tabs;
+                        let ix = ix.unwrap_or(tabs.len()).min(tabs.len());
+                        tabs.insert(ix, terminal);
+                        (group, ix)
+                    }
+                    TerminalPlace::GroupAfter(group) if group < self.terminal_groups.len() => {
+                        self.terminal_groups.insert(group + 1, TerminalGroup::new(terminal));
+                        (group + 1, 0)
+                    }
+                    // No group to put it in yet.
+                    _ => {
+                        self.terminal_groups.push(TerminalGroup::new(terminal));
+                        (self.terminal_groups.len() - 1, 0)
+                    }
+                };
+                self.terminal_groups[group].active = ix;
+                self.active_group = group;
+                self.show_terminal = true;
+                self.show_problems = false;
+                self.show_git_log = false;
+                self.show_debug = false;
+                if focus {
+                    self.focus_terminal(window, cx);
+                }
+                self.save_state();
+                self.schedule_session_save(cx);
+            }
+            Err(err) => {
+                // A Run tab being replaced may have left its group empty.
+                self.terminal_groups.retain(|g| !g.tabs.is_empty());
+                self.active_group = self.active_group.min(self.terminal_groups.len().saturating_sub(1));
+                // Don't retry on every frame.
+                self.show_terminal = !self.terminal_groups.is_empty();
+                self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
+            }
+        }
+        cx.notify();
+    }
+}

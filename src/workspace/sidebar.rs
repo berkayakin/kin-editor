@@ -1,0 +1,352 @@
+//! The sidebar: Files and Commit views on their island.
+
+use super::*;
+
+impl Workspace {
+    /// The Commit view's header: branch (opens Branches…), fetch, pull, push.
+    pub(super) fn render_git_toolbar(&self, cx: &mut Context<Self>) -> [AnyElement; 4] {
+        let theme = Theme::get(cx).clone();
+        let s = &self.git_status;
+        let branch = self.branch_label();
+        let button = |id: &'static str, icon: Icon, tip: &'static str, count: u32, op: GitOp, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .gap_0p5()
+                .h(px(24.))
+                .min_w(px(24.))
+                .px_1()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .hover_bg(theme.hover)
+                .tooltip(move |_, cx| tooltip_view(tip, cx))
+                .on_click(cx.listener(move |ws, _, window, cx| ws.run_git(op.clone(), window, cx)))
+                .child(icon_el(icon, px(14.), theme.text_muted.into()))
+                .when(count > 0, |el| el.child(count.to_string()))
+                .into_any_element()
+        };
+        [
+            div()
+                .id("sidebar-branch")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .flex_1()
+                .min_w_0()
+                .h(px(24.))
+                .px_1p5()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .hover_bg(theme.hover)
+                .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
+                .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
+                .child(icon_el(Icon::GitBranch, px(14.), theme.text_dim.into()))
+                .child(div().truncate().text_color(theme.text).child(branch))
+                .into_any_element(),
+            button("sidebar-fetch", Icon::Refresh, "Fetch", 0, GitOp::Fetch, cx),
+            button("sidebar-pull", Icon::ArrowDown, "Update Project (Pull)", s.behind, GitOp::Pull, cx),
+            button("sidebar-push", Icon::ArrowUp, "Push", s.ahead, GitOp::Push, cx),
+        ]
+    }
+
+    pub(super) fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        // Under the Files / Commit switch, the Commit view has a toolbar (its branch).
+        let header = (self.sidebar_mode == SidebarMode::Commit && self.repo.is_some()).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .h(px(30.))
+                .px_1()
+                .mb_1()
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(theme.border_subtle)
+                .children(self.render_git_toolbar(cx))
+        });
+
+        let body: AnyElement = if self.sidebar_mode == SidebarMode::Commit {
+            div().flex_1().min_h_0().child(cached(&self.git_panel)).into_any_element()
+        } else if self.root.is_some() {
+            let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
+            let entries = self.entries.clone();
+            let expanded = self.expanded.clone();
+            let git_paths = self.git_paths.clone();
+            let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
+            let tree_drop = self.tree_drop.clone();
+            let drop_on_root = tree_drop.is_some() && tree_drop == self.root;
+            uniform_list(
+                "file-tree",
+                entries.len(),
+                cx.processor(move |_ws, range: std::ops::Range<usize>, _window, cx| {
+                    let theme = Theme::get(cx);
+                    range
+                        .map(|ix| {
+                            let e = &entries[ix];
+                            let selected = active_path.as_deref() == Some(e.path.as_path());
+                            let change = git_paths.get(&e.path).copied();
+                            let name_color: Hsla = match change {
+                                Some(c) => change_color(theme, c),
+                                None if selected => theme.text.into(),
+                                None => theme.text_muted.into(),
+                            };
+                            let is_open = e.is_dir && expanded.contains(&e.path);
+                            let icon = if e.is_dir { folder_icon(is_open, px(16.), theme) } else { file_icon(&e.path, px(16.), theme) };
+                            // Dropping on a file moves into the folder it's in.
+                            let drop_dir = if e.is_dir { e.path.clone() } else { e.path.parent().map(Path::to_path_buf).unwrap_or_default() };
+                            let dragged = DraggedEntry { path: e.path.clone(), name: e.name.clone() };
+                            let is_target = e.is_dir && tree_drop.as_deref() == Some(e.path.as_path());
+                            div().w_full().px_1().child(div()
+                                .id(ix)
+                                .relative()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .h(px(TREE_ROW_HEIGHT))
+                                .pl(px(8. + e.depth as f32 * 14.))
+                                .pr_2()
+                                .gap_1p5()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .text_color(if selected { theme.text } else { theme.text_muted })
+                                // A lit edge marks the open file.
+                                .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(theme)))
+                                .row_hover(theme.hover)
+                                .on_click(cx.listener(move |ws, _, window, cx| ws.click_entry(ix, window, cx)))
+                                .on_drag(dragged, |entry, _, _, cx| cx.new(|_| DraggedTabView(entry.name.clone())))
+                                // While dragging, the folder a drop goes into lights up (see `tree_drop`).
+                                .when(is_target, |el| el.bg(theme.accent_soft).border_1().border_color(Hsla::from(theme.accent).alpha(0.7)))
+                                .on_drag_move(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, ev: &DragMoveEvent<DraggedEntry>, _, cx| {
+                                        if ev.bounds.contains(&ev.event.position) {
+                                            ws.set_tree_drop(Some(dir.clone()), cx);
+                                        }
+                                    }
+                                }))
+                                .on_drag_move(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, ev: &DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                                        if ev.bounds.contains(&ev.event.position) {
+                                            ws.set_tree_drop(Some(dir.clone()), cx);
+                                        }
+                                    }
+                                }))
+                                .on_drop(cx.listener({
+                                    let dir = drop_dir.clone();
+                                    move |ws, dragged: &DraggedEntry, _, cx| {
+                                        cx.stop_propagation();
+                                        ws.move_entry(dragged.path.clone(), dir.clone(), cx);
+                                    }
+                                }))
+                                .on_drop(cx.listener(move |ws, paths: &gpui::ExternalPaths, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.drop_into_tree(paths.paths().to_vec(), drop_dir.clone(), window, cx);
+                                }))
+                                .when(menu_target.as_deref() == Some(e.path.as_path()), |el| {
+                                    el.border_1().border_color(Hsla::from(theme.accent).alpha(0.6))
+                                })
+                                .on_mouse_down(MouseButton::Right, {
+                                    let path = e.path.clone();
+                                    let is_dir = e.is_dir;
+                                    cx.listener(move |ws, ev: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        ws.open_tree_menu(path.clone(), is_dir, ev.position, window, cx);
+                                    })
+                                })
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .flex_shrink_0()
+                                        .when(e.is_dir, |el| {
+                                            el.child(icon_el(
+                                                if is_open { Icon::ChevronDown } else { Icon::ChevronRight },
+                                                px(13.),
+                                                theme.text_dim.into(),
+                                            ))
+                                        }),
+                                )
+                                .child(icon)
+                                .child(div().flex_1().min_w_0().truncate().text_color(name_color).child(e.name.clone()))
+                                .when_some(change.filter(|_| !e.is_dir), |el, c| {
+                                    el.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(change_color(theme, c))
+                                            .child(c.letter()),
+                                    )
+                                }))
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(self.tree_scroll.clone())
+            // Over the tree but not on a row, a drop goes to the project folder;
+            // rows (told later) narrow it to theirs.
+            .on_drag_move(cx.listener(|ws, ev: &DragMoveEvent<DraggedEntry>, _, cx| {
+                let target = ev.bounds.contains(&ev.event.position).then(|| ws.root.clone()).flatten();
+                ws.set_tree_drop(target, cx);
+            }))
+            .on_drag_move(cx.listener(|ws, ev: &DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                let target = ev.bounds.contains(&ev.event.position).then(|| ws.root.clone()).flatten();
+                ws.set_tree_drop(target, cx);
+            }))
+            // The project folder itself has no row: outline the tree instead.
+            .when(drop_on_root, |el| el.border_1().border_color(Hsla::from(theme.accent).alpha(0.7)).rounded(px(6.)))
+            .on_drop(cx.listener(|ws, dragged: &DraggedEntry, _, cx| {
+                if let Some(root) = ws.root.clone() {
+                    ws.move_entry(dragged.path.clone(), root, cx);
+                }
+            }))
+            .on_drop(cx.listener(|ws, paths: &gpui::ExternalPaths, window, cx| {
+                cx.stop_propagation();
+                if let Some(root) = ws.root.clone() {
+                    ws.drop_into_tree(paths.paths().to_vec(), root, window, cx);
+                }
+            }))
+            .flex_1()
+            // Puts the first row's text level with the tab labels beside it
+            // (GPUI applies a uniform list's own padding twice, so this is 2px).
+            .pt(px(1.))
+            .pb_2()
+            .track_focus(&self.tree_focus)
+            .key_context("FileTree")
+            .on_action(cx.listener(|ws, _: &UndoFileChange, window, cx| ws.step_file_history(false, window, cx)))
+            .on_action(cx.listener(|ws, _: &RedoFileChange, window, cx| ws.step_file_history(true, window, cx)))
+            // Right-clicking empty space targets the project root.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|ws, ev: &MouseDownEvent, window, cx| {
+                    if let Some(root) = ws.root.clone() {
+                        ws.open_tree_menu(root, true, ev.position, window, cx);
+                    }
+                }),
+            )
+            .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .text_color(theme.text_muted)
+                .child("No folder opened.")
+                .child(self.primary_button("open-folder-side", Icon::FolderSearch, "Open Folder", cx, |ws, _, window, cx| {
+                    ws.open_folder(&OpenFolder, window, cx)
+                }))
+                .child(self.primary_button("clone-side", Icon::Download, "Clone Repository", cx, |ws, _, window, cx| {
+                    ws.git_clone(&GitClone, window, cx)
+                }))
+                .into_any_element()
+        };
+
+        // Files and Commit are tabs on the chrome, like the editor's, the
+        // current one joined to the island.
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .w(self.sidebar_width)
+            .flex_shrink_0()
+            .h_full()
+            .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
+            .child(
+                island(&theme)
+                    .flex_1()
+                    .min_h_0()
+                    .children(header)
+                    .child(body)
+                    // Deferred so the grab area sits above the editor it overlaps.
+                    .child(gpui::deferred(self.resize_handle(Edge::Sidebar, cx))),
+            )
+            // After the island, so the current tab paints over its top border.
+            .child(self.render_sidebar_tabs(window, cx))
+    }
+
+    /// The sidebar's two views as tabs above its island, shaped like the
+    /// editor's (`tab_shape`), without close buttons. In a narrow sidebar they
+    /// give up their names: the other tab first, then the current one too
+    /// (their tooltips still name them). `SIDEBAR_MIN_WIDTH` keeps two icons in.
+    pub(super) fn render_sidebar_tabs(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let files_on = self.sidebar_mode == SidebarMode::Files;
+        let changes = self.git_status.files.len();
+        let edge = Hsla::from(theme.border).alpha(0.75);
+        // Padding, icon and gap around a name; the change count adds a gap and itself.
+        let count = (changes > 0).then(|| changes.to_string());
+        let measured = measure_tab_names(&["Files".to_string(), "Commit".to_string(), count.clone().unwrap_or_default()], window, &theme);
+        let files_width = SIDEBAR_TAB_CHROME + measured[0].0;
+        let commit_width = SIDEBAR_TAB_CHROME + measured[1].0 + if count.is_some() { 6. + measured[2].0 } else { 0. };
+        let available = f32::from(self.sidebar_width) - 2. * TAB_STRIP_INSET;
+        let (active_width, other_width) = if files_on { (files_width, commit_width) } else { (commit_width, files_width) };
+        let (active_named, other_named) = if active_width + other_width <= available {
+            (true, true)
+        } else {
+            (active_width + TAB_ICON_WIDTH <= available, false)
+        };
+        let (files_named, commit_named) = if files_on { (active_named, other_named) } else { (other_named, active_named) };
+        let tab = |id: &'static str, icon: Icon, label: &'static str, on: bool, after_active: bool, named: bool| {
+            let tab = div()
+                .id(id)
+                .group(id)
+                .relative()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .h_full()
+                .map(|el| if named { el.px_3() } else { el.w(px(TAB_ICON_WIDTH)).justify_center() })
+                .cursor_pointer()
+                .text_color(if on { theme.text } else { theme.text_muted })
+                .when(on, |el| el.font_weight(FontWeight::MEDIUM));
+            tab_shape(tab, on, after_active, false, id.into(), edge, &theme)
+                .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
+                .when(named, |el| el.child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label)))
+        };
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(TAB_STRIP_HEIGHT))
+            .flex()
+            .items_end()
+            .pt(px(TAB_STRIP_TOP))
+            // Clear of the island's rounded corners, like the editor's tabs.
+            .pl(px(TAB_STRIP_INSET))
+            .pr(px(TAB_STRIP_INSET))
+            .overflow_hidden()
+            .child(
+                tab("sidebar-files", Icon::Folder, "Files", files_on, false, files_named)
+                    .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.show_files(window, cx))),
+            )
+            .child(
+                tab("sidebar-commit", Icon::GitBranch, "Commit", !files_on, files_on, commit_named)
+                    // Uncommitted changes, so they show from the Files view too (the
+                    // tooltip has them when the tab is only its icon).
+                    .when_some(count.clone().filter(|_| commit_named), |el, count| {
+                        el.child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(if files_on { theme.text_dim } else { theme.accent })
+                                .child(count),
+                        )
+                    })
+                    .tooltip(move |window, cx| {
+                        let label = if changes > 0 { format!("Commit ({changes} changed)") } else { "Commit".to_string() };
+                        status_tooltip(&label, &ToggleCommit, window, cx)
+                    })
+                    .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
+            )
+    }
+}
