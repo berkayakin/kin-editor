@@ -3,8 +3,11 @@
 //!
 //! An `LspStore` per window starts one server per kind and project root the
 //! first time a matching file opens, keeps open documents in sync and routes
-//! what servers send back. Editors talk to their document's [`Server`]
-//! directly for requests; see `Editor::lsp_request`.
+//! what servers send back. A document can have several servers (Kin's own,
+//! then extensions': ESLint beside TypeScript); they all get its text, and
+//! their diagnostics are combined. Editors talk to the servers directly for
+//! requests: the first that can answer, or all for completion and code
+//! actions; see `Editor::lsp_server_with`.
 
 pub mod install;
 pub mod protocol;
@@ -52,6 +55,9 @@ enum ServerState {
 
 /// A running, initialized server.
 pub struct Server {
+    /// Which server this is (`typescript`, an extension's): unique among a
+    /// document's servers, unlike `name`.
+    pub id: String,
     /// The executable's name, for the status bar and diagnostics.
     pub name: String,
     pub client: Arc<Client>,
@@ -120,10 +126,28 @@ impl Progress {
 
 struct OpenDocument {
     editor: WeakEntity<Editor>,
-    server: ServerKey,
+    /// Its servers, the main one first, and whether each got `didOpen` (a
+    /// server may still be starting).
+    servers: Vec<(ServerKey, bool)>,
     language_id: &'static str,
-    /// `didOpen` was sent (the server may still be starting).
-    opened: bool,
+}
+
+impl OpenDocument {
+    fn has(&self, key: &ServerKey) -> bool {
+        self.servers.iter().any(|(k, _)| k == key)
+    }
+
+    fn opened(&self, key: &ServerKey) -> bool {
+        self.servers.iter().any(|(k, opened)| k == key && *opened)
+    }
+
+    fn set_opened(&mut self, key: &ServerKey, opened: bool) {
+        for (k, o) in &mut self.servers {
+            if k == key {
+                *o = opened;
+            }
+        }
+    }
 }
 
 /// What the status bar shows for a file's server.
@@ -138,6 +162,16 @@ pub enum LspStatus {
     /// Kin is installing it (this command).
     Installing(&'static str),
     Failed(String),
+}
+
+/// One server's diagnostics for a document, as it published them.
+pub struct LspDiagnostics {
+    /// `Server::id`.
+    pub id: String,
+    /// `Server::name`, shown as the diagnostics' source.
+    pub server: String,
+    pub encoding: Encoding,
+    pub params: Value,
 }
 
 pub enum LspEvent {
@@ -156,11 +190,14 @@ pub struct LspStore {
     workspace_root: Option<PathBuf>,
     servers: HashMap<ServerKey, ServerState>,
     documents: HashMap<PathBuf, OpenDocument>,
-    /// Latest diagnostics per file, open or not, so a file gets them when it
-    /// opens later.
-    diagnostics: HashMap<PathBuf, Value>,
+    /// Latest diagnostics per file and server, open or not, so a file gets
+    /// them when it opens later.
+    diagnostics: HashMap<(PathBuf, ServerKey), Value>,
     /// Work-done progress per server, by token.
     progress: HashMap<ServerKey, HashMap<String, Progress>>,
+    /// Tests: the servers every document gets, instead of its language's.
+    #[cfg(test)]
+    pub(crate) test_specs: Option<Vec<&'static servers::ServerSpec>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -172,6 +209,8 @@ impl LspStore {
             documents: HashMap::new(),
             diagnostics: HashMap::new(),
             progress: HashMap::new(),
+            #[cfg(test)]
+            test_specs: None,
             _tasks: Vec::new(),
         }
     }
@@ -197,47 +236,65 @@ impl LspStore {
         if !crate::trust::is_trusted(&path) {
             return;
         }
-        let Some((key, custom)) = self.server_key(language, &path, cx) else { return };
+        let keys = self.server_keys(language, &path, cx);
+        if keys.is_empty() {
+            return;
+        }
         let store = cx.weak_entity();
         editor.update(cx, |e, _| e.set_lsp(store));
         self.documents.insert(
             path.clone(),
             OpenDocument {
                 editor: editor.downgrade(),
-                server: key.clone(),
+                servers: keys.iter().map(|(key, _, _)| (key.clone(), false)).collect(),
                 language_id: servers::language_id(language, &path),
-                opened: false,
             },
         );
-        match self.servers.get(&key) {
-            Some(ServerState::Running(server)) => {
-                let server = server.clone();
-                self.open_document(&path, &server, cx);
+        for (key, custom, spec) in keys {
+            match self.servers.get(&key) {
+                Some(ServerState::Running(server)) => {
+                    let server = server.clone();
+                    self.open_document(&path, &key, &server, cx);
+                }
+                Some(_) => {}
+                None => self.start(key, spec, custom, language, path.clone(), cx),
             }
-            Some(_) => {}
-            None => self.start(key, language, custom, path, cx),
         }
     }
 
-    /// Which server handles `language` for `path`, and a user-configured
-    /// command if any. None when disabled or there is no server.
-    fn server_key(&self, language: Language, path: &Path, cx: &App) -> Option<(ServerKey, Option<Vec<String>>)> {
+    /// The servers for `language` at `path`, the main one first (see
+    /// `servers::specs`), each with a user-configured command if any. None
+    /// when turned off in settings; a command there replaces them all.
+    #[allow(clippy::type_complexity)]
+    fn server_keys(&self, language: Language, path: &Path, cx: &App) -> Vec<(ServerKey, Option<Vec<String>>, &'static servers::ServerSpec)> {
         let custom = match Settings::get(cx).language_servers.get(language.name()) {
-            Some(Value::Bool(false)) => return None,
+            Some(Value::Bool(false)) => return Vec::new(),
             Some(Value::Array(command)) => Some(command.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>()),
             _ => None,
         };
-        // A command in settings works for languages without a server of their own.
-        let spec = servers::spec(language).or(custom.is_some().then_some(&servers::CUSTOM))?;
-        let root = servers::root_for(spec, path, self.workspace_root.as_deref());
-        match custom {
-            Some(command) => Some((ServerKey { id: format!("custom:{}", command.join(" ")), root }, Some(command))),
-            None => Some((ServerKey { id: spec.id.to_string(), root }, None)),
+        let root = |spec: &servers::ServerSpec| servers::root_for(spec, path, self.workspace_root.as_deref());
+        #[cfg(test)]
+        if let Some(specs) = &self.test_specs {
+            return specs.iter().map(|spec| (ServerKey { id: spec.id.to_string(), root: root(spec) }, None, *spec)).collect();
         }
+        // A command in settings works for languages without a server of their own too.
+        if let Some(command) = custom {
+            let spec = servers::spec(language).unwrap_or(&servers::CUSTOM);
+            let key = ServerKey { id: format!("custom:{}", command.join(" ")), root: root(spec) };
+            return vec![(key, Some(command), spec)];
+        }
+        servers::specs(language).into_iter().map(|spec| (ServerKey { id: spec.id.to_string(), root: root(spec) }, None, spec)).collect()
     }
 
-    fn start(&mut self, key: ServerKey, language: Language, custom: Option<Vec<String>>, file: PathBuf, cx: &mut Context<Self>) {
-        let Some(spec) = servers::spec(language).or(custom.is_some().then_some(&servers::CUSTOM)) else { return };
+    fn start(
+        &mut self,
+        key: ServerKey,
+        spec: &'static servers::ServerSpec,
+        custom: Option<Vec<String>>,
+        language: Language,
+        file: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
         self.servers.insert(key.clone(), ServerState::Finding);
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
@@ -306,13 +363,13 @@ impl LspStore {
                 Some(Value::Object(o)) => o.get("change").and_then(Value::as_u64).unwrap_or(0),
                 _ => 0,
             };
-            let server = Arc::new(Server { name, client, encoding, capabilities, sync });
+            let server = Arc::new(Server { id: key.id.clone(), name, client, encoding, capabilities, sync });
             this.update(cx, |s, cx| {
                 s.servers.insert(key.clone(), ServerState::Running(server.clone()));
                 let waiting: Vec<PathBuf> =
-                    s.documents.iter().filter(|(_, d)| d.server == key && !d.opened).map(|(p, _)| p.clone()).collect();
+                    s.documents.iter().filter(|(_, d)| d.has(&key) && !d.opened(&key)).map(|(p, _)| p.clone()).collect();
                 for path in waiting {
-                    s.open_document(&path, &server, cx);
+                    s.open_document(&path, &key, &server, cx);
                 }
                 cx.notify();
             })
@@ -355,7 +412,7 @@ impl LspStore {
                     let Some(path) = params.get("uri").and_then(Value::as_str).and_then(protocol::uri_to_path) else {
                         return;
                     };
-                    self.diagnostics.insert(path.clone(), params);
+                    self.diagnostics.insert((path.clone(), key.clone()), params);
                     self.apply_diagnostics(&path, cx);
                 }
                 "$/progress" => {
@@ -439,8 +496,8 @@ impl LspStore {
                 if !matches!(self.servers.get(key), Some(ServerState::Failed(_))) {
                     self.fail(key, message, cx);
                 }
-                for doc in self.documents.values_mut().filter(|d| &d.server == key) {
-                    doc.opened = false;
+                for doc in self.documents.values_mut() {
+                    doc.set_opened(key, false);
                 }
             }
         }
@@ -453,24 +510,38 @@ impl LspStore {
         }
     }
 
+    /// Gives the editor every running server's diagnostics for `path`.
     fn apply_diagnostics(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let (Some(params), Some(doc)) = (self.diagnostics.get(path), self.documents.get(path)) else { return };
-        let Some(ServerState::Running(server)) = self.servers.get(&doc.server) else { return };
-        let (encoding, name) = (server.encoding, server.name.clone());
+        let Some(doc) = self.documents.get(path) else { return };
+        let sources: Vec<LspDiagnostics> = doc
+            .servers
+            .iter()
+            .filter_map(|(key, _)| {
+                let ServerState::Running(server) = self.servers.get(key)? else { return None };
+                let params = self.diagnostics.get(&(path.to_path_buf(), key.clone()))?;
+                Some(LspDiagnostics { id: server.id.clone(), server: server.name.clone(), encoding: server.encoding, params: params.clone() })
+            })
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
         let Some(editor) = doc.editor.upgrade() else { return };
-        let params = params.clone();
-        editor.update(cx, |e, cx| e.set_lsp_diagnostics(&params, encoding, &name, cx));
+        editor.update(cx, |e, cx| e.set_lsp_diagnostics(sources, cx));
     }
 
-    fn open_document(&mut self, path: &Path, server: &Arc<Server>, cx: &mut Context<Self>) {
+    fn open_document(&mut self, path: &Path, key: &ServerKey, server: &Arc<Server>, cx: &mut Context<Self>) {
         let Some(doc) = self.documents.get_mut(path) else { return };
         let Some(editor) = doc.editor.upgrade() else {
             self.documents.remove(path);
             return;
         };
-        // The server gets the current text, so earlier edits don't matter.
+        // The server gets the current text, so earlier edits don't matter
+        // (unless another server still has to hear about them).
+        let first = !doc.servers.iter().any(|(_, opened)| *opened);
         let (text, version) = editor.update(cx, |e, _| {
-            e.doc.take_lsp_changes();
+            if first {
+                e.doc.take_lsp_changes();
+            }
             (e.doc.rope().to_string(), e.doc.version())
         });
         server.client.notify(
@@ -479,7 +550,7 @@ impl LspStore {
                 "uri": path_to_uri(path), "languageId": doc.language_id, "version": version as i64, "text": text
             } }),
         );
-        doc.opened = true;
+        doc.set_opened(key, true);
         self.apply_diagnostics(path, cx);
     }
 
@@ -495,18 +566,31 @@ impl LspStore {
             .collect()
     }
 
-    pub fn server_for(&self, path: &Path) -> Option<Arc<Server>> {
-        let doc = self.documents.get(path).filter(|d| d.opened)?;
-        match self.servers.get(&doc.server)? {
-            ServerState::Running(server) => Some(server.clone()),
-            _ => None,
+    /// The running servers that have an open document, the main one first.
+    pub fn servers_for(&self, path: &Path) -> Vec<Arc<Server>> {
+        let Some(doc) = self.documents.get(path) else { return Vec::new() };
+        doc.servers
+            .iter()
+            .filter(|(_, opened)| *opened)
+            .filter_map(|(key, _)| match self.servers.get(key)? {
+                ServerState::Running(server) => Some(server.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends an editor's edits since the last call to each of its servers.
+    pub fn did_change(&self, path: &Path, version: u64, changes: LspChanges, rope: &Rope) {
+        if changes.is_empty() {
+            return;
+        }
+        for server in self.servers_for(path) {
+            Self::send_changes(&server, path, version, &changes, rope);
         }
     }
 
-    /// Sends an editor's edits since the last call.
-    pub fn did_change(&self, path: &Path, version: u64, changes: LspChanges, rope: &Rope) {
-        let Some(server) = self.server_for(path) else { return };
-        if server.sync == 0 || changes.is_empty() {
+    fn send_changes(server: &Server, path: &Path, version: u64, changes: &LspChanges, rope: &Rope) {
+        if server.sync == 0 {
             return;
         }
         let content_changes: Vec<Value> = if changes.full || server.sync == 1 {
@@ -515,7 +599,7 @@ impl LspStore {
             let col = |(_, utf8, utf16): (u32, u32, u32)| if server.encoding == Encoding::Utf8 { utf8 } else { utf16 };
             changes
                 .changes
-                .into_iter()
+                .iter()
                 .map(|c| {
                     json!({
                         "range": {
@@ -534,7 +618,12 @@ impl LspStore {
     }
 
     pub fn did_save(&self, path: &Path, rope: &Rope) {
-        let Some(server) = self.server_for(path) else { return };
+        for server in self.servers_for(path) {
+            Self::send_save(&server, path, rope);
+        }
+    }
+
+    fn send_save(server: &Server, path: &Path, rope: &Rope) {
         let save = server.capabilities.get("textDocumentSync").and_then(|s| s.get("save"));
         if save.is_none_or(|s| s == &Value::Bool(false)) {
             return;
@@ -550,10 +639,10 @@ impl LspStore {
     /// Stops tracking a closed tab's document.
     pub fn did_close(&mut self, path: &Path) {
         let Some(doc) = self.documents.remove(path) else { return };
-        if doc.opened
-            && let Some(client) = self.client(&doc.server)
-        {
-            client.notify("textDocument/didClose", json!({ "textDocument": { "uri": path_to_uri(path) } }));
+        for (key, _) in doc.servers.iter().filter(|(_, opened)| *opened) {
+            if let Some(client) = self.client(key) {
+                client.notify("textDocument/didClose", json!({ "textDocument": { "uri": path_to_uri(path) } }));
+            }
         }
     }
 
@@ -570,8 +659,13 @@ impl LspStore {
     /// Installs the missing server of `path`'s document; when it's done,
     /// every window starts the servers it was missing.
     pub fn install_server(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(key) = self.documents.get(path).map(|d| d.server.clone()) else { return };
-        let Some(ServerState::Missing(spec)) = self.servers.get(&key) else { return };
+        let Some(doc) = self.documents.get(path) else { return };
+        let Some(spec) = doc.servers.iter().find_map(|(key, _)| match self.servers.get(key) {
+            Some(ServerState::Missing(spec)) => Some(*spec),
+            _ => None,
+        }) else {
+            return;
+        };
         let Some(installer) = install::for_spec(spec) else { return };
         if install::installing(installer.command) {
             return;
@@ -599,44 +693,56 @@ impl LspStore {
     /// Starts again every server that was missing (one was installed).
     pub fn retry_missing(&mut self, cx: &mut Context<Self>) {
         let missing: Vec<ServerKey> = self.servers.iter().filter(|(_, s)| matches!(s, ServerState::Missing(_))).map(|(k, _)| k.clone()).collect();
-        for key in missing {
-            self.servers.remove(&key);
-            let editors: Vec<Entity<Editor>> = self.documents.iter().filter(|(_, d)| d.server == key).filter_map(|(_, d)| d.editor.upgrade()).collect();
-            self.documents.retain(|_, d| d.server != key);
-            for editor in editors {
-                self.register(&editor, cx);
-            }
+        for key in &missing {
+            self.servers.remove(key);
         }
+        self.reregister(|d| missing.iter().any(|key| d.has(key)), cx);
         cx.notify();
     }
 
-    /// Restarts the server for a document (after installing it, or if it's stuck).
-    pub fn restart(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(key) = self.documents.get(path).map(|d| d.server.clone()) else { return };
-        if let Some(client) = self.client(&key) {
-            std::thread::spawn(move || client.shutdown());
-        }
-        self.servers.remove(&key);
-        self.progress.remove(&key);
-        let editors: Vec<Entity<Editor>> = self
-            .documents
-            .iter()
-            .filter(|(_, d)| d.server == key)
-            .filter_map(|(_, d)| d.editor.upgrade())
-            .collect();
-        self.documents.retain(|_, d| d.server != key);
+    /// Registers again the documents `which` picks (their servers changed).
+    fn reregister(&mut self, which: impl Fn(&OpenDocument) -> bool, cx: &mut Context<Self>) {
+        let editors: Vec<Entity<Editor>> = self.documents.values().filter(|d| which(d)).filter_map(|d| d.editor.upgrade()).collect();
+        self.documents.retain(|_, d| !which(d));
         for editor in editors {
             self.register(&editor, cx);
         }
     }
 
+    /// Restarts a document's servers (after installing one, or if it's stuck).
+    pub fn restart(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(keys) = self.documents.get(path).map(|d| d.servers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()) else { return };
+        for key in &keys {
+            if let Some(client) = self.client(key) {
+                std::thread::spawn(move || client.shutdown());
+            }
+            self.servers.remove(key);
+            self.progress.remove(key);
+        }
+        self.reregister(|d| keys.iter().any(|key| d.has(key)), cx);
+    }
+
+    /// The main server's state for the status bar; when it's up, the names
+    /// of all that are ("typescript-language-server, eslint").
     pub fn status(&self, path: &Path) -> Option<LspStatus> {
         let doc = self.documents.get(path)?;
-        Some(match self.servers.get(&doc.server)? {
+        let (main, _) = doc.servers.first()?;
+        let names = || {
+            let names: Vec<String> = doc
+                .servers
+                .iter()
+                .filter_map(|(key, _)| match self.servers.get(key)? {
+                    ServerState::Running(server) => Some(server.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            names.join(", ")
+        };
+        Some(match self.servers.get(main)? {
             ServerState::Finding | ServerState::Starting(..) => LspStatus::Starting,
-            ServerState::Running(server) => match self.progress.get(&doc.server).and_then(|p| p.values().next()) {
+            ServerState::Running(server) => match doc.servers.iter().find_map(|(key, _)| self.progress.get(key)?.values().next()) {
                 Some(work) => LspStatus::Busy(format!("{}: {}", server.name, work.label())),
-                None => LspStatus::Ready(server.name.clone()),
+                None => LspStatus::Ready(names()),
             },
             ServerState::Missing(spec) => match install::for_spec(spec) {
                 Some(installer) if install::installing(installer.command) => LspStatus::Installing(installer.command),
@@ -719,6 +825,60 @@ impl Default for LspStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A language server for tests: `python3 -c FAKE_SERVER <name> <trigger chars>`.
+/// It publishes one diagnostic per opened file ("<name> problem"), completes
+/// with "<name>-item", and offers "<name> fix (<diagnostics sent>)".
+#[cfg(test)]
+pub(crate) const FAKE_SERVER: &str = r#"
+import sys, json
+name = sys.argv[1]
+triggers = [t for t in sys.argv[2].split(",") if t] if len(sys.argv) > 2 else []
+def read():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        line = line.strip()
+        if not line:
+            break
+        k, v = line.split(b":", 1)
+        headers[k.lower()] = v.strip()
+    return json.loads(sys.stdin.buffer.read(int(headers[b"content-length"])))
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+while True:
+    m = read()
+    method, id = m.get("method"), m.get("id")
+    if method == "initialize":
+        caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True}
+        send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
+    elif method == "textDocument/didOpen":
+        uri = m["params"]["textDocument"]["uri"]
+        problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": name + " problem"}
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [problem]}})
+    elif method == "textDocument/completion":
+        send({"jsonrpc": "2.0", "id": id, "result": [{"label": name + "-item"}]})
+    elif method == "textDocument/codeAction":
+        sent = len(m["params"]["context"]["diagnostics"])
+        send({"jsonrpc": "2.0", "id": id, "result": [{"title": "%s fix (%d)" % (name, sent)}]})
+    elif method == "exit":
+        sys.exit(0)
+    elif id is not None:
+        send({"jsonrpc": "2.0", "id": id, "result": None})
+"#;
+
+/// A spec that runs [`FAKE_SERVER`] (leaked; tests only).
+#[cfg(test)]
+pub(crate) fn fake_server(name: &str, triggers: &str) -> &'static servers::ServerSpec {
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let args: &'static [&'static str] = Box::leak(vec!["-c", FAKE_SERVER, leak(name.to_string()), leak(triggers.to_string())].into_boxed_slice());
+    let candidates: &'static [(&'static str, &'static [&'static str])] = Box::leak(vec![("python3", args)].into_boxed_slice());
+    Box::leak(Box::new(servers::ServerSpec { id: leak(format!("fake-{name}")), candidates, install: "", root_markers: &[] }))
 }
 
 #[cfg(test)]

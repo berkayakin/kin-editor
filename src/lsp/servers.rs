@@ -29,12 +29,34 @@ pub static CUSTOM: ServerSpec = ServerSpec {
     root_markers: &[],
 };
 
-/// The server for `language`: an extension's when one provides it (for a
-/// built-in language too), else the built-in choice.
+/// The main server for `language` (see `specs`).
 pub fn spec(language: Language) -> Option<&'static ServerSpec> {
-    if let Some(spec) = crate::extensions::server_for(language.name()) {
-        return Some(spec);
+    specs(language).into_iter().next()
+}
+
+/// Every server a `language` document gets, the main one first: Kin's own
+/// choice, then the ones extensions bring, which run beside it (ESLint or
+/// Tailwind beside TypeScript). Requests go to the first server that can
+/// answer; diagnostics, completion and code actions come from all. An
+/// extension's server that's the same program as an earlier one (a choice
+/// Kin already makes) isn't started twice.
+pub fn specs(language: Language) -> Vec<&'static ServerSpec> {
+    combine(builtin(language), crate::extensions::servers_for(language.name()))
+}
+
+fn combine(builtin: Option<&'static ServerSpec>, extensions: Vec<&'static ServerSpec>) -> Vec<&'static ServerSpec> {
+    let mut out: Vec<&'static ServerSpec> = builtin.into_iter().collect();
+    for spec in extensions {
+        let same = |s: &&ServerSpec| s.candidates.iter().any(|(a, _)| spec.candidates.iter().any(|(b, _)| a == b));
+        if !out.iter().any(same) {
+            out.push(spec);
+        }
     }
+    out
+}
+
+/// Kin's own server for a built-in language.
+fn builtin(language: Language) -> Option<&'static ServerSpec> {
     static RUST: ServerSpec = ServerSpec {
         id: "rust-analyzer",
         candidates: &[("rust-analyzer", &[])],
@@ -325,6 +347,18 @@ mod tests {
         assert!(spec(Language::PlainText).is_none());
         assert_eq!(spec(Language::JavaScript).unwrap().id, spec(Language::Tsx).unwrap().id);
         assert_eq!(language_id(Language::JavaScript, Path::new("a.jsx")), "javascriptreact");
+    }
+
+    #[test]
+    fn extension_servers_run_beside_the_built_in_one() {
+        static ESLINT: ServerSpec = ServerSpec { id: "eslint", candidates: &[("vscode-eslint-language-server", &["--stdio"])], install: "", root_markers: &[] };
+        static VTSLS: ServerSpec = ServerSpec { id: "ext:vtsls", candidates: &[("vtsls", &["--stdio"])], install: "", root_markers: &[] };
+        let ids = |specs: Vec<&ServerSpec>| specs.iter().map(|s| s.id).collect::<Vec<_>>();
+        // ESLint joins TypeScript; an extension's vtsls is one of Kin's own
+        // choices for TypeScript already, so it isn't started a second time.
+        assert_eq!(ids(combine(builtin(Language::TypeScript), vec![&ESLINT, &VTSLS])), ["typescript", "eslint"]);
+        // A language Kin has no server for gets the extensions' alone.
+        assert_eq!(ids(combine(None, vec![&VTSLS, &ESLINT])), ["ext:vtsls", "eslint"]);
     }
 
     #[test]

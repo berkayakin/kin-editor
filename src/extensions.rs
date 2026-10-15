@@ -245,7 +245,8 @@ struct Registry {
     /// so open files keep their language; a removed one is None.
     languages: Vec<Option<&'static LanguageDef>>,
     /// Servers by the language name they serve (built-in languages too).
-    servers: HashMap<String, &'static ServerSpec>,
+    /// Per language, the servers extensions bring for it.
+    servers: HashMap<String, Vec<&'static ServerSpec>>,
     theme_dirs: Vec<PathBuf>,
     snippet_dirs: Vec<PathBuf>,
 }
@@ -277,8 +278,10 @@ pub fn language_for_file_name(path: &Path) -> Option<u16> {
 }
 
 /// An extension's server for a language (built-in or not), by its name.
-pub fn server_for(language: &str) -> Option<&'static ServerSpec> {
-    REGISTRY.read().unwrap().servers.get(language).copied()
+/// The servers extensions bring for `language` (one per extension: its
+/// alternatives for that language, the first installed one runs).
+pub fn servers_for(language: &str) -> Vec<&'static ServerSpec> {
+    REGISTRY.read().unwrap().servers.get(language).cloned().unwrap_or_default()
 }
 
 pub fn installed() -> Vec<ExtensionInfo> {
@@ -401,7 +404,7 @@ fn load() -> Vec<(String, Grammar)> {
 
     let mut extensions = Vec::new();
     let mut defs: Vec<LanguageDef> = Vec::new();
-    let mut servers: HashMap<String, &'static ServerSpec> = HashMap::new();
+    let mut servers: HashMap<String, Vec<&'static ServerSpec>> = HashMap::new();
     let mut jobs = Vec::new();
     for dir in dirs {
         let (info, languages, ext_servers, grammars) = read_extension(&dir);
@@ -410,7 +413,9 @@ fn load() -> Vec<(String, Grammar)> {
                 jobs.push((info.id.clone(), grammar.clone()));
             }
         }
-        servers.extend(ext_servers);
+        for (language, spec) in ext_servers {
+            servers.entry(language).or_default().push(spec);
+        }
         defs.extend(languages);
         extensions.push(info);
     }
@@ -423,7 +428,7 @@ fn load() -> Vec<(String, Grammar)> {
     let mut registry = REGISTRY.write().unwrap();
     let mut slots: Vec<Option<&'static LanguageDef>> = vec![None; registry.languages.len()];
     for mut def in defs {
-        def.server = servers.get(def.name).copied().or(def.server);
+        def.server = servers.get(def.name).and_then(|s| s.first().copied()).or(def.server);
         let def: &'static LanguageDef = Box::leak(Box::new(def));
         // A language keeps its index; an old one with the same name is replaced.
         let old = registry.languages.iter().position(|l| l.is_some_and(|l| l.name == def.name));
@@ -500,7 +505,8 @@ fn read_extension(dir: &Path) -> Read {
     // Per language, every server the extension lists for it: one spec with
     // them all as candidates, so the first that's installed runs.
     type Candidate = (&'static str, &'static [&'static str]);
-    let mut per_language: HashMap<String, (Vec<Candidate>, Option<&'static str>, Vec<&'static str>)> = HashMap::new();
+    // (server ids, candidates, install hint, root markers)
+    let mut per_language: HashMap<String, (Vec<String>, Vec<Candidate>, Option<&'static str>, Vec<&'static str>)> = HashMap::new();
     for (id, server) in manifest.get("language_servers").and_then(Value::as_table).into_iter().flatten() {
         let name = server.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
         let mut languages = strings(server.get("languages"));
@@ -520,19 +526,22 @@ fn read_extension(dir: &Path) -> Read {
         let markers: Vec<&'static str> = strings(server.get("root_markers")).into_iter().map(leak).collect();
         for language in languages {
             let entry = per_language.entry(language).or_default();
-            entry.0.push(candidate);
-            entry.1 = entry.1.or(install);
-            entry.2.extend(markers.iter().copied());
+            entry.0.push(id.clone());
+            entry.1.push(candidate);
+            entry.2 = entry.2.or(install);
+            entry.3.extend(markers.iter().copied());
         }
     }
     let mut servers = HashMap::new();
-    for (language, (candidates, install, markers)) in per_language {
+    for (language, (ids, candidates, install, markers)) in per_language {
         let names: Vec<&str> = candidates.iter().map(|(command, _)| *command).collect();
         let install = install.unwrap_or_else(|| {
             leak(format!("Install {}, or set a command in language_servers (for the {} extension)", names.join(" or "), info.name))
         });
         let spec: &'static ServerSpec = Box::leak(Box::new(ServerSpec {
-            id: leak(format!("{}:{language}", info.id)),
+            // Languages listing the same servers share one process per root
+            // (Tailwind for HTML, CSS and TSX).
+            id: leak(format!("{}:{}", info.id, ids.join("+"))),
             candidates: Box::leak(candidates.into_boxed_slice()),
             install,
             root_markers: Box::leak(markers.into_boxed_slice()),

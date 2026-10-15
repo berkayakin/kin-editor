@@ -1810,12 +1810,12 @@ impl Workspace {
                 };
                 self.ask_for_name(pending, window, cx);
             }
-            EditorLspEvent::CodeActions { server, actions, position } => {
+            EditorLspEvent::CodeActions { actions, position } => {
                 let entries = actions
                     .iter()
-                    .map(|a| if a.preferred { MenuEntry::item(a.title.clone(), Icon::Check) } else { MenuEntry::text(a.title.clone()) })
+                    .map(|(_, a)| if a.preferred { MenuEntry::item(a.title.clone(), Icon::Check) } else { MenuEntry::text(a.title.clone()) })
                     .collect();
-                let menu_actions = actions.iter().map(|a| Some(MenuAction::CodeAction(server.clone(), a.clone()))).collect();
+                let menu_actions = actions.iter().map(|(server, a)| Some(MenuAction::CodeAction(server.clone(), a.clone()))).collect();
                 self.show_context_menu(entries, menu_actions, *position, None, window, cx);
             }
             EditorLspEvent::Message(message) => self.toast(ToastKind::Info, message.clone(), None, cx),

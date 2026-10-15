@@ -56,7 +56,8 @@ impl Editor {
         };
         let server_only = matches!(&configured, Some(Value::String(s)) if s == "language_server");
         let selection = self.primary_selection().range();
-        let server = self.lsp_server(cx).filter(|s| {
+        // The first of the document's servers that formats.
+        let server = self.lsp_servers(cx).into_iter().find(|s| {
             if use_selection && !selection.is_empty() {
                 s.capability("documentRangeFormattingProvider") || s.capability("documentFormattingProvider")
             } else {

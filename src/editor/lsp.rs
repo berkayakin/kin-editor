@@ -37,8 +37,9 @@ pub enum EditorLspEvent {
     Navigate { title: SharedString, locations: Vec<Location>, encoding: Encoding },
     /// Ask for a new name, then rename through the server.
     Rename { server: Arc<Server>, path: PathBuf, position: Position, current: String },
-    /// Offer code actions in a menu at this window position.
-    CodeActions { server: Arc<Server>, actions: Vec<CodeAction>, position: Point<Pixels> },
+    /// Offer code actions (each with the server that offered it) in a menu
+    /// at this window position.
+    CodeActions { actions: Vec<(Arc<Server>, CodeAction)>, position: Point<Pixels> },
     /// Something to tell the user ("No usages found").
     Message(SharedString),
 }
@@ -57,7 +58,9 @@ pub(super) struct CompletionMenu {
     scroll: usize,
     /// Where the word being completed starts.
     start: usize,
-    server: Arc<Server>,
+    /// The servers that answered, and for each item the one it came from.
+    servers: Vec<Arc<Server>>,
+    sources: Vec<usize>,
     /// The server's list depends on the prefix; ask again as it grows.
     incomplete: bool,
 }
@@ -92,8 +95,9 @@ pub(super) struct EditorLsp {
     hover_hide: Option<Task<()>>,
     pub(super) signature: Option<SignatureHelp>,
     signature_task: Option<Task<()>>,
-    /// The server's diagnostics as received, for code action requests.
-    raw_diagnostics: Vec<Value>,
+    /// Each server's diagnostics as received (by `Server::id`), for code
+    /// action requests: a server gets its own back.
+    raw_diagnostics: Vec<(String, Vec<Value>)>,
     /// The server reports diagnostics, so the built-in syntax check is redundant.
     pub(super) active: bool,
     /// Other uses of the symbol at the caret (`textDocument/documentHighlight`),
@@ -101,6 +105,22 @@ pub(super) struct EditorLsp {
     pub(super) symbol_highlights: (u64, Vec<std::ops::Range<usize>>),
     symbol_highlight_task: Option<Task<()>>,
     inlay_task: Option<Task<()>>,
+}
+
+/// A server's name as a diagnostic source (sources are `&'static str`):
+/// each name is leaked once, and servers are few.
+fn diagnostic_source(server: &str) -> &'static str {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    if server.is_empty() {
+        return "lsp";
+    }
+    let mut names = NAMES.lock().unwrap();
+    if let Some(name) = names.iter().find(|n| **n == server) {
+        return name;
+    }
+    let name: &'static str = Box::leak(server.to_string().into_boxed_str());
+    names.push(name);
+    name
 }
 
 pub(super) fn is_word_char(c: char) -> bool {
@@ -112,9 +132,22 @@ impl Editor {
         self.lsp.store = Some(store);
     }
 
+    /// The document's servers that are up, the main one first.
+    pub(super) fn lsp_servers(&self, cx: &gpui::App) -> Vec<Arc<Server>> {
+        let (Some(path), Some(store)) = (self.doc.path.as_deref(), self.lsp.store.as_ref().and_then(|s| s.upgrade())) else {
+            return Vec::new();
+        };
+        store.read(cx).servers_for(path)
+    }
+
+    /// The main server.
     pub(super) fn lsp_server(&self, cx: &gpui::App) -> Option<Arc<Server>> {
-        let path = self.doc.path.as_deref()?;
-        self.lsp.store.as_ref()?.upgrade()?.read(cx).server_for(path)
+        self.lsp_servers(cx).into_iter().next()
+    }
+
+    /// The first server that has `capability` (`hoverProvider`…).
+    pub(super) fn lsp_server_with(&self, capability: &str, cx: &gpui::App) -> Option<Arc<Server>> {
+        self.lsp_servers(cx).into_iter().find(|s| s.capability(capability))
     }
 
     /// Records an edit: tells the server and the workspace, and drops
@@ -137,14 +170,17 @@ impl Editor {
         }
     }
 
-    pub fn set_lsp_diagnostics(&mut self, params: &Value, encoding: Encoding, server: &str, cx: &mut Context<Self>) {
-        let name: &'static str = match server {
-            "" => "lsp",
-            // Diagnostic sources are 'static; servers are few, so leaking the name once is fine.
-            other => Box::leak(other.to_string().into_boxed_str()),
-        };
-        let diagnostics = protocol::diagnostics(params, self.doc.rope(), encoding, name);
-        self.lsp.raw_diagnostics = params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
+    /// The document's diagnostics from its servers, all of them together.
+    pub fn set_lsp_diagnostics(&mut self, sources: Vec<crate::lsp::LspDiagnostics>, cx: &mut Context<Self>) {
+        let mut diagnostics = Vec::new();
+        self.lsp.raw_diagnostics.clear();
+        for source in sources {
+            let name = diagnostic_source(&source.server);
+            diagnostics.extend(protocol::diagnostics(&source.params, self.doc.rope(), source.encoding, name));
+            let raw = source.params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
+            self.lsp.raw_diagnostics.push((source.id, raw));
+        }
+        diagnostics.sort_by_key(|d| d.range.start);
         self.doc.set_lsp_diagnostics(diagnostics);
         // The server has (re)analysed the file: its hints may have changed too.
         self.schedule_inlay_hints(cx);
@@ -175,14 +211,16 @@ impl Editor {
         if self.selections.len() != 1 || self.mode != EditorMode::Full {
             return;
         }
-        let Some(server) = self.lsp_server(cx) else { return };
+        let servers = self.lsp_servers(cx);
         let Some(last) = typed.chars().last() else { return };
         let head = self.primary_selection().head;
-        let trigger = server
-            .completion_triggers()
-            .into_iter()
+        // Any completing server's trigger (`.` for TypeScript, `"` for Tailwind).
+        let trigger = servers
+            .iter()
+            .filter(|s| s.capability("completionProvider"))
+            .flat_map(|s| s.completion_triggers())
             .find(|t| head >= t.len() && self.doc.slice(head - t.len()..head) == *t);
-        if server.capability("completionProvider") {
+        if servers.iter().any(|s| s.capability("completionProvider")) {
             match (&self.lsp.completion, trigger) {
                 (_, Some(trigger)) => self.request_completion(Some(trigger), cx),
                 (Some(menu), None) if is_word_char(last) && menu.incomplete => self.request_completion(None, cx),
@@ -191,7 +229,7 @@ impl Editor {
                 (None, None) => {}
             }
         }
-        if server.capability("signatureHelpProvider")
+        if let Some(server) = servers.iter().find(|s| s.capability("signatureHelpProvider"))
             && (self.lsp.signature.is_some() || server.signature_triggers().iter().any(|t| typed.ends_with(t.as_str())))
         {
             self.request_signature_help(cx);
@@ -204,28 +242,54 @@ impl Editor {
         }
     }
 
+    /// Asks every completing server (for a trigger character, the ones it
+    /// triggers) and shows their items together.
     fn request_completion(&mut self, trigger: Option<String>, cx: &mut Context<Self>) {
-        let Some(server) = self.lsp_server(cx) else { return };
         let head = self.primary_selection().head;
         let start = self.word_start(head);
-        let Some(mut params) = self.position_params(head, &server) else { return };
-        params["context"] = match &trigger {
-            Some(t) => json!({ "triggerKind": 2, "triggerCharacter": t }),
-            None => json!({ "triggerKind": 1 }),
-        };
+        let requests: Vec<(Arc<Server>, Value)> = self
+            .lsp_servers(cx)
+            .into_iter()
+            .filter(|s| s.capability("completionProvider"))
+            .filter(|s| trigger.as_ref().is_none_or(|t| s.completion_triggers().contains(t)))
+            .filter_map(|server| {
+                let mut params = self.position_params(head, &server)?;
+                params["context"] = match &trigger {
+                    Some(t) => json!({ "triggerKind": 2, "triggerCharacter": t }),
+                    None => json!({ "triggerKind": 1 }),
+                };
+                Some((server, params))
+            })
+            .collect();
+        if requests.is_empty() {
+            return;
+        }
         self.lsp.completion_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(value) = server.request("textDocument/completion", params).await else { return };
-            let incomplete = value.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false);
-            let mut items = protocol::completion_items(value);
+            let servers: Vec<Arc<Server>> = requests.iter().map(|(s, _)| s.clone()).collect();
+            let answers = futures::future::join_all(requests.into_iter().map(|(server, params)| async move {
+                server.request("textDocument/completion", params).await
+            }))
+            .await;
+            let (mut items, mut sources, mut incomplete) = (Vec::new(), Vec::new(), false);
+            for (ix, answer) in answers.into_iter().enumerate() {
+                let Ok(value) = answer else { continue };
+                incomplete |= value.get("isIncomplete").and_then(Value::as_bool).unwrap_or(false);
+                let found = protocol::completion_items(value);
+                sources.extend(std::iter::repeat_n(ix, found.len()));
+                items.extend(found);
+            }
             this.update(cx, |e, cx| {
-                items.extend(super::snippet::user_snippet_items(e.doc.language));
+                let snippets = super::snippet::user_snippet_items(e.doc.language);
+                sources.extend(std::iter::repeat_n(0, snippets.len()));
+                items.extend(snippets);
                 e.lsp.completion = Some(CompletionMenu {
                     items: Arc::new(items),
                     matches: Vec::new(),
                     selected: 0,
                     scroll: 0,
                     start,
-                    server,
+                    servers,
+                    sources,
                     incomplete,
                 });
                 e.refilter_completion(cx);
@@ -312,8 +376,11 @@ impl Editor {
 
     fn accept_completion(&mut self, ix: usize, replace: bool, cx: &mut Context<Self>) {
         let Some(menu) = self.lsp.completion.take() else { return };
-        let Some(mut item) = menu.matches.get(ix).map(|&i| menu.items[i].clone()) else { return };
-        let (server, start) = (menu.server, menu.start);
+        let Some(&i) = menu.matches.get(ix) else { return };
+        let mut item = menu.items[i].clone();
+        // Resolved by, and positioned in the encoding of, the server it came from.
+        let Some(server) = menu.servers.get(menu.sources[i]).cloned() else { return };
+        let start = menu.start;
         cx.notify();
         // Auto-imports often arrive only on resolve.
         let own = item.raw.get("kinUserSnippet").is_some();
@@ -372,7 +439,7 @@ impl Editor {
     // ---- Signature help ----------------------------------------------------------------
 
     fn request_signature_help(&mut self, cx: &mut Context<Self>) {
-        let Some(server) = self.lsp_server(cx) else { return };
+        let Some(server) = self.lsp_server_with("signatureHelpProvider", cx) else { return };
         let head = self.primary_selection().head;
         let row = self.doc.row_of(head);
         let Some(params) = self.position_params(head, &server) else { return };
@@ -496,7 +563,7 @@ impl Editor {
             self.lsp.hover = Some(HoverPopover { range: range.clone(), diagnostics: diagnostics.clone(), blocks: Vec::new(), anchor });
             cx.notify();
         }
-        let server = self.lsp_server(cx).filter(|s| s.capability("hoverProvider"));
+        let server = self.lsp_server_with("hoverProvider", cx);
         let params = server.as_ref().and_then(|s| self.position_params(range.start, s));
         let (Some(server), Some(params)) = (server, params) else {
             self.lsp.hover_pending = None;
@@ -546,7 +613,7 @@ impl Editor {
         self.lsp.inlay_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
             let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
-                let server = e.lsp_server(cx).filter(|s| s.capability("inlayHintProvider"))?;
+                let server = e.lsp_server_with("inlayHintProvider", cx)?;
                 let rope = e.doc.rope();
                 let end = offset_to_position(rope, rope.len_bytes(), server.encoding);
                 let params = json!({
@@ -610,7 +677,7 @@ impl Editor {
         self.lsp.symbol_highlight_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
             let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
-                let server = e.lsp_server(cx).filter(|s| s.capability("documentHighlightProvider"))?;
+                let server = e.lsp_server_with("documentHighlightProvider", cx)?;
                 let params = e.position_params(e.primary_selection().head, &server)?;
                 Some((server, params, e.doc.version()))
             }) else {
@@ -688,7 +755,9 @@ impl Editor {
         context: Value,
         cx: &mut Context<Self>,
     ) {
-        let Some(server) = self.lsp_server(cx) else {
+        // `textDocument/definition` → `definitionProvider`.
+        let capability = format!("{}Provider", method.trim_start_matches("textDocument/"));
+        let Some(server) = self.lsp_server_with(&capability, cx).or_else(|| self.lsp_server(cx)) else {
             cx.emit(EditorLspEvent::Message("No language server for this file".into()));
             return;
         };
@@ -716,7 +785,7 @@ impl Editor {
     }
 
     pub(super) fn rename_symbol(&mut self, _: &super::RenameSymbol, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(server) = self.lsp_server(cx).filter(|s| s.capability("renameProvider")) else {
+        let Some(server) = self.lsp_server_with("renameProvider", cx) else {
             cx.emit(EditorLspEvent::Message("Renaming needs a language server".into()));
             return;
         };
@@ -729,41 +798,60 @@ impl Editor {
     }
 
     pub(super) fn show_context_actions(&mut self, _: &super::ShowContextActions, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(server) = self.lsp_server(cx).filter(|s| s.capability("codeActionProvider")) else {
+        let servers: Vec<Arc<Server>> = self.lsp_servers(cx).into_iter().filter(|s| s.capability("codeActionProvider")).collect();
+        if servers.is_empty() {
             cx.emit(EditorLspEvent::Message("No actions available here".into()));
             return;
-        };
+        }
         let range = self.primary_selection().range();
         let rope = self.doc.rope().clone();
-        // Fixes are offered for the problems under the caret.
-        let diagnostics: Vec<Value> = self
-            .lsp
-            .raw_diagnostics
-            .iter()
-            .filter(|d| {
-                protocol::LspRange::from_json(d.get("range").unwrap_or(&Value::Null))
-                    .map(|r| protocol::range_to_offsets(&rope, r, server.encoding))
-                    .is_some_and(|r| r.start <= range.end && r.end >= range.start)
-            })
-            .cloned()
-            .collect();
         let Some(document) = self.text_document() else { return };
-        let params = json!({
-            "textDocument": document,
-            "range": offsets_to_range(&rope, range.clone(), server.encoding).to_json(),
-            "context": { "diagnostics": diagnostics, "triggerKind": 1 },
-        });
+        // Each server is asked for fixes for its own problems under the caret.
+        let requests: Vec<(Arc<Server>, Value)> = servers
+            .into_iter()
+            .map(|server| {
+                let diagnostics: Vec<Value> = self
+                    .lsp
+                    .raw_diagnostics
+                    .iter()
+                    .filter(|(id, _)| *id == server.id)
+                    .flat_map(|(_, raw)| raw)
+                    .filter(|d| {
+                        protocol::LspRange::from_json(d.get("range").unwrap_or(&Value::Null))
+                            .map(|r| protocol::range_to_offsets(&rope, r, server.encoding))
+                            .is_some_and(|r| r.start <= range.end && r.end >= range.start)
+                    })
+                    .cloned()
+                    .collect();
+                let params = json!({
+                    "textDocument": document,
+                    "range": offsets_to_range(&rope, range.clone(), server.encoding).to_json(),
+                    "context": { "diagnostics": diagnostics, "triggerKind": 1 },
+                });
+                (server, params)
+            })
+            .collect();
         let Some(local) = self.local_position(range.start, window, cx) else { return };
         let Some(layout) = self.layout.clone() else { return };
         let position = layout.bounds.origin + local + gpui::point(px(0.), layout.line_height);
         cx.spawn(async move |this, cx| {
-            let result = server.request("textDocument/codeAction", params).await;
+            let answers = futures::future::join_all(requests.into_iter().map(|(server, params)| async move {
+                let result = server.request("textDocument/codeAction", params).await;
+                (server, result)
+            }))
+            .await;
+            let actions: Vec<(Arc<Server>, CodeAction)> = answers
+                .into_iter()
+                .flat_map(|(server, result)| {
+                    let found = result.map(|v| protocol::code_actions(&v)).unwrap_or_default();
+                    found.into_iter().map(move |action| (server.clone(), action))
+                })
+                .collect();
             this.update(cx, |_, cx| {
-                let actions = result.map(|v| protocol::code_actions(&v)).unwrap_or_default();
                 if actions.is_empty() {
                     cx.emit(EditorLspEvent::Message("No actions available here".into()));
                 } else {
-                    cx.emit(EditorLspEvent::CodeActions { server, actions, position });
+                    cx.emit(EditorLspEvent::CodeActions { actions, position });
                 }
             })
             .ok();
@@ -957,4 +1045,99 @@ impl Editor {
 pub(super) enum CompletionKey {
     Move(isize),
     Accept { replace: bool },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use gpui::{AppContext, Entity, TestAppContext};
+
+    use super::*;
+    use crate::{
+        document::Document,
+        lsp::{LspStatus, fake_server},
+    };
+
+    /// Runs the app until `done` holds; servers answer from other threads.
+    fn wait_for(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+        let started = Instant::now();
+        loop {
+            cx.run_until_parked();
+            if done(cx) {
+                return;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[gpui::test]
+    fn a_document_gets_every_server(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-servers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.ts");
+        std::fs::write(&path, "x.y\n").unwrap();
+
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("main", "."), fake_server("extra", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+
+        // Both get the text; their diagnostics are shown together, each
+        // server's kept apart for code actions.
+        let from_servers = |e: &Editor| e.doc.diagnostics.iter().filter(|d| d.message.ends_with(" problem")).count();
+        wait_for(cx, "diagnostics", |cx| {
+            let found = editor.read_with(cx, |e, _| from_servers(e));
+            if found < 2 {
+                eprintln!("status: {:?}, diagnostics: {found}", store.read_with(cx, |s, _| s.status(&path)));
+            }
+            found == 2
+        });
+        editor.read_with(cx, |e, _| {
+            let mut messages: Vec<&str> = e.doc.diagnostics.iter().map(|d| &*d.message).filter(|m| m.ends_with(" problem")).collect();
+            messages.sort();
+            assert_eq!(messages, ["extra problem", "main problem"]);
+            let ids: Vec<&str> = e.lsp.raw_diagnostics.iter().map(|(id, raw)| (id.as_str(), raw.len())).map(|(id, _)| id).collect();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&"fake-main") && ids.contains(&"fake-extra"));
+        });
+        store.read_with(cx, |s, _| assert_eq!(s.status(&path), Some(LspStatus::Ready("python3, python3".into()))));
+
+        // Completion asks both and lists their items together.
+        editor.update(cx, |e, cx| {
+            // Just after the dot: nothing typed yet, so every item shows.
+            e.select_range(2..2, cx);
+            e.request_completion(None, cx);
+        });
+        wait_for(cx, "completion", |cx| editor.read_with(cx, |e, _| e.lsp.completion.is_some()));
+        let labels = |cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, _| {
+                let menu = e.lsp.completion.as_ref().unwrap();
+                let mut labels: Vec<String> = menu.items.iter().map(|i| i.label.clone()).collect();
+                labels.sort();
+                labels
+            })
+        };
+        assert_eq!(labels(cx), ["extra-item", "main-item"]);
+
+        // A trigger character asks only the servers it triggers.
+        editor.update(cx, |e, cx| {
+            e.lsp.completion = None;
+            e.request_completion(Some(".".into()), cx);
+        });
+        wait_for(cx, "triggered completion", |cx| editor.read_with(cx, |e, _| e.lsp.completion.is_some()));
+        assert_eq!(labels(cx), ["main-item"]);
+
+        store.update(cx, |s, _| s.shutdown_all());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
