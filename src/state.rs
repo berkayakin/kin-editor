@@ -246,7 +246,11 @@ impl ProjectSession {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        // Its own temporary file: saves can overlap now that they run in
+        // the background, and one mustn't rename another's half-written file.
+        static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{}-{n}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_string_pretty(self)? + "\n")?;
         std::fs::rename(tmp, path)
     }

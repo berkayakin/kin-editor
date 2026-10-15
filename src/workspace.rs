@@ -1060,8 +1060,15 @@ impl Workspace {
 
     /// Writes the project's tabs, carets and unsaved text for next time.
     fn save_session(&self, cx: &App) -> std::io::Result<()> {
-        let Some(root) = self.root.clone() else { return Ok(()) };
+        self.session_snapshot(cx).map_or(Ok(()), SessionSnapshot::write)
+    }
+
+    /// The session to save, with unsaved texts as rope clones: making them
+    /// strings, serializing and writing can happen off the UI thread.
+    fn session_snapshot(&self, cx: &App) -> Option<SessionSnapshot> {
+        let root = self.root.clone()?;
         let mut tabs = Vec::new();
+        let mut unsaved = Vec::new();
         let mut active = 0;
         let mut pane_active = Vec::new();
         for (pane_ix, pane) in self.panes.iter().enumerate() {
@@ -1081,10 +1088,13 @@ impl Workspace {
                     }
                 }
                 count += 1;
+                if dirty {
+                    unsaved.push((tabs.len(), e.doc.rope().clone()));
+                }
                 tabs.push(TabSession {
                     path: e.doc.path.clone(),
                     cursor: e.primary_selection().head,
-                    unsaved: dirty.then(|| e.doc.rope().to_string()),
+                    unsaved: None,
                     pane: pane_ix,
                     pinned: self.pinned.contains(&tab.entity_id()),
                     folds: e.folded_rows(),
@@ -1109,7 +1119,8 @@ impl Workspace {
         breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
         let python_venv = crate::python::choice(&root).map(|c| c.to_saved());
         let terminals = Some(self.terminal_layout(cx));
-        ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals }.save()
+        let session = ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals };
+        Some(SessionSnapshot { session, unsaved })
     }
 
     /// The terminal panel as the session keeps it: each shell's folder and
@@ -1156,12 +1167,10 @@ impl Workspace {
         }
         self.session_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(800)).await;
-            this.update(cx, |ws, cx| {
-                if let Err(err) = ws.save_session(cx) {
-                    eprintln!("couldn't save the session: {err}");
-                }
-            })
-            .ok();
+            let Ok(Some(snapshot)) = this.update(cx, |ws, cx| ws.session_snapshot(cx)) else { return };
+            if let Err(err) = cx.background_executor().spawn(async move { snapshot.write() }).await {
+                eprintln!("couldn't save the session: {err}");
+            }
         }));
     }
 
@@ -8341,6 +8350,22 @@ fn tree_children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
         .collect();
     children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
     children
+}
+
+/// A session to write, its unsaved texts still ropes (see `session_snapshot`).
+struct SessionSnapshot {
+    session: ProjectSession,
+    /// Tabs with unsaved edits: index in `session.tabs` and the text.
+    unsaved: Vec<(usize, ropey::Rope)>,
+}
+
+impl SessionSnapshot {
+    fn write(mut self) -> std::io::Result<()> {
+        for (ix, text) in self.unsaved {
+            self.session.tabs[ix].unsaved = Some(text.to_string());
+        }
+        self.session.save()
+    }
 }
 
 /// A child view (editor, terminal, panel) drawn from its last layout until it
