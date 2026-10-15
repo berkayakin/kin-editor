@@ -650,7 +650,10 @@ which puts the default back.
 Everything is stored in `settings.json`. **Open settings.json** (at the bottom of the dialog and
 in Find Action) opens it, created with every option commented out. Edits to the file apply when
 you save (or when you come back to Kin after editing it elsewhere). Comments and trailing commas
-are fine, and Kin keeps them when it changes a value itself.
+are fine, and Kin keeps them when it changes a value itself. With the JSON language server
+installed (`vscode-langservers-extracted`), `settings.json`, `keymap.json` and your themes get
+completion, documentation on hover and checks from schemas Kin makes of its own options, actions
+and theme colors.
 
 | Setting | Default | |
 | --- | --- | --- |

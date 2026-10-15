@@ -314,6 +314,11 @@ fn defaults(program: &str) -> (Value, Value) {
             });
             (Value::Null, json!({ "gopls": { "hints": hints } }))
         }
+        // Schemas for Kin's own settings, keymap and theme files.
+        "vscode-json-language-server" => match crate::schemas::json_schemas() {
+            Value::Null => (Value::Null, Value::Null),
+            schemas => (Value::Null, json!({ "json": { "schemas": schemas } })),
+        },
         _ => (Value::Null, Value::Null),
     }
 }

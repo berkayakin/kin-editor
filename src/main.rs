@@ -38,6 +38,7 @@ mod trust;
 mod trust_dialog;
 mod preferences;
 mod run;
+mod schemas;
 mod project_search;
 mod push_dialog;
 mod search;

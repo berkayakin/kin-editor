@@ -12,6 +12,7 @@ use std::{
 };
 
 use gpui::{App, Global};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -22,7 +23,7 @@ use crate::{
     theme::{self, config_dir},
 };
 
-#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
     pub theme: Option<String>,
@@ -73,7 +74,7 @@ pub struct Settings {
 }
 
 /// One language server's settings (`lsp.<id>`).
-#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct LspSettings {
     /// Answers the server's `workspace/configuration` requests (by section,
@@ -85,14 +86,14 @@ pub struct LspSettings {
     pub binary: Option<LspBinary>,
 }
 
-#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct LspBinary {
     pub path: Option<String>,
     pub arguments: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct RunConfiguration {
     pub name: String,
@@ -103,7 +104,7 @@ pub struct RunConfiguration {
 impl Global for Settings {}
 
 /// Built-in keymaps, named as in Zed's `base_keymap` setting.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BaseKeymap {
     #[default]
     JetBrains,
@@ -140,7 +141,7 @@ impl BaseKeymap {
 /// How much decoration the interface draws, from most to least. Each level
 /// drops one more kind of effect: gradients first (the most decorative),
 /// then the shadows, glows and animations that also give depth and focus cues.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum VisualEffects {
     /// Gradients, shadows, glows and animations.
@@ -175,7 +176,7 @@ impl VisualEffects {
 
 /// Auto-save modes, named like VS Code's `files.autoSave`. Every mode but
 /// `off` also saves when the window loses focus, a tab is closed and on quit.
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoSave {
     Off,
@@ -200,7 +201,7 @@ impl AutoSave {
 }
 
 /// Which whitespace characters the editor marks (spaces as dots, tabs as lines).
-#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowWhitespace {
     /// Inside selections.
@@ -239,7 +240,7 @@ impl ShowWhitespace {
 }
 
 /// Options that can differ per language and per `.editorconfig` section.
-#[derive(Deserialize, Default, Clone, PartialEq, Debug)]
+#[derive(Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct EditorSettings {
     /// Columns per indent level and per tab character.
@@ -650,6 +651,7 @@ pub fn init(cx: &mut App) -> Vec<String> {
     crate::trust::set_trust_all(settings.trust_all_projects == Some(true));
     cx.set_global(settings);
     problems.extend(keymap::install(cx));
+    crate::schemas::init(cx);
     cx.set_global(ConfigStamps { settings: modified(Settings::path()), keymap: modified(keymap::keymap_path()) });
     problems
 }
