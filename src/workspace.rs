@@ -273,6 +273,17 @@ impl TerminalGroup {
     }
 }
 
+/// How much the title bar's command capsule shows, by window width.
+#[derive(Clone, Copy)]
+enum Capsule {
+    /// The folder, file and ⇧⇧ hint, this wide.
+    Full(f32),
+    /// Just the file, this wide.
+    Compact(f32),
+    /// A round search button.
+    Button,
+}
+
 /// Where `open_terminal` puts a new terminal.
 #[derive(Clone, Copy)]
 enum TerminalPlace {
@@ -5267,9 +5278,19 @@ impl Workspace {
 
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mac = cfg!(target_os = "macos");
+        let width = f32::from(window.viewport_size().width);
+        // Long project and branch names are cut shorter in narrow windows.
+        let narrow = width < 900.;
+        // The capsule gives up its extras as the window narrows, then becomes
+        // a round search button.
+        let capsule = if width < 720. {
+            Capsule::Button
+        } else {
+            let w = (width * 0.36).clamp(240., 460.);
+            if w < 360. { Capsule::Compact(w) } else { Capsule::Full(w) }
+        };
         div()
             .id("titlebar")
-            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -5291,63 +5312,61 @@ impl Workspace {
             // Drag areas (Windows) are the bar's empty parts, not the bar itself:
             // GPUI picks the first control area under the pointer, and a parent's
             // comes before its children's (the window buttons).
-            // Room for the traffic lights, which macOS moves out of the window in full screen.
+            //
+            // Two sides that share the space around the capsule equally keep it
+            // centered; the left one never gets less than its chips need (its
+            // minimum is their width), so when they need more the capsule moves
+            // right, and shrinks, instead of covering them.
             .child(
                 div()
+                    .flex()
+                    .flex_1()
+                    .flex_basis(px(0.))
                     .h_full()
-                    .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag),
+                    .items_center()
+                    // Room for the traffic lights, which macOS moves out of the window in full screen.
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
+                            .flex_shrink_0()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
+                            .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
+                            .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
+                    )
+                    .child(div().flex_1().min_w(px(GAP)).h_full().window_control_area(WindowControlArea::Drag)),
             )
+            .child(self.render_command_capsule(capsule, cx))
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap_1()
-                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(cx)))
-                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(cx)))
-                    .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
-            )
-            .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
-            .when(!mac, |el| el.child(self.render_window_controls(cx)))
-            // Centered on the window, not on the space the chips leave.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(relative(0.3))
-                    .right(relative(0.3))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(self.render_command_capsule(cx)),
+                    .flex_1()
+                    .flex_basis(px(0.))
+                    .min_w_0()
+                    .h_full()
+                    .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
+                    .when(!mac, |el| el.child(self.render_window_controls(cx))),
             )
     }
 
     /// The title bar's center: the current file, and a way into Search
     /// Everywhere (which it opens), like a command palette's field.
-    fn render_command_capsule(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_command_capsule(&self, capsule: Capsule, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let file = self.active_editor().map(|e| {
-            let doc = &e.read(cx).doc;
-            (doc.path.clone(), doc.file_name(), doc.is_dirty())
-        });
-        let folder = file.as_ref().and_then(|(path, _, _)| path.as_deref()).and_then(|path| {
-            let rel = self.display_rel(path);
-            let (dir, _) = rel.rsplit_once(['/', '\\'])?;
-            Some(format!("{dir}/"))
-        });
-        div()
+        let base = div()
             .id("command-capsule")
             .flex()
+            .flex_shrink_0()
             .items_center()
-            .gap_2()
-            .w_full()
-            .max_w(px(460.))
             .h(px(28.))
-            .pl_2p5()
-            .pr_1()
             .rounded(px(14.))
             .bg(theme.background)
             .border_1()
@@ -5356,7 +5375,36 @@ impl Workspace {
             .text_size(px(12.5))
             .hover(|s| s.border_color(theme.border))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)))
+            .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx)));
+        let width = match capsule {
+            Capsule::Button => {
+                return base
+                    .w(px(28.))
+                    .justify_center()
+                    .tooltip(|_, cx| tooltip_view(format!("Search Everywhere ({})", double_shift_label()), cx))
+                    .child(icon_el(Icon::Search, px(13.), theme.text_dim.into()))
+                    .into_any_element();
+            }
+            Capsule::Compact(w) | Capsule::Full(w) => w,
+        };
+        let full = matches!(capsule, Capsule::Full(_));
+        let file = self.active_editor().map(|e| {
+            let doc = &e.read(cx).doc;
+            (doc.path.clone(), doc.file_name(), doc.is_dirty())
+        });
+        // The folder only when there's room for it.
+        let folder = file.as_ref().filter(|_| full).and_then(|(path, _, _)| path.as_deref()).and_then(|path| {
+            let rel = self.display_rel(path);
+            let (dir, _) = rel.rsplit_once(['/', '\\'])?;
+            Some(format!("{dir}/"))
+        });
+        base.gap_2()
+            .w(px(width))
+            // Gives way to the chips beside it before they'd be cut.
+            .flex_shrink()
+            .min_w(px(160.))
+            .pl_2p5()
+            .pr(px(if full { 4. } else { 10. }))
             .child(icon_el(Icon::Search, px(13.), theme.text_dim.into()))
             .child(
                 div()
@@ -5377,28 +5425,31 @@ impl Workspace {
                                     .min_w_0()
                                     .overflow_hidden()
                                     .when_some(folder, |el, f| el.child(div().flex_shrink().truncate().text_color(theme.text_dim).child(f)))
-                                    .child(div().flex_shrink_0().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(name)),
+                                    .child(div().min_w_0().truncate().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(name)),
                             )
                             .when(dirty, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.accent))),
-                        None => el.text_color(theme.text_dim).child("Search Everywhere"),
+                        None => el.text_color(theme.text_dim).child(div().truncate().child("Search Everywhere")),
                     }),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .py(px(1.))
-                    .rounded(px(10.))
-                    .bg(theme.hover)
-                    .text_size(px(11.))
-                    .text_color(theme.text_dim)
-                    .child(double_shift_label()),
-            )
+            .when(full, |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded(px(10.))
+                        .bg(theme.hover)
+                        .text_size(px(11.))
+                        .text_color(theme.text_dim)
+                        .child(double_shift_label()),
+                )
+            })
+            .into_any_element()
     }
 
     /// The open project: a tinted monogram and its folder name. Clicking
     /// lists recent projects.
-    fn render_project_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_project_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let name = self.root.as_deref().map(folder_name).unwrap_or_default();
         let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
@@ -5420,6 +5471,7 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
+            .max_w(px(if narrow { 180. } else { 300. }))
             .child(
                 div()
                     .size(px(20.))
@@ -5438,11 +5490,11 @@ impl Workspace {
                     .text_color(gpui::hsla(0., 0., 0., 0.78))
                     .child(initial),
             )
-            .child(name)
+            .child(div().min_w_0().truncate().child(ellipsize(&name, if narrow { 16 } else { 30 })))
     }
 
     /// The current branch beside the project name. Clicking opens Branches….
-    fn render_branch_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_branch_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let s = &self.git_status;
         let dirty = !s.files.is_empty();
@@ -5452,7 +5504,7 @@ impl Workspace {
             .items_center()
             .gap_1p5()
             .h(px(24.))
-            .max_w(px(240.))
+            .max_w(px(if narrow { 150. } else { 280. }))
             .px_2()
             .rounded(px(12.))
             .cursor_pointer()
@@ -5464,7 +5516,7 @@ impl Workspace {
             .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
             .child(icon_el(Icon::GitBranch, px(12.), theme.text_dim.into()))
-            .child(div().truncate().child(self.branch_label()))
+            .child(div().min_w_0().truncate().child(ellipsize(&self.branch_label(), if narrow { 12 } else { 28 })))
             // Uncommitted changes, like a shell prompt's marker.
             .when(dirty, |el| el.child(div().flex_shrink_0().size(px(5.)).rounded_full().bg(theme.git_modified)))
             .when(s.ahead > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↑{}", s.ahead))))
@@ -7885,6 +7937,17 @@ fn tab_glow(theme: &Theme) -> impl IntoElement {
         .child(div().flex_1().h_full().bg(gpui::linear_gradient(90., gpui::linear_color_stop(accent, 0.), gpui::linear_color_stop(clear, 1.))))
 }
 
+/// `text` cut to `max` characters with a trailing "…". GPUI's own truncation
+/// doesn't apply in the title bar: a flex row measures text at full width
+/// first, and the text keeps that measurement.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
+}
+
 /// Search Everywhere's shortcut (double Shift works in every keymap).
 fn double_shift_label() -> &'static str {
     if cfg!(target_os = "macos") { "⇧⇧" } else { "Shift Shift" }
@@ -7990,5 +8053,20 @@ fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<Stri
         GitOp::Checkout(branch) => git::checkout(dir, &branch).map(|_| Some(format!("Switched to {}", branch.name))),
         GitOp::CreateBranch(name) => git::create_branch(dir, &name).map(|_| Some(format!("Created and switched to {name}"))),
         GitOp::Init => git::init(dir).map(|_| Some("Initialized a Git repository".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ellipsize;
+
+    #[test]
+    fn ellipsize_cuts_long_names_only() {
+        assert_eq!(ellipsize("main", 12), "main");
+        assert_eq!(ellipsize("exactly-twelve", 14), "exactly-twelve");
+        assert_eq!(ellipsize("feature/an-extremely-long-branch", 12), "feature/an-…");
+        // A cut right after a space doesn't leave it before the ellipsis.
+        assert_eq!(ellipsize("my long project", 4), "my…");
+        assert_eq!(ellipsize("çok-uzun-isim", 5), "çok-…");
     }
 }
