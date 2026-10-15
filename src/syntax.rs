@@ -1016,11 +1016,38 @@ fn bracket_partner(root: Node, at: usize) -> Option<usize> {
         "}" => ("{", false),
         _ => return None,
     };
-    let mut sibling = node;
-    loop {
-        sibling = if forward { sibling.next_sibling()? } else { sibling.prev_sibling()? };
-        if !sibling.is_named() && sibling.kind() == partner {
-            return Some(sibling.start_byte());
+    // A cursor steps to the next sibling in constant time; `Node`'s sibling
+    // methods start over from the parent each time, which is quadratic in a
+    // big array or object. Backwards, the nearest partner before the bracket
+    // is found in one pass from the first sibling.
+    let parent = node.parent()?;
+    let mut cursor = parent.walk();
+    if forward {
+        cursor.goto_first_child_for_byte(at)?;
+        if cursor.node() != node {
+            return None;
+        }
+        while cursor.goto_next_sibling() {
+            let sibling = cursor.node();
+            if !sibling.is_named() && sibling.kind() == partner {
+                return Some(sibling.start_byte());
+            }
+        }
+        None
+    } else {
+        cursor.goto_first_child();
+        let mut found = None;
+        loop {
+            let sibling = cursor.node();
+            if sibling == node {
+                return found;
+            }
+            if !sibling.is_named() && sibling.kind() == partner {
+                found = Some(sibling.start_byte());
+            }
+            if !cursor.goto_next_sibling() {
+                return None;
+            }
         }
     }
 }
@@ -1354,6 +1381,21 @@ mod tests {
         assert_eq!(css, [(".a, .b".to_string(), "selector", 0)]);
         let json = outline("a.json", "{\"a\": {\"b\": 1}}\n");
         assert_eq!(json, [("a".to_string(), "key", 0), ("b".to_string(), "key", 1)]);
+    }
+
+    #[test]
+    fn matches_brackets_of_big_arrays_quickly() {
+        // 40 000 elements: stepping sibling by sibling from the parent each
+        // time took seconds.
+        let src = format!("[{}[1]]", "1,".repeat(40_000));
+        let rope = Rope::from_str(&src);
+        let syntax = Syntax::new(Language::Json, &rope);
+        let (last, inner) = (src.len() - 1, src.len() - 4);
+        let started = std::time::Instant::now();
+        assert_eq!(syntax.matching_bracket(&rope, 0), Some((0, last)));
+        assert_eq!(syntax.matching_bracket(&rope, last), Some((last, 0)));
+        assert_eq!(syntax.matching_bracket(&rope, inner), Some((inner, inner + 2)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]
