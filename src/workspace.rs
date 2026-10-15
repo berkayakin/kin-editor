@@ -30,6 +30,7 @@ use crate::{
     onboarding::{Onboarding, OnboardingEvent},
     diff_view::{DiffSource, DiffView, DiffViewEvent},
     push_dialog::{PushDialog, PushDialogEvent},
+    remotes_dialog::{RemotesDialog, RemotesEvent},
     git_log::{GitLog, GitLogEvent},
     debugger::{DebugEvent, DebugSession, launch},
     extensions,
@@ -185,6 +186,8 @@ actions!(
         GitPull,
         GitFetch,
         GitBranches,
+        GitStash,
+        ManageRemotes,
         GitClone,
         GitInit,
         OpenRemote,
@@ -283,6 +286,9 @@ enum TreeAction {
     AddToGitignore(String),
     /// The commits touching this repository-relative path.
     ShowHistory(String),
+    /// Asks for a name, then runs a Git operation with it.
+    AskGit(GitPrompt),
+    CopyText(String),
     UndoFileChange,
     RedoFileChange,
 }
@@ -296,6 +302,18 @@ enum PendingInput {
     RenameSymbol { server: Arc<Server>, path: PathBuf, position: Position, current: String },
     /// A Vim `:` command.
     VimCommand,
+    Git(GitPrompt),
+}
+
+/// A name a Git operation needs.
+#[derive(Clone)]
+enum GitPrompt {
+    RenameBranch(String),
+    /// A new branch, or a tag, at a commit.
+    BranchAt(String),
+    TagAt(String),
+    /// The stash's message (optional).
+    Stash,
 }
 
 /// The panels the bottom area shows, one at a time.
@@ -462,6 +480,7 @@ enum Modal {
     Clone(Entity<CloneDialog>),
     Preferences(Entity<Preferences>),
     Push(Entity<PushDialog>),
+    Remotes(Entity<RemotesDialog>),
     Trust(Entity<crate::trust_dialog::TrustDialog>),
 }
 
@@ -680,6 +699,7 @@ impl Workspace {
         let git_panel = cx.new(GitPanel::new);
         let git_subscription = cx.subscribe_in(&git_panel, window, |ws, _, event: &GitPanelEvent, window, cx| match event {
             GitPanelEvent::Run(op) => ws.run_git(op.clone(), window, cx),
+            GitPanelEvent::Stash => ws.git_stash(&GitStash, window, cx),
             GitPanelEvent::OpenDiff { file, staged } => ws.open_diff(file.clone(), *staged, window, cx),
             GitPanelEvent::OpenFile(path) => ws.open_path(path.clone(), window, cx),
             GitPanelEvent::Menu { file, staged, position } => ws.open_git_file_menu(file.clone(), *staged, *position, window, cx),
@@ -729,6 +749,7 @@ impl Workspace {
         let git_log = cx.new(GitLog::new);
         let log_subscription = cx.subscribe_in(&git_log, window, |ws, _, event: &GitLogEvent, window, cx| match event {
             GitLogEvent::OpenDiff(source) => ws.show_diff(source.clone(), window, cx),
+            GitLogEvent::Menu { entry, position } => ws.open_commit_menu(entry.clone(), *position, window, cx),
             GitLogEvent::Close => {
                 ws.hide_bottom(BottomPanel::GitLog);
                 ws.focus_active(window, cx);

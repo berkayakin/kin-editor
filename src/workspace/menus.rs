@@ -171,6 +171,37 @@ impl Workspace {
         }
     }
 
+    /// A commit's menu in the Git log.
+    pub(super) fn open_commit_menu(&mut self, entry: git::LogEntry, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
+        let sha = entry.sha.clone();
+        let is_head = self.git_status.head_oid.as_deref() == Some(sha.as_str());
+        let mut entries: Vec<MenuEntry> = Vec::new();
+        let mut actions: Vec<Option<MenuAction>> = Vec::new();
+        let mut add = |entry: MenuEntry, action: Option<TreeAction>| {
+            entries.push(entry);
+            actions.push(action.map(MenuAction::Tree));
+        };
+        add(MenuEntry::item("Copy Commit Hash", Icon::Copy), Some(TreeAction::CopyText(sha.clone())));
+        add(MenuEntry::Separator, None);
+        add(MenuEntry::item("Checkout Revision", Icon::GitCommit), Some(TreeAction::Git(GitOp::CheckoutCommit(sha.clone()))));
+        add(MenuEntry::item("New Branch…", Icon::GitBranch), Some(TreeAction::AskGit(GitPrompt::BranchAt(sha.clone()))));
+        add(MenuEntry::item("New Tag…", Icon::Tag), Some(TreeAction::AskGit(GitPrompt::TagAt(sha.clone()))));
+        add(MenuEntry::Separator, None);
+        if !is_head {
+            add(MenuEntry::item("Cherry-Pick", Icon::Plus), Some(TreeAction::Git(GitOp::CherryPick(sha.clone()))));
+        }
+        add(MenuEntry::item("Revert Commit", Icon::Undo), Some(TreeAction::Git(GitOp::Revert(sha.clone()))));
+        if !is_head {
+            add(MenuEntry::Separator, None);
+            let reset = |mode| Some(TreeAction::Git(GitOp::Reset { sha: sha.clone(), mode }));
+            add(MenuEntry::item("Reset Here (Soft: Keep Changes Staged)", Icon::History), reset(git::ResetMode::Soft));
+            add(MenuEntry::item("Reset Here (Mixed: Keep Changes)", Icon::History), reset(git::ResetMode::Mixed));
+            add(MenuEntry::item("Reset Here (Hard: Discard Changes)…", Icon::History).danger(), reset(git::ResetMode::Hard));
+        }
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
     pub(super) fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
             self.focus_active(window, cx);
@@ -232,6 +263,8 @@ impl Workspace {
             TreeAction::ShowDiff(file, staged) => self.open_diff(file, staged, window, cx),
             TreeAction::AddToGitignore(rel) => self.add_to_gitignore(rel, cx),
             TreeAction::ShowHistory(rel) => self.show_history_of(rel, window, cx),
+            TreeAction::AskGit(prompt) => self.ask_for_name(PendingInput::Git(prompt), window, cx),
+            TreeAction::CopyText(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
             TreeAction::UndoFileChange => self.step_file_history(false, window, cx),
             TreeAction::RedoFileChange => self.step_file_history(true, window, cx),
         }
@@ -257,9 +290,23 @@ impl Workspace {
                 ("Rename", Icon::Pencil, format!("Rename {current} and its usages"), current.clone(), Some(0..current.len()))
             }
             PendingInput::VimCommand => (":", Icon::Terminal, "w, q, wq, x, or a line number".to_string(), String::new(), None),
+            PendingInput::Git(GitPrompt::RenameBranch(name)) => {
+                ("Rename Branch", Icon::GitBranch, format!("Rename {name}"), name.clone(), Some(0..name.len()))
+            }
+            PendingInput::Git(GitPrompt::BranchAt(sha)) => {
+                ("New Branch", Icon::GitBranch, format!("From {} · checks it out", &sha[..sha.len().min(7)]), String::new(), None)
+            }
+            PendingInput::Git(GitPrompt::TagAt(sha)) => ("New Tag", Icon::Tag, format!("At {}", &sha[..sha.len().min(7)]), String::new(), None),
+            PendingInput::Git(GitPrompt::Stash) => {
+                ("Stash Changes", Icon::Archive, "A message (optional) · untracked files are stashed too".into(), String::new(), None)
+            }
         };
         self.close_modal(window, cx);
-        let dialog = cx.new(|cx| InputDialog::new(title, icon, hint, &initial, select, window, cx));
+        let optional = matches!(pending, PendingInput::Git(GitPrompt::Stash));
+        let dialog = cx.new(|cx| {
+            let dialog = InputDialog::new(title, icon, hint, &initial, select, window, cx);
+            if optional { dialog.allow_empty() } else { dialog }
+        });
         let subscription = cx.subscribe_in(&dialog, window, |ws, dialog, event: &InputDialogEvent, window, cx| match event {
             InputDialogEvent::Confirm(name) => match ws.apply_name(name, window, cx) {
                 Ok(()) => {
@@ -281,6 +328,15 @@ impl Workspace {
         self.pending_input = Some(pending);
         self.modals.open(Modal::Input(dialog), subscription);
         cx.notify();
+    }
+
+    /// `name` as a branch name (spaces become dashes), if Git accepts it.
+    fn branch_name(&self, name: &str) -> Result<String, String> {
+        let name = name.replace(char::is_whitespace, "-");
+        match &self.repo {
+            Some(repo) if !git::valid_branch_name(repo, &name) => Err(format!("“{name}” isn't a valid branch name")),
+            _ => Ok(name),
+        }
     }
 
     pub(super) fn display_rel(&self, path: &Path) -> String {
@@ -349,6 +405,25 @@ impl Workspace {
             if let Err(err) = self.run_vim_command(&command, window, cx) {
                 self.toast(ToastKind::Error, err, None, cx);
             }
+            return Ok(());
+        }
+        let git_prompt = match &self.pending_input {
+            Some(PendingInput::Git(prompt)) => Some(prompt.clone()),
+            _ => None,
+        };
+        if let Some(prompt) = git_prompt {
+            let name = name.trim();
+            let op = match prompt {
+                GitPrompt::Stash => GitOp::Stash(Some(name.to_string()).filter(|n| !n.is_empty())),
+                _ if name.is_empty() => return Err("Enter a name".into()),
+                GitPrompt::RenameBranch(from) if from == name => return Ok(()),
+                GitPrompt::RenameBranch(from) => GitOp::RenameBranch { from, to: self.branch_name(name)? },
+                GitPrompt::BranchAt(sha) => GitOp::BranchAt { name: self.branch_name(name)?, sha },
+                GitPrompt::TagAt(sha) => GitOp::TagAt { name: name.to_string(), sha },
+            };
+            self.pending_input = None;
+            self.close_modal(window, cx);
+            self.run_git(op, window, cx);
             return Ok(());
         }
         if let Some(PendingInput::RenameSymbol { server, path, position, current }) = self.pending_input.as_ref() {
@@ -420,7 +495,7 @@ impl Workspace {
                 self.after_fs_change(cx);
             }
             // Handled before the name checks above.
-            PendingInput::RenameSymbol { .. } | PendingInput::VimCommand => {}
+            PendingInput::RenameSymbol { .. } | PendingInput::VimCommand | PendingInput::Git(_) => {}
         }
         Ok(())
     }
@@ -771,6 +846,7 @@ impl Workspace {
             Modal::Clone(c) => c.clone().into_any_element(),
             Modal::Preferences(p) => p.clone().into_any_element(),
             Modal::Push(p) => p.clone().into_any_element(),
+            Modal::Remotes(r) => r.clone().into_any_element(),
             Modal::Trust(t) => t.clone().into_any_element(),
         };
         let top = modal_top(window);

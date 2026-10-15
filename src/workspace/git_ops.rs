@@ -61,15 +61,16 @@ impl Workspace {
         }
         self.status_task = Some(cx.spawn(async move |this, cx| {
             let repo2 = repo.clone();
-            let (result, last_commit) = cx
+            let (result, last_commit, stashes) = cx
                 .background_executor()
-                .spawn(async move { (git::status(&repo2), git::last_commit(&repo2)) })
+                .spawn(async move { (git::status(&repo2), git::last_commit(&repo2), git::stashes(&repo2)) })
                 .await;
             this.update(cx, |ws, cx| {
                 ws.status_task = None;
                 if std::mem::take(&mut ws.git_refresh_again) {
                     ws.refresh_git(cx);
                 }
+                ws.git_panel.update(cx, |p, cx| p.set_stashes(stashes, cx));
                 if ws.last_commit != last_commit {
                     ws.last_commit = last_commit;
                     cx.notify();
@@ -165,6 +166,29 @@ impl Workspace {
                 return;
             }
         }
+        if let Some((message, detail, button)) = confirmation(&op) {
+            self.confirm_git(op, &message, detail, button, window, cx);
+            return;
+        }
+        // Deleting a branch whose commits aren't merged loses them, so look first.
+        if let (GitOp::DeleteBranch { name, force: false }, Some(repo)) = (&op, self.repo.clone()) {
+            let name = name.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let check = name.clone();
+                let merged = cx.background_executor().spawn(async move { git::is_merged(&repo, &check) }).await;
+                this.update_in(cx, |ws, window, cx| {
+                    let (detail, force) = if merged {
+                        ("Its commits are all in the current branch.", false)
+                    } else {
+                        ("It has commits that aren't in the current branch; they'll be lost unless another branch has them.", true)
+                    };
+                    ws.confirm_git(GitOp::DeleteBranch { name: name.clone(), force }, &format!("Delete branch {name}?"), detail, "Delete", window, cx);
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         if let GitOp::Discard(files) = &op {
             // Rolling back can't be undone, so ask first.
             let message = match files.as_slice() {
@@ -187,6 +211,17 @@ impl Workspace {
             return;
         }
         self.execute_git(op, cx);
+    }
+
+    /// Asks before `op`, then runs it.
+    fn confirm_git(&mut self, op: GitOp, message: &str, detail: &str, button: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = window.prompt(PromptLevel::Warning, message, Some(detail), &[button, "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if rx.await == Ok(0) {
+                this.update(cx, |ws, cx| ws.execute_git(op, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     pub(super) fn execute_git(&mut self, op: GitOp, cx: &mut Context<Self>) {
@@ -232,7 +267,14 @@ impl Workspace {
                             GitOp::Pull => "Update failed",
                             GitOp::Fetch => "Fetch failed",
                             GitOp::Commit { .. } => "Commit failed",
-                            GitOp::Checkout(_) | GitOp::CreateBranch(_) => "Checkout failed",
+                            GitOp::Checkout(_) | GitOp::CreateBranch(_) | GitOp::CheckoutCommit(_) | GitOp::BranchAt { .. } => {
+                                "Checkout failed"
+                            }
+                            GitOp::CherryPick(_) => "Cherry-pick failed",
+                            GitOp::Revert(_) => "Revert failed",
+                            GitOp::Reset { .. } => "Reset failed",
+                            GitOp::Stash(_) => "Stash failed",
+                            GitOp::Unstash { .. } => "Couldn't apply the stash",
                             _ => "Git operation failed",
                         };
                         ws.toast(ToastKind::Error, title, Some(err), cx);
@@ -240,7 +282,20 @@ impl Workspace {
                 }
                 if matches!(
                     op,
-                    GitOp::Discard(_) | GitOp::Pull | GitOp::Checkout(_) | GitOp::Merge(_) | GitOp::Rebase(_) | GitOp::Abort(_) | GitOp::Continue(_)
+                    GitOp::Discard(_)
+                        | GitOp::Pull
+                        | GitOp::Checkout(_)
+                        | GitOp::Merge(_)
+                        | GitOp::Rebase(_)
+                        | GitOp::Abort(_)
+                        | GitOp::Continue(_)
+                        | GitOp::Stash(_)
+                        | GitOp::Unstash { .. }
+                        | GitOp::CheckoutCommit(_)
+                        | GitOp::BranchAt { .. }
+                        | GitOp::CherryPick(_)
+                        | GitOp::Revert(_)
+                        | GitOp::Reset { .. }
                 ) {
                     ws.reload_changed_files(cx);
                 }
@@ -258,6 +313,17 @@ impl Workspace {
                             | GitOp::Rebase(_)
                             | GitOp::Abort(_)
                             | GitOp::Continue(_)
+                            | GitOp::RemoveRemote(_)
+                            | GitOp::EditRemote { .. }
+                            | GitOp::DeleteBranch { .. }
+                            | GitOp::RenameBranch { .. }
+                            | GitOp::Stash(_)
+                            | GitOp::CheckoutCommit(_)
+                            | GitOp::BranchAt { .. }
+                            | GitOp::TagAt { .. }
+                            | GitOp::CherryPick(_)
+                            | GitOp::Revert(_)
+                            | GitOp::Reset { .. }
                     )
                 {
                     ws.git_log.update(cx, |l, cx| l.reload(cx));
@@ -268,8 +334,15 @@ impl Workspace {
                         ws.load_diff_base(&editor, cx);
                     }
                 }
-                if let Some(Modal::Diff(view)) = &ws.modals.current {
-                    view.update(cx, |v, cx| v.reload(cx));
+                match &ws.modals.current {
+                    Some(Modal::Diff(view)) => view.update(cx, |v, cx| v.reload(cx)),
+                    Some(Modal::Remotes(dialog)) => dialog.update(cx, |d, cx| d.reload(cx)),
+                    _ => {}
+                }
+                if op.changes_remotes()
+                    && let Some(repo) = &ws.repo
+                {
+                    ws.git_remote = git::remote_url(repo);
                 }
                 ws.status_task = None;
                 ws.refresh_git(cx);
@@ -341,9 +414,36 @@ impl Workspace {
                 ws.close_modal(window, cx);
                 ws.run_git(op.clone(), window, cx);
             }
+            BranchPickerEvent::Rename(name) => ws.ask_for_name(PendingInput::Git(GitPrompt::RenameBranch(name.clone())), window, cx),
             BranchPickerEvent::Dismissed => ws.close_modal(window, cx),
         });
         self.modals.open(Modal::Branches(picker), subscription);
+        cx.notify();
+    }
+
+    pub(super) fn git_stash(&mut self, _: &GitStash, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            self.toast(ToastKind::Error, "Not a Git repository", None, cx);
+        } else if self.git_status.files.is_empty() {
+            self.toast(ToastKind::Info, "No changes to stash", None, cx);
+        } else {
+            self.ask_for_name(PendingInput::Git(GitPrompt::Stash), window, cx);
+        }
+    }
+
+    pub(super) fn manage_remotes(&mut self, _: &ManageRemotes, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            self.toast(ToastKind::Error, "Not a Git repository", None, cx);
+            return;
+        };
+        self.close_modal(window, cx);
+        let dialog = cx.new(|cx| RemotesDialog::new(repo, window, cx));
+        let subscription = cx.subscribe_in(&dialog, window, |ws, _, event: &RemotesEvent, window, cx| match event {
+            // The dialog stays open; `execute_git` reloads it.
+            RemotesEvent::Run(op) => ws.run_git(op.clone(), window, cx),
+            RemotesEvent::Dismissed => ws.close_modal(window, cx),
+        });
+        self.modals.open(Modal::Remotes(dialog), subscription);
         cx.notify();
     }
 
@@ -421,14 +521,15 @@ impl Workspace {
 
     pub(super) fn open_push_modal(&mut self, dialog: Entity<PushDialog>, window: &mut Window, cx: &mut Context<Self>) {
         let subscription = cx.subscribe_in(&dialog, window, |ws, dialog, event: &PushDialogEvent, window, cx| match event {
-            PushDialogEvent::Push { force } => {
+            PushDialogEvent::Push { force, remote } => {
                 ws.close_modal(window, cx);
-                ws.run_git(GitOp::PushNow { force: *force }, window, cx);
+                ws.run_git(GitOp::PushNow { force: *force, remote: remote.clone() }, window, cx);
             }
             PushDialogEvent::OpenDiff(source) => {
                 ws.diff_return = Some(dialog.clone());
                 ws.show_diff(source.clone(), window, cx);
             }
+            PushDialogEvent::ManageRemotes => ws.manage_remotes(&ManageRemotes, window, cx),
             PushDialogEvent::Dismissed => ws.close_modal(window, cx),
         });
         dialog.read(cx).focus(window);
@@ -487,20 +588,41 @@ impl Workspace {
 
 
 
+/// What to ask before an operation that loses something: message, detail, button.
+fn confirmation(op: &GitOp) -> Option<(String, &'static str, &'static str)> {
+    match op {
+        GitOp::RemoveRemote(name) => Some((
+            format!("Remove remote {name}?"),
+            "Its remote-tracking branches go too; the remote repository itself isn't touched.",
+            "Remove",
+        )),
+        GitOp::DropStash(index) => Some((format!("Drop stash@{{{index}}}?"), "Its changes will be lost.", "Drop")),
+        GitOp::Reset { sha, mode: git::ResetMode::Hard } => Some((
+            format!("Hard reset to {}?", &sha[..sha.len().min(7)]),
+            "Commits after it leave the branch, and every uncommitted change is lost. This can't be undone.",
+            "Reset",
+        )),
+        _ => None,
+    }
+}
+
 /// Runs one Git operation; blocking. Returns a message for a success toast.
 pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<String>, String> {
-    let push = |dir: &Path, force: bool| -> Result<String, String> {
-        if !git::has_remote(dir) {
-            return Err("No remote is configured. Add one with: git remote add origin <url>".into());
-        }
-        let branch = git::status(dir).ok().and_then(|s| s.branch).or_else(|| status.branch.clone());
-        let has_upstream = git::status(dir).ok().and_then(|s| s.upstream).is_some();
+    let push = |dir: &Path, force: bool, remote: Option<String>| -> Result<String, String> {
+        let Some(remote) = remote.or_else(|| git::default_remote(dir)) else {
+            return Err("No remote is configured. Add one in Git → Manage Remotes….".into());
+        };
+        let current = git::status(dir).ok();
+        let branch = current.as_ref().and_then(|s| s.branch.clone()).or_else(|| status.branch.clone());
+        let has_upstream = current.and_then(|s| s.upstream).is_some();
         let verb = if force { "Force-pushed" } else { "Pushed" };
         match (has_upstream, branch) {
-            (false, Some(branch)) => git::push(dir, Some(&branch), force).map(|_| format!("{verb} {branch} to origin")),
+            (false, Some(branch)) => git::push(dir, Some((&remote, &branch)), force).map(|_| format!("{verb} {branch} to {remote}")),
             _ => git::push(dir, None, force).map(|_| verb.to_string()),
         }
     };
+    let short = |sha: &str| sha[..sha.len().min(7)].to_string();
+    let stopped = |out: &str, what: &str, done: String| Some(if out == "CONFLICT" { format!("{what} stopped on conflicts") } else { done });
     match op {
         GitOp::Stage(rels) => git::stage(dir, &rels).map(|_| None),
         GitOp::Unstage(rels) => git::unstage(dir, &rels, status.head_oid.is_some()).map(|_| None),
@@ -536,15 +658,15 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
             }
             let summary = git::commit(dir, &message, amend)?;
             if and_push {
-                push(dir, false)?;
+                push(dir, false, None)?;
                 Ok(Some(format!("Committed and pushed {summary}")))
             } else {
                 Ok(Some(format!("Committed {summary}")))
             }
         }
         // `Push` opens the dialog before it gets here; treat it as a plain push.
-        GitOp::Push | GitOp::PushNow { force: false } => push(dir, false).map(Some),
-        GitOp::PushNow { force: true } => push(dir, true).map(Some),
+        GitOp::Push => push(dir, false, None).map(Some),
+        GitOp::PushNow { force, remote } => push(dir, force, remote).map(Some),
         GitOp::Pull => git::pull(dir).map(|out| {
             Some(if out.contains("Already up to date") { "Already up to date".into() } else { "Project updated".into() })
         }),
@@ -552,5 +674,26 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
         GitOp::Checkout(branch) => git::checkout(dir, &branch).map(|_| Some(format!("Switched to {}", branch.name))),
         GitOp::CreateBranch(name) => git::create_branch(dir, &name).map(|_| Some(format!("Created and switched to {name}"))),
         GitOp::Init => git::init(dir).map(|_| Some("Initialized a Git repository".into())),
+        GitOp::AddRemote { name, url } => git::add_remote(dir, &name, &url).map(|_| Some(format!("Added remote {name}"))),
+        GitOp::RemoveRemote(name) => git::remove_remote(dir, &name).map(|_| Some(format!("Removed remote {name}"))),
+        GitOp::EditRemote { name, new_name, url } => {
+            git::set_remote_url(dir, &name, &url)?;
+            if new_name != name {
+                git::rename_remote(dir, &name, &new_name)?;
+            }
+            Ok(Some(format!("Updated remote {new_name}")))
+        }
+        GitOp::DeleteBranch { name, force } => git::delete_branch(dir, &name, force).map(|_| Some(format!("Deleted branch {name}"))),
+        GitOp::RenameBranch { from, to } => git::rename_branch(dir, &from, &to).map(|_| Some(format!("Renamed {from} to {to}"))),
+        GitOp::Stash(message) => git::stash(dir, message.as_deref()).map(|_| Some("Stashed changes".into())),
+        GitOp::Unstash { index, pop } => git::unstash(dir, index, pop)
+            .map(|out| stopped(&out, "Applying the stash", if pop { "Popped stash".into() } else { "Applied stash".into() })),
+        GitOp::DropStash(index) => git::drop_stash(dir, index).map(|_| Some("Dropped stash".into())),
+        GitOp::CheckoutCommit(sha) => git::checkout_commit(dir, &sha).map(|_| Some(format!("Checked out {} (detached HEAD)", short(&sha)))),
+        GitOp::BranchAt { name, sha } => git::create_branch_at(dir, &name, &sha).map(|_| Some(format!("Created and switched to {name}"))),
+        GitOp::TagAt { name, sha } => git::create_tag(dir, &name, &sha).map(|_| Some(format!("Tagged {} as {name}", short(&sha)))),
+        GitOp::CherryPick(sha) => git::cherry_pick(dir, &sha).map(|out| stopped(&out, "Cherry-pick", format!("Cherry-picked {}", short(&sha)))),
+        GitOp::Revert(sha) => git::revert(dir, &sha).map(|out| stopped(&out, "Revert", format!("Reverted {}", short(&sha)))),
+        GitOp::Reset { sha, mode } => git::reset(dir, &sha, mode).map(|_| Some(format!("Reset to {}", short(&sha)))),
     }
 }

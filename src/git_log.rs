@@ -26,6 +26,8 @@ const MAX_COMMITS: usize = 3000;
 
 pub enum GitLogEvent {
     OpenDiff(DiffSource),
+    /// A commit was right-clicked.
+    Menu { entry: git::LogEntry, position: gpui::Point<gpui::Pixels> },
     Close,
 }
 
@@ -549,6 +551,15 @@ impl Render for GitLog {
                                         window.focus(&this.focus_handle);
                                         this.select(ix, cx);
                                     }))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Right,
+                                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                            window.focus(&this.focus_handle);
+                                            this.select(ix, cx);
+                                            let Some(entry) = this.entries.get(ix).cloned() else { return };
+                                            cx.emit(GitLogEvent::Menu { entry, position: event.position });
+                                        }),
+                                    )
                                     .when(show_graph, |el| el.child(this.render_graph(&graph[ix], graph_width, &palette)))
                                     .when(!show_graph, |el| el.pl_2())
                                     .children(refs)

@@ -1,5 +1,5 @@
 //! The Commit tool window (JetBrains ⌘K / ⌘0): changed files with
-//! stage/unstage/discard, a commit message box and push/pull controls.
+//! stage/unstage/discard, stashes, a commit message box and push/pull controls.
 //! Operations are emitted as events; the workspace runs them.
 
 use std::{ops::Range, path::PathBuf, sync::Arc};
@@ -14,7 +14,7 @@ use crate::{
     assets::Icon,
     busy::Busy,
     editor::{Editor, Submit},
-    git::{self, Branch, Change, FileStatus, RepoState, RepoStatus},
+    git::{self, Branch, Change, FileStatus, RepoState, RepoStatus, Stash},
     theme::Theme,
     ui::{Button, HoverFill, focus_ring, icon_el, kbd, tooltip_view},
 };
@@ -32,8 +32,9 @@ pub enum GitOp {
     Commit { message: String, amend: bool, all: bool, push: bool },
     /// Opens the Push dialog (the commits to push, then Push or Cancel).
     Push,
-    /// Pushes the current branch (from the Push dialog).
-    PushNow { force: bool },
+    /// Pushes the current branch (from the Push dialog); one without an
+    /// upstream goes to `remote` (else the default remote).
+    PushNow { force: bool, remote: Option<String> },
     Pull,
     Fetch,
     Checkout(Branch),
@@ -45,9 +46,31 @@ pub enum GitOp {
     Rebase(String),
     Abort(RepoState),
     Continue(RepoState),
+    AddRemote { name: String, url: String },
+    RemoveRemote(String),
+    /// Changes a remote's URL and name.
+    EditRemote { name: String, new_name: String, url: String },
+    DeleteBranch { name: String, force: bool },
+    RenameBranch { from: String, to: String },
+    /// Stashes every change (untracked files too), with an optional message.
+    Stash(Option<String>),
+    /// Applies `stash@{index}`; `pop` drops it afterwards.
+    Unstash { index: usize, pop: bool },
+    DropStash(usize),
+    /// Checks out a commit (detached HEAD).
+    CheckoutCommit(String),
+    BranchAt { name: String, sha: String },
+    TagAt { name: String, sha: String },
+    CherryPick(String),
+    Revert(String),
+    Reset { sha: String, mode: git::ResetMode },
 }
 
 impl GitOp {
+    pub fn changes_remotes(&self) -> bool {
+        matches!(self, GitOp::AddRemote { .. } | GitOp::RemoveRemote(_) | GitOp::EditRemote { .. })
+    }
+
     /// Progress text shown while the operation runs.
     pub fn busy_label(&self) -> &'static str {
         match self {
@@ -68,12 +91,27 @@ impl GitOp {
             GitOp::Checkout(_) => "Checking out…",
             GitOp::CreateBranch(_) => "Creating branch…",
             GitOp::Init => "Initializing…",
+            GitOp::AddRemote { .. } | GitOp::RemoveRemote(_) | GitOp::EditRemote { .. } => "Updating remotes…",
+            GitOp::DeleteBranch { .. } => "Deleting branch…",
+            GitOp::RenameBranch { .. } => "Renaming branch…",
+            GitOp::Stash(_) => "Stashing…",
+            GitOp::Unstash { .. } => "Applying stash…",
+            GitOp::DropStash(_) => "Dropping stash…",
+            GitOp::CheckoutCommit(_) => "Checking out…",
+            GitOp::BranchAt { .. } => "Creating branch…",
+            GitOp::TagAt { .. } => "Creating tag…",
+            GitOp::CherryPick(_) => "Cherry-picking…",
+            GitOp::Revert(_) => "Reverting…",
+            GitOp::Reset { .. } => "Resetting…",
         }
     }
 }
 
+#[derive(Clone)]
 pub enum GitPanelEvent {
     Run(GitOp),
+    /// Stash the changes (the workspace asks for a message).
+    Stash,
     OpenDiff { file: FileStatus, staged: bool },
     OpenFile(PathBuf),
     /// A file's row was right-clicked (`staged`: in the Staged section).
@@ -88,6 +126,7 @@ pub struct GitPanel {
     /// The open folder (to offer `git init` when it isn't a repository).
     project: Option<PathBuf>,
     status: Arc<RepoStatus>,
+    stashes: Arc<Vec<Stash>>,
     /// The running Git operation; its progress pill shows only if it takes a
     /// while (staging a file doesn't), then long enough to read.
     busy: Busy,
@@ -121,6 +160,7 @@ impl GitPanel {
             repo: None,
             project: None,
             status: Arc::new(RepoStatus::default()),
+            stashes: Arc::new(Vec::new()),
             busy: Busy::default(),
             selected: None,
             menu_target: None,
@@ -152,6 +192,13 @@ impl GitPanel {
         }
         self.status = status;
         cx.notify();
+    }
+
+    pub fn set_stashes(&mut self, stashes: Vec<Stash>, cx: &mut Context<Self>) {
+        if *self.stashes != stashes {
+            self.stashes = Arc::new(stashes);
+            cx.notify();
+        }
     }
 
     pub fn set_busy(&mut self, busy: Option<SharedString>, cx: &mut Context<Self>) {
@@ -387,7 +434,7 @@ impl GitPanel {
         )
     }
 
-    fn section_header(&self, id: &'static str, title: &str, count: usize, action: Option<(Icon, &'static str, GitOp)>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn section_header(&self, title: &str, count: usize, actions: Vec<(&'static str, Icon, &'static str, GitPanelEvent)>, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         div()
             .flex()
@@ -402,11 +449,70 @@ impl GitPanel {
             .child(title.to_uppercase())
             .child(div().px_1p5().rounded_full().bg(theme.active).text_color(theme.text_muted).child(count.to_string()))
             .child(div().flex_1())
-            .when_some(action, |el, (icon, tip, op)| {
-                el.child(self.small_button(id, icon, tip, cx).on_click(cx.listener(move |_, _, _, cx| {
-                    cx.emit(GitPanelEvent::Run(op.clone()));
-                })))
-            })
+            .children(actions.into_iter().map(|(id, icon, tip, event)| {
+                self.small_button(id, icon, tip, cx).on_click(cx.listener(move |_, _, _, cx| cx.emit(event.clone())))
+            }))
+    }
+
+    /// A stash: its message, with Pop / Apply / Drop on hover.
+    fn render_stash(&self, stash: &Stash, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let index = stash.index;
+        let group = SharedString::from(format!("git-stash-{index}"));
+        // "On main: message", or without one "WIP on main: abc123 subject":
+        // the message (else "WIP: subject"), then the branch.
+        let (text, branch) = match stash.message.split_once(": ") {
+            Some((on, text)) => match on.strip_prefix("WIP on ") {
+                Some(branch) => (format!("WIP: {}", text.split_once(' ').map_or(text, |(_, subject)| subject)), branch),
+                None => (text.to_string(), on.trim_start_matches("On ")),
+            },
+            None => (stash.message.clone(), ""),
+        };
+        let branch = branch.to_string();
+        let full: SharedString = stash.message.clone().into();
+        let button = |id: &'static str, icon: Icon, tip: &'static str, op: GitOp, cx: &mut Context<Self>| {
+            self.small_button((id, index), icon, tip, cx).on_click(cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.emit(GitPanelEvent::Run(op.clone()));
+            }))
+        };
+        div().w_full().px_1p5().child(
+            div()
+                .id(("stash", index))
+                .group(group.clone())
+                .relative()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(26.))
+                .pl_2()
+                .pr_1()
+                .rounded(px(6.))
+                .row_hover(theme.hover)
+                .tooltip(move |_, cx| tooltip_view(full.clone(), cx))
+                .child(icon_el(Icon::Archive, px(14.), theme.text_muted.into()))
+                .child(div().min_w_0().truncate().text_color(theme.text).child(text))
+                .child(div().flex_1().min_w_0().truncate().text_size(px(11.5)).text_color(theme.text_dim).child(branch))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(1.))
+                        .right(px(2.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .bg(theme.elevated)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow(crate::ui::soft_shadow(&theme, 1))
+                        .invisible()
+                        .group_hover(group, |s| s.visible())
+                        .child(button("stash-pop", Icon::ArrowUp, "Pop (Apply and Drop)", GitOp::Unstash { index, pop: true }, cx))
+                        .child(button("stash-apply", Icon::Check, "Apply (Keep the Stash)", GitOp::Unstash { index, pop: false }, cx))
+                        .child(button("stash-drop", Icon::Trash, "Drop…", GitOp::DropStash(index), cx)),
+                ),
+        )
     }
 
     /// A stopped merge or rebase: what's left, and Abort / Continue.
@@ -612,7 +718,8 @@ impl Render for GitPanel {
         }
 
         let (staged_count, unstaged_count) = (self.status.staged().count(), self.status.unstaged().count());
-        let list = if staged_count == 0 && unstaged_count == 0 {
+        let stash_count = self.stashes.len();
+        let list = if staged_count == 0 && unstaged_count == 0 && stash_count == 0 {
             div()
                 .flex_1()
                 .min_h_0()
@@ -628,27 +735,60 @@ impl Render for GitPanel {
                 )
                 .into_any_element()
         } else {
-            // A heading and the files of each non-empty section; only the
-            // rows on screen are built.
+            // A heading and the rows of each non-empty section (a "No changes"
+            // row when only stashes are left); only the rows on screen are built.
             let section = |n: usize| if n == 0 { 0 } else { 1 + n };
+            let no_changes = usize::from(staged_count == 0 && unstaged_count == 0);
             uniform_list(
                 "git-changes",
-                section(staged_count) + section(unstaged_count),
+                no_changes + section(staged_count) + section(unstaged_count) + section(stash_count),
                 cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    let theme = Theme::get(cx).clone();
                     let staged: Vec<&FileStatus> = this.status.staged().collect();
                     let unstaged: Vec<&FileStatus> = this.status.unstaged().collect();
-                    let staged_rows = section(staged.len());
+                    let (staged_rows, unstaged_rows) = (section(staged.len()), section(unstaged.len()));
+                    let stash = || ("stash", Icon::Archive, "Stash Changes…", GitPanelEvent::Stash);
                     range
                         .map(|ix| {
+                            if no_changes == 1 && ix == 0 {
+                                return div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .h(px(26.))
+                                    .px_3()
+                                    .text_color(theme.text_dim)
+                                    .child(icon_el(Icon::CircleCheck, px(15.), theme.success.into()))
+                                    .child("No changes")
+                                    .into_any_element();
+                            }
+                            let ix = ix - no_changes;
+                            if ix >= staged_rows + unstaged_rows {
+                                let ix = ix - staged_rows - unstaged_rows;
+                                return match ix {
+                                    0 => this.section_header("Stashes", this.stashes.len(), Vec::new(), cx).into_any_element(),
+                                    ix => match this.stashes.clone().get(ix - 1) {
+                                        Some(stash) => this.render_stash(stash, cx).into_any_element(),
+                                        None => div().into_any_element(),
+                                    },
+                                };
+                            }
                             let (files, is_staged, ix) = if ix < staged_rows { (&staged, true, ix) } else { (&unstaged, false, ix - staged_rows) };
                             match (ix, is_staged) {
                                 (0, true) => {
                                     let rels = files.iter().map(|f| f.rel.clone()).collect();
-                                    this.section_header("unstage-all", "Staged", files.len(), Some((Icon::Minus, "Unstage All", GitOp::Unstage(rels))), cx).into_any_element()
+                                    let mut actions = vec![("unstage-all", Icon::Minus, "Unstage All", GitPanelEvent::Run(GitOp::Unstage(rels)))];
+                                    // The first heading offers Stash.
+                                    actions.insert(0, stash());
+                                    this.section_header("Staged", files.len(), actions, cx).into_any_element()
                                 }
                                 (0, false) => {
                                     let rels = files.iter().map(|f| f.rel.clone()).collect();
-                                    this.section_header("stage-all", "Changes", files.len(), Some((Icon::Plus, "Stage All", GitOp::Stage(rels))), cx).into_any_element()
+                                    let mut actions = vec![("stage-all", Icon::Plus, "Stage All", GitPanelEvent::Run(GitOp::Stage(rels)))];
+                                    if staged.is_empty() {
+                                        actions.insert(0, stash());
+                                    }
+                                    this.section_header("Changes", files.len(), actions, cx).into_any_element()
                                 }
                                 (ix, _) => match files.get(ix - 1) {
                                     Some(file) => this.render_file(file, is_staged, ix - 1, cx).into_any_element(),

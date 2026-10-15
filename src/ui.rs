@@ -499,6 +499,29 @@ pub fn text_button(id: impl Into<gpui::ElementId>, label: &'static str, primary:
         .hover_fill(rest, hover)
 }
 
+/// A small outlined pill for a list row's actions (Merge, Edit, Pop…),
+/// usually shown on the row's hover; `danger` colors it like a destructive action.
+pub fn row_pill(id: impl Into<gpui::ElementId>, label: &'static str, danger: bool, cx: &App) -> Button {
+    let theme = Theme::get(cx);
+    let hover_text = if danger { theme.error } else { theme.text };
+    div()
+        .id(id)
+        .px_1p5()
+        .h(px(20.))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .rounded(px(10.))
+        .cursor_pointer()
+        .text_size(px(11.5))
+        .text_color(theme.text_muted)
+        .border_1()
+        .border_color(theme.border)
+        .hover(move |s| s.text_color(hover_text))
+        .child(label)
+        .hover_fill(theme.elevated, theme.hover)
+}
+
 /// A key hint chip, e.g. "⌘⇧F".
 pub fn kbd(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let theme = Theme::get(cx);

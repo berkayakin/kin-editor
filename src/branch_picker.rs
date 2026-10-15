@@ -1,5 +1,5 @@
-//! Branch switcher: check out local or remote branches, create one, or
-//! merge / rebase with another.
+//! Branch switcher: check out local or remote branches, create one, merge /
+//! rebase with another, rename or delete local ones.
 
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
@@ -15,11 +15,13 @@ use crate::{
     git::{self, Branch},
     git_panel::GitOp,
     theme::Theme,
-    ui::{HoverFill, icon_el, input_box, modal_panel},
+    ui::{HoverFill, icon_el, input_box, modal_panel, row_pill},
 };
 
 pub enum BranchPickerEvent {
     Run(GitOp),
+    /// Rename this local branch (the workspace asks for the name).
+    Rename(String),
     Dismissed,
 }
 
@@ -171,38 +173,38 @@ impl Render for BranchPicker {
                                 .when(b.current, |el| {
                                     el.child(div().text_size(px(11.)).text_color(theme.text_dim).child("current"))
                                 })
-                                // Merge into / rebase onto, on hover (or for the selected row).
-                                .when(!b.current, |el| {
+                                // Merge into / rebase onto, rename, delete: on hover (or for the selected row).
+                                .child({
                                     let group = SharedString::from(format!("branch-{ix}"));
-                                    let action = |id: &'static str, label: &'static str, tip: &'static str, op: GitOp| {
-                                        div()
-                                            .id((id, ix))
-                                            .px_1p5()
-                                            .h(px(20.))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(10.))
-                                            .text_size(px(11.5))
-                                            .text_color(theme.text_muted)
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .hover_fill(theme.elevated, theme.hover)
-                                            .hover(|s| s.text_color(theme.text))
+                                    let action = |id: &'static str, label: &'static str, tip: &'static str, danger: bool, event: fn(&Branch) -> BranchPickerEvent| {
+                                        let branch = b.clone();
+                                        row_pill((id, ix), label, danger, cx)
                                             .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
                                             .on_click(cx.listener(move |_, _, _, cx| {
                                                 cx.stop_propagation();
-                                                cx.emit(BranchPickerEvent::Run(op.clone()));
+                                                cx.emit(event(&branch));
                                             }))
-                                            .child(label)
                                     };
-                                    el.child(
-                                        div()
-                                            .flex()
-                                            .gap_1()
-                                            .when(!is_selected, |el| el.invisible().group_hover(group, |s| s.visible()))
-                                            .child(action("merge", "Merge", "Merge into Current Branch", GitOp::Merge(b.name.clone())))
-                                            .child(action("rebase", "Rebase", "Rebase Current Branch onto This", GitOp::Rebase(b.name.clone()))),
-                                    )
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .when(!is_selected, |el| el.invisible().group_hover(group, |s| s.visible()))
+                                        .when(!b.current, |el| {
+                                            el.child(action("merge", "Merge", "Merge into Current Branch", false, |b| {
+                                                BranchPickerEvent::Run(GitOp::Merge(b.name.clone()))
+                                            }))
+                                            .child(action("rebase", "Rebase", "Rebase Current Branch onto This", false, |b| {
+                                                BranchPickerEvent::Run(GitOp::Rebase(b.name.clone()))
+                                            }))
+                                        })
+                                        .when(!b.remote, |el| {
+                                            el.child(action("rename", "Rename", "Rename Branch", false, |b| BranchPickerEvent::Rename(b.name.clone())))
+                                        })
+                                        .when(!b.remote && !b.current, |el| {
+                                            el.child(action("delete", "Delete", "Delete Branch", true, |b| {
+                                                BranchPickerEvent::Run(GitOp::DeleteBranch { name: b.name.clone(), force: false })
+                                            }))
+                                        })
                                 }),
                         };
                         div().w_full().px_1().child(row)

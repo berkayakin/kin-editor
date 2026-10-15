@@ -440,13 +440,15 @@ pub fn last_commit_message(root: &Path) -> Option<String> {
 
 /// `force` replaces the remote branch, but only if it's still where we last
 /// saw it (`--force-with-lease`), so nobody's new commits are lost unseen.
-pub fn push(root: &Path, set_upstream: Option<&str>, force: bool) -> Result<String, String> {
+/// Pushes the current branch; `set_upstream` (remote, branch) publishes a
+/// branch that has no upstream yet.
+pub fn push(root: &Path, set_upstream: Option<(&str, &str)>, force: bool) -> Result<String, String> {
     let mut args = vec!["push", "--porcelain"];
     if force {
         args.push("--force-with-lease");
     }
-    if let Some(branch) = set_upstream {
-        args.extend(["--set-upstream", "origin", branch]);
+    if let Some((remote, branch)) = set_upstream {
+        args.extend(["--set-upstream", remote, branch]);
     }
     run(root, &args)
 }
@@ -463,6 +465,8 @@ pub struct PushPreview {
     /// rejected without force).
     pub behind: u32,
     pub has_remote: bool,
+    /// Every remote, for choosing where a branch without an upstream goes.
+    pub remotes: Vec<String>,
 }
 
 pub fn push_preview(root: &Path) -> Result<PushPreview, String> {
@@ -473,7 +477,8 @@ pub fn push_preview(root: &Path) -> Result<PushPreview, String> {
         Some(upstream) => log_args(root, 500, &[&format!("{upstream}..HEAD")])?,
         None => log_args(root, 500, &["HEAD", "--not", "--remotes"])?,
     };
-    Ok(PushPreview { branch, upstream: status.upstream, commits, behind: status.behind, has_remote: has_remote(root) })
+    let remotes: Vec<String> = remotes(root).unwrap_or_default().into_iter().map(|r| r.name).collect();
+    Ok(PushPreview { branch, upstream: status.upstream, commits, behind: status.behind, has_remote: !remotes.is_empty(), remotes })
 }
 
 pub fn pull(root: &Path) -> Result<String, String> {
@@ -482,10 +487,6 @@ pub fn pull(root: &Path) -> Result<String, String> {
 
 pub fn fetch(root: &Path) -> Result<String, String> {
     run(root, &["fetch", "--all", "--prune"])
-}
-
-pub fn has_remote(root: &Path) -> bool {
-    run(root, &["remote"]).is_ok_and(|s| !s.trim().is_empty())
 }
 
 pub fn branches(root: &Path) -> Result<Vec<Branch>, String> {
@@ -1220,6 +1221,162 @@ fn conflicts_or(root: &Path, err: String) -> Result<String, String> {
     }
 }
 
+// ---- Remotes ------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    pub name: String,
+    /// Where it fetches from.
+    pub url: String,
+}
+
+pub fn remotes(root: &Path) -> Result<Vec<Remote>, String> {
+    let out = run(root, &["remote", "-v"])?;
+    let mut remotes: Vec<Remote> = Vec::new();
+    for line in out.lines().filter(|l| l.ends_with("(fetch)")) {
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(url)) = (parts.next(), parts.next())
+            && !remotes.iter().any(|r| r.name == name)
+        {
+            remotes.push(Remote { name: name.to_string(), url: url.to_string() });
+        }
+    }
+    Ok(remotes)
+}
+
+pub fn add_remote(root: &Path, name: &str, url: &str) -> Result<(), String> {
+    run(root, &["remote", "add", name, url]).map(drop)
+}
+
+pub fn remove_remote(root: &Path, name: &str) -> Result<(), String> {
+    run(root, &["remote", "remove", name]).map(drop)
+}
+
+pub fn rename_remote(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    run(root, &["remote", "rename", from, to]).map(drop)
+}
+
+pub fn set_remote_url(root: &Path, name: &str, url: &str) -> Result<(), String> {
+    run(root, &["remote", "set-url", name, url]).map(drop)
+}
+
+/// Where a branch without an upstream is pushed: `origin`, else the only or
+/// first remote.
+pub fn default_remote(root: &Path) -> Option<String> {
+    let remotes = remotes(root).ok()?;
+    remotes.iter().find(|r| r.name == "origin").or(remotes.first()).map(|r| r.name.clone())
+}
+
+// ---- Branches, tags and commits ----------------------------------------------------
+
+pub fn delete_branch(root: &Path, name: &str, force: bool) -> Result<(), String> {
+    run(root, &["branch", if force { "-D" } else { "-d" }, name]).map(drop)
+}
+
+pub fn rename_branch(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    run(root, &["branch", "-m", from, to]).map(drop)
+}
+
+/// Whether `branch`'s commits are all in HEAD (deleting it loses nothing).
+pub fn is_merged(root: &Path, branch: &str) -> bool {
+    run(root, &["merge-base", "--is-ancestor", branch, "HEAD"]).is_ok()
+}
+
+/// A name Git accepts for a branch.
+pub fn valid_branch_name(root: &Path, name: &str) -> bool {
+    run(root, &["check-ref-format", "--branch", name]).is_ok()
+}
+
+pub fn checkout_commit(root: &Path, sha: &str) -> Result<(), String> {
+    run(root, &["switch", "--detach", sha]).map(drop)
+}
+
+pub fn create_branch_at(root: &Path, name: &str, at: &str) -> Result<(), String> {
+    run(root, &["switch", "-c", name, at]).map(drop)
+}
+
+pub fn create_tag(root: &Path, name: &str, at: &str) -> Result<(), String> {
+    run(root, &["tag", name, at]).map(drop)
+}
+
+/// Like `merge`: conflicts stop it ("CONFLICT"), for Continue / Abort.
+pub fn cherry_pick(root: &Path, sha: &str) -> Result<String, String> {
+    run(root, &["cherry-pick", sha]).or_else(|e| conflicts_or(root, e))
+}
+
+pub fn revert(root: &Path, sha: &str) -> Result<String, String> {
+    run(root, &["revert", "--no-edit", sha]).or_else(|e| conflicts_or(root, e))
+}
+
+/// How much a reset keeps: the changes staged (soft), in the working tree
+/// (mixed), or nothing (hard).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetMode {
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+pub fn reset(root: &Path, to: &str, mode: ResetMode) -> Result<(), String> {
+    run(root, &["reset", mode.flag(), to]).map(drop)
+}
+
+// ---- Stashes -----------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stash {
+    /// `stash@{index}`.
+    pub index: usize,
+    /// "On main: message", or "WIP on main: abc123 subject".
+    pub message: String,
+    pub time: i64,
+}
+
+pub fn stashes(root: &Path) -> Vec<Stash> {
+    let Ok(out) = run(root, &["stash", "list", "--format=%gd%x00%gs%x00%ct"]) else { return Vec::new() };
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\0');
+            let index = parts.next()?.strip_prefix("stash@{")?.strip_suffix('}')?.parse().ok()?;
+            let message = parts.next()?.to_string();
+            let time = parts.next()?.parse().unwrap_or(0);
+            Some(Stash { index, message, time })
+        })
+        .collect()
+}
+
+/// Stashes every change, untracked files too.
+pub fn stash(root: &Path, message: Option<&str>) -> Result<(), String> {
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+        args.extend(["--message", message]);
+    }
+    run(root, &args).map(drop)
+}
+
+/// Applies a stash (and drops it when `pop`). Conflicts leave the files
+/// conflicted and the stash kept: "CONFLICT".
+pub fn unstash(root: &Path, index: usize, pop: bool) -> Result<String, String> {
+    let name = format!("stash@{{{index}}}");
+    run(root, &["stash", if pop { "pop" } else { "apply" }, &name]).or_else(|e| {
+        if status(root).is_ok_and(|s| s.files.iter().any(|f| f.staged == Some(Change::Conflicted))) { Ok("CONFLICT".into()) } else { Err(e) }
+    })
+}
+
+pub fn drop_stash(root: &Path, index: usize) -> Result<(), String> {
+    run(root, &["stash", "drop", &format!("stash@{{{index}}}")]).map(drop)
+}
+
 // ---- History ------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1241,7 +1398,8 @@ pub struct LogEntry {
 pub fn log(root: &Path, limit: usize, all: bool, path: Option<&str>) -> Result<Vec<LogEntry>, String> {
     let mut extra = Vec::new();
     if all && path.is_none() {
-        extra.push("--all");
+        // Stashes are listed in the Commit view, not drawn as branches.
+        extra.extend(["--exclude=refs/stash", "--all"]);
     }
     if let Some(path) = path {
         extra.extend(["--follow", "--", path]);
@@ -1631,6 +1789,88 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
     }
 
     #[test]
+    fn remotes_branches_stashes_and_commit_actions() {
+        if !is_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kin-git-actions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        run(&dir, &["config", "user.name", "Test"]).unwrap();
+        run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        let root = discover(&dir).unwrap();
+        let file = dir.join("a.txt");
+        let commit_text = |text: &str, message: &str| {
+            std::fs::write(&file, text).unwrap();
+            stage(&root, &["a.txt".into()]).unwrap();
+            commit(&root, message, false).unwrap();
+            run(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string()
+        };
+        let first = commit_text("one\n", "first");
+
+        // Remotes.
+        assert_eq!(default_remote(&root), None);
+        add_remote(&root, "upstream", "https://example.com/u.git").unwrap();
+        add_remote(&root, "origin", "https://example.com/o.git").unwrap();
+        assert_eq!(default_remote(&root).as_deref(), Some("origin"));
+        set_remote_url(&root, "origin", "git@example.com:o.git").unwrap();
+        rename_remote(&root, "upstream", "fork").unwrap();
+        let names: Vec<(String, String)> = remotes(&root).unwrap().into_iter().map(|r| (r.name, r.url)).collect();
+        assert_eq!(names, vec![("fork".into(), "https://example.com/u.git".into()), ("origin".into(), "git@example.com:o.git".into())]);
+        remove_remote(&root, "fork").unwrap();
+        assert_eq!(remotes(&root).unwrap().len(), 1);
+
+        // Branches: a merged one deletes plainly, an unmerged one needs force.
+        let main = status(&root).unwrap().branch.unwrap();
+        assert!(valid_branch_name(&root, "feature/x") && !valid_branch_name(&root, "bad..name"));
+        create_branch_at(&root, "side", &first).unwrap();
+        let side = commit_text("side\n", "side change");
+        checkout(&root, &Branch { name: main.clone(), remote: false, current: false }).unwrap();
+        assert!(!is_merged(&root, "side"));
+        assert!(delete_branch(&root, "side", false).is_err());
+        rename_branch(&root, "side", "side2").unwrap();
+        delete_branch(&root, "side2", true).unwrap();
+
+        // Commits: tag, cherry-pick (the deleted branch's commit still exists), revert, reset.
+        create_tag(&root, "v1", &first).unwrap();
+        assert!(run(&root, &["tag"]).unwrap().contains("v1"));
+        assert_ne!(cherry_pick(&root, &side).unwrap(), "CONFLICT");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "side\n");
+        revert(&root, "HEAD").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        reset(&root, &first, ResetMode::Soft).unwrap();
+        assert!(status(&root).unwrap().files.is_empty(), "the revert undid the cherry-pick");
+        let second = commit_text("two\n", "second");
+        reset(&root, &first, ResetMode::Mixed).unwrap();
+        assert_eq!(status(&root).unwrap().files[0].unstaged, Some(Change::Modified));
+        reset(&root, &first, ResetMode::Hard).unwrap();
+        assert!(status(&root).unwrap().files.is_empty());
+        checkout_commit(&root, &second).unwrap();
+        assert_eq!(status(&root).unwrap().branch, None);
+        checkout(&root, &Branch { name: main.clone(), remote: false, current: false }).unwrap();
+
+        // Stashes, untracked files included.
+        std::fs::write(&file, "changed\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        stash(&root, Some("work in progress")).unwrap();
+        assert!(status(&root).unwrap().files.is_empty());
+        let list = stashes(&root);
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].index, list[0].message.ends_with("work in progress")), (0, true));
+        unstash(&root, 0, false).unwrap();
+        assert_eq!(stashes(&root).len(), 1);
+        assert!(dir.join("new.txt").exists());
+        discard(&root, &status(&root).unwrap().files).unwrap();
+        unstash(&root, 0, true).unwrap();
+        assert!(stashes(&root).is_empty());
+        stash(&root, None).unwrap();
+        drop_stash(&root, 0).unwrap();
+        assert!(stashes(&root).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn real_repository_round_trip() {
         if !is_available() {
             return;
@@ -1664,13 +1904,13 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let remote = dir.with_extension("remote.git");
         let _ = std::fs::remove_dir_all(&remote);
         run(&dir, &["init", "--bare", "--quiet", remote.to_str().unwrap()]).unwrap();
-        assert!(!has_remote(&root));
+        assert!(default_remote(&root).is_none());
         run(&root, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
-        assert!(has_remote(&root));
+        assert!(default_remote(&root).is_some());
         // Before pushing, the preview lists the unpushed commit for a new branch.
         let preview = push_preview(&root).unwrap();
         assert_eq!((preview.branch.as_str(), preview.upstream.as_deref(), preview.commits.len()), ("feature", None, 1));
-        push(&root, Some("feature"), false).unwrap();
+        push(&root, Some(("origin", "feature")), false).unwrap();
         let preview = push_preview(&root).unwrap();
         assert_eq!((preview.upstream.as_deref(), preview.commits.len()), (Some("origin/feature"), 0));
         let s = status(&root).unwrap();

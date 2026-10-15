@@ -270,6 +270,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_pull))
             .on_action(cx.listener(Self::git_fetch))
             .on_action(cx.listener(Self::git_branches))
+            .on_action(cx.listener(Self::git_stash))
+            .on_action(cx.listener(Self::manage_remotes))
             .on_action(cx.listener(Self::toggle_git_log))
             .on_action(cx.listener(Self::show_file_history))
             .on_action(cx.listener(Self::git_clone))

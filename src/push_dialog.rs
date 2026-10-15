@@ -24,7 +24,9 @@ actions!(push_dialog, [ConfirmPush]);
 const ROW_HEIGHT: f32 = 30.;
 
 pub enum PushDialogEvent {
-    Push { force: bool },
+    /// `remote`: where a branch without an upstream goes.
+    Push { force: bool, remote: Option<String> },
+    ManageRemotes,
     OpenDiff(DiffSource),
     Dismissed,
 }
@@ -36,6 +38,8 @@ pub struct PushDialog {
     /// The selected commit's message and files.
     details: Option<(String, Result<(String, Vec<CommitFile>), String>)>,
     force: bool,
+    /// The remote a new branch is pushed to (origin, else the first).
+    remote: Option<String>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     details_scroll: gpui::ScrollHandle,
@@ -52,6 +56,9 @@ impl PushDialog {
         cx.spawn(async move |this, cx| {
             let preview = cx.background_executor().spawn(async move { git::push_preview(&root) }).await;
             this.update(cx, |this, cx| {
+                if let Ok(p) = &preview {
+                    this.remote = p.remotes.iter().find(|r| *r == "origin").or(p.remotes.first()).cloned();
+                }
                 this.preview = Some(preview);
                 this.select(0, cx);
                 cx.notify();
@@ -65,6 +72,7 @@ impl PushDialog {
             selected: 0,
             details: None,
             force: false,
+            remote: None,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
             details_scroll: gpui::ScrollHandle::new(),
@@ -112,8 +120,10 @@ impl PushDialog {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if self.can_push() {
-            cx.emit(PushDialogEvent::Push { force: self.force });
+        if matches!(&self.preview, Some(Ok(p)) if !p.has_remote) {
+            cx.emit(PushDialogEvent::ManageRemotes);
+        } else if self.can_push() {
+            cx.emit(PushDialogEvent::Push { force: self.force, remote: self.remote.clone() });
         }
     }
 
@@ -220,10 +230,40 @@ impl Render for PushDialog {
         let theme = Theme::get(cx).clone();
         let preview = self.preview.clone();
 
-        // main → origin/main (new)
+        // main → origin/main (new); with several remotes, a new branch's is a choice.
         let route = match &preview {
             Some(Ok(p)) => {
-                let target = p.upstream.clone().unwrap_or_else(|| format!("origin/{}", p.branch));
+                let remote = self.remote.clone().unwrap_or_else(|| "origin".into());
+                let choose = p.upstream.is_none() && p.remotes.len() > 1;
+                let target = match &p.upstream {
+                    Some(upstream) => upstream.clone(),
+                    None if choose => p.branch.clone(),
+                    None => format!("{remote}/{}", p.branch),
+                };
+                let remotes = choose.then(|| {
+                    crate::ui::dock(&theme).children(p.remotes.iter().enumerate().map(|(ix, name)| {
+                        let on = *name == remote;
+                        let (name, label) = (name.clone(), name.clone());
+                        div()
+                            .id(("push-remote", ix))
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(if on { theme.text } else { theme.text_muted })
+                            .when(on, |el| crate::ui::segment_on(el, &theme))
+                            .tooltip(|_, cx| tooltip_view("Push the New Branch to This Remote", cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remote = Some(name.clone());
+                                cx.notify();
+                            }))
+                            .child(label)
+                            .hover_bg(theme.hover)
+                    }))
+                });
                 Some(
                     div()
                         .flex()
@@ -233,6 +273,8 @@ impl Render for PushDialog {
                         .child(icon_el(Icon::GitBranch, px(13.), theme.text_muted.into()))
                         .child(div().text_color(theme.text).child(p.branch.clone()))
                         .child(div().text_color(theme.text_dim).child("→"))
+                        .children(remotes)
+                        .when(choose, |el| el.child(div().text_color(theme.text_dim).child("/")))
                         .child(div().text_color(theme.text).child(target))
                         .when(p.upstream.is_none(), |el| {
                             el.child(
@@ -261,7 +303,12 @@ impl Render for PushDialog {
             .child(icon_el(Icon::ArrowUp, px(15.), theme.text_muted.into()))
             .child(div().font_weight(FontWeight::SEMIBOLD).child("Push Commits"))
             .child(div().flex_1())
-            .children(route);
+            .children(route)
+            .child(
+                crate::ui::icon_button("push-remotes", Icon::Cloud, theme.text_muted.into(), cx)
+                    .tooltip(|_, cx| tooltip_view("Manage Remotes…", cx))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PushDialogEvent::ManageRemotes))),
+            );
 
         let commits = self.commits().to_vec();
         let list = match &preview {
@@ -321,7 +368,7 @@ impl Render for PushDialog {
 
         // Why a push might not work, or what it's about to do.
         let note: Option<(String, Hsla)> = match &preview {
-            Some(Ok(p)) if !p.has_remote => Some(("No remote is configured (git remote add origin <url>).".into(), theme.error.into())),
+            Some(Ok(p)) if !p.has_remote => Some(("No remote is configured: add the repository to push to.".into(), theme.error.into())),
             Some(Ok(p)) if p.behind > 0 => Some((
                 format!(
                     "{} has {} commit{} you don't have. Update the project first, or force push to replace them.",
@@ -338,6 +385,7 @@ impl Render for PushDialog {
             _ => None,
         };
         let can_push = self.can_push();
+        let no_remote = matches!(&preview, Some(Ok(p)) if !p.has_remote);
         let force = self.force;
         let footer = div()
             .flex()
@@ -379,8 +427,8 @@ impl Render for PushDialog {
             )
             .child(text_button("push-cancel", "Cancel", false, cx).on_click(cx.listener(|_, _, _, cx| cx.emit(PushDialogEvent::Dismissed))))
             .child(
-                text_button("push-confirm", if force { "Force Push" } else { "Push" }, true, cx)
-                    .when(!can_push, |el| el.opacity(0.45))
+                text_button("push-confirm", if no_remote { "Add Remote…" } else if force { "Force Push" } else { "Push" }, true, cx)
+                    .when(!can_push && !no_remote, |el| el.opacity(0.45))
                     .on_click(cx.listener(|this, _, _, cx| this.confirm(cx))),
             );
 

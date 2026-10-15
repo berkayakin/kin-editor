@@ -47,6 +47,7 @@ mod run;
 mod schemas;
 mod project_search;
 mod push_dialog;
+mod remotes_dialog;
 mod search;
 mod settings;
 mod snippets;
@@ -71,7 +72,7 @@ use crate::{
     editor::*,
     workspace::{
         CheckForUpdates, CloseTab, CloseWindow, DecreaseFontSize, FileStructure, Find, IncreaseFontSize, OpenSettings, OpenExtensions, ProjectTrust,
-        ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitClone, GitFetch,
+        ResetFontSize, Rerun, RunConfiguration, SplitDown, SplitRight, StopRun, ShowFileHistory, ToggleGitLog, ToggleTerminal, FindAction, FindInFiles, GitBranches, GitStash, ManageRemotes, GitClone, GitFetch,
         GitInit, GitPull, GitPush, GoToFile, GoToLine, MinimizeWindow, ZoomWindow, NewFile, NewWindow, NextTab, OpenFile,
         OpenFolder, OpenFolderInThisWindow, OpenRemote, PrevTab, Quit, RecentFiles, RecentProjects,
         Replace, ReplaceInFiles, Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit,
@@ -206,6 +207,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Fetch", GitFetch),
                 MenuItem::separator(),
                 MenuItem::action("Branches…", GitBranches),
+                MenuItem::action("Stash Changes…", GitStash),
+                MenuItem::action("Manage Remotes…", ManageRemotes),
                 MenuItem::action("Log", ToggleGitLog),
                 MenuItem::action("Show History for File", ShowFileHistory),
                 MenuItem::action("Open Repository in Browser", OpenRemote),
