@@ -126,6 +126,18 @@ pub struct Branch {
     pub current: bool,
 }
 
+/// Environment variables that choose the repository instead of the folder.
+const REPOSITORY_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
 fn command(root: &Path) -> Command {
     let mut cmd = crate::process::command("git");
     // A repository's config can name a program for `git status` to run.
@@ -140,6 +152,12 @@ fn command(root: &Path) -> Command {
         // watcher sees as a change and answers with another status.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null());
+    // The repository is `root`. Inherited from a git hook or a shell, these
+    // would point every command at another repository (a test run once
+    // turned the project's own into a bare one this way).
+    for var in REPOSITORY_VARS {
+        cmd.env_remove(var);
+    }
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     }
@@ -1487,6 +1505,16 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let files = parse_name_status("M\0src/a.rs\0R087\0old.rs\0new.rs\0A\0b.txt\0");
         assert_eq!(files[1], CommitFile { change: Change::Renamed, rel: "new.rs".into(), old_rel: Some("old.rs".into()) });
         assert_eq!((files[0].change, files[2].change), (Change::Modified, Change::Added));
+    }
+
+    #[test]
+    fn git_runs_on_the_given_folder_whatever_the_environment_says() {
+        let cmd = command(Path::new("/some/project"));
+        let removed: Vec<_> = cmd.get_envs().filter(|(_, value)| value.is_none()).map(|(key, _)| key.to_string_lossy().into_owned()).collect();
+        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+            assert!(removed.iter().any(|r| r == var), "{var} isn't cleared: {removed:?}");
+        }
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/some/project")));
     }
 
     #[test]
