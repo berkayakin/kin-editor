@@ -45,7 +45,7 @@ use crate::{
     keymap,
     lint::Severity,
     lsp::{
-        LspEvent, LspStatus, LspStore, Server,
+        FileChange, LspEvent, LspStatus, LspStore, Server,
         protocol::{self, CodeAction, Encoding, Location, Position, TextEdit},
     },
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},

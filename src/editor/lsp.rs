@@ -1074,6 +1074,37 @@ mod tests {
     }
 
     #[gpui::test]
+    fn servers_hear_of_the_files_they_watch(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("watch", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let messages = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().map(|d| d.message.to_string()).collect::<Vec<_>>());
+        wait_for(cx, "the server", |cx| messages(cx).iter().any(|m| m == "watch problem"));
+
+        // It registered **/*.toml: it hears of Cargo.toml, not of b.rs.
+        let changes = [(dir.join("Cargo.toml"), crate::lsp::FileChange::Changed), (dir.join("b.rs"), crate::lsp::FileChange::Created)];
+        wait_for(cx, "the watched change", |cx| {
+            store.read_with(cx, |s, _| s.files_changed(&changes));
+            messages(cx).iter().any(|m| m.starts_with("watch watched"))
+        });
+        assert_eq!(messages(cx), ["watch watched 2 Cargo.toml"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
     fn a_document_gets_every_server(cx: &mut TestAppContext) {
         if crate::lsp::servers::which("python3").is_none() {
             return;

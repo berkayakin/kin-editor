@@ -21,6 +21,7 @@ futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 # Image dimensions for previews (GPUI already depends on it, with its formats).
 image = { version = "0.25", default-features = false }
+globset = "0.4"
 ignore = "0.4.33"
 # Extensions' tree-sitter grammars, compiled to libraries and loaded at run time.
 libloading = "0.8"

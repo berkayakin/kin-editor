@@ -203,6 +203,9 @@ pub struct LspStore {
     /// Each started server's spec, program and the configuration it was
     /// given, to answer `workspace/configuration` and notice changes.
     configs: HashMap<ServerKey, (&'static servers::ServerSpec, PathBuf, servers::ServerConfig)>,
+    /// Files each server asked to hear about (`workspace/didChangeWatchedFiles`),
+    /// by registration id.
+    watchers: HashMap<ServerKey, Vec<(String, Vec<FileWatcher>)>>,
     /// Tests: the servers every document gets, instead of its language's.
     #[cfg(test)]
     pub(crate) test_specs: Option<Vec<&'static servers::ServerSpec>>,
@@ -212,6 +215,7 @@ pub struct LspStore {
 impl LspStore {
     pub fn new() -> Self {
         Self {
+            watchers: HashMap::new(),
             workspace_root: None,
             servers: HashMap::new(),
             documents: HashMap::new(),
@@ -541,6 +545,30 @@ impl LspStore {
                         client.respond(id, Value::Array(answers.collect()));
                     }
                     "workspace/workspaceFolders" => client.respond(id, workspace_folders(&key.root)),
+                    "client/registerCapability" => {
+                        for registration in params.get("registrations").and_then(Value::as_array).into_iter().flatten() {
+                            if registration.get("method").and_then(Value::as_str) != Some("workspace/didChangeWatchedFiles") {
+                                continue;
+                            }
+                            let id = registration.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                            let watchers = registration.pointer("/registerOptions/watchers").and_then(Value::as_array);
+                            let watchers: Vec<FileWatcher> = watchers.into_iter().flatten().filter_map(FileWatcher::parse).collect();
+                            let list = self.watchers.entry(key.clone()).or_default();
+                            list.retain(|(existing, _)| *existing != id);
+                            list.push((id, watchers));
+                        }
+                        client.respond(id, Value::Null);
+                    }
+                    "client/unregisterCapability" => {
+                        let gone = params.get("unregisterations").and_then(Value::as_array);
+                        for item in gone.into_iter().flatten() {
+                            let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                            if let Some(list) = self.watchers.get_mut(key) {
+                                list.retain(|(existing, _)| existing != id);
+                            }
+                        }
+                        client.respond(id, Value::Null);
+                    }
                     "workspace/applyEdit" => {
                         let encoding = match self.servers.get(key) {
                             Some(ServerState::Running(server)) => server.encoding,
@@ -553,6 +581,7 @@ impl LspStore {
                 }
             }
             Incoming::Closed { stderr_tail } => {
+                self.watchers.remove(key);
                 // Stopped on purpose (Restricted Mode, closing): nothing to report.
                 if !self.servers.contains_key(key) {
                     return;
@@ -578,6 +607,23 @@ impl LspStore {
                 for doc in self.documents.values_mut() {
                     doc.set_opened(key, false);
                 }
+            }
+        }
+    }
+
+    /// Files changed on disk (created, changed or deleted): each server hears
+    /// about the ones it watches.
+    pub fn files_changed(&self, changes: &[(PathBuf, FileChange)]) {
+        for (key, registrations) in &self.watchers {
+            let events: Vec<Value> = changes
+                .iter()
+                .filter(|(path, change)| registrations.iter().flat_map(|(_, w)| w).any(|w| w.matches(path, *change)))
+                .map(|(path, change)| json!({ "uri": path_to_uri(path), "type": *change as u8 }))
+                .collect();
+            if !events.is_empty()
+                && let Some(client) = self.client(key)
+            {
+                client.notify("workspace/didChangeWatchedFiles", json!({ "changes": events }));
             }
         }
     }
@@ -890,6 +936,7 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
                 "workspaceEdit": { "documentChanges": true },
                 "configuration": true,
                 "workspaceFolders": true,
+                "didChangeWatchedFiles": { "dynamicRegistration": true, "relativePatternSupport": true },
             },
             "window": { "workDoneProgress": true },
             "textDocument": {
@@ -938,6 +985,54 @@ impl Default for LspStore {
     }
 }
 
+/// How a file changed on disk, as `workspace/didChangeWatchedFiles` numbers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileChange {
+    Created = 1,
+    Changed = 2,
+    Deleted = 3,
+}
+
+/// One of a server's file watchers: a glob, relative to `base` when given
+/// (else matched against the whole path), and which changes it wants.
+struct FileWatcher {
+    base: Option<PathBuf>,
+    glob: globset::GlobMatcher,
+    /// Bits: 1 created, 2 changed, 4 deleted.
+    kind: u64,
+}
+
+impl FileWatcher {
+    fn parse(watcher: &Value) -> Option<Self> {
+        let pattern = watcher.get("globPattern")?;
+        let (base, glob) = match pattern {
+            Value::String(glob) => (None, glob.as_str()),
+            // A RelativePattern: a base folder (a URI or a workspace folder) and a glob.
+            _ => {
+                let base = pattern.get("baseUri").and_then(|b| b.as_str().or_else(|| b.get("uri")?.as_str()))?;
+                (Some(protocol::uri_to_path(base)?), pattern.get("pattern")?.as_str()?)
+            }
+        };
+        let glob = globset::GlobBuilder::new(glob).literal_separator(true).build().ok()?.compile_matcher();
+        Some(Self { base, glob, kind: watcher.get("kind").and_then(Value::as_u64).unwrap_or(7) })
+    }
+
+    fn matches(&self, path: &Path, change: FileChange) -> bool {
+        let bit = match change {
+            FileChange::Created => 1,
+            FileChange::Changed => 2,
+            FileChange::Deleted => 4,
+        };
+        if self.kind & bit == 0 {
+            return false;
+        }
+        match &self.base {
+            Some(base) => path.strip_prefix(base).is_ok_and(|rel| self.glob.is_match(rel)),
+            None => self.glob.is_match(path),
+        }
+    }
+}
+
 /// A language server for tests: `python3 -c FAKE_SERVER <name> <trigger chars>`.
 /// It publishes one diagnostic per opened file ("<name> problem", followed
 /// by its initialization option `greeting` and the `mode` in its `fake`
@@ -965,15 +1060,27 @@ def send(msg):
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
 init = {}
+last_uri = None
 while True:
     m = read()
     method, id = m.get("method"), m.get("id")
-    if method == "initialize":
+    if method is None:
+        continue
+    if method == "initialized":
+        # Watches TOML files, and tells (as a diagnostic) what it hears of them.
+        watchers = [{"globPattern": "**/*.toml"}]
+        send({"jsonrpc": "2.0", "id": "reg", "method": "client/registerCapability", "params": {"registrations": [{"id": "w", "method": "workspace/didChangeWatchedFiles", "registerOptions": {"watchers": watchers}}]}})
+    elif method == "workspace/didChangeWatchedFiles" and last_uri:
+        heard = ", ".join("%d %s" % (c["type"], c["uri"].rsplit("/", 1)[-1]) for c in m["params"]["changes"])
+        problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 3, "message": name + " watched " + heard}
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
+    elif method == "initialize":
         init = m["params"].get("initializationOptions") or {}
         caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True}
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
+        last_uri = uri
         # Asks for its whole section and reads `mode` in it, as basedpyright
         # asks for "basedpyright" and reads its "analysis".
         send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})

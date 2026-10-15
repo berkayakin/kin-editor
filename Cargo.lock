@@ -3420,6 +3420,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "futures",
+ "globset",
  "gpui",
  "ignore",
  "image",

@@ -42,6 +42,8 @@ impl Workspace {
         self.venv_shown.take();
         let (mut tree, mut git) = (false, false);
         let mut structural = Vec::new();
+        // For language servers watching files.
+        let mut file_changes = Vec::new();
         let mut paths = HashSet::new();
         for change in changes {
             match watcher::git_path(&change.path) {
@@ -64,6 +66,12 @@ impl Workspace {
                     if change.structural {
                         structural.push(change.path.clone());
                     }
+                    let kind = match (change.path.exists(), change.structural) {
+                        (false, _) => FileChange::Deleted,
+                        (true, true) => FileChange::Created,
+                        (true, false) => FileChange::Changed,
+                    };
+                    file_changes.push((change.path.clone(), kind));
                     git |= !ignored(&change.path);
                     paths.insert(change.path);
                 }
@@ -75,6 +83,9 @@ impl Workspace {
         }
         if !structural.is_empty() {
             self.update_project(structural, cx);
+        }
+        if !file_changes.is_empty() {
+            self.lsp.read(cx).files_changed(&file_changes);
         }
         if git {
             self.refresh_git(cx);
