@@ -14,7 +14,10 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::{lsp::servers, run::DebugSpec};
+use crate::{
+    lsp::servers,
+    run::{DebugSpec, RunTarget},
+};
 
 /// How to start an adapter.
 pub struct Adapter {
@@ -26,26 +29,150 @@ pub struct Adapter {
     pub port: Option<u16>,
 }
 
-/// The adapter for `spec`, or what to install when it's missing.
-pub fn adapter(spec: &DebugSpec, cwd: &Path) -> Result<Adapter, String> {
-    match spec {
-        DebugSpec::Cargo { .. } => lldb_dap(),
-        DebugSpec::Go { .. } => delve(),
-        DebugSpec::Python { .. } => debugpy(cwd),
-        DebugSpec::Node { .. } => js_debug(),
+/// A debug adapter Kin can start: built in (lldb-dap, Delve, debugpy,
+/// js-debug) or from an extension.
+pub trait DebugAdapter: Sync {
+    /// Its `adapterID`.
+    fn id(&self) -> &'static str;
+    /// Other names configurations call it: VS Code's `type`, Zed's `adapter`.
+    fn aliases(&self) -> &[&'static str] {
+        &[]
+    }
+    /// How to start it, or what to install when it's missing.
+    fn start(&self, cwd: &Path) -> Result<Adapter, String>;
+}
+
+struct LldbDap;
+struct Delve;
+struct Debugpy;
+struct JsDebug;
+
+impl DebugAdapter for LldbDap {
+    fn id(&self) -> &'static str {
+        "lldb-dap"
+    }
+    // CodeLLDB's configurations mostly read the same (program, args, cwd).
+    fn aliases(&self) -> &[&'static str] {
+        &["lldb", "lldb-vscode", "codelldb", "CodeLLDB"]
+    }
+    fn start(&self, _: &Path) -> Result<Adapter, String> {
+        lldb_dap()
+    }
+}
+
+impl DebugAdapter for Delve {
+    fn id(&self) -> &'static str {
+        "go"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["delve", "Delve", "dlv"]
+    }
+    fn start(&self, _: &Path) -> Result<Adapter, String> {
+        delve()
+    }
+}
+
+impl DebugAdapter for Debugpy {
+    fn id(&self) -> &'static str {
+        "python"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["debugpy", "Debugpy"]
+    }
+    fn start(&self, cwd: &Path) -> Result<Adapter, String> {
+        debugpy(cwd)
+    }
+}
+
+impl DebugAdapter for JsDebug {
+    fn id(&self) -> &'static str {
+        "pwa-node"
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &["node", "JavaScript", "js-debug"]
+    }
+    fn start(&self, _: &Path) -> Result<Adapter, String> {
+        js_debug()
+    }
+}
+
+/// An adapter an extension declares (`[debug_adapters.<id>]`): a command
+/// that talks DAP over stdio, or over TCP on the port given in its
+/// arguments as `{port}`.
+#[derive(Debug)]
+pub struct ExtensionAdapter {
+    pub id: &'static str,
+    pub aliases: Vec<&'static str>,
+    pub command: String,
+    pub args: Vec<String>,
+    pub tcp: bool,
+}
+
+impl DebugAdapter for ExtensionAdapter {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn aliases(&self) -> &[&'static str] {
+        &self.aliases
+    }
+    fn start(&self, _: &Path) -> Result<Adapter, String> {
+        let program = servers::custom(std::slice::from_ref(&self.command))
+            .map(|c| c.program)
+            .ok_or_else(|| format!("The {} debugger needs {}, which isn't installed", self.id, self.command))?;
+        let port = if self.tcp { Some(crate::dap::free_port().map_err(|e| e.to_string())?) } else { None };
+        let args = self.args.iter().map(|a| port.map_or(a.clone(), |p| a.replace("{port}", &p.to_string()))).collect();
+        Ok(Adapter { id: self.id, program, args, port })
+    }
+}
+
+static EXTENSION_ADAPTERS: std::sync::RwLock<Vec<&'static ExtensionAdapter>> = std::sync::RwLock::new(Vec::new());
+
+/// Replaces the adapters extensions declare (after they reload).
+pub fn set_extension_adapters(adapters: Vec<&'static ExtensionAdapter>) {
+    *EXTENSION_ADAPTERS.write().unwrap() = adapters;
+}
+
+/// The adapter a configuration names, by id or alias: Kin's, then extensions'.
+pub fn find_adapter(name: &str) -> Option<&'static dyn DebugAdapter> {
+    let built_in: [&'static dyn DebugAdapter; 4] = [&LldbDap, &Delve, &Debugpy, &JsDebug];
+    let named = |a: &&'static dyn DebugAdapter| a.id() == name || a.aliases().contains(&name);
+    if let Some(adapter) = built_in.into_iter().find(named) {
+        return Some(adapter);
+    }
+    let extensions = EXTENSION_ADAPTERS.read().unwrap();
+    extensions.iter().map(|a| *a as &'static dyn DebugAdapter).find(named)
+}
+
+/// The adapter that debugs `spec`.
+fn adapter_for(spec: &DebugSpec) -> Option<&'static dyn DebugAdapter> {
+    Some(match spec {
+        DebugSpec::Cargo { .. } => &LldbDap,
+        DebugSpec::Go { .. } => &Delve,
+        DebugSpec::Python { .. } => &Debugpy,
+        DebugSpec::Node { .. } => &JsDebug,
         // What the process runs decides; anything else is native code.
         DebugSpec::Attach { program, .. } => {
             let name = program.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             if name == "node" {
-                js_debug()
+                &JsDebug
             } else if name.starts_with("python") {
-                debugpy(cwd)
+                &Debugpy
             } else if is_go_program(program) {
-                delve()
+                &Delve
             } else {
-                lldb_dap()
+                &LldbDap
             }
         }
+        DebugSpec::Config { adapter, .. } => return find_adapter(adapter),
+    })
+}
+
+/// The adapter for `spec`, started, or what to install when it's missing.
+pub fn adapter(spec: &DebugSpec, cwd: &Path) -> Result<Adapter, String> {
+    match (adapter_for(spec), spec) {
+        (Some(adapter), _) => adapter.start(cwd),
+        (None, DebugSpec::Config { adapter, .. }) => Err(format!("Kin has no debugger for \"{adapter}\"")),
+        (None, _) => Err("This can't be debugged".into()),
     }
 }
 
@@ -142,7 +269,7 @@ pub fn initialize_arguments(adapter_id: &str) -> Value {
 
 /// The request that starts debugging: `attach` to a running process, else `launch`.
 pub fn request(spec: &DebugSpec) -> &'static str {
-    if matches!(spec, DebugSpec::Attach { .. }) { "attach" } else { "launch" }
+    if spec.is_attach() { "attach" } else { "launch" }
 }
 
 /// LLDB setup: Step Into skips the standard library (it ships with line info,
@@ -214,7 +341,116 @@ pub fn launch_arguments(spec: &DebugSpec, cwd: &Path, program: Option<&Path>, ad
             // The executable too, or lldb finds no debug info for it.
             _ => json!({ "pid": pid, "program": program, "initCommands": lldb_commands(cwd) }),
         },
+        // As written, in the project's folder unless it says otherwise.
+        DebugSpec::Config { request, config, .. } => {
+            let mut config = config.clone();
+            if config.get("cwd").is_none() {
+                config["cwd"] = json!(cwd);
+            }
+            // js-debug reads these from the configuration itself.
+            if adapter_id == "pwa-node" {
+                config["type"] = json!("pwa-node");
+                config["request"] = json!(request);
+            }
+            config
+        }
     }
+}
+
+/// The debug configurations a project has written for VS Code
+/// (`.vscode/launch.json`) or Zed (`.zed/debug.json`), with their variables
+/// filled in (`${workspaceFolder}`, `${file}`, `${env:HOME}`; Zed's
+/// `$ZED_WORKTREE_ROOT`, `$ZED_FILE`…). `file` is the current file.
+pub fn project_configurations(root: &Path, file: Option<&Path>) -> Vec<RunTarget> {
+    let read = |path: &Path| -> Option<Value> { serde_json::from_str(&crate::settings::strip_jsonc(&std::fs::read_to_string(path).ok()?)).ok() };
+    // (name, adapter, configuration)
+    let mut found: Vec<(String, String, Value)> = Vec::new();
+    if let Some(launch) = read(&root.join(".vscode/launch.json")) {
+        for config in launch["configurations"].as_array().into_iter().flatten() {
+            if let (Some(name), Some(kind)) = (config["name"].as_str(), config["type"].as_str()) {
+                found.push((name.to_string(), kind.to_string(), config.clone()));
+            }
+        }
+    }
+    if let Some(Value::Array(configs)) = read(&root.join(".zed/debug.json")) {
+        for config in configs {
+            if let (Some(name), Some(adapter)) = (config["label"].as_str(), config["adapter"].as_str()) {
+                found.push((name.to_string(), adapter.to_string(), config.clone()));
+            }
+        }
+    }
+    let lookup = |name: &str| variable(name, root, file);
+    found
+        .into_iter()
+        .map(|(name, adapter, mut config)| {
+            fill_in(&mut config, &lookup);
+            let request = config["request"].as_str().unwrap_or("launch").to_string();
+            if let Value::Object(map) = &mut config {
+                for key in ["name", "label", "type", "adapter", "request", "preLaunchTask", "postDebugTask"] {
+                    map.remove(key);
+                }
+            }
+            let cwd = config["cwd"].as_str().map(PathBuf::from).unwrap_or_else(|| root.to_path_buf());
+            RunTarget { name, command: String::new(), cwd, row: None, rows: 0..0, debug: Some(DebugSpec::Config { adapter, request, config }) }
+        })
+        .collect()
+}
+
+/// A configuration variable's value: VS Code's names or Zed's.
+fn variable(name: &str, root: &Path, file: Option<&Path>) -> Option<String> {
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    if let Some(var) = name.strip_prefix("env:") {
+        return Some(std::env::var(var).unwrap_or_default());
+    }
+    let file_part = |f: fn(&Path) -> Option<String>| file.and_then(f);
+    match name {
+        "workspaceFolder" | "workspaceRoot" | "ZED_WORKTREE_ROOT" => Some(text(root)),
+        "workspaceFolderBasename" => root.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "file" | "ZED_FILE" => file.map(text),
+        "relativeFile" | "ZED_RELATIVE_FILE" => file.map(|f| text(f.strip_prefix(root).unwrap_or(f))),
+        "fileDirname" | "ZED_DIRNAME" => file_part(|f| Some(f.parent()?.to_string_lossy().into_owned())),
+        "fileBasename" | "ZED_FILENAME" => file_part(|f| Some(f.file_name()?.to_string_lossy().into_owned())),
+        "fileBasenameNoExtension" | "ZED_STEM" => file_part(|f| Some(f.file_stem()?.to_string_lossy().into_owned())),
+        "fileExtname" => file_part(|f| Some(format!(".{}", f.extension()?.to_string_lossy()))),
+        "userHome" => std::env::var("HOME").ok(),
+        "pathSeparator" => Some(std::path::MAIN_SEPARATOR.to_string()),
+        _ => None,
+    }
+}
+
+/// Fills in `${name}` and `$ZED_NAME` in every string of `value`; names it
+/// doesn't know stay as written.
+fn fill_in(value: &mut Value, lookup: &dyn Fn(&str) -> Option<String>) {
+    match value {
+        Value::String(text) => *text = substitute(text, lookup),
+        Value::Array(items) => items.iter_mut().for_each(|v| fill_in(v, lookup)),
+        Value::Object(map) => map.values_mut().for_each(|v| fill_in(v, lookup)),
+        _ => {}
+    }
+}
+
+fn substitute(text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let (name, len) = match after.strip_prefix('{').and_then(|b| Some((&b[..b.find('}')?], b.find('}')? + 2))) {
+            Some(braced) => braced,
+            None => {
+                let end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(after.len());
+                // Bare names only for Zed's variables ($HOME stays for the shell).
+                if after[..end].starts_with("ZED_") { (&after[..end], end) } else { ("", 0) }
+            }
+        };
+        match (!name.is_empty()).then(|| lookup(name)).flatten() {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[i..i + 1 + len]),
+        }
+        rest = &after[len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Node listens for a debugger after a SIGUSR1 (js-debug's own server
@@ -357,6 +593,75 @@ fn pick_executable(artifacts: &[Value], args: &[String]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_vs_code_and_zed_debug_configurations() {
+        let root = std::env::temp_dir().join(format!("kin-debug-configs-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".vscode")).unwrap();
+        std::fs::create_dir_all(root.join(".zed")).unwrap();
+        std::fs::write(
+            root.join(".vscode/launch.json"),
+            r#"{
+              // VS Code allows comments and trailing commas here.
+              "version": "0.2.0",
+              "configurations": [
+                { "type": "node", "request": "launch", "name": "Server", "program": "${workspaceFolder}/server.js",
+                  "env": { "HOME_DIR": "${env:KIN_TEST_DEBUG_VAR}" }, "preLaunchTask": "build", },
+                { "type": "debugpy", "request": "attach", "name": "Attach", "connect": { "port": 5678 } },
+              ],
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".zed/debug.json"),
+            r#"[{ "label": "Go tests", "adapter": "Delve", "request": "launch", "mode": "test", "program": "$ZED_WORKTREE_ROOT/pkg", "cwd": "${fileDirname}" }]"#,
+        )
+        .unwrap();
+        // SAFETY: only this test reads the variable.
+        unsafe { std::env::set_var("KIN_TEST_DEBUG_VAR", "/home/k") };
+        let file = root.join("src/main.go");
+        let targets = project_configurations(&root, Some(&file));
+        let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Server", "Attach", "Go tests"]);
+        let Some(DebugSpec::Config { adapter, request, config }) = &targets[0].debug else { panic!() };
+        assert_eq!((adapter.as_str(), request.as_str()), ("node", "launch"));
+        assert_eq!(config["program"], json!(format!("{}/server.js", root.display())));
+        assert_eq!(config["env"]["HOME_DIR"], "/home/k");
+        assert!(config.get("name").is_none() && config.get("preLaunchTask").is_none() && config.get("type").is_none());
+        assert!(targets[1].debug.as_ref().unwrap().is_attach());
+        let Some(DebugSpec::Config { adapter, config, .. }) = &targets[2].debug else { panic!() };
+        assert_eq!((adapter.as_str(), &config["program"]), ("Delve", &json!(format!("{}/pkg", root.display()))));
+        assert_eq!(targets[2].cwd, root.join("src"));
+        // Unknown variables stay as written; $HOME is the shell's.
+        assert_eq!(substitute("${nope} $HOME $ZED_NOPE", &|_| None), "${nope} $HOME $ZED_NOPE");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn configurations_name_adapters_the_way_editors_do() {
+        let id = |name: &str| find_adapter(name).map(|a| a.id());
+        assert_eq!(id("node"), Some("pwa-node"));
+        assert_eq!(id("JavaScript"), Some("pwa-node"));
+        assert_eq!(id("Debugpy"), Some("python"));
+        assert_eq!(id("Delve"), Some("go"));
+        assert_eq!(id("CodeLLDB"), Some("lldb-dap"));
+        assert_eq!(id("chrome"), None);
+
+        // As written, with the folder and what js-debug reads from it.
+        let spec = DebugSpec::Config { adapter: "node".into(), request: "attach".into(), config: json!({ "port": 9229 }) };
+        let args = launch_arguments(&spec, Path::new("/p"), None, "pwa-node");
+        assert_eq!(args, json!({ "port": 9229, "cwd": "/p", "type": "pwa-node", "request": "attach" }));
+        assert_eq!(request(&spec), "attach");
+    }
+
+    #[test]
+    fn extension_adapters_listen_on_a_port_of_their_own() {
+        let adapter = ExtensionAdapter { id: "test-dap", aliases: vec![], command: "sh".into(), args: vec!["--port={port}".into()], tcp: true };
+        let started = adapter.start(Path::new("/")).unwrap();
+        let port = started.port.unwrap();
+        assert_eq!(started.args, [format!("--port={port}")]);
+        assert_eq!(started.id, "test-dap");
+    }
 
     #[test]
     fn picks_the_executable_cargo_made() {

@@ -3718,7 +3718,7 @@ impl Workspace {
 
     /// Run… (⌃⌥R / Alt+Shift+F10): the project's configurations and the current file.
     fn run_configuration(&mut self, _: &RunConfiguration, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(targets) = self.configurations(self.last_run.clone(), cx) else { return };
+        let Some(targets) = self.configurations(self.last_run.clone(), false, cx) else { return };
         self.close_modal(window, cx);
         self.open_picker(PickerMode::Run, window, cx);
         if let Some(Modal::Picker(picker)) = &self.modal {
@@ -3728,7 +3728,7 @@ impl Workspace {
 
     /// Debug… (⌃⌥D / Alt+Shift+F9): the configurations that can be debugged.
     fn debug_configuration(&mut self, _: &DebugConfiguration, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(mut targets) = self.configurations(self.last_debug.clone(), cx) else { return };
+        let Some(mut targets) = self.configurations(self.last_debug.clone(), true, cx) else { return };
         targets.retain(|t| t.debug.is_some());
         if targets.is_empty() {
             self.toast(ToastKind::Info, "Nothing to debug here", Some("Rust, Go, Python and JavaScript tests and programs can be debugged".into()), cx);
@@ -3778,7 +3778,11 @@ impl Workspace {
 
     /// Run… and Debug…'s list: settings' configurations, the project's, the
     /// current file's; `last` first. None (after a notice) when there's nothing.
-    fn configurations(&mut self, last: Option<RunTarget>, cx: &mut Context<Self>) -> Option<Vec<RunTarget>> {
+    /// What Run… (or with `debug`, Debug…) offers: settings' configurations,
+    /// detected project commands, the current file's tests and mains, and for
+    /// Debug the project's own debug configurations (`.vscode/launch.json`,
+    /// `.zed/debug.json`).
+    fn configurations(&mut self, last: Option<RunTarget>, debug: bool, cx: &mut Context<Self>) -> Option<Vec<RunTarget>> {
         let root = self
             .root
             .clone()
@@ -3803,6 +3807,9 @@ impl Workspace {
                 debug: None,
             })
             .collect();
+        if debug {
+            targets.extend(launch::project_configurations(&root, current.as_ref().map(|(p, _)| p.as_path())));
+        }
         targets.extend(run::project_targets(&root, current.as_ref().map(|(p, l)| (p.as_path(), *l))));
         // Then the current file's tests and mains, by name.
         if let Some(editor) = self.active_editor() {
@@ -3811,7 +3818,8 @@ impl Workspace {
         }
         // The last one comes first, so Enter repeats it.
         if let Some(last) = last {
-            targets.retain(|t| t.command != last.command || t.cwd != last.cwd);
+            // Debug configurations have no command: those go by name.
+            targets.retain(|t| !(t.command == last.command && t.cwd == last.cwd && (!t.command.is_empty() || t.name == last.name)));
             targets.insert(0, last);
         }
         if targets.is_empty() {

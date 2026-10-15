@@ -173,7 +173,7 @@ impl DebugSession {
     }
 
     fn is_attach(&self) -> bool {
-        matches!(self.target.debug, Some(DebugSpec::Attach { .. }))
+        self.target.debug.as_ref().is_some_and(DebugSpec::is_attach)
     }
 
     /// Where requests go: the active connection, else the adapter's own.

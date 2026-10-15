@@ -45,6 +45,20 @@ pub enum DebugSpec {
     Node { runtime: String, args: Vec<String> },
     /// A running process; its executable decides the adapter.
     Attach { pid: u32, program: PathBuf },
+    /// A configuration as written (`.vscode/launch.json`, `.zed/debug.json`):
+    /// the adapter by name, `launch` or `attach`, and its arguments.
+    Config { adapter: String, request: String, config: serde_json::Value },
+}
+
+impl DebugSpec {
+    /// Attaching to a running program (which ending the session leaves running).
+    pub fn is_attach(&self) -> bool {
+        match self {
+            DebugSpec::Attach { .. } => true,
+            DebugSpec::Config { request, .. } => request == "attach",
+            _ => false,
+        }
+    }
 }
 
 /// Quotes for a POSIX shell when needed.

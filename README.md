@@ -486,6 +486,11 @@ and Zed use):
   are saved first; Rust is built with cargo (its output shows in the console). JavaScript and
   TypeScript debug what Run would run (`node`, `npx tsx`, npm/pnpm/yarn scripts, Vitest, Jest,
   `node --test`), every Node process it starts included; TypeScript breakpoints work through source maps.
+- **The project's own configurations**: Debug… also lists what the project wrote for VS Code
+  (`.vscode/launch.json`) or Zed (`.zed/debug.json`), with their variables filled in
+  (`${workspaceFolder}`, `${file}`, `${env:NAME}`, Zed's `$ZED_WORKTREE_ROOT`…). Kin starts the
+  adapter they name (`node`/`pwa-node`, `debugpy`/`python`, `go`/`Delve`, `lldb`/`CodeLLDB`, or an
+  extension's) with the configuration as written; `preLaunchTask` isn't run.
 - **Attach to Process…** (⌥⇧F5 / Ctrl+Alt+F5, or the Run menu) lists your running processes (search
   by name, command line or PID) and debugs the one you pick: Node with js-debug, Python with debugpy,
   Go with Delve, anything else (Rust, C, C++) with lldb-dap. Stop detaches and leaves it running.
@@ -507,6 +512,7 @@ Nothing is downloaded; the adapters come from your system:
 
 One session runs at a time. Attaching to Python injects debugpy into the process, which macOS can
 block; attaching to Node turns on its inspector (port 9229 unless it was started with `--inspect`).
+An extension can bring another adapter (`[debug_adapters]`, see [Extensions](#extensions)).
 
 ## Extensions
 
@@ -571,6 +577,15 @@ languages = ["MyLang"]
 command = "mylang-ls"
 args = ["--stdio"]
 install = "brew install mylang-ls"   # shown when it isn't found
+# A debug adapter, for configurations naming its id or an alias in launch.json
+# or .zed/debug.json (Kin's keys: Zed extensions start theirs in code). With
+# `tcp`, it listens on the port Kin puts in its arguments as {port}.
+# [debug_adapters.mylang-dap]
+# command = "mylang-dap"
+# args = ["--listen", "{port}"]
+# tcp = true
+# aliases = ["MyLang"]
+
 # What Zed extensions' code would pass the server (Kin's keys):
 initialization_options = { lint = true }
 settings = { mylang = { formatting = "auto" } }

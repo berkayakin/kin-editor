@@ -104,6 +104,8 @@ pub struct ExtensionInfo {
     pub problems: Vec<String>,
     /// How to install its servers, where it says.
     installers: Vec<&'static crate::lsp::install::Installer>,
+    /// Debug adapters it declares (`[debug_adapters.<id>]`).
+    adapters: Vec<&'static crate::debugger::launch::ExtensionAdapter>,
 }
 
 /// A language an extension adds.
@@ -444,6 +446,7 @@ fn load() -> Vec<(String, Grammar)> {
     registry.languages = slots;
     registry.servers = servers;
     crate::lsp::install::set_extension_installers(extensions.iter().flat_map(|e| e.installers.iter().copied()).collect());
+    crate::debugger::launch::set_extension_adapters(extensions.iter().flat_map(|e| e.adapters.iter().copied()).collect());
     registry.extensions = extensions;
     jobs
 }
@@ -467,6 +470,7 @@ fn read_extension(dir: &Path) -> Read {
         building: Vec::new(),
         problems: Vec::new(),
         installers: Vec::new(),
+        adapters: Vec::new(),
     };
     let manifest = match read_toml(&dir.join("extension.toml")) {
         Ok(manifest) => manifest,
@@ -504,6 +508,22 @@ fn read_extension(dir: &Path) -> Read {
             checkout,
         };
         grammars.insert(name.clone(), grammar);
+    }
+
+    // Debug adapters: Zed extensions start theirs in code; here it's the
+    // `command` (with `{port}` in `args` when `tcp`).
+    for (id, adapter) in manifest.get("debug_adapters").and_then(Value::as_table).into_iter().flatten() {
+        let Some(command) = adapter.get("command").and_then(Value::as_str) else {
+            info.problems.push(format!("debug adapter {id}: it needs a command"));
+            continue;
+        };
+        info.adapters.push(Box::leak(Box::new(crate::debugger::launch::ExtensionAdapter {
+            id: leak(id.clone()),
+            aliases: strings(adapter.get("aliases")).into_iter().map(leak).collect(),
+            command: command.to_string(),
+            args: strings(adapter.get("args")),
+            tcp: adapter.get("tcp").and_then(Value::as_bool).unwrap_or(false),
+        })));
     }
 
     // Per language, every server the extension lists for it: one spec with
@@ -947,6 +967,12 @@ args = ["lsp"]
 [language_servers.other]
 name = "Needs code"
 language = "Gleam"
+
+[debug_adapters.gleam-dap]
+command = "gleam-dap"
+args = ["--listen", "{port}"]
+tcp = true
+aliases = ["Gleam"]
 "#,
         );
         write(
@@ -969,6 +995,8 @@ formatter = ["gleam", "format", "--stdin"]
         assert_eq!(info.themes, 1);
         assert_eq!(info.servers, ["Gleam LSP (gleam)", "Needs code (other)"]);
         assert!(info.problems.is_empty(), "{:?}", info.problems);
+        let dap = info.adapters[0];
+        assert_eq!((dap.id, dap.aliases.as_slice(), dap.command.as_str(), dap.tcp), ("gleam-dap", &["Gleam"][..], "gleam-dap", true));
 
         let gleam = &languages[0];
         assert_eq!((gleam.name, gleam.id), ("Gleam", "gleam"));
