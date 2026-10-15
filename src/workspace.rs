@@ -444,6 +444,8 @@ enum Modal {
 
 /// How long two Shift taps may be apart to count as a double Shift.
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
+/// How long Save waits for format on save before saving unformatted.
+const FORMAT_ON_SAVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 const TITLEBAR_HEIGHT: f32 = 40.0;
 const STATUSBAR_HEIGHT: f32 = 30.0;
@@ -1665,8 +1667,14 @@ impl Workspace {
         // auto-save never reformats mid-typing.
         if editor.read(cx).format_on_save() {
             let task = editor.update(cx, |e, cx| e.format(false, cx));
+            let timeout = cx.background_executor().timer(FORMAT_ON_SAVE_TIMEOUT);
             cx.spawn_in(window, async move |this, cx| {
-                let result = task.await;
+                // A stuck formatter or server mustn't stop the save; dropping
+                // the task cancels its request.
+                let result = match futures::future::select(task, timeout).await {
+                    futures::future::Either::Left((result, _)) => result,
+                    futures::future::Either::Right(_) => Err("The formatter took too long".to_string()),
+                };
                 this.update_in(cx, |ws, window, cx| {
                     if let Err(err) = result {
                         ws.toast(ToastKind::Info, "Saved without formatting", Some(err), cx);

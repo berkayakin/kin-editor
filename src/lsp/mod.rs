@@ -92,10 +92,7 @@ impl Server {
 
     /// Sends a request and waits for its result.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        match self.client.request(method, params).await {
-            Ok(result) => result,
-            Err(_) => Err(RpcError { message: rpc::STOPPED.into() }),
-        }
+        self.client.request(method, params).await
     }
 }
 
@@ -289,15 +286,13 @@ impl LspStore {
 
             let init = client.request("initialize", initialize_params(&key.root));
             let result = match init.await {
-                Ok(Ok(result)) => result,
+                Ok(result) => result,
                 // An exit is reported (and explained) by `Closed`.
-                Ok(Err(err)) if err.message == rpc::STOPPED => return,
-                Ok(Err(err)) => {
+                Err(err) if err.message == rpc::STOPPED => return,
+                Err(err) => {
                     this.update(cx, |s, cx| s.fail(&key, format!("{name} failed to start: {err}"), cx)).ok();
                     return;
                 }
-                // The reader reports the exit; `Closed` marks it failed.
-                Err(_) => return,
             };
             client.notify("initialized", json!({}));
             let capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);

@@ -5,14 +5,17 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     io::{BufRead, BufReader, Read, Write},
     path::Path,
+    pin::Pin,
     process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
         mpsc,
     },
+    task::Poll,
 };
 
 use futures::channel::{mpsc as async_mpsc, oneshot};
@@ -104,13 +107,14 @@ impl Client {
         Ok((client, incoming))
     }
 
-    /// Sends a request; the future resolves with the result.
-    pub fn request(&self, method: &str, params: Value) -> oneshot::Receiver<Result<Value, RpcError>> {
+    /// Sends a request; the future resolves with the result. Dropping it
+    /// before the answer comes tells the server to stop working on it.
+    pub fn request(&self, method: &str, params: Value) -> Request {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
-        rx
+        Request { id, rx, pending: self.pending.clone(), writer: self.writer.clone() }
     }
 
     pub fn notify(&self, method: &str, params: Value) {
@@ -123,17 +127,14 @@ impl Client {
     }
 
     fn send(&self, message: Value) {
-        let body = message.to_string();
-        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        frame.extend_from_slice(body.as_bytes());
-        // Fails only once the writer thread is gone (server exited).
-        self.writer.send(frame).ok();
+        send(&self.writer, message);
     }
 
     /// Asks the server to exit, then makes sure it does. Blocks for up to
     /// half a second, so call it off the main thread.
     pub fn shutdown(&self) {
-        let _ = self.request("shutdown", Value::Null);
+        // Kept until the end, so it isn't cancelled.
+        let _shutdown = self.request("shutdown", Value::Null);
         self.notify("exit", Value::Null);
         for _ in 0..20 {
             if self.child.lock().ok().and_then(|mut c| c.try_wait().ok().flatten()).is_some() {
@@ -145,6 +146,39 @@ impl Client {
             let _ = child.kill();
         }
     }
+}
+
+/// A request waiting for its answer (see [`Client::request`]).
+pub struct Request {
+    id: i64,
+    rx: oneshot::Receiver<Result<Value, RpcError>>,
+    pending: Pending,
+    writer: mpsc::Sender<Vec<u8>>,
+}
+
+impl Future for Request {
+    type Output = Result<Value, RpcError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.rx).poll(cx).map(|answer| answer.unwrap_or_else(|_| Err(RpcError { message: STOPPED.into() })))
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        // Still pending: no answer came, so the server may still be at it.
+        if self.pending.lock().unwrap().remove(&self.id).is_some() {
+            send(&self.writer, json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": self.id } }));
+        }
+    }
+}
+
+fn send(writer: &mpsc::Sender<Vec<u8>>, message: Value) {
+    let body = message.to_string();
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(body.as_bytes());
+    // Fails only once the writer thread is gone (server exited).
+    writer.send(frame).ok();
 }
 
 impl Drop for Client {
@@ -243,6 +277,32 @@ fn dispatch(mut message: Value, pending: &Pending, incoming: &async_mpsc::Unboun
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_an_unanswered_request_cancels_it() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, written) = mpsc::channel();
+        let request = |id: i64| {
+            let (tx, rx) = oneshot::channel();
+            pending.lock().unwrap().insert(id, tx);
+            Request { id, rx, pending: pending.clone(), writer: writer.clone() }
+        };
+        let (incoming, _) = async_mpsc::unbounded();
+
+        // Answered, then dropped: nothing to cancel.
+        let answered = request(1);
+        dispatch(json!({ "jsonrpc": "2.0", "id": 1, "result": 42 }), &pending, &incoming);
+        assert_eq!(futures::executor::block_on(answered).unwrap(), 42);
+        assert!(written.try_recv().is_err());
+
+        // Dropped while waiting: the server hears $/cancelRequest, and a
+        // late answer goes nowhere.
+        drop(request(2));
+        let frame = String::from_utf8(written.try_recv().unwrap()).unwrap();
+        assert!(frame.ends_with(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}"#), "{frame}");
+        assert!(pending.lock().unwrap().is_empty());
+        dispatch(json!({ "jsonrpc": "2.0", "id": 2, "result": null }), &pending, &incoming);
+    }
 
     #[test]
     fn reads_frames() {
