@@ -115,8 +115,6 @@ pub struct DebugSession {
     /// The last console line has no line break yet (output comes in pieces).
     console_open: bool,
     console_scroll: ScrollHandle,
-    frames_scroll: ScrollHandle,
-    vars_scroll: ScrollHandle,
     input: Entity<Editor>,
     watch_input: Entity<Editor>,
     build: launch::Build,
@@ -158,8 +156,6 @@ impl DebugSession {
             console: Vec::new(),
             console_open: false,
             console_scroll: ScrollHandle::new(),
-            frames_scroll: ScrollHandle::new(),
-            vars_scroll: ScrollHandle::new(),
             input,
             watch_input,
             build,
@@ -1088,19 +1084,12 @@ impl Render for DebugSession {
                             .child(column_title("FRAMES"))
                             .child(
                                 div()
-                                    .relative()
+                                    .id("debug-frames")
                                     .flex_1()
                                     .min_h_0()
-                                    .child(
-                                        div()
-                                            .id("debug-frames")
-                                            .size_full()
-                                            .overflow_y_scroll()
-                                            .track_scroll(&self.frames_scroll)
-                                            .when(frames.is_empty(), |el| el.child(div().px_3().py_1().text_color(theme.text_dim).child(frames_empty)))
-                                            .children(frames),
-                                    )
-                                    .child(crate::ui::scrollbar("debug-frames-scrollbar", &self.frames_scroll, cx)),
+                                    .overflow_y_scroll()
+                                    .when(frames.is_empty(), |el| el.child(div().px_3().py_1().text_color(theme.text_dim).child(frames_empty)))
+                                    .children(frames),
                             ),
                     )
                     .child(
@@ -1112,14 +1101,7 @@ impl Render for DebugSession {
                             .border_r_1()
                             .border_color(theme.border_subtle)
                             .child(column_title("VARIABLES"))
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .child(div().id("debug-vars").size_full().overflow_y_scroll().track_scroll(&self.vars_scroll).children(rows))
-                                    .child(crate::ui::scrollbar("debug-vars-scrollbar", &self.vars_scroll, cx)),
-                            )
+                            .child(div().id("debug-vars").flex_1().min_h_0().overflow_y_scroll().children(rows))
                             .child(div().p_1p5().border_t_1().border_color(theme.border_subtle).child(input_box(&self.watch_input, Some(Icon::Plus), window, cx))),
                     )
                     .child(
@@ -1131,21 +1113,15 @@ impl Render for DebugSession {
                             .child(column_title("CONSOLE"))
                             .child(
                                 div()
-                                    .relative()
+                                    .id("debug-console")
                                     .flex_1()
                                     .min_h_0()
-                                    .child(
-                                        div()
-                                            .id("debug-console")
-                                            .size_full()
-                                            .overflow_y_scroll()
-                                            .track_scroll(&self.console_scroll)
-                                            .px_2()
-                                            .font(mono.clone())
-                                            .text_size(code_size)
-                                            .children(console),
-                                    )
-                                    .child(crate::ui::scrollbar("debug-console-scrollbar", &self.console_scroll, cx)),
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.console_scroll)
+                                    .px_2()
+                                    .font(mono.clone())
+                                    .text_size(code_size)
+                                    .children(console),
                             )
                             .child(div().p_1p5().border_t_1().border_color(theme.border_subtle).child(input_box(&self.input, Some(Icon::ChevronRight), window, cx))),
                     ),

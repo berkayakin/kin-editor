@@ -34,7 +34,6 @@ pub struct KeymapPage {
     /// Shown under a row after recording, e.g. other actions using the keys.
     notice: Option<(usize, String)>,
     _subscriptions: Vec<Subscription>,
-    scroll: gpui::ScrollHandle,
 }
 
 impl EventEmitter<PreferencesEvent> for KeymapPage {}
@@ -77,7 +76,7 @@ impl KeymapPage {
                 page.update(cx, |page, cx| page.record(keystroke, window, cx));
             }),
         ];
-        let mut page = Self { filter, rows, defaults_for: base, recording: None, notice: None, _subscriptions: subscriptions, scroll: gpui::ScrollHandle::new() };
+        let mut page = Self { filter, rows, defaults_for: base, recording: None, notice: None, _subscriptions: subscriptions };
         page.load_defaults(base);
         page
     }
@@ -353,15 +352,10 @@ impl Render for KeymapPage {
             )
             .child(
                 div()
-                    .relative()
+                    .id("keymap-list")
                     .flex_1()
                     .min_h_0()
-                    .child(
-                div()
-                    .id("keymap-list")
-                    .size_full()
                     .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
                     .px(px(28.))
                     .pb(px(28.))
                     .child(if empty {
@@ -385,8 +379,7 @@ impl Render for KeymapPage {
                             .p_1()
                             .children(rows)
                             .into_any_element()
-                    }))
-                    .child(crate::ui::scrollbar("keymap-scrollbar", &self.scroll, cx)),
+                    }),
             )
     }
 }

@@ -35,14 +35,13 @@ const FEATURED_THEMES: [&str; 8] =
 
 pub struct Onboarding {
     focus_handle: FocusHandle,
-    scroll: gpui::ScrollHandle,
 }
 
 impl EventEmitter<OnboardingEvent> for Onboarding {}
 
 impl Onboarding {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self { focus_handle: cx.focus_handle(), scroll: gpui::ScrollHandle::new() }
+        Self { focus_handle: cx.focus_handle() }
     }
 
     /// Applies what was just written, reporting anything that went wrong.
@@ -428,14 +427,13 @@ impl Render for Onboarding {
                     .child(icon_el(Icon::ArrowRight, px(14.), theme.background.into())),
             );
 
-        let page = div()
+        div()
             .id("onboarding")
             .key_context("Onboarding")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(&self.scroll)
             .bg(theme.background)
             .child(
                 div().flex().justify_center().px_6().py(px(44.)).child(
@@ -458,8 +456,7 @@ impl Render for Onboarding {
                         .child(div().h(px(1.)).bg(theme.border_subtle))
                         .child(footer),
                 ),
-            );
-        div().relative().size_full().child(page).child(crate::ui::scrollbar("onboarding-scrollbar", &self.scroll, cx))
+            )
     }
 }
 

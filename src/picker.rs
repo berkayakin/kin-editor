@@ -835,7 +835,7 @@ impl Render for Picker {
         .w_full();
         // Padding goes on a wrapper: GPUI's scroll-to-item counts a list's own
         // padding twice, so a list that fits its rows would scroll by 8px.
-        let list = div().py_1().child(div().relative().child(list).child(crate::ui::list_scrollbar("picker-scrollbar", &self.scroll, cx)));
+        let list = div().py_1().child(list);
 
         modal_panel(cx)
             .key_context("Picker")

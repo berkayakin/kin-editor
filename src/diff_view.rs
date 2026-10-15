@@ -474,7 +474,7 @@ impl Render for DiffView {
             Some(loaded) => {
                 let side_by_side = self.side_by_side;
                 let current_change = self.current_change;
-                let list = uniform_list("diff-rows", rows, {
+                uniform_list("diff-rows", rows, {
                     cx.processor(move |this, range: Range<usize>, _window, cx| {
                         let theme = Theme::get(cx).clone();
                         range.map(|ix| this.render_row(&loaded, ix, side_by_side, current_change, &theme, cx)).collect()
@@ -487,17 +487,8 @@ impl Render for DiffView {
                 .pb(px(10.))
                 .bg(theme.background)
                 .font_family(theme.mono_font.clone())
-                .text_size(px(theme.editor_font_size - 1.));
-                div()
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(list)
-                    .child(crate::ui::list_scrollbar("diff-scrollbar", &self.scroll, cx))
-                    .into_any_element()
+                .text_size(px(theme.editor_font_size - 1.))
+                .into_any_element()
             }
         };
 

@@ -38,7 +38,6 @@ pub struct PushDialog {
     force: bool,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
-    details_scroll: gpui::ScrollHandle,
     details_task: Option<Task<()>>,
 }
 
@@ -67,7 +66,6 @@ impl PushDialog {
             force: false,
             focus_handle,
             scroll: UniformListScrollHandle::new(),
-            details_scroll: gpui::ScrollHandle::new(),
             details_task: None,
         }
     }
@@ -134,13 +132,7 @@ impl PushDialog {
     }
 
     fn render_details(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = div()
-            .id("push-details")
-            .size_full()
-            .border_l_1()
-            .border_color(theme.border_subtle)
-            .overflow_y_scroll()
-            .track_scroll(&self.details_scroll);
+        let panel = div().id("push-details").w(px(340.)).flex_shrink_0().h_full().border_l_1().border_color(theme.border_subtle).overflow_y_scroll();
         let entry = self.commits().get(self.selected).cloned();
         let (Some(entry), Some((sha, details))) = (entry, self.details.as_ref()) else {
             return panel;
@@ -395,31 +387,7 @@ impl Render for PushDialog {
             .max_w(window.viewport_size().width - px(48.))
             .h(px(520.).min(crate::workspace::modal_max_height(window)))
             .child(header)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .relative()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(list)
-                            .child(crate::ui::list_scrollbar("push-commits-scrollbar", &self.scroll, cx)),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .w(px(340.))
-                            .flex_shrink_0()
-                            .h_full()
-                            .child(self.render_details(&theme, cx))
-                            .child(crate::ui::scrollbar("push-details-scrollbar", &self.details_scroll, cx)),
-                    ),
-            )
+            .child(div().flex().flex_1().min_h_0().child(list).child(self.render_details(&theme, cx)))
             .child(footer)
     }
 }

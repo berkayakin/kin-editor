@@ -33,7 +33,6 @@ pub struct ProblemsPanel {
     /// The last Run's name and problems.
     run: Option<(String, Vec<OutputProblem>)>,
     root: Option<PathBuf>,
-    scroll: gpui::UniformListScrollHandle,
 }
 
 impl ProblemsPanel {
@@ -206,17 +205,10 @@ impl Render for ProblemsPanel {
                     rows
                 }),
             )
-            .track_scroll(self.scroll.clone())
-            .size_full()
+            .flex_1()
             .py_1()
             .into_any_element()
         };
-        let list = div()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .child(list)
-            .child(crate::ui::list_scrollbar("problems-scrollbar", &self.scroll, cx));
         div().flex().flex_col().size_full().child(header).child(list)
     }
 }

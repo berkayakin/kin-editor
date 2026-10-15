@@ -249,10 +249,6 @@ pub struct Editor {
     layout: Option<LayoutSnapshot>,
     drag: Option<Drag>,
     scrollbar_drag: Option<Pixels>,
-    /// The pointer is over the scrollbar (it shows while it is).
-    scrollbar_hovered: bool,
-    /// The thumb fades out when the text stops scrolling; the track's markers stay.
-    scrollbar_fade: crate::ui::ScrollbarFade,
     marked_range: Option<Range<usize>>,
     indent_unit: String,
     /// Display width of a tab character (and of an indent level with tabs).
@@ -384,8 +380,6 @@ impl Editor {
             layout: None,
             drag: None,
             scrollbar_drag: None,
-            scrollbar_hovered: false,
-            scrollbar_fade: Default::default(),
             marked_range: None,
             indent_unit: String::new(),
             tab_size: file_settings.tab_size,
@@ -1376,7 +1370,6 @@ impl Editor {
                     }))
                     .child(crate::markdown_preview::render(&blocks, crate::markdown_preview::Draw { zoom }, cx)),
             )
-            .child(crate::ui::scrollbar("markdown-preview-scrollbar", &self.md_scroll, cx))
             .child(zoom_bar)
     }
 
@@ -3560,23 +3553,8 @@ impl Editor {
 
         // Scrollbar with diagnostic and search markers.
         if let Some((track, thumb)) = self.scrollbar_geometry(cx).filter(|_| !single) {
-            let active = self.scrollbar_drag.is_some() || self.scrollbar_hovered;
-            let (fade, wake) = self.scrollbar_fade.step(self.scroll.y, active, theme.reduce_effects);
-            match wake {
-                crate::ui::FadeWake::Frame => window.request_animation_frame(),
-                crate::ui::FadeWake::After(delay) => cx
-                    .spawn(async move |this, cx| {
-                        cx.background_executor().timer(delay).await;
-                        this.update(cx, |_, cx| cx.notify()).ok();
-                    })
-                    .detach(),
-                crate::ui::FadeWake::None => {}
-            }
-            if fade > 0. {
-                let alpha = if active { 0.28 } else { 0.16 } * fade;
-                frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(alpha)).corner_radii(px(4.)));
-            }
-            frame.scrollbar_track = Some(track);
+            let hovered_color = if self.scrollbar_drag.is_some() { 0.28 } else { 0.16 };
+            frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(hovered_color)).corner_radii(px(4.)));
             let rows = display_rows.max(1) as f32;
             for d in &self.doc.read(cx).diagnostics {
                 let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
@@ -4684,9 +4662,6 @@ pub struct FrameLayout {
     lens_hitboxes: Vec<Hitbox>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
-    /// The scrollbar's strip, for its cursor and hover.
-    scrollbar_track: Option<Bounds<Pixels>>,
-    scrollbar_hitbox: Option<Hitbox>,
     sticky_bgs: Vec<PaintQuad>,
     sticky_lines: Vec<(Point<Pixels>, ShapedLine)>,
     sticky_numbers: Vec<(Point<Pixels>, ShapedLine)>,
@@ -4745,7 +4720,6 @@ impl Element for EditorElement {
         frame.hitbox = Some(window.insert_hitbox(frame.text_bounds, HitboxBehavior::Normal));
         // Over the text's, so a code lens shows it can be clicked.
         frame.lens_hitboxes = frame.lens_bounds.iter().map(|b| window.insert_hitbox(*b, HitboxBehavior::Normal)).collect();
-        frame.scrollbar_hitbox = frame.scrollbar_track.map(|b| window.insert_hitbox(b, HitboxBehavior::Normal));
         frame
     }
 
@@ -4766,21 +4740,6 @@ impl Element for EditorElement {
         }
         for hitbox in &frame.lens_hitboxes {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
-        }
-        if let Some(hitbox) = frame.scrollbar_hitbox.clone() {
-            window.set_cursor_style(CursorStyle::Arrow, &hitbox);
-            // Anywhere in the window: leaving the editor straight from the bar
-            // ends its hover too.
-            let editor = self.editor.clone();
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let over = hitbox.is_hovered(window);
-                if phase == gpui::DispatchPhase::Bubble && editor.read(cx).scrollbar_hovered != over {
-                    editor.update(cx, |e, cx| {
-                        e.scrollbar_hovered = over;
-                        cx.notify();
-                    });
-                }
-            });
         }
 
         let line_height = frame.line_height;
