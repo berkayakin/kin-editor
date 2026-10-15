@@ -116,6 +116,7 @@ impl Page {
 enum Setting {
     Theme,
     IconTheme,
+    ReduceEffects,
     BaseKeymap,
     FontFamily,
     FontSize,
@@ -139,9 +140,10 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 22] = [
+    const ALL: [Setting; 23] = [
         Setting::Theme,
         Setting::IconTheme,
+        Setting::ReduceEffects,
         Setting::BaseKeymap,
         Setting::FontFamily,
         Setting::FontSize,
@@ -166,7 +168,7 @@ impl Setting {
 
     fn page(self) -> Page {
         match self {
-            Setting::Theme | Setting::IconTheme => Page::Appearance,
+            Setting::Theme | Setting::IconTheme | Setting::ReduceEffects => Page::Appearance,
             Setting::BaseKeymap => Page::Keymap,
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
@@ -186,6 +188,7 @@ impl Setting {
         match self {
             Setting::Theme => "Theme",
             Setting::IconTheme => "File icons",
+            Setting::ReduceEffects => "Effects",
             Setting::BaseKeymap => "Keymap",
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => "Font",
             Setting::TabSize | Setting::HardTabs => "Indentation",
@@ -206,6 +209,7 @@ impl Setting {
         match self {
             Setting::Theme => "Theme",
             Setting::IconTheme => "Icon theme",
+            Setting::ReduceEffects => "Reduce visual effects",
             Setting::BaseKeymap => "Base keymap",
             Setting::FontFamily => "Family",
             Setting::FontSize => "Size",
@@ -233,6 +237,7 @@ impl Setting {
         match self {
             Setting::Theme => "Add your own themes as .json files in the themes folder.",
             Setting::IconTheme => "File and folder icons. Extensions can add icon themes (Zed's work too).",
+            Setting::ReduceEffects => "A plainer interface: solid colors instead of gradients, and no shadows or glows.",
             Setting::BaseKeymap => "The shortcuts Kin starts from. Your own changes below stay on top of any of them.",
             Setting::FontFamily => "Monospaced fonts installed on this computer.",
             Setting::FontSize => "Zoom (Increase / Decrease Font Size) adds to this until you reset it.",
@@ -261,6 +266,7 @@ impl Setting {
         match self {
             Setting::Theme => "color scheme dark light appearance",
             Setting::IconTheme => "icons file icons folder icon theme",
+            Setting::ReduceEffects => "simple simplify plain flat minimal gradient shadow glow effects decoration",
             Setting::BaseKeymap => "keymap shortcuts key bindings vscode vs code jetbrains intellij webstorm sublime zed",
             Setting::FontFamily => "typeface family monospace",
             Setting::FontSize => "font zoom text",
@@ -1277,6 +1283,9 @@ impl Preferences {
             }
             Setting::InlayHints => self.switch_with_default("pref-inlay-hints", "inlay_hints", settings.editor.inlay_hints, true, cx),
             Setting::VimMode => self.bool_switch("pref-vim", "vim_mode", settings.vim_mode, cx),
+            Setting::ReduceEffects => {
+                self.bool_switch("pref-reduce-effects", "reduce_visual_effects", settings.reduce_visual_effects, cx)
+            }
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
             Setting::TrustAll => self.switch_with_default("pref-trust-all", "trust_all_projects", settings.trust_all_projects, false, cx),
             Setting::AutoUpdate => self.switch_with_default("pref-auto-update", "auto_update", settings.auto_update, true, cx),
@@ -2217,6 +2226,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::TabSize => "tab_size",
         Setting::HardTabs => "hard_tabs",
         Setting::IconTheme => "icon_theme",
+        Setting::ReduceEffects => "reduce_visual_effects",
         Setting::SoftWrap => "soft_wrap",
         Setting::Rulers => "rulers",
         Setting::ShowWhitespace => "show_whitespace",

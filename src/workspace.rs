@@ -5590,11 +5590,17 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded(px(6.))
-                    .bg(gpui::linear_gradient(
-                        135.,
-                        gpui::linear_color_stop(tint, 0.),
-                        gpui::linear_color_stop(tint.alpha(0.55), 1.),
-                    ))
+                    .map(|el| {
+                        if theme.reduce_effects {
+                            el.bg(tint)
+                        } else {
+                            el.bg(gpui::linear_gradient(
+                                135.,
+                                gpui::linear_color_stop(tint, 0.),
+                                gpui::linear_color_stop(tint.alpha(0.55), 1.),
+                            ))
+                        }
+                    })
                     .text_size(px(11.))
                     .font_weight(FontWeight::BOLD)
                     .text_color(gpui::hsla(0., 0., 0., 0.78))
@@ -6529,7 +6535,7 @@ impl Workspace {
                                 .bg(theme.elevated)
                                 .border_1()
                                 .border_color(theme.border)
-                                .shadow_lg()
+                                .shadow(soft_shadow(&theme, 2))
                                 .text_color(theme.text)
                                 .child(icon_el(Icon::FileCode, px(15.), theme.accent.into()))
                                 .child("Drop to open"),
@@ -7399,12 +7405,7 @@ impl Workspace {
                 .gap_1p5()
                 .text_color(color)
                 .child(
-                    div().size(px(6.)).rounded_full().bg(light).shadow(vec![gpui::BoxShadow {
-                        color: light.alpha(0.6),
-                        offset: point(px(0.), px(0.)),
-                        blur_radius: px(4.),
-                        spread_radius: px(0.),
-                    }]),
+                    div().size(px(6.)).rounded_full().bg(light).shadow(crate::ui::glow(theme, light.alpha(0.6), 4., 0.)),
                 )
                 .when(matches!(status, LspStatus::Missing { .. } | LspStatus::Failed(_)), |el| el.cursor_pointer())
                 .child(label)

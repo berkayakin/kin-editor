@@ -48,6 +48,9 @@ pub struct Theme {
     pub name: SharedString,
     pub appearance: Appearance,
     pub italic_comments: bool,
+    /// From the `reduce_visual_effects` setting (not theme files): solid
+    /// colors instead of gradients, and no shadows or glows.
+    pub reduce_effects: bool,
 
     pub ui_font: SharedString,
     pub mono_font: SharedString,
@@ -232,6 +235,7 @@ impl Theme {
             name: "".into(),
             appearance,
             italic_comments: true,
+            reduce_effects: false,
             ui_font: ".SystemUIFont".into(),
             mono_font: "Menlo".into(),
             ui_font_size: 13.0,
@@ -815,6 +819,7 @@ pub fn apply_fonts(cx: &mut App) {
     theme.mono_font = mono_font;
     theme.editor_font_size = size;
     theme.editor_line_height = (size * line_height).round();
+    theme.reduce_effects = settings.reduce_visual_effects == Some(true);
     cx.set_global(theme);
     cx.refresh_windows();
 }

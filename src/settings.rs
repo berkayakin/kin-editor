@@ -60,6 +60,9 @@ pub struct Settings {
     pub vim_mode: Option<bool>,
     /// File icons from an extension's icon theme, by name (built-in when unset).
     pub icon_theme: Option<String>,
+    /// A plainer interface: solid colors instead of gradients, and no shadows
+    /// or glows (off by default).
+    pub reduce_visual_effects: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone, PartialEq, Debug)]
@@ -250,6 +253,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "trust_all_projects",
     "vim_mode",
     "icon_theme",
+    "reduce_visual_effects",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -390,6 +394,7 @@ impl Settings {
             "inlay_hints" => self.editor.inlay_hints.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
+            "reduce_visual_effects" => self.reduce_visual_effects.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
@@ -619,6 +624,9 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
 
   // File icons from an extension's icon theme (Zed's format), by name.
   // "icon_theme": "Soft Charmed Icons",
+  // A plainer interface: solid colors instead of gradients, and no shadows
+  // or glows.
+  // "reduce_visual_effects": false,
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {

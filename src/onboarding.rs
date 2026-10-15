@@ -149,6 +149,20 @@ impl Onboarding {
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(OnboardingEvent::BrowseThemes))),
                     ),
             )
+            .child(option_rows(
+                vec![(
+                    "Reduce visual effects",
+                    "A plainer interface: solid colors instead of gradients, and no shadows or glows.",
+                    self.toggle(
+                        "welcome-reduce-effects",
+                        Settings::get(cx).reduce_visual_effects == Some(true),
+                        &current,
+                        cx,
+                        |this, on, cx| this.set_or_default("reduce_visual_effects", json!(on), json!(false), cx),
+                    ),
+                )],
+                &current,
+            ))
             .into_any_element()
     }
 
@@ -283,12 +297,7 @@ impl Onboarding {
             );
 
         let toggle = |id: &'static str, on: bool, cx: &mut Context<Self>, set: fn(&mut Self, bool, &mut Context<Self>)| {
-            div()
-                .id(id)
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| set(this, !on, cx)))
-                .child(switch(on, &theme))
-                .into_any_element()
+            self.toggle(id, on, &theme, cx, set)
         };
         let rows: Vec<(&str, &str, AnyElement)> = vec![
             ("Font size", "For code and the terminal. Zoom in and out any time.", font_size.into_any_element()),
@@ -322,34 +331,16 @@ impl Onboarding {
                 }),
             ),
         ];
-        let count = rows.len();
+        option_rows(rows, &theme)
+    }
+
+    /// An on/off switch writing `set`'s choice to the settings.
+    fn toggle(&self, id: &'static str, on: bool, theme: &Theme, cx: &mut Context<Self>, set: fn(&mut Self, bool, &mut Context<Self>)) -> AnyElement {
         div()
-            .flex()
-            .flex_col()
-            .rounded(px(10.))
-            .border_1()
-            .border_color(theme.border_subtle)
-            .bg(theme.panel)
-            .children(rows.into_iter().enumerate().map(|(ix, (label, detail, control))| {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .min_h(px(56.))
-                    .px_4()
-                    .py_2()
-                    .when(ix + 1 < count, |el| el.border_b_1().border_color(theme.border_subtle))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_color(theme.text).child(label))
-                            .child(div().text_size(px(12.)).text_color(theme.text_dim).child(detail)),
-                    )
-                    .child(control)
-            }))
+            .id(id)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| set(this, !on, cx)))
+            .child(switch(on, theme))
             .into_any_element()
     }
 }
@@ -503,6 +494,39 @@ fn section(number: usize, title: &str, detail: &str, content: AnyElement, theme:
 }
 
 /// Rows of equal-width cells (GPUI's grid doesn't size these cards).
+/// Settings as rows in a card: label and detail on the left, the control on the right.
+fn option_rows(rows: Vec<(&str, &str, AnyElement)>, theme: &Theme) -> AnyElement {
+    let count = rows.len();
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(theme.border_subtle)
+        .bg(theme.panel)
+        .children(rows.into_iter().enumerate().map(|(ix, (label, detail, control))| {
+            div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .min_h(px(56.))
+                .px_4()
+                .py_2()
+                .when(ix + 1 < count, |el| el.border_b_1().border_color(theme.border_subtle))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_color(theme.text).child(label.to_string()))
+                        .child(div().text_size(px(12.)).text_color(theme.text_dim).child(detail.to_string())),
+                )
+                .child(control)
+        }))
+        .into_any_element()
+}
+
 fn grid(mut cells: Vec<AnyElement>, columns: usize, gap: gpui::Pixels) -> gpui::Div {
     while cells.len() % columns != 0 {
         cells.push(div().into_any_element());

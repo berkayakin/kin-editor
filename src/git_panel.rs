@@ -326,7 +326,7 @@ impl GitPanel {
                         .bg(theme.elevated)
                         .border_1()
                         .border_color(theme.border)
-                        .shadow_sm()
+                        .shadow(crate::ui::soft_shadow(&theme, 1))
                         .invisible()
                         .group_hover(group.clone(), |s| s.visible())
                         .when(!staged && !conflicted, |el| {
@@ -648,7 +648,7 @@ impl Render for GitPanel {
                                     .bg(theme.elevated)
                                     .border_1()
                                     .border_color(theme.border)
-                                    .shadow_md()
+                                    .shadow(crate::ui::soft_shadow(&theme, 2))
                                     .text_size(px(12.))
                                     .text_color(theme.text_muted)
                                     .child(icon_el(Icon::Refresh, px(12.), theme.accent.into()))
