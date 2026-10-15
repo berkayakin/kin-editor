@@ -78,11 +78,8 @@ impl Workspace {
             self.close_modal(window, cx);
             return;
         }
-        if mode != PickerMode::Structure {
-            self.refresh_file_index(cx);
-        }
         let files = if self.root.is_some() {
-            self.file_index.clone()
+            self.project.openable()
         } else {
             Arc::new(self.tabs.iter().filter_map(|t| t.read(cx).doc.read(cx).path.clone()).collect())
         };
@@ -331,7 +328,10 @@ impl Workspace {
             (!s.is_empty() && !text.contains('\n')).then_some(text)
         });
         let overrides = self.open_buffers(cx);
-        let search = cx.new(|cx| ProjectSearch::new(root, initial, replace, overrides, window, cx));
+        // The scanned project's files, if the search is in it.
+        let scanned = !self.project.root().as_os_str().is_empty() && root.starts_with(self.project.root());
+        let project = scanned.then(|| self.project.clone());
+        let search = cx.new(|cx| ProjectSearch::new(root, project, initial, replace, overrides, window, cx));
         let subscription = cx.subscribe_in(&search, window, |ws, _, event: &ProjectSearchEvent, window, cx| match event {
             ProjectSearchEvent::Open { path, range } => {
                 let range = range.clone();

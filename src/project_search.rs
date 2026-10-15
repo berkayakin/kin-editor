@@ -17,7 +17,8 @@ use gpui::{
 use crate::{
     assets::Icon,
     editor::{Cancel, Editor, EditorEvent, Indent, MoveDown, MoveUp, Newline, Outdent, PageDown, PageUp},
-    search::{ProjectMatch, SearchOptions, SearchQuery, search_project},
+    project::ProjectSnapshot,
+    search::{ProjectMatch, SearchOptions, SearchQuery, project_files, search_project},
     theme::Theme,
     ui::{HoverFill, icon_el, input_box, kbd, modal_panel, text_button, toggle},
 };
@@ -30,6 +31,8 @@ pub enum ProjectSearchEvent {
 
 pub struct ProjectSearch {
     root: PathBuf,
+    /// The project's files, when they're scanned and `root` is in the project.
+    project: Option<Arc<ProjectSnapshot>>,
     query: Entity<Editor>,
     replacement: Entity<Editor>,
     replace_mode: bool,
@@ -51,6 +54,7 @@ impl EventEmitter<ProjectSearchEvent> for ProjectSearch {}
 impl ProjectSearch {
     pub fn new(
         root: PathBuf,
+        project: Option<Arc<ProjectSnapshot>>,
         initial: Option<String>,
         replace_mode: bool,
         overrides: HashMap<PathBuf, Arc<str>>,
@@ -66,6 +70,7 @@ impl ProjectSearch {
         let subscription = cx.subscribe(&query, |this, _, _: &EditorEvent, cx| this.search(cx));
         let mut this = Self {
             root,
+            project,
             query,
             replacement,
             replace_mode,
@@ -107,14 +112,21 @@ impl ProjectSearch {
         };
         self.error = None;
         self.searching = true;
-        let root = self.root.clone();
+        let (root, project) = (self.root.clone(), self.project.clone());
         let overrides = self.overrides.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             // Debounce typing.
             cx.background_executor().timer(Duration::from_millis(120)).await;
             let results = cx
                 .background_executor()
-                .spawn(async move { search_project(&root, &query, &overrides) })
+                .spawn(async move {
+                    // The project's files under the folder searched, else a walk of it.
+                    let files = match project {
+                        Some(project) => project.searchable().into_iter().filter(|p| p.starts_with(&root)).collect(),
+                        None => project_files(&root),
+                    };
+                    search_project(&root, files, &query, &overrides)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.matches = Arc::new(results.matches);

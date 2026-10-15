@@ -251,13 +251,3 @@ pub(super) fn copy_recursive(source: &Path, target: &Path) -> std::io::Result<()
         std::fs::copy(source, target).map(|_| ())
     }
 }
-
-
-/// The project's .gitignore and .git/info/exclude.
-pub(super) fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    builder.add(root.join(".gitignore"));
-    builder.add(root.join(".git/info/exclude"));
-    builder.build().ok()
-}
-

@@ -138,8 +138,9 @@ impl Workspace {
         self.auto_save_tasks.clear();
         self.auto_save_warned.clear();
         self.recent.clear();
-        self.file_index = Arc::new(Vec::new());
-        self.index_task = None;
+        self.project = Arc::default();
+        self.project_task = None;
+        self.project_changes.clear();
         self.watcher = None;
         self.watch_task = None;
         self.root = None;

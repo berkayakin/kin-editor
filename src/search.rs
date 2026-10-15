@@ -120,22 +120,6 @@ pub fn project_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Files to offer in Go to File / Search Everywhere: like `project_files`,
-/// but git-ignored *files* (`.env`, local configs) are listed too. Ignored
-/// folders (build output, dependencies) still aren't entered.
-pub fn openable_files(root: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = walker(root)
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
-        .filter_map(|dir| std::fs::read_dir(dir.path()).ok())
-        .flat_map(|entries| entries.filter_map(|e| e.ok()))
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && e.file_name() != ".DS_Store")
-        .map(|e| e.path())
-        .collect();
-    files.sort();
-    files
-}
-
 fn walker(root: &Path) -> ignore::Walk {
     ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -146,17 +130,19 @@ fn walker(root: &Path) -> ignore::Walk {
         .build()
 }
 
-/// Searches every text file under `root`. `overrides` supplies the contents
-/// of unsaved open buffers so results reflect what the user sees.
+/// Searches every text file of `paths` (the project's, see
+/// `crate::project`). `overrides` supplies the contents of unsaved open
+/// buffers so results reflect what the user sees.
 pub fn search_project(
     root: &Path,
+    paths: Vec<PathBuf>,
     query: &SearchQuery,
     overrides: &HashMap<PathBuf, Arc<str>>,
 ) -> ProjectResults {
     let mut matches = Vec::new();
     let mut files = 0;
     let mut truncated = false;
-    for path in project_files(root) {
+    for path in paths {
         let contents: Arc<str> = match overrides.get(&path) {
             Some(text) => text.clone(),
             None => {
@@ -244,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn openable_files_include_ignored_files_but_not_ignored_folders() {
+    fn project_files_skip_ignored_files_and_folders() {
         let dir = std::env::temp_dir().join(format!("kin-search-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in [".git", "config", "build", "node_modules/pkg"] {
@@ -257,7 +243,6 @@ mod tests {
         let names = |files: Vec<PathBuf>| -> Vec<String> {
             files.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect()
         };
-        assert_eq!(names(openable_files(&dir)), [".gitignore", "config/partners.yml", "config/partners.yml.example"]);
         assert_eq!(names(project_files(&dir)), [".gitignore", "config/partners.yml.example"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -39,6 +39,7 @@ use crate::{
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent},
     problems_panel::{ProblemsEvent, ProblemsPanel},
+    project::{Applied, ProjectSnapshot, project_ignore},
     project_tree::{ProjectTree, TreeEvent},
     find_bar::{FindBar, FindBarEvent},
     keymap,
@@ -49,7 +50,7 @@ use crate::{
     },
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
-    search::{SearchQuery, openable_files},
+    search::{SearchQuery},
     state::{
         FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, TerminalGroupSession, TerminalLayout, TerminalTabSession,
         WindowPlacement,
@@ -579,8 +580,12 @@ pub struct Workspace {
     show_find: bool,
     modals: ModalLayer,
     /// All project files, refreshed in the background.
-    file_index: Arc<Vec<PathBuf>>,
-    index_task: Option<Task<()>>,
+    /// The project's files (see `crate::project`), kept up to date from the watcher.
+    project: Arc<ProjectSnapshot>,
+    /// Scanning the project, or catching up with changes (one at a time).
+    project_task: Option<Task<()>>,
+    /// Changes waiting for the running update.
+    project_changes: Vec<PathBuf>,
     /// Most recently used files, newest first.
     recent: Vec<PathBuf>,
     actions: Arc<Vec<ActionEntry>>,
@@ -873,8 +878,9 @@ impl Workspace {
             find_bar,
             show_find: false,
             modals: ModalLayer::default(),
-            file_index: Arc::new(Vec::new()),
-            index_task: None,
+            project: Arc::default(),
+            project_task: None,
+            project_changes: Vec::new(),
             recent: Vec::new(),
             actions: Arc::new(keymap::action_entries()),
             shift_down: false,

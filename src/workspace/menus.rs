@@ -595,8 +595,8 @@ impl Workspace {
     }
 
     pub(super) fn after_fs_change(&mut self, cx: &mut Context<Self>) {
+        // Go to File hears of the change from the watcher.
         self.tree.update(cx, |t, cx| t.rebuild(cx));
-        self.refresh_file_index(cx);
         self.refresh_git(cx);
         cx.notify();
     }
