@@ -53,6 +53,7 @@ mod theme_picker;
 mod transition;
 mod ui;
 mod updater;
+mod wasi_sdk;
 mod watcher;
 mod workspace;
 mod wrap;

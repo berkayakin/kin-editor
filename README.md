@@ -624,10 +624,14 @@ others stay. Kin's own are in [`assets/languages`](assets/languages), in this sa
 Tested with Zed's Gleam, Elixir, Zig, Dockerfile, Lua, Nix, Kotlin and Haskell extensions and the
 Catppuccin themes, installed from their repositories.
 
-A grammar that comes prebuilt as WebAssembly (`grammars/<name>.wasm`, as in the extensions Zed
-installs) runs as is in Kin's WebAssembly runtime. Otherwise it's compiled the first time with your
-C compiler (`cc`; on macOS the Xcode command line tools: `xcode-select --install`), in the
-background; files of that language are highlighted when it's done. Fetching uses `git`. Zed
+Grammars run as WebAssembly, sandboxed in Kin's runtime. One that comes prebuilt
+(`grammars/<name>.wasm`, as in the extensions Zed installs) runs as is. Otherwise it's compiled
+the first time, in the background, with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk): Kin
+asks before downloading it once (about 180 MB, 170 MB on disk in `~/.config/kin/toolchains/`;
+`WASI_SDK_PATH` uses one you have). Files of that language are highlighted when it's done.
+Fetching uses `git`. With `native_grammars` on, grammars of extensions in trusted folders are
+compiled with your C compiler instead (`cc`; on macOS `xcode-select --install`), which C++
+scanners need. Zed
 extensions' own WebAssembly code (downloading language servers, slash commands) isn't run yet, so
 a language server has to be installed (see `[language_servers]` above).
 
@@ -687,6 +691,7 @@ and theme colors.
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
 | `trust_all_projects` | `false` | run language servers, formatters and project tools in every folder without asking; see [Project trust](#project-trust) |
+| `native_grammars` | `false` | compile extensions' grammars to native code with your C compiler instead of WebAssembly (only for extensions in trusted folders) |
 | `auto_update` | `true` | download new releases in the background; see [Releases and updates](#releases-and-updates) |
 
 ```jsonc

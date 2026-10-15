@@ -713,9 +713,12 @@ impl Workspace {
         // An update finished downloading: show Restart to Update.
         let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
         // Extensions reloaded, or a grammar finished building.
-        let extensions_observer = cx.observe_global::<extensions::ExtensionsChanged>(|ws, cx| ws.extensions_changed(cx));
+        let extensions_observer =
+            cx.observe_global_in::<extensions::ExtensionsChanged>(window, |ws, window, cx| ws.extensions_changed(window, cx));
         // A folder was trusted or stopped being trusted (here or in another window).
         let trust_observer = cx.observe_global::<crate::trust::TrustChanged>(|ws, cx| ws.trust_changed(cx));
+        // Extensions load before the first window: it asks for what they wait for.
+        cx.defer_in(window, |ws, window, cx| ws.offer_wasi_sdk(window, cx));
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -3317,7 +3320,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn extensions_changed(&mut self, cx: &mut Context<Self>) {
+    fn extensions_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for editor in self.tabs.clone() {
             if editor.update(cx, |e, cx| e.refresh_language(cx)) {
                 self.lsp.update(cx, |s, cx| s.register(&editor, cx));
@@ -3326,7 +3329,41 @@ impl Workspace {
         if let Some(message) = cx.global::<extensions::ExtensionsChanged>().message.clone() {
             self.toast(ToastKind::Info, message, None, cx);
         }
+        self.offer_wasi_sdk(window, cx);
         cx.notify();
+    }
+
+    /// Grammars are waiting for the WebAssembly toolchain: asks to download
+    /// it, once per reload of the extensions (in one window).
+    fn offer_wasi_sdk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let waiting = extensions::waiting_for_toolchain();
+        let generation = cx.global::<extensions::ExtensionsChanged>().generation;
+        let Some(mb) = crate::wasi_sdk::download_mb() else { return };
+        if waiting.is_empty() || crate::wasi_sdk::installing() || ASKED.swap(generation, std::sync::atomic::Ordering::SeqCst) == generation {
+            return;
+        }
+        let detail = format!(
+            "Extensions' grammars ({}) are compiled to WebAssembly, which runs them sandboxed. The compiler, wasi-sdk, is a {mb} MB download (about 170 MB on disk, in Kin's config folder).",
+            waiting.join(", ")
+        );
+        let rx = window.prompt(PromptLevel::Info, "Download the WebAssembly toolchain?", Some(&detail), &["Download", "Not Now"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if rx.await != Ok(0) {
+                return;
+            }
+            this.update(cx, |ws, cx| ws.toast(ToastKind::Info, "Downloading wasi-sdk…", None, cx)).ok();
+            let result = cx.background_executor().spawn(async { crate::wasi_sdk::install() }).await;
+            this.update(cx, |ws, cx| match result {
+                Ok(()) => {
+                    ws.toast(ToastKind::Success, "wasi-sdk installed; building grammars", None, cx);
+                    extensions::reload(cx);
+                }
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't install wasi-sdk", Some(err), cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The last Run's problems, without the ones the active file shows

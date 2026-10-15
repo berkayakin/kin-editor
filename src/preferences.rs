@@ -137,11 +137,12 @@ enum Setting {
     Shell,
     RunConfigurations,
     TrustAll,
+    NativeGrammars,
     AutoUpdate,
 }
 
 impl Setting {
-    const ALL: [Setting; 23] = [
+    const ALL: [Setting; 24] = [
         Setting::Theme,
         Setting::IconTheme,
         Setting::VisualEffects,
@@ -164,6 +165,7 @@ impl Setting {
         Setting::Shell,
         Setting::RunConfigurations,
         Setting::TrustAll,
+        Setting::NativeGrammars,
         Setting::AutoUpdate,
     ];
 
@@ -180,7 +182,7 @@ impl Setting {
             | Setting::TrimWhitespace
             | Setting::FinalNewline => Page::Saving,
             Setting::Shell | Setting::RunConfigurations => Page::Terminal,
-            Setting::TrustAll => Page::Trust,
+            Setting::TrustAll | Setting::NativeGrammars => Page::Trust,
             Setting::AutoUpdate => Page::Updates,
         }
     }
@@ -201,7 +203,7 @@ impl Setting {
             Setting::FormatOnSave | Setting::TrimWhitespace | Setting::FinalNewline => "On save",
             Setting::Shell => "Terminal",
             Setting::RunConfigurations => "Run configurations",
-            Setting::TrustAll => "Restricted Mode",
+            Setting::TrustAll | Setting::NativeGrammars => "Restricted Mode",
             Setting::AutoUpdate => "Updates",
         }
     }
@@ -230,6 +232,7 @@ impl Setting {
             Setting::Shell => "Shell",
             Setting::RunConfigurations => "Run configurations",
             Setting::TrustAll => "Trust all folders",
+            Setting::NativeGrammars => "Native extension grammars",
             Setting::AutoUpdate => "Update automatically",
         }
     }
@@ -258,6 +261,7 @@ impl Setting {
             Setting::Shell => "Program and arguments for new terminals. Empty uses your login shell.",
             Setting::RunConfigurations => "Commands for Run… next to the detected ones (cargo, npm scripts, go, make, pytest).",
             Setting::TrustAll => "Run language servers, formatters and project tools in every folder without asking. Not recommended.",
+            Setting::NativeGrammars => "Compile extensions' grammars with your C compiler instead of WebAssembly, which runs them sandboxed. Only for extensions in trusted folders.",
             Setting::AutoUpdate => "Download new versions from GitHub in the background. Restart to Update in the status bar installs them.",
         }
     }
@@ -287,6 +291,7 @@ impl Setting {
             Setting::Shell => "terminal bash zsh fish powershell",
             Setting::RunConfigurations => "run tasks commands scripts",
             Setting::TrustAll => "trust security restricted mode workspace untrusted safe",
+            Setting::NativeGrammars => "extensions grammars tree-sitter native compiler wasm webassembly sandbox",
             Setting::AutoUpdate => "update upgrade version release download",
         }
     }
@@ -1312,6 +1317,7 @@ impl Preferences {
             }
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
             Setting::TrustAll => self.switch_with_default("pref-trust-all", "trust_all_projects", settings.trust_all_projects, false, cx),
+            Setting::NativeGrammars => self.switch_with_default("pref-native-grammars", "native_grammars", settings.native_grammars, false, cx),
             Setting::AutoUpdate => self.switch_with_default("pref-auto-update", "auto_update", settings.auto_update, true, cx),
             Setting::TrimWhitespace => {
                 self.bool_switch("pref-trim", "trim_trailing_whitespace", settings.editor.trim_trailing_whitespace, cx)
@@ -1921,7 +1927,7 @@ impl Preferences {
     /// Restricted Mode's switch and the trusted folders, each removable.
     fn render_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let switch_row = self.render_setting(Setting::TrustAll, window, cx);
+        let switch_rows = vec![self.render_setting(Setting::TrustAll, window, cx), self.render_setting(Setting::NativeGrammars, window, cx)];
         let folders = crate::trust::folders();
         let rows: Vec<AnyElement> = if folders.is_empty() {
             vec![
@@ -1955,7 +1961,7 @@ impl Preferences {
                 .collect()
         };
         self.body()
-            .child(section(Setting::TrustAll.section(), vec![switch_row], &theme))
+            .child(section(Setting::TrustAll.section(), switch_rows, &theme))
             .child(section("Trusted folders", rows, &theme))
     }
 
@@ -2263,6 +2269,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::FinalNewline => "insert_final_newline",
         Setting::Shell => "terminal_shell",
         Setting::TrustAll => "trust_all_projects",
+        Setting::NativeGrammars => "native_grammars",
         Setting::AutoUpdate => "auto_update",
     }
 }

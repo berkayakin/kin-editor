@@ -25,7 +25,10 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{LazyLock, Mutex, OnceLock, RwLock},
+    sync::{
+        LazyLock, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -34,6 +37,7 @@ use toml::{Table, Value};
 use tree_sitter::Language as TsLanguage;
 
 use crate::{
+    wasi_sdk,
     lsp::servers::{self, ServerSpec},
     syntax::{LangConfig, Language, LanguageQueries, OutlineConfig},
     theme::config_dir,
@@ -225,10 +229,16 @@ impl LanguageDef {
             None => {
                 let grammar = self.grammar.as_ref()?;
                 // Not built yet: try again when it is.
-                if !grammar.wasm.is_file() && (!grammar.library.is_file() || BUILDING.lock().unwrap().contains(&grammar.library)) {
+                if BUILDING.lock().unwrap().contains(&grammar.library) {
                     return None;
                 }
-                if grammar.wasm.is_file() { load_wasm(&grammar.wasm, &grammar.name) } else { load_library(&grammar.library, &grammar.name) }
+                if grammar.wasm.is_file() {
+                    load_wasm(&grammar.wasm, &grammar.name)
+                } else if grammar.library.is_file() && native(grammar) {
+                    load_library(&grammar.library, &grammar.name)
+                } else {
+                    return None;
+                }
             }
         };
         let loaded = match language.and_then(|language| self.load_now(language)) {
@@ -394,7 +404,23 @@ impl Global for ExtensionsChanged {}
 /// Reads every extension, then fetches and compiles the grammars that need
 /// it in the background.
 pub fn reload(cx: &mut App) {
-    let jobs = load();
+    NATIVE.store(crate::settings::Settings::get(cx).native_grammars == Some(true), Ordering::Relaxed);
+    let mut jobs = load();
+    // Compiling to WebAssembly needs wasi-sdk: the grammars wait for it
+    // (workspaces offer to download it) instead of each failing.
+    let mut waiting = Vec::new();
+    if wasi_sdk::clang().is_none() {
+        jobs.retain(|(extension, grammar)| {
+            if native(grammar) || (!grammar.src.join("parser.c").is_file() && grammar.repository.is_none()) {
+                return true;
+            }
+            set_building(extension, &grammar.name, false);
+            add_problem(extension, format!("grammar {}: waiting for the WebAssembly toolchain (wasi-sdk)", grammar.name));
+            waiting.push(grammar.name.clone());
+            false
+        });
+    }
+    *WAITING.lock().unwrap() = waiting;
     apply_icon_theme(cx);
     changed(None, cx);
     // At startup the themes load after this.
@@ -420,6 +446,13 @@ pub fn reload(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Grammars waiting for wasi-sdk to compile them, as of the last reload.
+static WAITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub fn waiting_for_toolchain() -> Vec<String> {
+    WAITING.lock().unwrap().clone()
 }
 
 fn changed(message: Option<String>, cx: &mut App) {
@@ -881,14 +914,32 @@ pub fn uninstall(path: &Path) -> Result<(), String> {
 
 // ---- Grammars ----------------------------------------------------------------------
 
+/// The `native_grammars` setting, as of the last reload.
+static NATIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether a grammar is compiled to (and loaded as) native code: only with
+/// `native_grammars` on, and for an extension in a trusted folder (a folder
+/// install is a link, so where it points).
+fn native(grammar: &Grammar) -> bool {
+    NATIVE.load(Ordering::Relaxed)
+        && grammar
+            .checkout
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|extension| std::fs::canonicalize(extension).ok())
+            .is_some_and(|extension| crate::trust::is_trusted(&extension))
+}
+
 /// Not compiled yet, or its sources changed since. A prebuilt WASM grammar
-/// never needs building.
+/// (no sources) never needs building.
 fn needs_build(grammar: &Grammar) -> bool {
-    if grammar.wasm.is_file() {
+    let has_source = grammar.src.join("parser.c").is_file();
+    if grammar.wasm.is_file() && !has_source {
         return false;
     }
+    let output = if native(grammar) { &grammar.library } else { &grammar.wasm };
     let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    match (modified(&grammar.library), modified(&grammar.src.join("parser.c"))) {
+    match (modified(output), modified(&grammar.src.join("parser.c"))) {
         (None, _) => true,
         (Some(built), Some(source)) => source > built,
         (Some(_), None) => false,
@@ -926,13 +977,32 @@ fn fetch(grammar: &Grammar) -> Result<(), String> {
     Ok(())
 }
 
-/// `cc -shared` over `parser.c` and the scanner (C, or C++ with `c++`), into
-/// a temporary file renamed into place, so a half-written one is never loaded.
+/// To WebAssembly with wasi-sdk, or with the system's C compiler when
+/// `native` allows it; into a temporary file renamed into place, so a
+/// half-written one is never loaded.
 fn compile(grammar: &Grammar) -> Result<(), String> {
     let src = &grammar.src;
     if !src.join("parser.c").is_file() {
         return Err(format!("no parser.c in {}", src.display()));
     }
+    if native(grammar) {
+        return compile_native(grammar);
+    }
+    if src.join("scanner.cc").is_file() {
+        return Err("its scanner is C++, which only builds as native code (the native_grammars setting)".into());
+    }
+    let clang = wasi_sdk::clang().ok_or("the WebAssembly toolchain (wasi-sdk) isn't installed")?;
+    let temp = grammar.wasm.with_extension("building");
+    if let Err(err) = wasi_sdk::compile(&clang, src, &grammar.name, &temp) {
+        std::fs::remove_file(&temp).ok();
+        return Err(err);
+    }
+    std::fs::rename(&temp, &grammar.wasm).map_err(|e| e.to_string())
+}
+
+/// `cc -shared` over `parser.c` and the scanner (C, or C++ with `c++`).
+fn compile_native(grammar: &Grammar) -> Result<(), String> {
+    let src = &grammar.src;
     let cpp = src.join("scanner.cc").is_file();
     let compiler = std::env::var("CC").ok().filter(|_| !cpp).unwrap_or_else(|| if cpp { "c++".into() } else { "cc".into() });
     let temp = grammar.library.with_extension("building");
@@ -967,7 +1037,7 @@ static WASM_ENGINE: LazyLock<tree_sitter::wasmtime::Engine> = LazyLock::new(Defa
 static WASM_LOADER: Mutex<Option<tree_sitter::WasmStore>> = Mutex::new(None);
 
 /// A WebAssembly grammar, run by wasmtime.
-fn load_wasm(path: &Path, name: &str) -> Result<TsLanguage, String> {
+pub(crate) fn load_wasm(path: &Path, name: &str) -> Result<TsLanguage, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let mut loader = WASM_LOADER.lock().unwrap_or_else(|e| e.into_inner());
     if loader.is_none() {
@@ -1205,7 +1275,7 @@ formatter = ["gleam", "format", "--stdin"]
     /// The whole path a Zed extension's grammar takes: fetched from a
     /// repository at a revision, compiled, loaded, then highlighting a file.
     #[test]
-    #[ignore = "needs git, a C compiler and the tree-sitter-json crate's sources; run with --ignored"]
+    #[ignore = "needs git, wasi-sdk (WASI_SDK_PATH) and the tree-sitter-json crate's sources; run with --ignored"]
     fn fetches_builds_and_loads_a_grammar() {
         let home = std::env::var("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".cargo"));
         let sources = std::fs::read_dir(home.join("registry/src"))
@@ -1243,7 +1313,9 @@ formatter = ["gleam", "format", "--stdin"]
         // The language takes the grammar's own highlights query.
         let def: &'static LanguageDef = Box::leak(Box::new(read_language(&ext.join("languages/json5"), &grammars, "json5").unwrap()));
         let language = def.grammar().expect("the grammar loads");
+        assert!(language.is_wasm());
         let mut parser = tree_sitter::Parser::new();
+        prepare_parser(&mut parser, &language);
         parser.set_language(&language).unwrap();
         let tree = parser.parse("{\"a\": 1}", None).unwrap();
         assert_eq!(tree.root_node().kind(), "document");

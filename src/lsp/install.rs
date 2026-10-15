@@ -440,7 +440,7 @@ fn install_node() -> Result<(), String> {
 
 /// Unpacks a .zip or .tar.gz with `tar`, which macOS, Linux and Windows 10+
 /// have (bsdtar reads zips too).
-fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
+pub(crate) fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
     let output = crate::process::command("tar")
         .arg("-xf")
         .arg(archive)

@@ -61,6 +61,10 @@ pub struct Settings {
     pub auto_update: Option<bool>,
     /// Treat every folder as trusted (no Restricted Mode).
     pub trust_all_projects: Option<bool>,
+    /// Compile extensions' grammars to native libraries with the system's C
+    /// compiler instead of WebAssembly (off by default; only for extensions
+    /// in trusted folders).
+    pub native_grammars: Option<bool>,
     /// Vim keys: Normal, Insert and Visual modes.
     pub vim_mode: Option<bool>,
     /// File icons from an extension's icon theme, by name (built-in when unset).
@@ -313,6 +317,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "run_configurations",
     "auto_update",
     "trust_all_projects",
+    "native_grammars",
     "vim_mode",
     "icon_theme",
     "visual_effects",
@@ -501,6 +506,7 @@ impl Settings {
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
             "trust_all_projects" => self.trust_all_projects.is_some(),
+            "native_grammars" => self.native_grammars.is_some(),
             _ => false,
         }
     }
@@ -678,7 +684,11 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
                 crate::trust::set_trust_all(trust_all);
                 crate::trust::changed(cx);
             }
+            let native_changed = settings.native_grammars != Settings::get(cx).native_grammars;
             cx.set_global(settings.clone());
+            if native_changed {
+                crate::extensions::reload(cx);
+            }
             if icons_changed {
                 crate::extensions::apply_icon_theme(cx);
             }
@@ -813,7 +823,11 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
 
   // Run language servers, formatters and project tools in every folder
   // without asking (no Restricted Mode). Not recommended.
-  // "trust_all_projects": false
+  // "trust_all_projects": false,
+
+  // Compile extensions' grammars to native code with your C compiler
+  // instead of WebAssembly (only for extensions in trusted folders).
+  // "native_grammars": false
 }
 "#;
 
