@@ -1464,21 +1464,8 @@ impl Workspace {
     }
 
     fn push_children(&mut self, dir: &Path, depth: usize) {
-        let Ok(read) = std::fs::read_dir(dir) else { return };
-        let mut children: Vec<(PathBuf, bool, String)> = read
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if matches!(name.as_str(), ".git" | ".DS_Store" | "target") {
-                    return None;
-                }
-                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                Some((e.path(), is_dir, name))
-            })
-            .collect();
-        children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase())));
-        for (path, is_dir, name) in children {
-            let expanded = is_dir && self.expanded.contains(&path);
+        for (path, is_dir, cycle, name) in tree_children(dir) {
+            let expanded = is_dir && !cycle && self.expanded.contains(&path);
             self.entries.push(TreeEntry {
                 path: path.clone(),
                 name: name.into(),
@@ -1493,7 +1480,8 @@ impl Workspace {
 
     fn click_entry(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.get(ix).cloned() else { return };
-        if entry.is_dir {
+        // Never `open_path` a folder: that opens it as the project.
+        if entry.is_dir || entry.path.is_dir() {
             if !self.expanded.remove(&entry.path) {
                 self.expanded.insert(entry.path);
             }
@@ -8324,6 +8312,37 @@ fn project_ignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     builder.build().ok()
 }
 
+/// A folder's entries for the file tree, folders first: (path, is a folder,
+/// is a link to a folder this one is inside, name).
+fn tree_children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
+    let Ok(read) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut here: Option<Option<PathBuf>> = None;
+    let mut children: Vec<(PathBuf, bool, bool, String)> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if matches!(name.as_str(), ".git" | ".DS_Store" | "target") {
+                return None;
+            }
+            let file_type = e.file_type().ok()?;
+            let path = e.path();
+            // A link to a folder is a folder; one to a folder around it
+            // would expand forever, so it doesn't.
+            let (is_dir, cycle) = if file_type.is_symlink() {
+                let target = std::fs::canonicalize(&path).ok().filter(|t| t.is_dir());
+                let here = here.get_or_insert_with(|| std::fs::canonicalize(dir).ok());
+                let cycle = target.as_ref().zip(here.as_ref()).is_some_and(|(t, h)| h.starts_with(t));
+                (target.is_some(), cycle)
+            } else {
+                (file_type.is_dir(), false)
+            };
+            Some((path, is_dir, cycle, name))
+        })
+        .collect();
+    children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
+    children
+}
+
 /// A child view (editor, terminal, panel) drawn from its last layout until it
 /// notifies, so a caret blink or terminal output doesn't lay out the whole
 /// window again. It fills its parent. State it draws must reach it through
@@ -8956,7 +8975,28 @@ fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::ellipsize;
+    use std::path::Path;
+
+    use super::{ellipsize, tree_children};
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_folders_are_folders_in_the_tree() {
+        let dir = std::env::temp_dir().join(format!("kin-tree-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real/inner")).unwrap();
+        std::fs::write(dir.join("file.txt"), "").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("linked")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("real/inner/up")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("broken")).unwrap();
+
+        let entries = |d: &Path| tree_children(d).into_iter().map(|(_, dir, cycle, name)| (name, dir, cycle)).collect::<Vec<_>>();
+        let top = entries(&dir);
+        assert_eq!(top, [("linked".into(), true, false), ("real".into(), true, false), ("broken".into(), false, false), ("file.txt".into(), false, false)]);
+        // A link back up to a folder around it doesn't expand.
+        assert_eq!(entries(&dir.join("linked/inner")), [("up".into(), true, true)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ellipsize_cuts_long_names_only() {
