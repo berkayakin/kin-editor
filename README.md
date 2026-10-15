@@ -767,8 +767,9 @@ all apply. Prompts are disabled, so a remote that needs a password fails fast wi
 message instead of hanging; use an SSH agent or a credential helper.
 
 - **Gutter:** green/blue/red bars mark added, changed and deleted lines against `HEAD`,
-  updated as you type; staged changes are drawn faded. Click a bar to see the original lines,
-  **Stage** (or **Unstage**) just that change, or **Rollback** it. Stage Lines / Unstage Lines are
+  updated as you type; staged changes are drawn faded. Click a bar to see the lines it replaced
+  inline, above the new ones (Escape hides them), and **Stage** (or **Unstage**) just that change,
+  or **Rollback** it. Stage Lines / Unstage Lines are
   also in the editor's right-click menu and Find Action, and stage what the editor shows, unsaved
   edits included.
 - **Inline blame:** the caret line shows its author, age and commit message

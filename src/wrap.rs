@@ -1,5 +1,7 @@
 //! Display rows: where long buffer lines break into several rows (soft
-//! wrap) and which lines are hidden by folds (zero rows).
+//! wrap), which lines are hidden by folds (zero rows), and block rows: rows
+//! between lines that show something else than the text (a hunk's deleted
+//! lines), which carets skip.
 //!
 //! Positions are byte offsets into a line's [`DisplayLine`] text (tabs
 //! expanded). A break's offset starts a new row, so a cursor exactly on a
@@ -42,9 +44,13 @@ pub struct WrapMap {
     pub version: u64,
     /// The folded byte ranges whose lines take no rows.
     folds: Vec<Range<usize>>,
+    /// Block rows above buffer lines: (line, rows), sorted; a line one past
+    /// the last means after it.
+    blocks: Vec<(usize, usize)>,
     /// Breaks per buffer line; empty for lines that fit.
     breaks: Vec<Vec<Break>>,
-    /// First display row of each line, plus the total at the end.
+    /// First display row of each line (its block rows, then its text),
+    /// plus the total at the end.
     row_starts: Vec<usize>,
 }
 
@@ -112,7 +118,7 @@ impl WrapMap {
     ) -> Self {
         let mut measure = Measure::new(&key, text_system, font, char_width);
         let breaks = (0..rope.len_lines()).map(|row| measure.line(rope, row)).collect();
-        let mut map = WrapMap { key, version, folds: folds.to_vec(), breaks, row_starts: Vec::new() };
+        let mut map = WrapMap { key, version, folds: folds.to_vec(), blocks: Vec::new(), breaks, row_starts: Vec::new() };
         map.count_rows(rope, 0);
         map
     }
@@ -166,6 +172,35 @@ impl WrapMap {
         true
     }
 
+    /// Sets the block rows (see `blocks`); rows are counted again from the
+    /// first line whose blocks changed.
+    pub fn set_blocks(&mut self, blocks: &[(usize, usize)], rope: &Rope) {
+        if self.blocks == blocks {
+            return;
+        }
+        let first = self.blocks.iter().zip(blocks).position(|(a, b)| a != b).unwrap_or(self.blocks.len().min(blocks.len()));
+        let from = [self.blocks.get(first), blocks.get(first)].into_iter().flatten().map(|(line, _)| *line).min().unwrap_or(0);
+        self.blocks = blocks.to_vec();
+        self.count_rows(rope, from);
+    }
+
+    fn blocks_above(&self, row: usize) -> usize {
+        self.blocks.iter().filter(|(line, _)| *line == row).map(|(_, n)| n).sum()
+    }
+
+    /// The block row on display row `drow`: (the line it's above, which of
+    /// its rows).
+    pub fn block_at(&self, drow: usize) -> Option<(usize, usize)> {
+        let lines = self.row_starts.len().saturating_sub(1);
+        self.blocks.iter().find_map(|&(line, rows)| {
+            if line < lines && self.hidden(line) {
+                return None;
+            }
+            let start = if line < lines { self.row_starts[line] } else { self.row_count() - rows };
+            (start..start + rows).contains(&drow).then(|| (line, drow - start))
+        })
+    }
+
     /// Display rows from buffer line `from` on (the ones before it stand).
     fn count_rows(&mut self, rope: &Rope, from: usize) {
         let lines = self.breaks.len();
@@ -188,10 +223,11 @@ impl WrapMap {
             }
             self.row_starts.push(rows);
             if hidden_to.is_none_or(|to| row > to) {
-                rows += 1 + self.breaks[row].len();
+                rows += self.blocks_above(row) + 1 + self.breaks[row].len();
             }
         }
-        self.row_starts.push(rows);
+        // Blocks after the last line count in the total.
+        self.row_starts.push(rows + self.blocks_above(lines));
     }
 
     pub fn row_count(&self) -> usize {
@@ -200,6 +236,9 @@ impl WrapMap {
 
     /// Whether a fold hides buffer line `row`.
     pub fn hidden(&self, row: usize) -> bool {
+        if self.row_starts.len() <= row + 1 {
+            return false;
+        }
         matches!((self.row_starts.get(row), self.row_starts.get(row + 1)), (Some(a), Some(b)) if a == b)
     }
 
@@ -210,7 +249,12 @@ impl WrapMap {
     /// The first display row of buffer line `row`; one past the last line
     /// gives the total.
     pub fn first_display_row(&self, row: usize) -> usize {
-        self.row_starts.get(row).copied().unwrap_or_else(|| self.row_count())
+        let lines = self.row_starts.len().saturating_sub(1);
+        if row >= lines {
+            return self.row_count();
+        }
+        let start = self.row_starts[row];
+        if self.hidden(row) { start } else { start + self.blocks_above(row) }
     }
 
     /// The buffer line and its segment index shown on display row `drow`.
@@ -220,8 +264,16 @@ impl WrapMap {
             return (0, 0);
         }
         let row = self.row_starts[..lines].partition_point(|&s| s <= drow).saturating_sub(1);
-        let seg = (drow - self.row_starts[row]).min(self.breaks(row).len());
-        (row, seg)
+        let text = self.first_display_row(row);
+        if drow < text {
+            // A block row counts as the end of the shown line above it (the
+            // top of the first line for blocks above it).
+            return match (0..row).rev().find(|&r| !self.hidden(r)) {
+                Some(above) => (above, self.breaks(above).len()),
+                None => (row, 0),
+            };
+        }
+        (row, (drow - text).min(self.breaks(row).len()))
     }
 }
 
@@ -336,6 +388,7 @@ mod tests {
     #[test]
     fn maps_display_rows_to_lines() {
         let map = WrapMap {
+            blocks: Vec::new(),
             key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true },
             version: 0,
             folds: Vec::new(),
@@ -351,10 +404,29 @@ mod tests {
         assert_eq!(map.first_display_row(2), 4);
     }
 
+    #[gpui::test]
+    fn block_rows_sit_between_lines(cx: &mut gpui::TestAppContext) {
+        let rope = Rope::from_str("a\nb\nc\n");
+        let key = WrapKey { width: gpui::px(400.), font_family: "Menlo".into(), font_size: gpui::px(13.), tab_size: 4, wrap: false };
+        let mut map = cx.update(|cx| WrapMap::new(key, 0, &[], &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
+        // Two rows above line 1 ("b"), one after the last line.
+        map.set_blocks(&[(1, 2), (4, 1)], &rope);
+        assert_eq!(map.row_count(), 4 + 3);
+        assert_eq!(map.first_display_row(1), 3);
+        assert_eq!((map.block_at(1), map.block_at(2), map.block_at(3)), (Some((1, 0)), Some((1, 1)), None));
+        assert_eq!(map.block_at(6), Some((4, 0)));
+        // A block row maps to the line above it, for clicks and carets.
+        assert_eq!(map.line_of(2), (0, 0));
+        assert_eq!(map.line_of(3), (1, 0));
+        map.set_blocks(&[], &rope);
+        assert_eq!((map.row_count(), map.first_display_row(1)), (4, 1));
+    }
+
     #[test]
     fn folded_lines_take_no_rows() {
         // Lines 1 and 2 are hidden: row_starts repeats.
         let map = WrapMap {
+            blocks: Vec::new(),
             key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false },
             version: 0,
             folds: Vec::new(),

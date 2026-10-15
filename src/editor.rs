@@ -1260,7 +1260,12 @@ impl Editor {
     }
 
     fn vertical_target(&self, sel: &Selection, rows: isize, goal: Pixels, window: &mut Window, cx: &App) -> usize {
-        let drow = self.display_row_of(sel.head, cx) as isize + rows;
+        let mut drow = self.display_row_of(sel.head, cx) as isize + rows;
+        // Carets don't stop on block rows.
+        let step = if rows < 0 { -1 } else { 1 };
+        while drow >= 0 && self.wrap.as_ref().is_some_and(|w| w.block_at(drow as usize).is_some()) {
+            drow += step;
+        }
         if drow < 0 {
             0
         } else if drow as usize >= self.display_row_count(cx) {
@@ -1391,8 +1396,9 @@ impl Editor {
     /// before anything maps between offsets and display rows.
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
         let wrap = self.soft_wrap && !self.is_single_line();
-        // Without wrapping, folds or long lines, display rows are buffer lines.
-        if !wrap && self.doc.read(cx).folds().is_empty() && !self.doc.read(cx).has_long_lines() {
+        let blocks = self.block_rows(cx);
+        // Without wrapping, folds, long lines or blocks, display rows are buffer lines.
+        if !wrap && blocks.is_empty() && self.doc.read(cx).folds().is_empty() && !self.doc.read(cx).has_long_lines() {
             self.wrap = None;
             return;
         }
@@ -1415,10 +1421,24 @@ impl Editor {
                 None => false,
             };
             if caught_up {
+                map.set_blocks(&blocks, rope);
                 return;
             }
         }
-        self.wrap = Some(WrapMap::new(key, version, folds, rope, window.text_system(), font, char_width));
+        let mut map = WrapMap::new(key, version, folds, rope, window.text_system(), font, char_width);
+        map.set_blocks(&blocks, rope);
+        self.wrap = Some(map);
+    }
+
+    /// Rows between lines that aren't text (see `wrap`): a hunk opened from
+    /// the gutter shows the lines it deleted, above the ones that replaced them.
+    fn block_rows(&self, cx: &App) -> Vec<(usize, usize)> {
+        let Some(hunk) = self.open_hunk.and_then(|ix| self.hunks.get(ix)) else { return Vec::new() };
+        let deleted = hunk.old_text.lines().count();
+        if deleted == 0 || self.is_single_line() {
+            return Vec::new();
+        }
+        vec![(hunk.new_rows.start.min(self.doc.read(cx).line_count()), deleted)]
     }
 
     /// Both brackets of the pairs around carets (a few, so many cursors stay
@@ -2770,6 +2790,28 @@ impl Editor {
             })
             .collect();
 
+        // Block rows: an opened hunk's deleted lines, in the gap the display
+        // map leaves above the lines that replaced them.
+        if let (Some(hunk), Some(map)) = (self.open_hunk.and_then(|ix| self.hunks.get(ix)), self.wrap.as_ref()) {
+            let deleted: Vec<&str> = hunk.old_text.lines().collect();
+            let start = (first_drow..last_drow).find(|&d| map.block_at(d).is_some_and(|(_, i)| i == 0)).or_else(|| {
+                // Scrolled past the first block row: work back from a visible one.
+                (first_drow..last_drow).find_map(|d| map.block_at(d).map(|(_, i)| d - i))
+            });
+            let tint = Hsla::from(theme.git_deleted);
+            for (i, line) in deleted.iter().enumerate() {
+                let Some(drow) = start.map(|s| s + i).filter(|d| (first_drow..last_drow).contains(d)) else { continue };
+                let y = top + line_height * drow as f32 - self.scroll.y;
+                frame.backgrounds.push(fill(Bounds::from_corners(point(bounds.left(), y), point(bounds.right(), y + line_height)), tint.alpha(0.12)));
+                let run = |text: &str, color: Hsla| TextRun { len: text.len(), font: editor_font.clone(), color, background_color: None, underline: None, strikethrough: None };
+                let text = DisplayLine::new(line, self.tab_size).text;
+                let shaped = text_system.shape_line(SharedString::from(text.clone()), font_size, &[run(&text, theme.text_muted.into())], None);
+                frame.lines.push((point(text_left - self.scroll.x, y), shaped));
+                let minus = text_system.shape_line("−".into(), font_size, &[run("−", tint)], None);
+                frame.numbers.push((point(text_left - char_width * 2., y), minus));
+            }
+        }
+
         let mut hl_ix = 0;
         for row in first_row..last_row {
             if self.row_hidden(row) {
@@ -3832,10 +3874,11 @@ impl Editor {
         let hunk = self.hunks.get(ix)?.clone();
         let layout = self.layout.as_ref()?;
         let theme = Theme::get(cx).clone();
-        let anchor_row = self.first_display_row(if hunk.kind == HunkKind::Deleted { hunk.new_rows.start } else { hunk.new_rows.end });
-        let top = layout.line_height * anchor_row as f32 - self.scroll.y + px(2.);
-        let left = layout.gutter_width - px(4.);
-        let width = (layout.bounds.size.width - left - px(28.)).min(px(720.)).max(px(240.));
+        // Just above the hunk: its deleted lines (block rows, see `block_rows`)
+        // or the lines it added, at the right so it covers little code.
+        let deleted = hunk.old_text.lines().count();
+        let first_row = self.first_display_row(hunk.new_rows.start).saturating_sub(deleted);
+        let top = (layout.line_height * first_row as f32 - self.scroll.y - px(36.)).max(px(4.));
         let staged = self.hunk_staged.get(ix).copied().unwrap_or(false);
         let (title, color): (String, Hsla) = match hunk.kind {
             HunkKind::Added => (format!("{} added line{}", hunk.new_rows.len(), plural(hunk.new_rows.len())), theme.git_added.into()),
@@ -3855,14 +3898,12 @@ impl Editor {
                 .tooltip(move |_, cx| crate::ui::tooltip_view(tip, cx))
                 .child(crate::ui::icon_el(icon, px(14.), theme.text_muted.into()))
         };
-        let old_lines: Vec<String> = hunk.old_text.lines().map(|l| l.replace('\t', "    ")).collect();
         Some(
             div()
                 .id("hunk-popover")
                 .absolute()
                 .top(top)
-                .left(left)
-                .w(width)
+                .right(px(28.))
                 .flex()
                 .flex_col()
                 .bg(theme.elevated)
@@ -3900,31 +3941,6 @@ impl Editor {
                             cx.notify();
                         }))),
                 )
-                .child(if old_lines.is_empty() {
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_color(theme.text_dim)
-                        .child("New lines — nothing to show from HEAD")
-                        .into_any_element()
-                } else {
-                    div()
-                        .id("hunk-old-lines")
-                        .max_h(px(240.))
-                        .overflow_y_scroll()
-                        .py_1()
-                        .font_family(theme.mono_font.clone())
-                        .text_size(px(theme.editor_font_size - 1.))
-                        .children(old_lines.into_iter().map(|line| {
-                            div()
-                                .flex()
-                                .px_2()
-                                .bg(Hsla::from(theme.git_deleted).alpha(0.1))
-                                .child(div().w(px(16.)).flex_shrink_0().text_color(theme.git_deleted).child("−"))
-                                .child(div().text_color(theme.text_muted).whitespace_nowrap().child(line))
-                        }))
-                        .into_any_element()
-                })
                 .into_any_element(),
         )
     }
