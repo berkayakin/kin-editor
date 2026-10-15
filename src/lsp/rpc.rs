@@ -130,11 +130,16 @@ impl Client {
         send(&self.writer, message);
     }
 
-    /// Asks the server to exit, then makes sure it does. Blocks for up to
-    /// half a second, so call it off the main thread.
+    /// Asks the server to exit, then makes sure it does. Blocks for up to a
+    /// second, so call it off the main thread.
     pub fn shutdown(&self) {
-        // Kept until the end, so it isn't cancelled.
-        let _shutdown = self.request("shutdown", Value::Null);
+        // `exit` comes after the answer to `shutdown`, as the protocol asks
+        // (a server may still be saving state); one that doesn't answer in
+        // time gets it anyway.
+        let shutdown = self.request("shutdown", Value::Null);
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || answered.send(futures::executor::block_on(shutdown)).ok());
+        answer.recv_timeout(std::time::Duration::from_millis(500)).ok();
         self.notify("exit", Value::Null);
         for _ in 0..20 {
             if self.child.lock().ok().and_then(|mut c| c.try_wait().ok().flatten()).is_some() {
