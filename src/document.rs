@@ -85,6 +85,10 @@ pub enum EditKind {
     Other,
 }
 
+/// Line edits kept for views catching up (soft wrap); past this many they
+/// rebuild from scratch.
+const LINE_EDIT_LOG: usize = 10_000;
+
 /// Above this, a file opens as plain text without language features.
 const LARGE_FILE_SIZE: u64 = 20_000_000;
 /// Above this, it doesn't open at all (it would take that much memory twice over).
@@ -119,6 +123,11 @@ pub struct Document {
     breakpoints: Vec<(usize, Breakpoint)>,
     /// Where the line a debug session is paused on starts.
     debug_line: Option<usize>,
+    /// What each edit did to lines, tagged with the version it led to, so
+    /// views can update just those lines (see `line_edits_since`).
+    line_edits: Vec<(u64, LineEdit)>,
+    /// The version `line_edits` start from.
+    line_edits_base: u64,
     /// The tab stops of a snippet being filled in; they follow edits.
     pub snippet: Option<crate::snippets::SnippetStops>,
     /// The language server's inlay hints (sorted); they follow edits until
@@ -159,7 +168,7 @@ impl Document {
         Ok(doc)
     }
 
-    fn from_text(text: String, path: Option<PathBuf>) -> Self {
+    pub(crate) fn from_text(text: String, path: Option<PathBuf>) -> Self {
         Self::with_text(text, path, false)
     }
 
@@ -197,6 +206,8 @@ impl Document {
             folds: Vec::new(),
             breakpoints: Vec::new(),
             debug_line: None,
+            line_edits: Vec::new(),
+            line_edits_base: 0,
             snippet: None,
             inlay_hints: Vec::new(),
             disk_mtime: None,
@@ -315,6 +326,8 @@ impl Document {
         // Breakpoints and the debug line keep their line numbers across a reload.
         let (breakpoints, debug_row) = (self.breakpoints(), self.debug_row());
         self.rope = Rope::from_str(&text);
+        self.line_edits.clear();
+        self.line_edits_base = self.version + 1;
         self.set_breakpoints(&breakpoints);
         self.set_debug_row(debug_row);
         self.syntax = Syntax::new(self.language, &self.rope);
@@ -599,12 +612,36 @@ impl Document {
 
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
         self.lsp_changes.record(&self.rope, range.clone(), text);
+        // Every caller bumps the version once its edits are done.
+        if self.line_edits.len() >= LINE_EDIT_LOG {
+            // From after this transaction: part of it would mislead.
+            self.line_edits.clear();
+            self.line_edits_base = self.version + 1;
+        }
+        let row = self.rope.byte_to_line(range.start);
+        let edit = LineEdit {
+            row,
+            old_rows: self.rope.byte_to_line(range.end) - row + 1,
+            new_rows: 1 + text.bytes().filter(|&b| b == b'\n').count(),
+        };
+        self.line_edits.push((self.version + 1, edit));
         let edit = input_edit(&self.rope, range.clone(), text);
         let s = self.rope.byte_to_char(range.start);
         let e = self.rope.byte_to_char(range.end);
         self.rope.remove(s..e);
         self.rope.insert(s, text);
         self.syntax.edit(&edit);
+    }
+
+    /// The line edits that lead from `version` to the current text, oldest
+    /// first, each in the lines of the text before it; None when they
+    /// aren't kept (too many, or the whole text was replaced).
+    pub fn line_edits_since(&self, version: u64) -> Option<impl Iterator<Item = &LineEdit>> {
+        if version < self.line_edits_base || version > self.version {
+            return None;
+        }
+        let first = self.line_edits.partition_point(|(v, _)| *v <= version);
+        Some(self.line_edits[first..].iter().map(|(_, edit)| edit))
     }
 
     /// Moves what follows the text (folds, breakpoints, the debug line, a
@@ -819,6 +856,14 @@ impl Document {
         self.diagnostics
             .sort_by_key(|d| (d.range.start, d.severity));
     }
+}
+
+/// Lines `row..row + old_rows` became `new_rows` lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineEdit {
+    pub row: usize,
+    pub old_rows: usize,
+    pub new_rows: usize,
 }
 
 /// A type or parameter name from the language server, shown in the text

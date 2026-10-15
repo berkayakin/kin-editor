@@ -6,10 +6,12 @@
 //! break shows at the start of the next row. Continuation rows keep the
 //! line's indentation, like Zed and VS Code.
 
-use gpui::{Font, LineFragment, Pixels, SharedString, TextSystem};
+use std::ops::Range;
+
+use gpui::{Font, LineFragment, LineWrapperHandle, Pixels, SharedString, TextSystem};
 use ropey::Rope;
 
-use crate::editor::DisplayLine;
+use crate::{document::LineEdit, editor::DisplayLine};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Break {
@@ -19,73 +21,161 @@ pub struct Break {
     pub indent: u32,
 }
 
-/// What a wrap map was computed for; any change means recomputing.
+/// What line breaks depend on; a change means measuring every line again.
+/// (Edits and folds update the map in place.)
 #[derive(Clone, PartialEq)]
 pub struct WrapKey {
-    pub version: u64,
-    pub len: usize,
     pub width: Pixels,
     pub font_family: SharedString,
     pub font_size: Pixels,
     pub tab_size: usize,
     /// Break long lines (off when only folds need the map).
     pub wrap: bool,
-    /// Folded byte ranges.
-    pub folds: Vec<std::ops::Range<usize>>,
 }
 
 pub struct WrapMap {
     pub key: WrapKey,
+    /// The document version the breaks are for.
+    pub version: u64,
+    /// The folded byte ranges whose lines take no rows.
+    folds: Vec<Range<usize>>,
     /// Breaks per buffer line; empty for lines that fit.
     breaks: Vec<Vec<Break>>,
     /// First display row of each line, plus the total at the end.
     row_starts: Vec<usize>,
 }
 
+/// Finds a line's breaks; only lines that may be wider than the view are
+/// shaped.
+struct Measure {
+    wrapper: LineWrapperHandle,
+    width: Pixels,
+    max_cols: usize,
+    tab_size: usize,
+}
+
+impl Measure {
+    fn new(key: &WrapKey, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
+        Measure {
+            wrapper: text_system.line_wrapper(font, key.font_size),
+            width: key.width,
+            // Lines narrower than this many columns can't wrap, which skips
+            // shaping-free measurement for most lines.
+            max_cols: (key.width / char_width).floor().max(1.) as usize,
+            tab_size: key.tab_size,
+        }
+    }
+
+    fn line(&mut self, rope: &Rope, row: usize) -> Vec<Break> {
+        let line = rope.line(row);
+        if line.len_chars() <= self.max_cols / self.tab_size || display_columns(line, self.tab_size) <= self.max_cols {
+            return Vec::new();
+        }
+        // Same text as `Document::line_text`: without the newline.
+        let text = line.to_string();
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        let dl = DisplayLine::new(text, self.tab_size);
+        let fragments = [LineFragment::text(&dl.text)];
+        self.wrapper.wrap_line(&fragments, self.width).map(|b| Break { ix: b.ix as u32, indent: b.next_indent }).collect()
+    }
+}
+
 impl WrapMap {
-    pub fn new(key: WrapKey, rope: &Rope, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
-        // Rows hidden by folds take no display rows.
-        let mut hidden = vec![false; rope.len_lines()];
-        for fold in &key.folds {
-            let (first, last) = (rope.byte_to_line(fold.start.min(rope.len_bytes())), rope.byte_to_line(fold.end.min(rope.len_bytes())));
-            for row in first..=last.min(hidden.len().saturating_sub(1)) {
-                hidden[row] = true;
+    pub fn new(
+        key: WrapKey,
+        version: u64,
+        folds: &[Range<usize>],
+        rope: &Rope,
+        text_system: &std::sync::Arc<TextSystem>,
+        font: Font,
+        char_width: Pixels,
+    ) -> Self {
+        let breaks = if key.wrap {
+            let mut measure = Measure::new(&key, text_system, font, char_width);
+            (0..rope.len_lines()).map(|row| measure.line(rope, row)).collect()
+        } else {
+            vec![Vec::new(); rope.len_lines()]
+        };
+        let mut map = WrapMap { key, version, folds: folds.to_vec(), breaks, row_starts: Vec::new() };
+        map.count_rows(rope, 0);
+        map
+    }
+
+    /// Catches up with `edits` (from `self.version` to `version`, see
+    /// `Document::line_edits_since`) and `folds`: only the lines the edits
+    /// touched are measured again, and rows are counted from the first of
+    /// them. False when the edits don't fit this map; then build a new one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update<'e>(
+        &mut self,
+        edits: impl Iterator<Item = &'e LineEdit>,
+        version: u64,
+        folds: &[Range<usize>],
+        rope: &Rope,
+        text_system: &std::sync::Arc<TextSystem>,
+        font: Font,
+        char_width: Pixels,
+    ) -> bool {
+        // Asked every frame; usually nothing changed.
+        if version == self.version && self.folds == folds {
+            return true;
+        }
+        let mut dirty = vec![false; self.breaks.len()];
+        let mut first = self.breaks.len();
+        for edit in edits {
+            let old = edit.row..edit.row + edit.old_rows;
+            if old.end > self.breaks.len() {
+                return false;
+            }
+            self.breaks.splice(old.clone(), std::iter::repeat_with(Vec::new).take(edit.new_rows));
+            dirty.splice(old, std::iter::repeat_n(true, edit.new_rows));
+            first = first.min(edit.row);
+        }
+        if self.breaks.len() != rope.len_lines() {
+            return false;
+        }
+        if self.key.wrap && first < dirty.len() {
+            let mut measure = Measure::new(&self.key, text_system, font, char_width);
+            for row in (first..dirty.len()).filter(|&row| dirty[row]) {
+                self.breaks[row] = measure.line(rope, row);
             }
         }
-        let (width, tab_size) = (key.width, key.tab_size);
-        let mut wrapper = text_system.line_wrapper(font, key.font_size);
-        // Lines narrower than this many columns can't wrap, which skips
-        // shaping-free measurement for most lines.
-        let max_cols = (width / char_width).floor().max(1.) as usize;
-        let lines = rope.len_lines();
-        let mut breaks = Vec::with_capacity(lines);
-        let mut row_starts = Vec::with_capacity(lines + 1);
-        let mut rows = 0;
-        for row in 0..lines {
-            row_starts.push(rows);
-            if hidden[row] {
-                breaks.push(Vec::new());
-                continue;
-            }
-            let line = rope.line(row);
-            let mut line_breaks = Vec::new();
-            if key.wrap && line.len_chars() > max_cols / tab_size && display_columns(line, tab_size) > max_cols {
-                // Same text as `Document::line_text`: without the newline.
-                let text = line.to_string();
-                let text = text.strip_suffix('\n').unwrap_or(&text);
-                let dl = DisplayLine::new(text, tab_size);
-                let fragments = [LineFragment::text(&dl.text)];
-                line_breaks.extend(
-                    wrapper
-                        .wrap_line(&fragments, width)
-                        .map(|b| Break { ix: b.ix as u32, indent: b.next_indent }),
-                );
-            }
-            rows += 1 + line_breaks.len();
-            breaks.push(line_breaks);
+        self.version = version;
+        // Folds that moved or opened can hide rows above the first edit.
+        if self.folds != folds {
+            self.folds = folds.to_vec();
+            first = 0;
         }
-        row_starts.push(rows);
-        Self { key, breaks, row_starts }
+        self.count_rows(rope, first);
+        true
+    }
+
+    /// Display rows from buffer line `from` on (the ones before it stand).
+    fn count_rows(&mut self, rope: &Rope, from: usize) {
+        let lines = self.breaks.len();
+        let last_line = lines.saturating_sub(1);
+        // Rows hidden by folds take no display rows: (first, last) per fold.
+        let mut hidden: Vec<(usize, usize)> = self
+            .folds
+            .iter()
+            .map(|f| (rope.byte_to_line(f.start.min(rope.len_bytes())), rope.byte_to_line(f.end.min(rope.len_bytes())).min(last_line)))
+            .collect();
+        hidden.sort_unstable();
+        let from = from.min(self.row_starts.len().saturating_sub(1));
+        let mut rows = self.row_starts.get(from).copied().unwrap_or(0);
+        self.row_starts.truncate(from);
+        let (mut next, mut hidden_to) = (0, None);
+        for row in from..lines {
+            while let Some(&(_, last)) = hidden.get(next).filter(|(first, _)| *first <= row) {
+                hidden_to = hidden_to.max(Some(last));
+                next += 1;
+            }
+            self.row_starts.push(rows);
+            if hidden_to.is_none_or(|to| row > to) {
+                rows += 1 + self.breaks[row].len();
+            }
+        }
+        self.row_starts.push(rows);
     }
 
     pub fn row_count(&self) -> usize {
@@ -101,7 +191,6 @@ impl WrapMap {
         self.breaks.get(row).map_or(&[], Vec::as_slice)
     }
 
-    /// The first display row of buffer line `row`.
     /// The first display row of buffer line `row`; one past the last line
     /// gives the total.
     pub fn first_display_row(&self, row: usize) -> usize {
@@ -152,6 +241,42 @@ pub fn segment_of(breaks: &[Break], col: usize) -> usize {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn edits_update_the_map_like_a_new_one(cx: &mut gpui::TestAppContext) {
+        use crate::document::{Document, EditKind};
+        let text_system = cx.update(|cx| cx.text_system().clone());
+        let font = gpui::font("Test");
+        let key = |wrap| WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 4, wrap };
+        let long = "word ".repeat(40);
+        let text: String = (0..30).map(|i| if i % 3 == 0 { format!("{i} {long}\n") } else { format!("line {i}\n") }).collect();
+        for wrap in [true, false] {
+            let mut doc = Document::from_text(text.clone(), None);
+            doc.fold_rows(10, 12);
+            let mut map = WrapMap::new(key(wrap), doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+            assert_eq!(wrap, map.breaks.iter().any(|b| !b.is_empty()), "long lines wrap");
+            let line = |doc: &Document, row: usize| doc.line_start(row);
+            let steps: Vec<Box<dyn Fn(&mut Document)>> = vec![
+                // Typing in a long line, then several carets adding lines.
+                Box::new(|d| drop(d.edit(vec![(line(d, 3) + 5..line(d, 3) + 5, "more ".repeat(20))], &[], EditKind::Other))),
+                Box::new(|d| drop(d.edit(vec![(line(d, 1)..line(d, 1), "a\nb\n".into()), (line(d, 20)..line(d, 20), long.clone())], &[], EditKind::Other))),
+                // Joining lines, an edit that opens the fold, undo and redo.
+                Box::new(|d| drop(d.edit(vec![(line(d, 5) - 1..line(d, 7), String::new())], &[], EditKind::Other))),
+                Box::new(|d| drop(d.edit(vec![(line(d, 11) + 1..line(d, 11) + 1, "x".into())], &[], EditKind::Other))),
+                Box::new(|d| drop(d.undo())),
+                Box::new(|d| drop(d.redo())),
+            ];
+            for step in steps {
+                // Two versions at a time, as when frames are skipped.
+                step(&mut doc);
+                step(&mut doc);
+                let edits = doc.line_edits_since(map.version).expect("kept");
+                assert!(map.update(edits, doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.)));
+                let fresh = WrapMap::new(key(wrap), doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+                assert_eq!((&map.breaks, &map.row_starts), (&fresh.breaks, &fresh.row_starts));
+            }
+        }
+    }
+
     #[test]
     fn segments_cover_the_line() {
         let breaks = [Break { ix: 10, indent: 4 }, Break { ix: 20, indent: 4 }];
@@ -176,7 +301,9 @@ mod tests {
     #[test]
     fn maps_display_rows_to_lines() {
         let map = WrapMap {
-            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true, folds: Vec::new() },
+            key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true },
+            version: 0,
+            folds: Vec::new(),
             breaks: vec![vec![], vec![Break { ix: 5, indent: 0 }, Break { ix: 9, indent: 0 }], vec![]],
             row_starts: vec![0, 1, 4, 5],
         };
@@ -193,7 +320,9 @@ mod tests {
     fn folded_lines_take_no_rows() {
         // Lines 1 and 2 are hidden: row_starts repeats.
         let map = WrapMap {
-            key: WrapKey { version: 0, len: 0, width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false, folds: Vec::new() },
+            key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false },
+            version: 0,
+            folds: Vec::new(),
             breaks: vec![vec![], vec![], vec![], vec![]],
             row_starts: vec![0, 1, 1, 1, 2],
         };

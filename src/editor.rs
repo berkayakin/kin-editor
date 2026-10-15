@@ -1233,20 +1233,26 @@ impl Editor {
         let Some(layout) = self.layout.as_ref() else { return };
         let font = self.editor_font(cx);
         let key = WrapKey {
-            version: self.doc.version(),
-            len: self.doc.len(),
             width: layout.wrap_width,
             font_family: font.family.clone(),
             font_size: self.font_size(cx),
             tab_size: self.tab_size,
             wrap,
-            folds: self.doc.folds().to_vec(),
         };
-        if self.wrap.as_ref().is_some_and(|w| w.key == key) {
-            return;
+        let (char_width, version, folds, rope) = (layout.char_width, self.doc.version(), self.doc.folds(), self.doc.rope());
+        // Edits re-measure only their lines; a new width, font or tab size
+        // measures them all.
+        if let Some(map) = self.wrap.as_mut().filter(|map| map.key == key) {
+            let edits = self.doc.line_edits_since(map.version);
+            let caught_up = match edits {
+                Some(edits) => map.update(edits, version, folds, rope, window.text_system(), font.clone(), char_width),
+                None => false,
+            };
+            if caught_up {
+                return;
+            }
         }
-        let char_width = layout.char_width;
-        self.wrap = Some(WrapMap::new(key, self.doc.rope(), window.text_system(), font, char_width));
+        self.wrap = Some(WrapMap::new(key, version, folds, rope, window.text_system(), font, char_width));
     }
 
     fn display_row_count(&self) -> usize {
