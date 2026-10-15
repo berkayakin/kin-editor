@@ -320,6 +320,9 @@ popover scrolls, and a copy button that appears on hover copies its text); compl
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
 server or turn one off, see `language_servers` below; to configure one, `lsp` (Zed's format).
 
+A problem shows at the end of its line, cut short when it's long. With the caret on that line, a
+problem that doesn't fit there (or several, or a multi-line message) shows in full in rows under it.
+
 A file can have several servers: Kin's own and any an extension adds for its language (ESLint or
 Tailwind beside TypeScript). All of them get the file; their problems show together, completion
 and code actions list all of theirs, and the rest (hover, Go to Declaration, rename, formatting)

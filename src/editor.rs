@@ -1451,6 +1451,11 @@ impl Editor {
                 blocks.push(Block { line: hunk.new_rows.start.min(doc.line_count()), kind: BlockKind::Deleted(deleted) });
             }
         }
+        let problems = self.caret_problem_rows(cx);
+        if !problems.is_empty() {
+            let row = doc.row_of(self.primary_selection().head);
+            blocks.push(Block { line: row + 1, kind: BlockKind::Problems(problems) });
+        }
         if self.file_settings.code_lens {
             for lens in doc.code_lenses() {
                 let line = doc.row_of(lens.line_start);
@@ -1460,8 +1465,49 @@ impl Editor {
                 }
             }
         }
-        blocks.sort_by_key(|b| (b.line, matches!(b.kind, BlockKind::Lenses(_))));
+        // Above a line: the problems of the line before it, then deleted
+        // lines, then the line's own lenses.
+        let rank = |kind: &BlockKind| match kind {
+            BlockKind::Problems(_) => 0,
+            BlockKind::Deleted(_) => 1,
+            BlockKind::Lenses(_) => 2,
+        };
+        blocks.sort_by_key(|b| (b.line, rank(&b.kind)));
         blocks
+    }
+
+    /// The caret line's problems in full when its end-of-line hint can't
+    /// show them: a message on several lines, one too long for the room
+    /// after the code, or more than one problem. A row per line, wrapped to
+    /// the view.
+    fn caret_problem_rows(&self, cx: &App) -> Vec<(lint::Severity, String)> {
+        let Some(layout) = self.layout.as_ref() else { return Vec::new() };
+        if self.selections.len() != 1 || self.mode != EditorMode::Full {
+            return Vec::new();
+        }
+        let doc = self.doc.read(cx);
+        let row = doc.row_of(self.primary_selection().head);
+        let (start, end) = (doc.line_start(row), doc.line_end(row));
+        let first = doc.diagnostics.partition_point(|d| d.range.start < start);
+        let problems: Vec<&lint::Diagnostic> = doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).collect();
+        let Some(only) = problems.first() else { return Vec::new() };
+        let text = doc.line_text(row);
+        let cols = (layout.wrap_width / layout.char_width).floor().max(20.) as usize;
+        let line_cols = DisplayLine::new(&text, self.tab_size).text.chars().count();
+        let message = only.message.trim();
+        if problems.len() == 1 && !message.contains('\n') && line_cols + 4 + message.chars().count() <= cols {
+            return Vec::new();
+        }
+        let indent = DisplayLine::new(&text[..text.len() - text.trim_start().len()], self.tab_size).text.len();
+        let width = cols.saturating_sub(indent + 2).max(20);
+        let mut rows = Vec::new();
+        for problem in problems {
+            for line in problem.message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                rows.extend(wrap_words(line, width).into_iter().map(|chunk| (problem.severity, chunk)));
+            }
+        }
+        rows.truncate(12);
+        rows
     }
 
     fn block_rows(&self, cx: &App) -> Vec<(usize, usize)> {
@@ -2824,6 +2870,8 @@ impl Editor {
 
         // Block rows, in the gaps the display map leaves above their lines.
         self.lens_hits.clear();
+        // The line whose problems show in full under it (no hint at its end then).
+        let mut problems_row = None;
         if let Some(map) = self.wrap.as_ref() {
             let mut lens_hits = Vec::new();
             let mut used: HashMap<usize, usize> = HashMap::new();
@@ -2870,6 +2918,23 @@ impl Editor {
                         }
                     }
                     BlockKind::Lenses(_) => {}
+                    BlockKind::Problems(rows) => {
+                        // Under the caret line, in the hint's colors, lined up with its text.
+                        let line = self.doc.read(cx).line_text(block.line.saturating_sub(1));
+                        let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
+                        let msg_size = px(theme.ui_font_size - 0.5);
+                        for (i, (severity, text)) in rows.iter().enumerate().filter(|(i, _)| visible(start + i)) {
+                            let y = y_of(start + i);
+                            let color = severity_color(&theme, *severity);
+                            frame.backgrounds.push(fill(
+                                Bounds::from_corners(point(bounds.left() + gutter_width, y), point(bounds.right(), y + line_height)),
+                                color.alpha(0.07),
+                            ));
+                            let shaped = text_system.shape_line(SharedString::from(text.clone()), msg_size, &[run(text, ui_font.clone(), color.alpha(0.9))], None);
+                            frame.lines.push((point(text_left - self.scroll.x + char_width * indent as f32, y + (line_height - msg_size) / 4.), shaped));
+                        }
+                        problems_row = Some(block.line.saturating_sub(1));
+                    }
                 }
             }
             self.lens_hits = lens_hits;
@@ -3399,7 +3464,7 @@ impl Editor {
                     self.fold_pills.push((pill, fold.start));
                     text_end = pill.right();
                 }
-                if let Some(worst) = worst {
+                if let Some(worst) = worst.filter(|_| problems_row != Some(row)) {
                     let color = severity_color(&theme, worst.severity);
                     // Multi-line messages (rust-analyzer's) fit on one line here;
                     // hovering shows them in full.
@@ -4009,6 +4074,25 @@ impl Editor {
     }
 }
 
+/// `text` in lines of at most `width` characters, broken between words.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -4531,6 +4615,8 @@ impl Editor {
 /// What block rows show (see `Editor::blocks`).
 #[derive(Clone)]
 enum BlockKind {
+    /// The caret line's problems in full, a row each (under that line).
+    Problems(Vec<(lint::Severity, String)>),
     /// An opened hunk's deleted lines, a row each.
     Deleted(Vec<String>),
     /// A line's code lenses, on one row.
@@ -4548,6 +4634,7 @@ impl Block {
     fn rows(&self) -> usize {
         match &self.kind {
             BlockKind::Deleted(lines) => lines.len(),
+            BlockKind::Problems(rows) => rows.len(),
             BlockKind::Lenses(_) => 1,
         }
     }
@@ -4709,5 +4796,57 @@ impl Element for EditorElement {
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);
         }
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use gpui::{AppContext, TestAppContext};
+
+    use super::*;
+
+    #[test]
+    fn wraps_between_words() {
+        assert_eq!(wrap_words("expected `i32`, found `&str`", 12), ["expected", "`i32`, found", "`&str`"]);
+        assert_eq!(wrap_words("short", 40), ["short"]);
+    }
+
+    #[gpui::test]
+    fn the_caret_lines_problems_show_in_full_when_the_hint_cant(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::new(Document::from_text("let x = 1;\nlet y = 2;\n".into(), None), cx));
+        let problem = |at: usize, message: &str| lint::Diagnostic {
+            range: at..at + 1,
+            severity: lint::Severity::Error,
+            message: message.into(),
+            rule: "e".into(),
+        };
+        editor.update(cx, |e, cx| {
+            // 50 columns of text.
+            e.layout = Some(LayoutSnapshot {
+                bounds: Bounds::default(),
+                text_left: px(0.),
+                line_height: px(20.),
+                char_width: px(8.),
+                gutter_width: px(0.),
+                rows_per_page: 10,
+                wrap_width: px(400.),
+            });
+            // Fits after the code: the end-of-line hint is enough.
+            e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(4, "unused")]);
+            assert!(e.caret_problem_rows(cx).is_empty());
+            // Several lines: each gets a row, under the line.
+            e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(4, "mismatched types\nexpected `i32`")]);
+            let rows: Vec<String> = e.caret_problem_rows(cx).into_iter().map(|(_, t)| t).collect();
+            assert_eq!(rows, ["mismatched types", "expected `i32`"]);
+            assert_eq!(e.block_rows(cx), [(1, 2)]);
+            // Two problems on the line: both.
+            e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(0, "first"), problem(4, "second")]);
+            assert_eq!(e.caret_problem_rows(cx).len(), 2);
+            // Another line's problems don't show; nor with several carets.
+            e.set_selections(vec![Selection::cursor(12)], 0, cx);
+            assert!(e.caret_problem_rows(cx).is_empty());
+            e.set_selections(vec![Selection::cursor(0), Selection::cursor(12)], 0, cx);
+            assert!(e.caret_problem_rows(cx).is_empty());
+        });
     }
 }
