@@ -1,0 +1,56 @@
+# Release notes, written by git-cliff (https://git-cliff.org) in the release
+# workflow: `git cliff --latest --strip header` gives the notes for the newest tag.
+#
+# Commits and pull requests together, each change once: a commit pushed to main
+# is a line of its own (its subject); a pull request's commits become one line
+# (the PR title, its author, its number), however it was merged. Merge commits
+# and the "Release x.y.z" version bumps are left out. GitHub logins and PR data
+# come from the API (GITHUB_TOKEN), so people get @mentioned and listed under
+# the release, and first-time contributors get their own section.
+
+[remote.github]
+owner = "berkayakin"
+repo = "kin-editor"
+
+[changelog]
+header = ""
+body = """
+{%- set_global seen = [] -%}
+## What's Changed
+{% for commit in commits | reverse -%}
+  {%- set pr = commit.remote.pr_number -%}
+  {%- if pr -%}
+    {%- if pr not in seen -%}
+      {%- set_global seen = seen | concat(with=pr) %}
+* {{ commit.remote.pr_title | default(value=commit.message | split(pat="\n") | first) | trim }}\
+  {%- set author = commit.remote.pr_author | default(value=commit.remote.username) -%}
+  {%- if author %} by @{{ author }}{% endif %} in #{{ pr }}
+    {%- endif -%}
+  {%- else %}
+* {{ commit.message | split(pat="\n") | first | trim }}\
+  {%- if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}
+  {%- endif -%}
+{%- endfor %}
+{% set newcomers = github.contributors | filter(attribute="is_first_time", value=true) -%}
+{%- if newcomers %}
+## New Contributors
+{% for person in newcomers -%}
+* @{{ person.username }} made their first contribution\
+  {%- if person.pr_number %} in #{{ person.pr_number }}{% endif %}
+{% endfor -%}
+{%- endif %}
+{% if previous.version and version -%}
+**Full Changelog**: https://github.com/berkayakin/kin-editor/compare/{{ previous.version }}...{{ version }}
+{% endif -%}
+"""
+trim = true
+
+[git]
+conventional_commits = false
+filter_unconventional = false
+filter_commits = false
+topo_order = false
+commit_parsers = [
+  { message = "^Merge (pull request|branch|remote-tracking branch)", skip = true },
+  { message = "^Release \\d+\\.\\d+\\.\\d+", skip = true },
+]

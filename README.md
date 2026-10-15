@@ -148,6 +148,9 @@ The release gets a universal macOS `Kin.app` (`.dmg` and `.zip`), a Windows inst
 [`scripts/kin.iss`](scripts/kin.iss)) and `.zip`, and a Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
 [minisign](https://jedisct1.github.io/minisign/) using the `MINISIGN_SECRET_KEY` repository
 secret. Tags with a hyphen (`v0.3.0-beta.1`) become pre-releases, which the updater skips.
+The release notes come from [git-cliff](https://git-cliff.org) ([`cliff.toml`](cliff.toml)):
+every commit and pull request since the previous tag, each change once (a pull request is one
+line, however it was merged), with authors @mentioned and first-time contributors listed.
 
 Released builds check for updates shortly after launch and every few hours (unless
 `auto_update` is `false`; **Check for Updates…** works either way), download in the background
