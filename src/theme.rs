@@ -48,6 +48,9 @@ pub struct Theme {
     pub name: SharedString,
     pub appearance: Appearance,
     pub italic_comments: bool,
+    /// The theme file's `deep_chrome`: keep its chrome as dark as written
+    /// instead of capping it at `MAX_CHROME_STEP` from the islands.
+    pub deep_chrome: bool,
     /// From the `visual_effects` setting (not theme files): draw gradients
     /// (Full only).
     pub gradients: bool,
@@ -241,6 +244,7 @@ impl Theme {
             name: "".into(),
             appearance,
             italic_comments: true,
+            deep_chrome: false,
             gradients: true,
             reduce_effects: false,
             ui_font: ".SystemUIFont".into(),
@@ -373,6 +377,8 @@ pub struct ThemeFile {
     #[serde(default)]
     pub italic_comments: Option<bool>,
     #[serde(default)]
+    pub deep_chrome: Option<bool>,
+    #[serde(default)]
     pub colors: HashMap<String, String>,
     #[serde(default)]
     pub syntax: HashMap<String, String>,
@@ -390,6 +396,7 @@ impl ThemeFile {
 
 static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/clay-black.json"),
+    include_str!("../assets/themes/onyx.json"),
     include_str!("../assets/themes/clay-dark.json"),
     include_str!("../assets/themes/clay-light.json"),
     include_str!("../assets/themes/github-light.json"),
@@ -402,6 +409,7 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/rose-pine.json"),
     include_str!("../assets/themes/solarized-dark.json"),
     include_str!("../assets/themes/monokai-pro.json"),
+    include_str!("../assets/themes/monokai-pro-contrast.json"),
     include_str!("../assets/themes/everforest-dark.json"),
     include_str!("../assets/themes/kanagawa.json"),
     include_str!("../assets/themes/ayu-dark.json"),
@@ -423,7 +431,7 @@ static BUILTIN: &[&str] = &[
 ];
 
 /// The theme used when settings name none.
-pub const DEFAULT_THEME: &str = "Monokai Pro";
+pub const DEFAULT_THEME: &str = "Monokai Pro Contrast";
 /// What themes without `extends` fill missing colors from, per appearance.
 pub const DEFAULT_DARK: &str = "Clay Black";
 pub const DEFAULT_LIGHT: &str = "Clay Light";
@@ -600,6 +608,7 @@ fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
             appearance: theme.get("appearance").and_then(|a| a.as_str()).map(str::to_string),
             extends: None,
             italic_comments: None,
+            deep_chrome: None,
             colors,
             syntax,
         });
@@ -653,6 +662,9 @@ fn resolve(
     if let Some(i) = file.italic_comments {
         theme.italic_comments = i;
     }
+    if let Some(d) = file.deep_chrome {
+        theme.deep_chrome = d;
+    }
     let entries = file
         .colors
         .iter()
@@ -699,7 +711,7 @@ pub const MAX_CHROME_STEP: f32 = 2.5;
 /// Moves a dark theme's panel (the chrome) toward its background until the two
 /// are at most `MAX_CHROME_STEP` apart, keeping the theme's own hue between them.
 fn cap_chrome_step(theme: &mut Theme) {
-    if theme.appearance != Appearance::Dark {
+    if theme.appearance != Appearance::Dark || theme.deep_chrome {
         return;
     }
     let (panel, island) = (theme.panel, theme.background);
@@ -1040,7 +1052,7 @@ mod tests {
     #[test]
     fn builtins_are_complete() {
         let all = builtins();
-        assert_eq!(all.len(), 31);
+        assert_eq!(all.len(), 33);
         for file in all.values() {
             let mut errors = Vec::new();
             resolve(file, &all, &mut Vec::new(), &mut errors).unwrap();
@@ -1066,6 +1078,10 @@ mod tests {
         assert_eq!(ayu.panel, parse_color(&all["Ayu Dark"].colors["panel"]).unwrap());
         let solarized = theme("Solarized Light");
         assert_eq!(solarized.panel, parse_color(&all["Solarized Light"].colors["panel"]).unwrap());
+        // A theme with `deep_chrome` keeps its own, however dark.
+        let onyx = theme("Onyx");
+        assert_eq!(onyx.panel, parse_color(&all["Onyx"].colors["panel"]).unwrap());
+        assert!(step(&onyx) > MAX_CHROME_STEP);
     }
 
     #[test]

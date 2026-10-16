@@ -87,6 +87,7 @@ fn theme_schema() -> Value {
             "appearance": { "enum": ["dark", "light"] },
             "extends": { "type": "string", "description": "A theme to take the colors this one doesn't set from." },
             "italic_comments": { "type": "boolean" },
+            "deep_chrome": { "type": "boolean" },
             "colors": { "type": "object", "properties": colors, "additionalProperties": false },
             // Any capture name ("keyword.control") besides the base kinds.
             "syntax": { "type": "object", "properties": syntax, "additionalProperties": color },

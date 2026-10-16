@@ -12,7 +12,7 @@ JetBrains-style comfort, native speed, works with Zed extensions. Free and open 
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md)
 
-![Kuana with the file tree and a Rust file open, in the Monokai Pro theme](docs/screenshots/default.png)
+![Kuana with the file tree and a Rust file open, in the Monokai Pro Contrast theme](docs/screenshots/default.png)
 
 ## Why Kuana
 
@@ -28,7 +28,7 @@ tabs aren't read from disk until you look at them.
 
 **🎨 Beautiful out of the box.** A calm "islands" layout: the sidebar, editors and panels float
 as rounded cards. Tabs are browser-style, transitions are smooth and the chrome stays minimal.
-There are **31 built-in themes**, from Monokai Pro and Catppuccin to Tokyo Night and Rosé Pine,
+There are **33 built-in themes**, from Monokai Pro and Catppuccin to Tokyo Night and Rosé Pine,
 each previewed live as you pick it. Prefer something plainer? One setting tones down gradients,
 shadows and animations.
 

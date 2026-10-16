@@ -750,7 +750,7 @@ impl Global for StartupProblems {}
 pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you save this file.
 // Comments and trailing commas are allowed.
 {
-  // "theme": "Monokai Pro",
+  // "theme": "Monokai Pro Contrast",
 
   // The shortcuts to start from: "JetBrains", "VSCode", "SublimeText" or "Zed".
   // keymap.json goes on top.
