@@ -64,7 +64,11 @@ impl Workspace {
             );
 
         // ---- Start tiles ----
+        // Hovered, a card lights up like a focused text field: the border eases
+        // to the accent and the same soft glow fades in.
+        let (edge, lit) = (Hsla::from(theme.border_subtle), Hsla::from(theme.accent).alpha(0.7));
         let tile = |id: &'static str, icon: Icon, title: &'static str, detail: &'static str, keys: Option<String>| {
+            let glow = crate::ui::field_glow(&theme);
             div()
                 .id(id)
                 .flex()
@@ -74,25 +78,15 @@ impl Workspace {
                 .rounded(px(12.))
                 .bg(theme.panel)
                 .border_1()
-                .border_color(theme.border_subtle)
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.hover).border_color(Hsla::from(theme.accent).alpha(0.45)))
                 .active(|s| s.bg(theme.active))
                 .child(
                     div()
                         .flex()
                         .items_start()
                         .justify_between()
-                        .child(
-                            div()
-                                .size(px(32.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(9.))
-                                .bg(theme.accent_soft)
-                                .child(icon_el(icon, px(16.), theme.accent.into())),
-                        )
+                        // Just the icon, in the accent: no tile behind it.
+                        .child(icon_el(icon, px(24.), theme.accent.into()))
                         .when_some(keys, |el, k| el.child(kbd(k, cx))),
                 )
                 .child(
@@ -103,6 +97,9 @@ impl Workspace {
                         .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(title))
                         .child(div().text_size(px(12.)).text_color(theme.text_dim).line_clamp(2).child(detail)),
                 )
+                .with_hover_transition(SharedString::from(format!("{id}-hover")), transition::FOCUS, move |el, t| {
+                    el.border_color(crate::transition::mix(edge, lit, t)).when(t > 0., |el| el.shadow(crate::ui::faded(glow, t)))
+                })
         };
         let tiles = div()
             .grid()
