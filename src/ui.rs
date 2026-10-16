@@ -93,14 +93,50 @@ pub struct ScrollbarState {
     fade: ScrollbarFade,
 }
 
-/// A scrollbar for what `handle` tracks (a `uniform_list`'s `base_handle`, or a
-/// div's `track_scroll`), laid over the right edge of its parent, which must be
+/// What `scrollbar` scrolls: a div's `track_scroll` or a `uniform_list`'s
+/// `base_handle` (a `ScrollHandle`), or a `list`'s `ListState`.
+pub trait Scrolled: Clone + 'static {
+    /// How far down it is, as a negative offset (GPUI's way).
+    fn offset_y(&self) -> Pixels;
+    fn max_offset_y(&self) -> Pixels;
+    fn set_offset_y(&self, y: Pixels);
+}
+
+impl Scrolled for gpui::ScrollHandle {
+    fn offset_y(&self) -> Pixels {
+        self.offset().y
+    }
+
+    fn max_offset_y(&self) -> Pixels {
+        self.max_offset().height
+    }
+
+    fn set_offset_y(&self, y: Pixels) {
+        self.set_offset(gpui::point(self.offset().x, y));
+    }
+}
+
+impl Scrolled for gpui::ListState {
+    fn offset_y(&self) -> Pixels {
+        self.scroll_px_offset_for_scrollbar().y
+    }
+
+    fn max_offset_y(&self) -> Pixels {
+        self.max_offset_for_scrollbar().height
+    }
+
+    fn set_offset_y(&self, y: Pixels) {
+        self.set_offset_from_scrollbar(gpui::point(px(0.), y));
+    }
+}
+
+/// A scrollbar for what `handle` tracks (`Scrolled`), laid over the right edge of its parent, which must be
 /// `relative` and as tall as the scrolled area. Like an overlay scrollbar: it
 /// shows while the content scrolls or the pointer is over it, then fades out
 /// (`ScrollbarFade`; no fades with Minimal visual effects); only when the
 /// content overflows.
 /// Drag the thumb, or click the track to jump there.
-pub fn scrollbar(id: impl Into<gpui::ElementId>, handle: &gpui::ScrollHandle, cx: &App) -> gpui::Canvas<(gpui::Hitbox, Entity<ScrollbarState>)> {
+pub fn scrollbar(id: impl Into<gpui::ElementId>, handle: &impl Scrolled, cx: &App) -> gpui::Canvas<(gpui::Hitbox, Entity<ScrollbarState>)> {
     let id = id.into();
     let handle = handle.clone();
     let theme = Theme::get(cx);
@@ -111,12 +147,12 @@ pub fn scrollbar(id: impl Into<gpui::ElementId>, handle: &gpui::ScrollHandle, cx
             (window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal), state)
         },
         move |bounds, (hitbox, state), window, cx| {
-            let max = handle.max_offset().height;
+            let max = handle.max_offset_y();
             let track = bounds.size.height;
             if max <= px(0.) || track <= px(0.) {
                 return;
             }
-            let offset = handle.offset().y;
+            let offset = handle.offset_y();
             let (fade, wake) = state.update(cx, |s, _| s.fade.step(offset, s.grab.is_some() || s.hovered, minimal));
             match wake {
                 FadeWake::Frame => window.request_animation_frame(),
@@ -151,7 +187,7 @@ pub fn scrollbar(id: impl Into<gpui::ElementId>, handle: &gpui::ScrollHandle, cx
                 let handle = handle.clone();
                 move |y: Pixels, grab: Pixels| {
                     let t = ((y - grab - top) / travel).clamp(0., 1.);
-                    handle.set_offset(gpui::point(handle.offset().x, -(max * t)));
+                    handle.set_offset_y(-(max * t));
                 }
             };
             window.on_mouse_event({

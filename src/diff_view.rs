@@ -9,8 +9,8 @@ use std::{
 };
 
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, IntoElement, Render,
-    ScrollStrategy, SharedString, StyledText, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, IntoElement, ListAlignment,
+    ListOffset, ListState, Render, SharedString, StyledText, Window, div, list, prelude::*, px,
 };
 use ropey::Rope;
 
@@ -25,7 +25,10 @@ use crate::{
     ui::{HoverFill, icon_el, text_button, tooltip_view},
 };
 
+/// A line's height: a row is one line, more when its text wraps.
 const ROW_HEIGHT: f32 = 20.;
+/// Room on the right of a change's first row for its Stage / Unstage button.
+const CHANGE_BUTTON_ROOM: f32 = 84.;
 
 pub enum DiffViewEvent {
     Close,
@@ -76,7 +79,8 @@ pub struct DiffView {
     /// The change last jumped to with F7 / ⇧F7.
     current_change: Option<usize>,
     focus_handle: FocusHandle,
-    scroll: UniformListScrollHandle,
+    /// The rows, which wrap long lines and so differ in height.
+    list: ListState,
 }
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
@@ -93,7 +97,7 @@ impl DiffView {
             loaded: None,
             current_change: None,
             focus_handle,
-            scroll: UniformListScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(400.)).measure_all(),
         };
         view.reload(cx);
         view
@@ -162,6 +166,10 @@ impl DiffView {
                 .await;
             this.update(cx, |this, cx| {
                 this.loaded = Some(Arc::new(loaded));
+                // A change staged: the same place, by row (the rows are much the same).
+                let top = this.list.logical_scroll_top();
+                this.list.reset(this.rows_len());
+                this.list.scroll_to(top);
                 cx.notify();
             })
             .ok();
@@ -228,7 +236,7 @@ impl DiffView {
         };
         self.current_change = Some(next);
         if let Some(row) = self.row_of_change(next) {
-            self.scroll.scroll_to_item(row.saturating_sub(3), ScrollStrategy::Top);
+            self.list.scroll_to(ListOffset { item_ix: row.saturating_sub(3), offset_in_item: px(0.) });
         }
         cx.notify();
     }
@@ -248,7 +256,7 @@ impl DiffView {
     fn set_side_by_side(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.side_by_side != on {
             self.side_by_side = on;
-            self.scroll = UniformListScrollHandle::new();
+            self.list.reset(self.rows_len());
             cx.emit(DiffViewEvent::Layout { side_by_side: on });
             cx.notify();
         }
@@ -458,7 +466,6 @@ impl Render for DiffView {
             })
             .child(icon_button("diff-close", Icon::X, "Close (Esc)").on_click(cx.listener(|_, _, _, cx| cx.emit(DiffViewEvent::Close))));
 
-        let rows = self.rows_len();
         let body = match self.loaded.clone() {
             None => div().flex_1().p_4().text_color(theme.text_dim).child("Loading diff…").into_any_element(),
             Some(loaded) if loaded.images.is_some() => self.render_images(loaded.images.as_ref().unwrap(), &theme).into_any_element(),
@@ -474,20 +481,20 @@ impl Render for DiffView {
             Some(loaded) => {
                 let side_by_side = self.side_by_side;
                 let current_change = self.current_change;
-                let list = uniform_list("diff-rows", rows, {
-                    cx.processor(move |this, range: Range<usize>, _window, cx| {
-                        let theme = Theme::get(cx).clone();
-                        range.map(|ix| this.render_row(&loaded, ix, side_by_side, current_change, &theme, cx)).collect()
-                    })
-                })
-                .track_scroll(self.scroll.clone())
+                let row_theme = theme.clone();
+                let rows = list(
+                    self.list.clone(),
+                    cx.processor(move |this, ix: usize, _window, cx| this.render_row(&loaded, ix, side_by_side, current_change, &row_theme, cx)),
+                )
                 .flex_1()
                 .w_full()
                 .pt_1()
                 .pb(px(10.))
                 .bg(theme.background)
                 .font_family(theme.mono_font.clone())
-                .text_size(px(theme.editor_font_size - 1.));
+                .text_size(px(theme.editor_font_size - 1.))
+                // Wrapped lines stack at the rows' height.
+                .line_height(px(ROW_HEIGHT));
                 div()
                     .relative()
                     .flex()
@@ -495,8 +502,8 @@ impl Render for DiffView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(list)
-                    .child(crate::ui::list_scrollbar("diff-scrollbar", &self.scroll, cx))
+                    .child(rows)
+                    .child(crate::ui::scrollbar("diff-scrollbar", &self.list, cx))
                     .into_any_element()
             }
         };
@@ -581,7 +588,7 @@ impl DiffView {
                 .text_color(theme.line_number)
                 .child(n.map(|n| n.to_string()).unwrap_or_default())
         };
-        let row = div().id(ix).relative().w_full().flex().h(px(ROW_HEIGHT));
+        let row = div().id(ix).relative().w_full().flex().min_h(px(ROW_HEIGHT));
 
         let (kind, label, change) = if side_by_side {
             let r = &loaded.doc.split[ix];
@@ -592,6 +599,7 @@ impl DiffView {
         };
         if kind == DiffLineKind::Skipped {
             return row
+                .h(px(ROW_HEIGHT))
                 .justify_center()
                 .items_center()
                 .bg(theme.panel)
@@ -608,23 +616,30 @@ impl DiffView {
                 .into_any_element();
         }
 
+        // A change's first row has its Stage / Unstage button at the right:
+        // the text under it wraps before it.
+        let button = match change {
+            Some((c, true)) => self.change_op(c),
+            _ => None,
+        };
+        let text = |line: StyledText, room: bool| div().flex_1().min_w_0().when(room, |el| el.pr(px(CHANGE_BUTTON_ROOM))).child(line);
         let row = if side_by_side {
             let r = &loaded.doc.split[ix];
-            let half = |side: Option<&git::DiffSide>, spans: &LineSpans, bg: Hsla, em: Hsla, changed: bool| {
-                let cell = div().flex_1().min_w_0().h_full().flex().overflow_hidden();
+            let half = |side: Option<&git::DiffSide>, spans: &LineSpans, bg: Hsla, em: Hsla, changed: bool, room: bool| {
+                let cell = div().flex_1().min_w_0().flex().overflow_hidden();
                 match side {
                     Some(s) => cell
                         .when(changed, |el| el.bg(bg))
                         .child(number(Some(s.no)))
-                        .child(div().whitespace_nowrap().child(styled_line(&s.text, spans.get(s.no - 1), &s.emphasis, em, theme))),
+                        .child(text(styled_line(&s.text, spans.get(s.no - 1), &s.emphasis, em, theme), room)),
                     // The other side has no line here.
                     None => cell.bg(theme.panel),
                 }
             };
             let changed = r.kind != DiffLineKind::Context;
-            row.child(half(r.left.as_ref(), &loaded.old_spans, removed_bg, removed_em, changed))
+            row.child(half(r.left.as_ref(), &loaded.old_spans, removed_bg, removed_em, changed, false))
                 .child(div().w(px(1.)).h_full().flex_shrink_0().bg(theme.border))
-                .child(half(r.right.as_ref(), &loaded.new_spans, added_bg, added_em, changed))
+                .child(half(r.right.as_ref(), &loaded.new_spans, added_bg, added_em, changed, button.is_some()))
         } else {
             let l = &loaded.doc.unified[ix];
             let (bg, sign, sign_color, em, spans): (Option<Hsla>, &str, Hsla, Hsla, Option<&Vec<_>>) = match l.kind {
@@ -636,14 +651,14 @@ impl DiffView {
                 .child(number(l.old_no))
                 .child(number(l.new_no))
                 .child(div().w(px(16.)).flex_shrink_0().text_color(sign_color).child(sign.to_string()))
-                .child(div().whitespace_nowrap().child(styled_line(&l.text, spans, &l.emphasis, em, theme)))
+                .child(text(styled_line(&l.text, spans, &l.emphasis, em, theme), button.is_some()))
         };
 
         // The first row of a change: a marker for F7, and Stage / Unstage.
         let row = match change {
             Some((c, true)) => {
                 let row = row.when(current_change == Some(c), |el| el.border_t_1().border_color(theme.accent));
-                match self.change_op(c) {
+                match button {
                     Some((op, label)) => row.child(
                         div()
                             .id(("change-op", c))
