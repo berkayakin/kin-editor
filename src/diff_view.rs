@@ -3,14 +3,16 @@
 //! colors, changed words emphasized, and Stage / Unstage per change.
 
 use std::{
+    cell::Cell,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, Hsla, IntoElement, ListAlignment,
-    ListOffset, ListState, Render, SharedString, StyledText, Window, div, list, prelude::*, px,
+    ListOffset, ListState, Pixels, Render, SharedString, StyledText, Window, canvas, div, list, prelude::*, px,
 };
 use ropey::Rope;
 
@@ -29,6 +31,14 @@ use crate::{
 const ROW_HEIGHT: f32 = 20.;
 /// Room on the right of a change's first row for its Stage / Unstage button.
 const CHANGE_BUTTON_ROOM: f32 = 84.;
+/// Narrower than this, two halves are too narrow to read: the diff shows
+/// unified (as VS Code's does) and drops the switch, keeping the choice.
+const SIDE_BY_SIDE_MIN_WIDTH: f32 = 720.;
+
+/// Whether a view `width` wide fits side by side (0: not laid out yet).
+fn fits_side_by_side(width: Pixels) -> bool {
+    width == px(0.) || width >= px(SIDE_BY_SIDE_MIN_WIDTH)
+}
 
 pub enum DiffViewEvent {
     Close,
@@ -72,7 +82,12 @@ struct Loaded {
 pub struct DiffView {
     repo: PathBuf,
     source: DiffSource,
+    /// The chosen layout.
     side_by_side: bool,
+    /// The layout shown: unified when the view is too narrow for halves.
+    shown_side_by_side: bool,
+    /// The view's width last frame.
+    width: Rc<Cell<Pixels>>,
     /// Show every line instead of collapsing unchanged runs.
     expanded: bool,
     loaded: Option<Arc<Loaded>>,
@@ -93,6 +108,8 @@ impl DiffView {
             repo,
             source,
             side_by_side,
+            shown_side_by_side: side_by_side,
+            width: Rc::default(),
             expanded: false,
             loaded: None,
             current_change: None,
@@ -213,13 +230,13 @@ impl DiffView {
     }
 
     fn rows_len(&self) -> usize {
-        self.loaded.as_ref().map_or(0, |l| if self.side_by_side { l.doc.split.len() } else { l.doc.unified.len() })
+        self.loaded.as_ref().map_or(0, |l| if self.shown_side_by_side { l.doc.split.len() } else { l.doc.unified.len() })
     }
 
     /// Row of the first line of change `ix` in the current layout.
     fn row_of_change(&self, ix: usize) -> Option<usize> {
         let loaded = self.loaded.as_ref()?;
-        if self.side_by_side {
+        if self.shown_side_by_side {
             loaded.doc.split.iter().position(|r| r.change == Some((ix, true)))
         } else {
             loaded.doc.unified.iter().position(|l| l.change == Some((ix, true)))
@@ -256,6 +273,7 @@ impl DiffView {
     fn set_side_by_side(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.side_by_side != on {
             self.side_by_side = on;
+            self.shown_side_by_side = on && fits_side_by_side(self.width.get());
             self.list.reset(self.rows_len());
             cx.emit(DiffViewEvent::Layout { side_by_side: on });
             cx.notify();
@@ -367,6 +385,12 @@ impl Focusable for DiffView {
 impl Render for DiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        // Narrowed or widened past where halves fit: the other layout.
+        let fits = fits_side_by_side(self.width.get());
+        if self.shown_side_by_side != (self.side_by_side && fits) {
+            self.shown_side_by_side = self.side_by_side && fits;
+            self.list.reset(self.rows_len());
+        }
         let (path, rel, change) = self.file_label();
         let file_icon = crate::ui::file_icon(&path, px(16.), &theme);
         let (added, removed) = self.loaded.as_ref().map_or((0, 0), |l| (l.doc.added, l.doc.removed));
@@ -434,7 +458,7 @@ impl Render for DiffView {
                     .child(div().flex_shrink_0().text_size(px(12.)).text_color(theme.git_deleted).child(format!("−{removed}")))
             })
             .child(div().flex_1())
-            .when(!binary, |el| el.child(
+            .when(!binary && fits, |el| el.child(
                 crate::ui::dock(&theme)
                     .child(segment("diff-split", "Side by Side", self.side_by_side).on_click(cx.listener(|this, _, _, cx| this.set_side_by_side(true, cx))))
                     .child(segment("diff-unified", "Unified", !self.side_by_side).on_click(cx.listener(|this, _, _, cx| this.set_side_by_side(false, cx)))),
@@ -479,7 +503,7 @@ impl Render for DiffView {
                 div().flex_1().p_4().text_color(theme.text_dim).child("No differences").into_any_element()
             }
             Some(loaded) => {
-                let side_by_side = self.side_by_side;
+                let side_by_side = self.shown_side_by_side;
                 let current_change = self.current_change;
                 let row_theme = theme.clone();
                 let rows = list(
@@ -508,7 +532,9 @@ impl Render for DiffView {
             }
         };
 
+        let width = self.width.clone();
         div()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.elevated)
@@ -524,6 +550,21 @@ impl Render for DiffView {
             .size_full()
             .child(header)
             .child(body)
+            // Its width, for the layout: a frame again when halves stop or start fitting.
+            .child(
+                canvas(
+                    move |bounds, window, _| {
+                        let was = width.replace(bounds.size.width);
+                        // (A refresh while drawing is ignored; this asks for the next frame.)
+                        if fits_side_by_side(was) != fits_side_by_side(bounds.size.width) {
+                            window.request_animation_frame();
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 }
 
