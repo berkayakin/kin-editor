@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{Context, Div, Entity, EventEmitter, FontWeight, Hsla, MouseButton, Render, SharedString, Stateful, Subscription, Window, div, prelude::*, px, uniform_list};
+use gpui::{Context, Div, Entity, EventEmitter, FontWeight, Hsla, Render, SharedString, Stateful, Subscription, Window, div, prelude::*, px, uniform_list};
 
 use crate::{
     assets::Icon,
@@ -14,7 +14,7 @@ use crate::{
     lint::Severity,
     run::OutputProblem,
     theme::Theme,
-    ui::{HoverFill, icon_button, icon_el},
+    ui::{HoverFill, icon_el},
 };
 
 pub enum ProblemsEvent {
@@ -91,15 +91,7 @@ impl Render for ProblemsPanel {
         let run_count = self.run_shown(doc).len();
         let diag_count = doc.map_or(0, |d| d.diagnostics.len());
 
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .h(px(32.))
-            .px_3()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border_subtle)
+        let header = crate::ui::panel_header(&theme)
             .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child("PROBLEMS"))
             .child(
                 div()
@@ -111,11 +103,7 @@ impl Render for ProblemsPanel {
                     .child((diag_count + run_count).to_string()),
             )
             .child(div().flex_1())
-            .child(
-                icon_button("close-problems", Icon::X, theme.text_dim.into(), cx)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ProblemsEvent::Close))),
-            );
+            .child(crate::ui::panel_close_button("close-problems", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(ProblemsEvent::Close))));
 
         // Rows, top to bottom: the file's title when the last Run reported
         // problems too, the file's problems, then the Run's title and its

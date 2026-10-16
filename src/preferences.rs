@@ -27,7 +27,7 @@ use crate::{
     workspace::Find,
     ui::{
         Button, HoverFill,
-        GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, selected_edge, switch, text_button,
+        GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, switch, text_button,
         tooltip_view,
     },
 };
@@ -1020,7 +1020,7 @@ impl Preferences {
                 .rounded(px(8.))
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
-                .when(selected, |el| el.bg(theme.accent_soft).font_weight(FontWeight::MEDIUM).child(selected_edge(&theme)))
+                .when(selected, |el| el.bg(theme.accent_soft).font_weight(FontWeight::MEDIUM))
                 .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
                 .row_hover(theme.hover)
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.show_page(page, window, cx)))
@@ -2155,7 +2155,7 @@ impl Preferences {
                 .rounded(px(8.))
                 .cursor_pointer()
                 .text_color(if selected { theme.text } else { theme.text_muted })
-                .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(&theme)))
+                .when(selected, |el| el.bg(theme.accent_soft))
                 .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
                 .row_hover(theme.hover)
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.select_language(language, cx)))

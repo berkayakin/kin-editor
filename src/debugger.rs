@@ -951,7 +951,7 @@ impl Render for DebugSession {
                     .mx_1()
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(4.)).bottom(px(4.))))
+                    .when(selected, |el| el.bg(theme.accent_soft))
                     .row_hover(theme.hover)
                     .on_click(cx.listener(move |s, _: &ClickEvent, _, cx| s.select_frame(ix, cx)))
                     .child(div().flex_1().min_w_0().truncate().text_color(if ours { theme.text } else { theme.text_dim }).child(f.name.clone()))

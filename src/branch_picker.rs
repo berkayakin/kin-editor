@@ -152,7 +152,7 @@ impl Render for BranchPicker {
                             .px_2p5()
                             .rounded(px(8.))
                             .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
+                            .when(is_selected, |el| el.bg(theme.accent_soft))
                             .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, _, _, cx| this.confirm(ix, cx)));
                         let row = match &items[ix] {

@@ -462,20 +462,13 @@ impl Render for GitLog {
             Some(path) => format!("HISTORY · {}", path.rsplit('/').next().unwrap_or(path)).into(),
             None => "GIT LOG".into(),
         };
-        let header = div()
-            .flex()
-            .items_center()
+        let header = crate::ui::panel_header(&theme)
             .gap_1()
-            .h(px(32.))
-            .px_2()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border_subtle)
-            .child(div().px_1().mr_1().flex_shrink_0().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child(title))
+            .child(div().mr_1().flex_shrink_0().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child(title))
             .when(self.path.is_some(), |el| {
                 el.child(toggle("log-whole", Icon::X, false, "Show the Whole Log").on_click(cx.listener(|this, _, _, cx| this.show_path(None, cx))))
             })
-            // Compact, like the header's buttons, so the 32px header keeps some room.
+            // Compact, like the header's buttons, so the header keeps some room around it.
             .child(div().w(px(280.)).child(input_box(&self.filter, Some(Icon::Search), window, cx).h(px(24.)).rounded(px(6.)).text_size(px(12.5))))
             .when(self.path.is_none(), |el| {
                 el.child(toggle("log-all", Icon::GitBranch, self.all_branches, "Show All Branches").on_click(cx.listener(|this, _, _, cx| {
@@ -486,7 +479,7 @@ impl Render for GitLog {
             .child(toggle("log-refresh", Icon::Refresh, false, "Refresh").on_click(cx.listener(|this, _, _, cx| this.reload(cx))))
             .when(self.loading, |el| el.child(div().text_size(px(11.5)).text_color(theme.text_dim).child("Loading…")))
             .child(div().flex_1())
-            .child(toggle("log-close", Icon::X, false, "Hide").on_click(cx.listener(|_, _, _, cx| cx.emit(GitLogEvent::Close))));
+            .child(crate::ui::panel_close_button("log-close", cx).on_click(cx.listener(|_, _, _, cx| cx.emit(GitLogEvent::Close))));
 
         let list = if let Some(err) = &self.error {
             div().flex_1().p_3().text_color(theme.error).child(err.clone()).into_any_element()

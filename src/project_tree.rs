@@ -20,7 +20,7 @@ use crate::{
     git::Change,
     git_panel::change_color,
     theme::Theme,
-    ui::{DragLabel, HoverFill, file_icon, folder_icon, icon_el, selected_edge},
+    ui::{DragLabel, HoverFill, file_icon, folder_icon, icon_el},
     workspace::{RedoFileChange, UndoFileChange},
 };
 
@@ -265,7 +265,7 @@ impl Render for ProjectTree {
                                 .cursor_pointer()
                                 .text_color(if selected { theme.text } else { theme.text_muted })
                                 // A lit edge marks the open file.
-                                .when(selected, |el| el.bg(theme.accent_soft).child(selected_edge(theme)))
+                                .when(selected, |el| el.bg(theme.accent_soft))
                                 .row_hover(theme.hover)
                                 .on_click(cx.listener(move |tree, _, _, cx| tree.click(ix, cx)))
                                 .on_drag(dragged, |entry, _, _, cx| cx.new(|_| DragLabel(entry.name.clone())))

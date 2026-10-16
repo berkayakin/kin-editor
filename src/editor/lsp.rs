@@ -1214,7 +1214,7 @@ impl Editor {
                             .px_2()
                             .rounded(px(6.))
                             .cursor_pointer()
-                            .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(4.)).bottom(px(4.))))
+                            .when(selected, |el| el.bg(theme.accent_soft))
                             .on_mouse_down(MouseButton::Left, cx.listener(move |e, _, _, cx| {
                                 cx.stop_propagation();
                                 e.accept_completion(ix, false, cx);

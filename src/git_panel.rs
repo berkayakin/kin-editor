@@ -386,7 +386,7 @@ impl GitPanel {
                 .pr_1()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
+                .when(is_selected, |el| el.bg(theme.accent_soft))
                 .when(is_menu_target, |el| el.border_1().border_color(Hsla::from(theme.accent).alpha(0.6)))
                 .row_hover(theme.hover)
                 .on_mouse_down(

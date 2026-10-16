@@ -176,7 +176,7 @@ impl Render for ThemePicker {
                                 .px_2p5()
                                 .rounded(px(8.))
                                 .cursor_pointer()
-                                .when(is_selected, |el| el.bg(current.accent_soft).child(crate::ui::selected_edge(&current)))
+                                .when(is_selected, |el| el.bg(current.accent_soft))
                                 .row_hover(current.hover)
                                 .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                     this.select(ix, cx);

@@ -707,7 +707,7 @@ impl Render for Picker {
                                 let is_selected = ix == selected;
                                 let row = row
                                     .cursor_pointer()
-                                    .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme)))
+                                    .when(is_selected, |el| el.bg(theme.accent_soft))
                                     .row_hover(theme.hover)
                                     .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
                                         this.confirm(ix, ev.modifiers().secondary(), cx)

@@ -430,7 +430,7 @@ impl Render for ProjectSearch {
                             .px_3()
                             .rounded(px(7.))
                             .cursor_pointer()
-                            .when(is_selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
+                            .when(is_selected, |el| el.bg(theme.accent_soft))
                             .row_hover(theme.hover)
                             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                 this.select(ix, cx);

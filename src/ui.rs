@@ -310,13 +310,6 @@ pub fn popover(theme: &Theme) -> Div {
         .shadow(soft_shadow(theme, 2))
 }
 
-/// The lit edge that marks the selected row in a list (the row must be
-/// `relative`), like the open file in the file tree: a short pill set just
-/// inside the row, wide enough that its rounded ends show.
-pub fn selected_edge(theme: &Theme) -> Div {
-    div().absolute().left(px(3.)).top(px(7.)).bottom(px(7.)).w(px(3.)).rounded_full().bg(theme.accent)
-}
-
 /// A container for related toggles, drawn like a segmented control; its
 /// buttons use `segment_on` for the one that's active.
 pub fn dock(theme: &Theme) -> Div {
@@ -472,6 +465,30 @@ pub fn switch(on: bool, theme: &Theme) -> impl IntoElement {
         .when(on, |el| el.bg(theme.accent).justify_end().shadow(focus_glow(theme)))
         .when(!on, |el| el.bg(theme.active))
         .child(div().size(px(12.)).rounded_full().bg(if on { theme.background } else { theme.text_dim }))
+}
+
+/// A bottom panel's header row (Problems, Git log): its title at the left, a
+/// hairline under it, room above and below its controls, and the close button
+/// (`panel_close_button`) at the same place in every panel.
+pub fn panel_header(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(38.))
+        .flex_shrink_0()
+        .pl(px(10.))
+        .pr(px(4.))
+        .border_b_1()
+        .border_color(theme.border_subtle)
+}
+
+/// The close button at the right of a `panel_header`.
+pub fn panel_close_button(id: impl Into<gpui::ElementId>, cx: &App) -> Button {
+    let theme = Theme::get(cx);
+    icon_button(id, Icon::X, theme.text_dim.into(), cx)
+        .tooltip(|_, cx| tooltip_view("Hide", cx))
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
 }
 
 pub fn icon_button(id: impl Into<gpui::ElementId>, icon: Icon, color: Hsla, cx: &App) -> Button {

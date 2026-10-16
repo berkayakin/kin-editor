@@ -180,7 +180,7 @@ impl Render for ContextMenu {
                                 .rounded(px(6.))
                                 .cursor_pointer()
                                 .text_color(color)
-                                .when(selected, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(&theme).top(px(5.)).bottom(px(5.))))
+                                .when(selected, |el| el.bg(theme.accent_soft))
                                 .row_hover(theme.accent_soft)
                                 .on_mouse_move(cx.listener(move |this, _, _, cx| {
                                     if this.selected != Some(ix) {

@@ -201,7 +201,7 @@ impl RemotesDialog {
                     .h(px(34.))
                     .px_2p5()
                     .rounded(px(8.))
-                    .when(editing, |el| el.bg(theme.accent_soft).child(crate::ui::selected_edge(theme)))
+                    .when(editing, |el| el.bg(theme.accent_soft))
                     .row_hover(theme.hover)
                     .child(icon_el(Icon::Cloud, px(14.), if editing { theme.accent.into() } else { theme.text_muted.into() }))
                     .child(div().flex_shrink_0().font_weight(FontWeight::MEDIUM).text_color(theme.text).child(remote.name.clone()))
