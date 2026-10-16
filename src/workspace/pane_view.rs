@@ -251,7 +251,7 @@ impl Workspace {
         let theme = Theme::get(cx).clone();
         let (path, rel) = view.read(cx).tab_file();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
-        let edge = Hsla::from(theme.border).alpha(0.75);
+        let edge = crate::ui::island_edge(&theme);
         let close_view = view.clone();
         let tab = div()
             .id("diff-tab")
@@ -343,9 +343,9 @@ impl Workspace {
         let drop_group = SharedString::from(format!("pane-drop-{pane_ix}"));
         // With splits, the pane that has the keyboard is outlined (its current tab too).
         let edge: Hsla = if multiple && pane_ix == self.active_pane {
-            Hsla::from(theme.accent).alpha(0.35)
+            crate::ui::focused_edge(&theme)
         } else {
-            Hsla::from(theme.border).alpha(0.75)
+            crate::ui::island_edge(&theme)
         };
         let island = island(&theme)
             .flex_1()

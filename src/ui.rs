@@ -228,6 +228,19 @@ pub fn list_scrollbar(
 // above). The main window, Preferences and the pickers all follow it; menus,
 // popovers and tooltips are `popover`s floating above everything.
 
+/// An island's resting outline, the same at every visual effects level: the
+/// chrome is kept close to the islands' color (`theme::MAX_CHROME_STEP`) and
+/// their shadows are light, so the outline is what shows where an island ends.
+pub fn island_edge(theme: &Theme) -> Hsla {
+    Hsla::from(theme.border).alpha(0.6)
+}
+
+/// The outline of the split (pane or terminal group) that has the keyboard:
+/// a hint of the accent, not a frame.
+pub fn focused_edge(theme: &Theme) -> Hsla {
+    Hsla::from(theme.accent).alpha(0.22)
+}
+
 /// Space between islands, and around them.
 pub const GAP: f32 = 6.0;
 pub const ISLAND_RADIUS: f32 = 12.0;
@@ -235,14 +248,14 @@ pub const ISLAND_RADIUS: f32 = 12.0;
 /// (editor, terminal) is kept this far inside an island's rounded corners.
 pub const ISLAND_INSET: f32 = 4.0;
 
-/// The chrome's background: the panel color, with an accent glow at the top
-/// that has faded out by `fade` (0–1) of the height; just the panel color
-/// below Full visual effects.
+/// The chrome's background: the panel color, with a faint accent glow at the
+/// top (more would tint the whole title bar) that has faded out by `fade`
+/// (0–1) of the height; just the panel color below Full visual effects.
 pub fn chrome_bg(theme: &Theme, fade: f32) -> gpui::Background {
     if !theme.gradients {
         return theme.panel.into();
     }
-    let top = Hsla::from(theme.panel).blend(Hsla::from(theme.accent).alpha(0.07));
+    let top = Hsla::from(theme.panel).blend(Hsla::from(theme.accent).alpha(0.02));
     gpui::linear_gradient(180., gpui::linear_color_stop(top, 0.), gpui::linear_color_stop(theme.panel, fade))
 }
 
@@ -252,17 +265,18 @@ pub fn soft_shadow(theme: &Theme, depth: u8) -> Vec<gpui::BoxShadow> {
     if theme.reduce_effects {
         return Vec::new();
     }
-    let alpha: f32 = match theme.appearance {
-        Appearance::Dark => 0.32,
-        Appearance::Light => 0.07,
-    };
-    let (alpha, y, blur) = match depth {
-        0 | 1 => (alpha, 2., 12.),
-        2 => (alpha * 1.4, 8., 24.),
-        _ => (alpha * 1.8, 16., 48.),
+    // On dark chrome an island's shadow only darkens the gap around it, so it
+    // stays light; things that float above the window need the depth.
+    let (alpha, y, blur): (f32, f32, f32) = match (theme.appearance, depth) {
+        (Appearance::Dark, 0 | 1) => (0.12, 2., 12.),
+        (Appearance::Dark, 2) => (0.35, 8., 24.),
+        (Appearance::Dark, _) => (0.45, 16., 48.),
+        (Appearance::Light, 0 | 1) => (0.07, 2., 12.),
+        (Appearance::Light, 2) => (0.1, 8., 24.),
+        (Appearance::Light, _) => (0.13, 16., 48.),
     };
     vec![gpui::BoxShadow {
-        color: gpui::hsla(0., 0., 0., alpha.min(0.6)),
+        color: gpui::hsla(0., 0., 0., alpha),
         offset: gpui::point(px(0.), px(y)),
         blur_radius: px(blur),
         spread_radius: px(0.),
@@ -280,7 +294,7 @@ pub fn island(theme: &Theme) -> Div {
         .rounded(px(ISLAND_RADIUS))
         .bg(theme.background)
         .border_1()
-        .border_color(Hsla::from(theme.border).alpha(0.75))
+        .border_color(island_edge(theme))
         .shadow(soft_shadow(theme, 1))
 }
 

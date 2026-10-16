@@ -683,7 +683,50 @@ fn resolve(
             (_, None) => errors.push(format!("{}: invalid color \"{value}\" for \"{key}\"", file.name)),
         }
     }
+    // Once, on the theme as a whole (a parent's own result is still edited above).
+    if stack.is_empty() {
+        cap_chrome_step(&mut theme);
+    }
     Some(theme)
+}
+
+/// How far, in perceived lightness (CIE L*), a dark theme's chrome may be
+/// from its islands. Dark themes often make their panels much darker than the
+/// editor (Cobalt2 by 8): around every island that reads as a dark trench, and
+/// a window full of them is tiring to look at. Light themes keep theirs.
+pub const MAX_CHROME_STEP: f32 = 2.5;
+
+/// Moves a dark theme's panel (the chrome) toward its background until the two
+/// are at most `MAX_CHROME_STEP` apart, keeping the theme's own hue between them.
+fn cap_chrome_step(theme: &mut Theme) {
+    if theme.appearance != Appearance::Dark {
+        return;
+    }
+    let (panel, island) = (theme.panel, theme.background);
+    let step = |c: gpui::Rgba| (lightness(c) - lightness(island)).abs();
+    if step(panel) <= MAX_CHROME_STEP {
+        return;
+    }
+    let mix = |t: f32| gpui::Rgba {
+        r: panel.r + (island.r - panel.r) * t,
+        g: panel.g + (island.g - panel.g) * t,
+        b: panel.b + (island.b - panel.b) * t,
+        a: 1.,
+    };
+    // The step shrinks steadily toward the island color: find where it's the cap.
+    let (mut far, mut near) = (0f32, 1f32);
+    for _ in 0..24 {
+        let t = (far + near) / 2.;
+        if step(mix(t)) > MAX_CHROME_STEP { far = t } else { near = t }
+    }
+    theme.panel = mix(near);
+}
+
+/// CIE L* (0 black – 100 white) of an sRGB color.
+pub fn lightness(c: gpui::Rgba) -> f32 {
+    let linear = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let y = 0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b);
+    if y > 0.008856 { 116. * y.cbrt() - 16. } else { 903.3 * y }
 }
 
 /// The known key closest to a misspelled one, if any is close enough.
@@ -993,6 +1036,22 @@ mod tests {
         }
         let light = all.values().filter(|f| f.appearance() == Some(Appearance::Light)).count();
         assert_eq!(light, 7);
+    }
+
+    #[test]
+    fn dark_chrome_stays_near_the_islands() {
+        let all = builtins();
+        let theme = |name: &str| resolve(&all[name], &all, &mut Vec::new(), &mut Vec::new()).unwrap();
+        let step = |t: &Theme| (lightness(t.panel) - lightness(t.background)).abs();
+        // Cobalt2's panel is 8 L* darker than its editor: it moves up to the cap.
+        let cobalt = theme("Cobalt2");
+        assert!((step(&cobalt) - MAX_CHROME_STEP).abs() < 0.05, "{}", step(&cobalt));
+        assert!(lightness(cobalt.panel) < lightness(cobalt.background));
+        // Ayu Dark's is already close, and light themes keep theirs.
+        let ayu = theme("Ayu Dark");
+        assert_eq!(ayu.panel, parse_color(&all["Ayu Dark"].colors["panel"]).unwrap());
+        let solarized = theme("Solarized Light");
+        assert_eq!(solarized.panel, parse_color(&all["Solarized Light"].colors["panel"]).unwrap());
     }
 
     #[test]

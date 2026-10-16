@@ -212,9 +212,9 @@ impl TerminalPanel {
         let last = g + 1 == count;
         // With splits, the group that has the keyboard is outlined (its current tab too), like a pane.
         let edge: Hsla = if count > 1 && current {
-            Hsla::from(theme.accent).alpha(0.35)
+            crate::ui::focused_edge(&theme)
         } else {
-            Hsla::from(theme.border).alpha(0.75)
+            crate::ui::island_edge(&theme)
         };
         let tabs: Vec<Entity<TerminalView>> = group.map(|g| g.tabs.clone()).unwrap_or_default();
         let active = group.map_or(0, |g| g.active);

@@ -162,8 +162,9 @@ pub(super) fn shared_limit(widths: &[f32], available: f32) -> f32 {
 /// the island's border color `edge` down to its feet, which join it to the
 /// island; the others plain, with a hairline after them (`separator`, hidden
 /// while the tab's `group` is hovered) and, fading in on hover, the same shape,
-/// borderless, between the chrome's and the island's colors, stopping above the
-/// island's border.
+/// borderless, the chrome moved toward the text color (lighter on dark themes,
+/// darker on light ones: the chrome and islands are too close in color for a
+/// shade between them to show), stopping above the island's border.
 ///
 /// Tabs paint left to right, so the hover shape of the tab right after the
 /// current one would cover the current tab's right foot: it repaints that
@@ -217,7 +218,7 @@ pub(super) fn tab_shape(
             .right(px(-TAB_FOOT)),
         );
     }
-    let hover_fill = Hsla::from(theme.panel).blend(island.alpha(0.5));
+    let hover_fill = Hsla::from(theme.panel).blend(Hsla::from(theme.text).alpha(0.07));
     el.child(
         div()
             .absolute()

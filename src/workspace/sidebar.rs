@@ -124,7 +124,7 @@ impl Workspace {
         let theme = Theme::get(cx).clone();
         let files_on = self.sidebar_mode == SidebarMode::Files;
         let changes = self.git_status.files.len();
-        let edge = Hsla::from(theme.border).alpha(0.75);
+        let edge = crate::ui::island_edge(&theme);
         // Padding, icon and gap around a name; the change count adds a gap and itself.
         let count = (changes > 0).then(|| changes.to_string());
         let measured = measure_tab_names(&["Files".to_string(), "Commit".to_string(), count.clone().unwrap_or_default()], window, &theme);
