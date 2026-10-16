@@ -3437,6 +3437,7 @@ name = "kuana"
 version = "0.1.8"
 dependencies = [
  "alacritty_terminal",
+ "base64",
  "encoding_rs",
  "flate2",
  "futures",

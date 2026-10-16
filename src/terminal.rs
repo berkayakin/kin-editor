@@ -138,6 +138,14 @@ impl TerminalView {
         let configured = Settings::get(cx).terminal_shell.clone();
         let venv = crate::python::venv(&cwd);
         let shell = match &run {
+            // PowerShell (the user's when that's PowerShell 7) with their
+            // profile, as a login shell would read it. The script goes
+            // encoded: Windows hands a program one command line, unquoted.
+            Some(target) if cfg!(windows) => {
+                let program = configured.as_ref().and_then(|c| c.first()).filter(|p| is_powershell(p)).cloned();
+                let script = powershell_run_script(&target.command, &cwd, venv.as_deref());
+                Some(vec![program.unwrap_or_else(|| "powershell".into()), "-NoLogo".into(), "-EncodedCommand".into(), encoded_command(&script)])
+            }
             Some(target) => {
                 // A login, interactive shell so PATH matches the user's terminal.
                 let program = configured
@@ -1074,6 +1082,37 @@ fn run_script(command: &str) -> String {
     )
 }
 
+/// The same in PowerShell (Run tabs on Windows), back in `cwd` first (a
+/// profile may change folders) and with the venv's PATH. The last line is
+/// written in `finally`, so a Stop still shows it; `$?` is false for a
+/// command that failed without an exit code (one that isn't found).
+fn powershell_run_script(command: &str, cwd: &Path, venv: Option<&Path>) -> String {
+    use crate::run::powershell_string as quote;
+    // Quoted, a program would just be a string.
+    let call = if command.starts_with(['\'', '"']) { "& " } else { "" };
+    format!(
+        "Set-Location -LiteralPath {cwd}\n{setup}Write-Host {shown} -ForegroundColor DarkGray\n\
+         try {{\n$global:LASTEXITCODE = 0\n{call}{command}\n$kuanaOk = $?\n}} finally {{\n\
+         $kuanaCode = if ($kuanaOk) {{ 0 }} elseif ($global:LASTEXITCODE) {{ $global:LASTEXITCODE }} else {{ 1 }}\n\
+         Write-Host ''\nWrite-Host \"Process finished with exit code $kuanaCode\" -ForegroundColor DarkGray\n}}\nexit $kuanaCode\n",
+        cwd = quote(&cwd.to_string_lossy()),
+        setup = venv.map(crate::python::powershell_exports).unwrap_or_default(),
+        shown = quote(&format!("$ {command}")),
+    )
+}
+
+/// A script for PowerShell's `-EncodedCommand`: base64 of its UTF-16LE.
+fn encoded_command(script: &str) -> String {
+    use base64::Engine;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn is_powershell(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or_default().to_ascii_lowercase();
+    matches!(name.strip_suffix(".exe").unwrap_or(&name), "pwsh" | "powershell")
+}
+
 // ---- Colors ------------------------------------------------------------------------
 
 fn to_hsla(rgb: Rgb) -> Hsla {
@@ -1407,6 +1446,22 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_runs_keep_their_command_and_exit_code() {
+        let script = powershell_run_script("npx jest -t 'doesn''t crash'", Path::new(r"C:\Users\O'Brien\app"), Some(Path::new(r"C:\app\.venv")));
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(lines[0], r"Set-Location -LiteralPath 'C:\Users\O''Brien\app'");
+        let bin = crate::python::bin_dir(Path::new(r"C:\app\.venv"));
+        assert_eq!(lines[2], format!("$env:PATH = '{};' + $env:PATH", bin.display()));
+        assert_eq!(lines[4], "Write-Host '$ npx jest -t ''doesn''''t crash''' -ForegroundColor DarkGray");
+        assert_eq!(lines[7..9], ["npx jest -t 'doesn''t crash'", "$kuanaOk = $?"]);
+        assert_eq!(lines.last(), Some(&"exit $kuanaCode"));
+        // A quoted program is called, not printed.
+        assert!(powershell_run_script(r"'C:\my tools\x.exe' a", Path::new("C:\\"), None).contains("\n& 'C:\\my tools\\x.exe' a\n"));
+        assert_eq!(encoded_command("A"), "QQA=");
+        assert!(is_powershell(r"C:\Program Files\PowerShell\7\pwsh.exe") && is_powershell("powershell") && !is_powershell("cmd"));
+    }
 
     #[test]
     fn titles_name_programs_without_their_folders() {

@@ -120,7 +120,7 @@ pub fn activate_command(venv: &Path, shell: &str) -> Option<String> {
         "fish" => ("activate.fish", |s| format!("source {}", quote(s))),
         "csh" | "tcsh" => ("activate.csh", |s| format!("source {}", quote(s))),
         "nu" => ("activate.nu", |s| format!("overlay use {}", quote(s))),
-        "pwsh" | "powershell" => ("Activate.ps1", |s| format!("& {}", quote(s))),
+        "pwsh" | "powershell" => ("Activate.ps1", |s| format!("& {}", crate::run::powershell_string(s))),
         "cmd" => ("activate.bat", |s| format!("\"{s}\"")),
         _ => ("activate", |s| format!(". {}", quote(s))),
     };
@@ -138,7 +138,17 @@ pub fn exports(venv: &Path) -> String {
     )
 }
 
-/// Single-quoted for POSIX shells, fish and PowerShell.
+/// The same for PowerShell (Run tabs on Windows).
+pub fn powershell_exports(venv: &Path) -> String {
+    use crate::run::powershell_string;
+    format!(
+        "$env:VIRTUAL_ENV = {}\n$env:PATH = {} + $env:PATH\nRemove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue\n",
+        powershell_string(&venv.to_string_lossy()),
+        powershell_string(&format!("{};", bin_dir(venv).to_string_lossy()))
+    )
+}
+
+/// Single-quoted for POSIX shells and fish.
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }

@@ -77,7 +77,7 @@ pub fn from_rust_analyzer(runnable: &serde_json::Value) -> Option<RunTarget> {
     let (cargo, exe) = (strings("cargoArgs"), strings("executableArgs"));
     let subcommand = cargo.first()?.clone();
     let cwd = ["cwd", "workspaceRoot"].iter().find_map(|k| args.get(*k).and_then(|v| v.as_str())).map(PathBuf::from)?;
-    let quote = |list: &[String]| list.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ");
+    let quote = |list: &[String]| list.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
     let mut command = format!("cargo {}", quote(&cargo));
     if !exe.is_empty() {
         command.push_str(&format!(" -- {}", quote(&exe)));
@@ -98,14 +98,45 @@ pub fn from_rust_analyzer(runnable: &serde_json::Value) -> Option<RunTarget> {
     })
 }
 
-/// Quotes for a POSIX shell when needed.
-pub fn sh_quote(s: &str) -> String {
+/// Quotes for the shell Run tabs use, when needed: PowerShell on Windows,
+/// else a POSIX shell.
+pub fn shell_quote(s: &str) -> String {
+    if cfg!(windows) { powershell_quote(s) } else { posix_quote(s) }
+}
+
+fn posix_quote(s: &str) -> String {
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+%,".contains(c)) {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
+
+/// In PowerShell `,` and `@` make arrays and splats, and `\` is plain.
+fn powershell_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || r"-_./:=+%\".contains(c)) {
+        s.to_string()
+    } else {
+        powershell_string(s)
+    }
+}
+
+/// A PowerShell string literal: single-quoted, verbatim but for its quote
+/// characters (curly ones count too), which are doubled.
+pub fn powershell_string(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out + "'"
+}
+
+/// Python's command. On Windows `python3` is the Microsoft Store's stub
+/// unless Python came from there, and a venv has no `python3.exe`.
+const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 
 fn nearest_with(file: &Path, marker: &str) -> Option<PathBuf> {
     file.ancestors().skip(1).find(|d| d.join(marker).is_file()).map(Path::to_path_buf)
@@ -199,8 +230,8 @@ fn extension_targets(language: Language, path: &Path, text: &str, tree: &Tree, o
             // The command is shell text, so values put into it are quoted (a
             // path with spaces, or a symbol that looks like `$(…)`); each
             // argument stays one word.
-            let command = std::iter::once(expand_vars(&task.command, &vars, sh_quote))
-                .chain(task.args.iter().map(|a| sh_quote(&plain(a))))
+            let command = std::iter::once(expand_vars(&task.command, &vars, shell_quote))
+                .chain(task.args.iter().map(|a| shell_quote(&plain(a))))
                 .collect::<Vec<_>>()
                 .join(" ");
             out.push(RunTarget {
@@ -268,11 +299,11 @@ fn rust_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
     // `cargo test` needs to know which target an integration test or binary is.
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let target_flag = if rel_str.starts_with("tests/") {
-        format!(" --test {}", sh_quote(&stem))
+        format!(" --test {}", shell_quote(&stem))
     } else if rel_str.starts_with("src/bin/") {
-        format!(" --bin {}", sh_quote(&stem))
+        format!(" --bin {}", shell_quote(&stem))
     } else if rel_str.starts_with("examples/") {
-        format!(" --example {}", sh_quote(&stem))
+        format!(" --example {}", shell_quote(&stem))
     } else {
         String::new()
     };
@@ -338,7 +369,7 @@ fn rust_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
                 let filter = full.join("::");
                 out.push(target(
                     format!("Test '{ident}'"),
-                    format!("cargo test{target_flag} -- {} --exact", sh_quote(&filter)),
+                    format!("cargo test{target_flag} -- {} --exact", shell_quote(&filter)),
                     &crate_dir,
                     node,
                     name,
@@ -358,7 +389,7 @@ fn rust_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
                     && (node_text(node, text).contains("#[test") || has_cfg_test(node, text)) =>
             {
                 let filter = full.join("::");
-                let command = format!("cargo test{target_flag} -- {}", sh_quote(&filter));
+                let command = format!("cargo test{target_flag} -- {}", shell_quote(&filter));
                 out.push(target(format!("Tests in '{ident}'"), command, &crate_dir, node, name, debug_test(&filter, false)));
             }
             _ => {}
@@ -391,7 +422,7 @@ fn go_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
             };
             out.push(target(
                 format!("Test '{ident}'"),
-                format!("go test {flag} {} .", sh_quote(&pattern)),
+                format!("go test {flag} {} .", shell_quote(&pattern)),
                 dir,
                 node,
                 name,
@@ -408,7 +439,7 @@ fn go_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
 
 fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
     let dir = path.parent().unwrap_or(path);
-    let file = sh_quote(&path.to_string_lossy());
+    let file = shell_quote(&path.to_string_lossy());
     let mut cursor = root.walk();
     for node in root.named_children(&mut cursor) {
         let node = if node.kind() == "decorated_definition" { node.child_by_field_name("definition").unwrap_or(node) } else { node };
@@ -418,7 +449,7 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                 let ident = node_text(name, text);
                 if ident.starts_with("test") {
                     let debug = pytest(path, &[ident]);
-                    out.push(target(format!("Test '{ident}'"), format!("python3 -m pytest {file}::{ident}"), dir, node, name, debug));
+                    out.push(target(format!("Test '{ident}'"), format!("{PYTHON} -m pytest {file}::{ident}"), dir, node, name, debug));
                 }
             }
             "class_definition" => {
@@ -428,7 +459,7 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                     continue;
                 }
                 let debug = pytest(path, &[class]);
-                out.push(target(format!("Tests in '{class}'"), format!("python3 -m pytest {file}::{class}"), dir, node, name, debug));
+                out.push(target(format!("Tests in '{class}'"), format!("{PYTHON} -m pytest {file}::{class}"), dir, node, name, debug));
                 let Some(body) = node.child_by_field_name("body") else { continue };
                 let mut c = body.walk();
                 for method in body.named_children(&mut c) {
@@ -444,13 +475,13 @@ fn python_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>)
                     let m = node_text(mname, text);
                     if m.starts_with("test") {
                         let debug = pytest(path, &[class, m]);
-                        out.push(target(format!("Test '{m}'"), format!("python3 -m pytest {file}::{class}::{m}"), dir, method, mname, debug));
+                        out.push(target(format!("Test '{m}'"), format!("{PYTHON} -m pytest {file}::{class}::{m}"), dir, method, mname, debug));
                     }
                 }
             }
             "if_statement" if node_text(node, text).starts_with("if __name__") => {
                 let debug = Some(DebugSpec::Python { program: Some(path.to_path_buf()), module: None, args: Vec::new() });
-                out.push(target("Run file".into(), format!("python3 {file}"), dir, node, node, debug));
+                out.push(target("Run file".into(), format!("{PYTHON} {file}"), dir, node, node, debug));
             }
             _ => {}
         }
@@ -488,7 +519,7 @@ fn js_test_runner(package_dir: &Path) -> &'static str {
 fn js_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
     let package_dir = nearest_with(path, "package.json").unwrap_or_else(|| path.parent().unwrap_or(path).to_path_buf());
     let runner = js_test_runner(&package_dir);
-    let file = sh_quote(&path.to_string_lossy());
+    let file = shell_quote(&path.to_string_lossy());
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         let mut cursor = node.walk();
@@ -508,9 +539,9 @@ fn js_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
         let title = node_text(first, text).trim_matches(['"', '\'', '`']).to_string();
         let pattern = regex::escape(&title);
         let command = match runner {
-            "vitest" => format!("npx vitest run {file} -t {}", sh_quote(&pattern)),
-            "jest" => format!("npx jest {file} -t {}", sh_quote(&pattern)),
-            _ => format!("node --test --test-name-pattern={} {file}", sh_quote(&pattern)),
+            "vitest" => format!("npx vitest run {file} -t {}", shell_quote(&pattern)),
+            "jest" => format!("npx jest {file} -t {}", shell_quote(&pattern)),
+            _ => format!("node --test --test-name-pattern={} {file}", shell_quote(&pattern)),
         };
         let path = path.to_string_lossy().into_owned();
         let debug = match runner {
@@ -547,7 +578,7 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
             for bin in bins.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "rs")) {
                 let name = bin.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let debug = cargo(&["build", "--bin", &name]);
-                add(format!("cargo run --bin {name}"), format!("cargo run --bin {}", sh_quote(&name)), root, debug);
+                add(format!("cargo run --bin {name}"), format!("cargo run --bin {}", shell_quote(&name)), root, debug);
             }
         }
     }
@@ -567,7 +598,7 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
         for name in scripts.keys() {
             // Bun isn't Node: js-debug can't debug it.
             let debug = if manager == "bun" { None } else { node_debug(manager, &["run", name]) };
-            add(format!("{manager} run {name}"), format!("{manager} run {}", sh_quote(name)), root, debug);
+            add(format!("{manager} run {name}"), format!("{manager} run {}", shell_quote(name)), root, debug);
         }
     }
     if root.join("go.mod").is_file() {
@@ -584,22 +615,22 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
                 continue;
             }
             for t in target.split_whitespace() {
-                add(format!("make {t}"), format!("make {}", sh_quote(t)), root, None);
+                add(format!("make {t}"), format!("make {}", shell_quote(t)), root, None);
             }
         }
     }
     if root.join("pyproject.toml").is_file() || root.join("pytest.ini").is_file() {
         let debug = Some(DebugSpec::Python { program: None, module: Some("pytest".into()), args: Vec::new() });
-        add("pytest".into(), "python3 -m pytest".into(), root, debug);
+        add("pytest".into(), format!("{PYTHON} -m pytest"), root, debug);
     }
     if let Some((path, language)) = current {
-        let file = sh_quote(&path.to_string_lossy());
+        let file = shell_quote(&path.to_string_lossy());
         let dir = path.parent().unwrap_or(root);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let (command, debug) = match language {
             Language::Python => {
                 let debug = DebugSpec::Python { program: Some(path.to_path_buf()), module: None, args: Vec::new() };
-                (Some(format!("python3 {file}")), Some(debug))
+                (Some(format!("{PYTHON} {file}")), Some(debug))
             }
             Language::JavaScript => (Some(format!("node {file}")), node_debug("node", &[&path.to_string_lossy()])),
             Language::TypeScript | Language::Tsx => (Some(format!("npx tsx {file}")), node_debug("npx", &["tsx", &path.to_string_lossy()])),
@@ -788,7 +819,7 @@ mod tests {
             ("ZED_ROW".to_string(), "$ZED_FILE".to_string()),
         ];
         assert_eq!(
-            expand_vars("run $ZED_FILE ${ZED_FILENAME} $ZED_SYMBOL:$ZED_ROW $HOME ${X} $ ${", &vars, sh_quote),
+            expand_vars("run $ZED_FILE ${ZED_FILENAME} $ZED_SYMBOL:$ZED_ROW $HOME ${X} $ ${", &vars, shell_quote),
             "run '/tmp/my project/a b.rs' 'a b.rs' '$(rm -rf ~)':'$ZED_FILE' $HOME ${X} $ ${"
         );
         // Unquoted for labels and folders; values aren't expanded again.
@@ -818,7 +849,7 @@ mod tests {
         let py = "def test_one():\n    pass\n\nclass TestThing:\n    def test_two(self):\n        pass\n\nif __name__ == \"__main__\":\n    main()\n";
         let got = targets(Language::Python, Path::new("/p/t.py"), py);
         assert_eq!(got.iter().map(|t| t.0.as_str()).collect::<Vec<_>>(), ["Test 'test_one'", "Tests in 'TestThing'", "Test 'test_two'", "Run file"]);
-        assert_eq!(got[2].1, "python3 -m pytest /p/t.py::TestThing::test_two");
+        assert_eq!(got[2].1, format!("{PYTHON} -m pytest /p/t.py::TestThing::test_two"));
 
         let dir = temp_project(&[("package.json", "{\"devDependencies\": {\"vitest\": \"1\"}}"), ("a.test.ts", "")]);
         let ts = "describe('math', () => {\n  it('adds 1+1', () => {});\n});\n";
@@ -901,7 +932,16 @@ mod tests {
         let path = dir.join("a.ts").to_string_lossy().into_owned();
         assert_eq!(current.last().unwrap().debug, Some(DebugSpec::Node { runtime: "npx".into(), args: vec!["tsx".into(), path] }));
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(sh_quote("a b'c"), "'a b'\\''c'");
-        assert_eq!(sh_quote("src/a.rs"), "src/a.rs");
+    }
+
+    #[test]
+    fn quotes_for_each_shell() {
+        assert_eq!(posix_quote("a b'c"), "'a b'\\''c'");
+        assert_eq!(posix_quote("src/a.rs"), "src/a.rs");
+        assert_eq!(powershell_quote("doesn't crash"), "'doesn''t crash'");
+        assert_eq!(powershell_quote("it\u{2019}s"), "'it\u{2019}\u{2019}s'");
+        assert_eq!(powershell_quote(r"C:\src\a.rs"), r"C:\src\a.rs");
+        assert_eq!(powershell_quote("a,b"), "'a,b'");
+        assert_eq!(powershell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
     }
 }

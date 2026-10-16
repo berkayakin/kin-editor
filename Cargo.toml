@@ -17,6 +17,8 @@ info_plist_exts = ["assets/macos/document-types.plist"]
 
 [dependencies]
 alacritty_terminal = { version = "0.26.0", default-features = false }
+# Run tabs on Windows hand PowerShell their script encoded (`-EncodedCommand`).
+base64 = "0.22"
 futures = "0.3.34"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 # Image dimensions for previews (GPUI already depends on it, with its formats).
