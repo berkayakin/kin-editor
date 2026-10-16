@@ -24,6 +24,7 @@ impl Workspace {
             None => TerminalPlace::Tab { group: self.terminals.read(cx).active_group(), ix: None },
         };
         self.last_run = Some(target.clone());
+        self.schedule_session_save(cx);
         let focused = self.active_editor().cloned();
         self.open_terminal(target.cwd.clone(), Some(target), place, false, window, cx);
         if let Some(editor) = focused {
@@ -99,6 +100,7 @@ impl Workspace {
         if !matches!(target.debug, Some(DebugSpec::Attach { .. })) {
             self.last_run = Some(target.clone());
             self.last_debug = Some(target);
+            self.schedule_session_save(cx);
         }
         self.bottom = Some(BottomPanel::Debug);
         cx.notify();

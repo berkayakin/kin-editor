@@ -9,12 +9,14 @@ use std::{
 };
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Tree};
 
 use crate::{lint::Severity, syntax::Language};
 
 /// Something runnable: a configuration in Run…, or a gutter ▶ on `row`.
-#[derive(Clone, Debug, PartialEq)]
+/// The project's session keeps the last one run (without its place in a file).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunTarget {
     /// "Run 'main'", "Test 'parses_input'", "npm run dev".
     pub name: String,
@@ -22,22 +24,25 @@ pub struct RunTarget {
     pub command: String,
     pub cwd: PathBuf,
     /// The line it belongs to, for gutter targets.
+    #[serde(skip)]
     pub row: Option<usize>,
     /// Lines it spans (the function or block), for Run at caret.
+    #[serde(skip)]
     pub rows: std::ops::Range<usize>,
     /// How to start it under a debugger instead, when that's possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<DebugSpec>,
 }
 
 /// What a debug session starts (see `crate::debugger`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DebugSpec {
     /// Rust: cargo builds it (`build …` or `test --no-run …`), then lldb-dap
     /// runs the executable it made with `args`.
     Cargo { build: Vec<String>, args: Vec<String> },
     /// Go, through Delve: mode "debug" (a main package) or "test", the
     /// package folder (or a file), and the program's arguments.
-    Go { mode: &'static str, program: PathBuf, args: Vec<String> },
+    Go { mode: String, program: PathBuf, args: Vec<String> },
     /// Python, through debugpy: a script, or a module (pytest) with arguments.
     Python { program: Option<PathBuf>, module: Option<String>, args: Vec<String> },
     /// JavaScript and TypeScript, through js-debug: a command (`node`, `npm`,
@@ -390,10 +395,10 @@ fn go_targets(path: &Path, text: &str, root: Node, out: &mut Vec<RunTarget>) {
                 dir,
                 node,
                 name,
-                Some(DebugSpec::Go { mode: "test", program: dir.to_path_buf(), args }),
+                Some(DebugSpec::Go { mode: "test".into(), program: dir.to_path_buf(), args }),
             ));
         } else if ident == "main" && is_main_package {
-            let debug = Some(DebugSpec::Go { mode: "debug", program: dir.to_path_buf(), args: Vec::new() });
+            let debug = Some(DebugSpec::Go { mode: "debug".into(), program: dir.to_path_buf(), args: Vec::new() });
             out.push(target("Run 'main'".into(), "go run .".into(), dir, node, name, debug));
         }
     }
@@ -566,7 +571,7 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
         }
     }
     if root.join("go.mod").is_file() {
-        let debug = Some(DebugSpec::Go { mode: "debug", program: root.to_path_buf(), args: Vec::new() });
+        let debug = Some(DebugSpec::Go { mode: "debug".into(), program: root.to_path_buf(), args: Vec::new() });
         add("go run .".into(), "go run .".into(), root, debug);
         add("go test ./...".into(), "go test ./...".into(), root, None);
         add("go build ./...".into(), "go build ./...".into(), root, None);
@@ -600,7 +605,7 @@ pub fn project_targets(root: &Path, current: Option<(&Path, Language)>) -> Vec<R
             Language::TypeScript | Language::Tsx => (Some(format!("npx tsx {file}")), node_debug("npx", &["tsx", &path.to_string_lossy()])),
             Language::Shell => (Some(format!("bash {file}")), None),
             Language::Go => {
-                let debug = DebugSpec::Go { mode: "debug", program: path.to_path_buf(), args: Vec::new() };
+                let debug = DebugSpec::Go { mode: "debug".into(), program: path.to_path_buf(), args: Vec::new() };
                 (Some(format!("go run {file}")), Some(debug))
             }
             Language::Php => (Some(format!("php {file}")), None),

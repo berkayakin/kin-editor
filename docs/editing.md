@@ -75,7 +75,8 @@ closed the first time; without a project the sidebar is always closed), which si
 position (on the same display while it's connected, full screen included). This lives in
 `state.json` next to `settings.json` in the config folder.
 
-Each project also reopens with the tabs it had, the active tab, each caret and the folders
-expanded in the file tree. Unsaved edits
+Each project also reopens with the tabs it had, the active tab, each tab's caret and scroll
+position (a split of one file keeps both), the folders expanded in the file tree and the last
+run configuration. Unsaved edits
 are kept as well (like VS Code's hot exit) and undo goes back to the file's saved text. These
 live in `sessions/` in the config folder, one file per project.

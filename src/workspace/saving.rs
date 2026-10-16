@@ -55,6 +55,8 @@ impl Workspace {
                 self.auto_save_warned.remove(&id);
                 self.refresh_git(cx);
                 self.check_config(cx);
+                // The session may hold the text as unsaved.
+                self.schedule_session_save(cx);
                 true
             }
             Err(err) => {

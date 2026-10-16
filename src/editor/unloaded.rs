@@ -13,10 +13,12 @@ use crate::{
 };
 
 /// What a restored tab brings back once its file is read: the session's
-/// caret, folds, encoding and unsaved text, kept as saved until then.
+/// caret, view, folds, encoding and unsaved text, kept as saved until then.
 pub struct Unloaded {
     /// The caret, as a byte offset.
     pub cursor: usize,
+    /// The line at the top of the view (None: the caret is centered).
+    pub top_line: Option<usize>,
     /// The whole text, when the buffer had unsaved edits.
     pub unsaved: Option<Rope>,
     /// Folded regions as (header row, last hidden row).
@@ -63,6 +65,39 @@ impl Editor {
         self.unloaded = Some(unloaded);
     }
 
+    /// A split of a tab not read yet: where its own caret and view go once
+    /// the text is there (they're the session's until then).
+    pub fn set_waiting_view(&mut self, cursor: usize, top_line: Option<usize>) {
+        if self.waiting {
+            self.waiting_view = Some((cursor, top_line));
+        }
+    }
+
+    pub fn waiting_view(&self) -> Option<(usize, Option<usize>)> {
+        self.waiting_view
+    }
+
+    /// The buffer line at the top of the view, for the session; None before
+    /// the tab was shown.
+    pub fn top_line(&self, cx: &gpui::App) -> Option<usize> {
+        if self.scroll_to_line.is_some() {
+            return self.scroll_to_line;
+        }
+        let layout = self.layout.as_ref()?;
+        Some(self.line_at_row((self.scroll.y / layout.line_height).floor() as usize, cx))
+    }
+
+    /// Puts a restored tab's caret back, and its view where it was (else
+    /// the caret in view).
+    pub(super) fn restore_view(&mut self, cursor: usize, top_line: Option<usize>, cx: &mut Context<Self>) {
+        let cursor = self.doc.read(cx).clip(cursor.min(self.doc.read(cx).len()));
+        self.set_selections(vec![Selection::cursor(cursor)], 0, cx);
+        match top_line {
+            Some(line) => self.scroll_to_line = Some(line),
+            None => self.center_on_next_frame = true,
+        }
+    }
+
     /// Reads an unloaded tab's file and brings back its unsaved text, folds
     /// and caret. Fails (keeping the empty stand-in) when the file can't be
     /// read and there's no unsaved text.
@@ -91,15 +126,16 @@ impl Editor {
         self.doc.write(cx, doc);
         *self = Self::with_document(self.doc.clone(), cx);
         self.focus_handle = focus_handle;
-        if let Some(text) = unloaded.unsaved {
+        // Unless the file has it already (saved after the session was written).
+        if let Some(text) = unloaded.unsaved
+            && text != *self.doc.read(cx).rope()
+        {
             // An edit on top of the file, so undo gets back to the saved text.
             let len = self.doc.read(cx).len();
             self.replace_ranges(vec![(0..len, text.to_string())], cx);
         }
         self.restore_folds(&unloaded.folds, cx);
-        let cursor = self.doc.read(cx).clip(unloaded.cursor.min(self.doc.read(cx).len()));
-        self.set_selections(vec![Selection::cursor(cursor)], 0, cx);
-        self.center_on_next_frame = true;
+        self.restore_view(unloaded.cursor, unloaded.top_line, cx);
         cx.emit(EditorLoaded { error: None });
         cx.notify();
         Ok(())
@@ -121,7 +157,7 @@ mod tests {
     }
 
     fn unloaded(cursor: usize, unsaved: Option<&str>) -> Unloaded {
-        Unloaded { cursor, unsaved: unsaved.map(Rope::from_str), folds: Vec::new(), encoding: None }
+        Unloaded { cursor, top_line: None, unsaved: unsaved.map(Rope::from_str), folds: Vec::new(), encoding: None }
     }
 
     #[gpui::test]
@@ -219,6 +255,41 @@ mod tests {
         second.update(cx, |e, cx| e.replace_ranges(vec![(0..3, "1".into())], cx));
         cx.run_until_parked();
         first.read_with(cx, |e, cx| assert_eq!(e.text(cx), "1\ntwo\n"));
+    }
+
+    #[gpui::test]
+    fn each_editor_of_a_restored_split_gets_its_own_caret_and_view(cx: &mut TestAppContext) {
+        let text: String = (0..60).map(|n| format!("line {n}\n")).collect();
+        let path = temp_file("views.txt", text.as_bytes());
+        let mut state = unloaded(8, None);
+        state.top_line = Some(1);
+        let first = cx.new(|cx| Editor::new_unloaded(Some(path), state, cx));
+        let second = cx.new(|cx| Editor::view_of(&first, cx));
+        second.update(cx, |e, _| e.set_waiting_view(text.find("line 40").unwrap(), Some(35)));
+        // Until the text is there, the session keeps what it had.
+        second.read_with(cx, |e, _| assert_eq!(e.waiting_view(), Some((text.find("line 40").unwrap(), Some(35)))));
+        first.update(cx, |e, cx| e.load(cx)).unwrap();
+        cx.run_until_parked();
+        first.read_with(cx, |e, cx| {
+            assert_eq!(e.primary_selection().head, 8);
+            assert_eq!(e.top_line(cx), Some(1));
+        });
+        second.read_with(cx, |e, cx| {
+            assert_eq!(e.primary_selection().head, text.find("line 40").unwrap());
+            assert_eq!(e.top_line(cx), Some(35));
+        });
+    }
+
+    #[gpui::test]
+    fn unsaved_text_the_file_already_has_is_not_unsaved(cx: &mut TestAppContext) {
+        // Auto-save wrote the file after the session kept the text.
+        let path = temp_file("autosaved.txt", b"typed and saved\n");
+        let editor = cx.new(|cx| Editor::new_unloaded(Some(path), unloaded(0, Some("typed and saved\n")), cx));
+        editor.update(cx, |e, cx| e.load(cx)).unwrap();
+        editor.read_with(cx, |e, cx| {
+            assert_eq!(e.text(cx), "typed and saved\n");
+            assert!(!e.doc.read(cx).is_dirty());
+        });
     }
 
     #[gpui::test]

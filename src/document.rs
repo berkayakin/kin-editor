@@ -221,6 +221,17 @@ impl Document {
         Ok(doc)
     }
 
+    /// Whether the file at `path` reads as `text` (in `encoding`, else as
+    /// `open` would read it; line endings as LF), like a document of it.
+    pub fn file_has(path: &Path, text: &str, encoding: Option<TextEncoding>) -> bool {
+        let Ok(bytes) = std::fs::read(path) else { return false };
+        let read = match encoding {
+            Some(encoding) => encoding::decode_as(&bytes, encoding),
+            None => encoding::decode(&bytes, None).0,
+        };
+        read.replace("\r\n", "\n") == text
+    }
+
     pub(crate) fn from_text(text: String, path: Option<PathBuf>) -> Self {
         Self::with_text(text, path, false, None)
     }
@@ -405,6 +416,9 @@ impl Document {
         self.lsp_changes.mark_full();
         self.folds.clear();
         self.snippet = None;
+        // The server's hints and lenses point into the old text; editors ask again.
+        self.inlay_hints.clear();
+        self.code_lenses.clear();
         self.version += 1;
         self.patches.clear();
         self.patches_base = self.version;
@@ -1470,6 +1484,39 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert!(doc.changed_on_disk(), "a deleted file counts as changed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reload_drops_what_the_server_placed_in_the_old_text() {
+        let dir = std::env::temp_dir().join(format!("kin-doc-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "let index = 1;\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        doc.set_inlay_hints(vec![InlayHint { offset: 9, label: ": usize".into(), pad_left: false, pad_right: false }]);
+        doc.set_code_lenses(vec![CodeLens { line_start: 0, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() }]);
+        // A merge rewrote the file: offset 9 is somewhere else entirely now.
+        std::fs::write(&path, "fn main() {\n    let index = 1;\n}\n").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        assert!(doc.reload_from_disk().unwrap());
+        assert!(doc.inlay_hints().is_empty());
+        assert!(doc.code_lenses().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tells_whether_a_file_reads_as_some_text() {
+        let dir = std::env::temp_dir().join(format!("kin-doc-has-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        assert!(Document::file_has(&path, "one\ntwo\n", None));
+        assert!(!Document::file_has(&path, "one\ntwo", None));
+        std::fs::write(&path, [0xEF, 0xF2]).unwrap();
+        assert!(Document::file_has(&path, "пт", TextEncoding::from_key("windows-1251")));
+        assert!(!Document::file_has(&dir.join("gone.txt"), "", None));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

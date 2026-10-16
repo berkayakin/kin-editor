@@ -45,8 +45,8 @@ A ▶ in the gutter marks what can run in the file; click it to run that one thi
 project's commands (cargo run/test/build and binaries, `package.json` scripts with its package
 manager, go, Makefile targets, pytest) and the current file's tests. **Run** (⌃R / Shift+F10)
 repeats the last one (run or debugged), **Stop** (⌘F2 / Ctrl+F2) interrupts it. The title bar's
-top right has the same: the last configuration (click it for Run…), Run, Debug and, while
-something runs, Stop, next to the sidebar and bottom panel toggles.
+top right has the same: the last configuration (click it for Run…; the project keeps it for next
+time), Run, Debug and, while something runs, Stop, next to the sidebar and bottom panel toggles.
 
 Each run gets a terminal tab named after it, which stays open with the exit code when it ends and
 shows ▶ while running, ✓ on success and ✕ on failure. Running the same thing again reuses its tab.

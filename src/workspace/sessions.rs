@@ -23,34 +23,32 @@ impl Workspace {
             let mut count = 0;
             for (ix, tab) in pane.tabs.iter().enumerate() {
                 let e = tab.read(cx);
-                let dirty = e.doc.read(cx).is_dirty();
-                // A tab not read yet goes back as it was restored.
-                if let Some(u) = e.unloaded() {
-                    if ix == pane.active {
-                        active_in_pane = count;
-                        if pane_ix == self.active_pane {
-                            active = tabs.len();
-                        }
+                let doc = e.doc.read(cx);
+                let mut session =
+                    TabSession { path: doc.path.clone(), pane: pane_ix, pinned: self.pinned.contains(&tab.entity_id()), ..TabSession::default() };
+                let text = if let Some(u) = e.unloaded() {
+                    // A tab not read yet goes back as it was restored.
+                    session.cursor = u.cursor;
+                    session.top_line = u.top_line;
+                    session.folds = u.folds.clone();
+                    session.encoding = u.encoding.filter(|&enc| enc != TextEncoding::UTF8).map(TextEncoding::key);
+                    u.unsaved.clone()
+                } else if !e.is_loaded() {
+                    // A split of one: its own caret and view (the text, folds
+                    // and encoding go with that tab).
+                    (session.cursor, session.top_line) = e.waiting_view().unwrap_or_default();
+                    None
+                } else {
+                    // An untitled buffer without edits has nothing to bring back.
+                    if doc.path.is_none() && !doc.is_dirty() {
+                        continue;
                     }
-                    count += 1;
-                    if let Some(text) = &u.unsaved {
-                        unsaved.push((tabs.len(), text.clone()));
-                    }
-                    tabs.push(TabSession {
-                        path: e.doc.read(cx).path.clone(),
-                        cursor: u.cursor,
-                        unsaved: None,
-                        pane: pane_ix,
-                        pinned: self.pinned.contains(&tab.entity_id()),
-                        folds: u.folds.clone(),
-                        encoding: u.encoding.filter(|&enc| enc != TextEncoding::UTF8).map(TextEncoding::key),
-                    });
-                    continue;
-                }
-                // An untitled buffer without edits has nothing to bring back.
-                if e.doc.read(cx).path.is_none() && !dirty {
-                    continue;
-                }
+                    session.cursor = e.primary_selection().head;
+                    session.top_line = e.top_line(cx);
+                    session.folds = e.folded_rows(cx);
+                    session.encoding = (doc.encoding != TextEncoding::UTF8).then(|| doc.encoding.key());
+                    doc.is_dirty().then(|| doc.rope().clone())
+                };
                 if ix == pane.active {
                     active_in_pane = count;
                     if pane_ix == self.active_pane {
@@ -58,18 +56,10 @@ impl Workspace {
                     }
                 }
                 count += 1;
-                if dirty {
-                    unsaved.push((tabs.len(), e.doc.read(cx).rope().clone()));
+                if let Some(text) = text {
+                    unsaved.push((tabs.len(), text));
                 }
-                tabs.push(TabSession {
-                    path: e.doc.read(cx).path.clone(),
-                    cursor: e.primary_selection().head,
-                    unsaved: None,
-                    pane: pane_ix,
-                    pinned: self.pinned.contains(&tab.entity_id()),
-                    folds: e.folded_rows(cx),
-                    encoding: (e.doc.read(cx).encoding != TextEncoding::UTF8).then(|| e.doc.read(cx).encoding.key()),
-                });
+                tabs.push(session);
             }
             pane_active.push(active_in_pane);
         }
@@ -89,7 +79,8 @@ impl Workspace {
         breakpoints.sort_by(|a, b| a.path.cmp(&b.path));
         let python_venv = crate::python::choice(&root).map(|c| c.to_saved());
         let terminals = Some(self.terminal_layout(cx));
-        let session = ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals };
+        let last_run = self.last_run.clone();
+        let session = ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals, last_run };
         Some(SessionSnapshot { session, unsaved })
     }
 
@@ -124,16 +115,25 @@ impl Workspace {
             if tab.unsaved.is_none() && tab.path.as_deref().is_none_or(|p| !p.is_file()) {
                 continue;
             }
+            let encoding = tab.encoding.as_deref().and_then(TextEncoding::from_key);
+            // Text the file has by now isn't unsaved (auto-save wrote it after
+            // the session was written).
+            let unsaved = tab.unsaved.filter(|text| tab.path.as_deref().is_none_or(|p| !Document::file_has(p, text, encoding)));
             let unloaded = Unloaded {
                 cursor: tab.cursor,
-                unsaved: tab.unsaved.as_deref().map(ropey::Rope::from_str),
+                top_line: tab.top_line,
+                unsaved: unsaved.as_deref().map(ropey::Rope::from_str),
                 folds: tab.folds,
-                encoding: tab.encoding.as_deref().and_then(TextEncoding::from_key),
+                encoding,
             };
             // A file shown in two panes is one document, in two editors.
             let shown = tab.path.as_ref().and_then(|p| restored.iter().find(|(q, _)| q == p)).map(|(_, e)| e.clone());
             let editor = match shown {
-                Some(first) => cx.new(|cx| Editor::view_of(&first, cx)),
+                Some(first) => cx.new(|cx| {
+                    let mut split = Editor::view_of(&first, cx);
+                    split.set_waiting_view(tab.cursor, tab.top_line);
+                    split
+                }),
                 None => cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx)),
             };
             if let Some(path) = &tab.path {

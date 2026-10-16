@@ -3,7 +3,7 @@
 //! and the requests behind Go to Declaration, Find Usages, Rename and
 //! Show Context Actions (whose results the workspace presents).
 
-use std::{path::PathBuf, sync::Arc};
+use std::{cmp::Reverse, path::PathBuf, sync::Arc};
 
 use gpui::{App, 
     AnyElement, Context, FontWeight, HighlightStyle, MouseButton, Pixels, Point, SharedString, StyledText, Task,
@@ -129,6 +129,70 @@ fn diagnostic_source(server: &str) -> &'static str {
 
 pub(super) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// How a completion item ranks against what's typed (lower first).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank<'a> {
+    /// The filter text starts with what's typed: an exact match first, then
+    /// the server's ranking, which knows what fits here.
+    Prefix { exact: Reverse<bool>, sort_text: &'a str, score: Reverse<u32> },
+    /// Any other fuzzy match: the best match first.
+    Fuzzy { score: Reverse<u32>, sort_text: &'a str },
+}
+
+impl Rank<'_> {
+    /// Items alike in this are equally good matches, among which the
+    /// server's preselected item is chosen.
+    fn tier(&self) -> (u8, u32) {
+        match *self {
+            Rank::Prefix { exact, .. } => (u8::from(!exact.0), 0),
+            Rank::Fuzzy { score, .. } => (2, score.0),
+        }
+    }
+}
+
+/// The items matching what's typed, best first, and which of them to
+/// select. Ties go by label, as in VS Code: servers rank many items alike
+/// (rust-analyzer gives most of a type's methods one `sortText`) and list
+/// them in no useful order. The selection is the first item the server
+/// preselects among the best matches, else the first.
+fn rank_completions(items: &[CompletionItem], typed: &str) -> (Vec<usize>, usize) {
+    let pattern = Pattern::parse(typed, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
+    let mut ranked: Vec<(Rank, String, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let score = match typed.is_empty() {
+                true => 0,
+                false => pattern.score(Utf32Str::new(&item.filter_text, &mut buf), &mut matcher)?,
+            };
+            let sort_text = item.sort_text.as_str();
+            let rank = match starts_with_typed(&item.filter_text, typed) {
+                Some(exact) => Rank::Prefix { exact: Reverse(exact), sort_text, score: Reverse(score) },
+                None => Rank::Fuzzy { score: Reverse(score), sort_text },
+            };
+            Some((rank, item.label.to_lowercase(), i))
+        })
+        .collect();
+    // The server's order last.
+    ranked.sort_unstable();
+    let best = ranked.first().map(|(rank, ..)| rank.tier());
+    let selected = ranked
+        .iter()
+        .take_while(|(rank, ..)| Some(rank.tier()) == best)
+        .position(|&(.., i)| items[i].preselect)
+        .unwrap_or(0);
+    (ranked.into_iter().map(|(.., i)| i).collect(), selected)
+}
+
+/// Whether `text` starts with `typed` ignoring case, and if so, whether
+/// that's all of it.
+fn starts_with_typed(text: &str, typed: &str) -> Option<bool> {
+    let mut rest = text.chars().flat_map(char::to_lowercase);
+    typed.chars().flat_map(char::to_lowercase).all(|c| rest.next() == Some(c)).then(|| !typed.is_empty() && rest.next().is_none())
 }
 
 impl Editor {
@@ -330,29 +394,13 @@ impl Editor {
             return;
         }
         let prefix = self.doc.read(cx).slice(menu.start..head);
-        if prefix.is_empty() {
-            let mut order: Vec<usize> = (0..menu.items.len()).collect();
-            order.sort_by(|&a, &b| menu.items[a].sort_text.cmp(&menu.items[b].sort_text));
-            menu.matches = order;
-        } else {
-            let pattern = Pattern::parse(&prefix, CaseMatching::Smart, Normalization::Smart);
-            let mut matcher = Matcher::new(Config::DEFAULT);
-            let mut buf = Vec::new();
-            let mut scored: Vec<(u32, usize)> = menu
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| Some((pattern.score(Utf32Str::new(&item.filter_text, &mut buf), &mut matcher)?, i)))
-                .collect();
-            // Best score first; the server's order breaks ties.
-            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| menu.items[a.1].sort_text.cmp(&menu.items[b.1].sort_text)));
-            menu.matches = scored.into_iter().map(|(_, i)| i).collect();
-        }
-        if menu.matches.is_empty() {
+        let (matches, selected) = rank_completions(&menu.items, &prefix);
+        if matches.is_empty() {
             self.lsp.completion = None;
         } else {
-            menu.selected = 0;
-            menu.scroll = 0;
+            menu.matches = matches;
+            menu.selected = selected;
+            menu.scroll = selected.saturating_sub(MENU_ROWS - 1);
         }
         cx.notify();
     }
@@ -1207,6 +1255,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completions_starting_with_what_is_typed_keep_the_servers_ranking() {
+        let item = |label: &str, sort: &str| CompletionItem::from_json(json!({ "label": label, "sortText": sort })).unwrap();
+        // rust-analyzer on `self.tasks.cl` (a Vec): most methods share one
+        // sortText, in no useful order; trait methods rank lower.
+        let mut items = vec![
+            item("select_nth_unstable", "7fffffff"),
+            item("clone_from_slice", "7fffffff"),
+            item("copy_from_slice", "0"),
+            item("clone", "80000004"),
+            item("clear", "7fffffff"),
+            item("split_off", "7ffffff1"),
+        ];
+        let rank = |items: &[CompletionItem], typed: &str| {
+            let (matches, selected) = rank_completions(items, typed);
+            (matches.iter().map(|&i| items[i].label.clone()).collect::<Vec<_>>(), selected)
+        };
+        // Fuzzy matches follow, however the server ranks them.
+        assert_eq!(rank(&items, "cl").0, ["clear", "clone_from_slice", "clone", "copy_from_slice", "select_nth_unstable"]);
+        // An exact match goes first.
+        assert_eq!(rank(&items, "clone").0, ["clone", "clone_from_slice"]);
+        // Nothing typed: the server's ranking, then labels.
+        assert_eq!(rank(&items, "").0[..4], ["copy_from_slice", "split_off", "clear", "clone_from_slice"]);
+        // The server's preselected item is chosen among matches as good as
+        // the first, but not over an exact match or a prefix match.
+        items[1].preselect = true;
+        assert_eq!(rank(&items, "cl").1, 1);
+        assert_eq!(rank(&items, "clone").1, 0);
+        items[1].preselect = false;
+        items[2].preselect = true;
+        assert_eq!(rank(&items, "cl").1, 0);
+    }
+
     #[gpui::test]
     fn code_lenses_come_resolved_sit_above_their_line_and_run(cx: &mut TestAppContext) {
         if crate::lsp::servers::which("python3").is_none() {
@@ -1248,6 +1329,44 @@ mod tests {
         });
         editor.update(cx, |e, cx| e.run_code_lens(lens, cx));
         assert_eq!(*events.borrow(), [("lens lens".to_string(), 1)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn inlay_hints_are_asked_again_when_the_file_changes_on_disk(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-hints-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "let index = 1;\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("hints", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let hints = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| e.doc.read(cx).inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>());
+        // The server's hint goes at the end of the first line.
+        wait_for(cx, "the hint", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            hints(cx) == [14]
+        });
+
+        // A merge rewrites the file: the old hint would land mid-line.
+        std::fs::write(&path, "// merged\nlet index = 1;\n").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        editor.update(cx, |e, cx| e.reload_if_changed(cx));
+        assert!(hints(cx).is_empty());
+        wait_for(cx, "the new hint", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            hints(cx) == [9]
+        });
         std::fs::remove_dir_all(&dir).ok();
     }
 

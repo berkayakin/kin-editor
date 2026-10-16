@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn launch_arguments_per_adapter() {
-        let go = DebugSpec::Go { mode: "test", program: "/p/pkg".into(), args: vec!["-test.run".into(), "^TestA$".into()] };
+        let go = DebugSpec::Go { mode: "test".into(), program: "/p/pkg".into(), args: vec!["-test.run".into(), "^TestA$".into()] };
         let launch = launch_arguments(&go, Path::new("/p/pkg"), None, "go");
         assert_eq!((launch["mode"].as_str(), launch["args"][1].as_str()), (Some("test"), Some("^TestA$")));
         let py = DebugSpec::Python { program: None, module: Some("pytest".into()), args: vec!["t.py::test_a".into()] };

@@ -264,6 +264,19 @@ impl WrapMap {
         if self.hidden(row) { start } else { start + self.blocks_above(row) }
     }
 
+    /// Where buffer line `row`'s rows start: the block rows above it, if it
+    /// has any, else its text.
+    pub fn rows_start(&self, row: usize) -> usize {
+        self.row_starts.get(row).copied().unwrap_or_else(|| self.row_count())
+    }
+
+    /// The buffer line whose rows (block rows above it included) hold
+    /// display row `drow`.
+    pub fn line_at(&self, drow: usize) -> usize {
+        let lines = self.row_starts.len().saturating_sub(1);
+        self.row_starts[..lines].partition_point(|&s| s <= drow).saturating_sub(1)
+    }
+
     /// The buffer line and its segment index shown on display row `drow`.
     pub fn line_of(&self, drow: usize) -> (usize, usize) {
         let lines = self.row_starts.len().saturating_sub(1);

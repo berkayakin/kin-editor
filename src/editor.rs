@@ -242,6 +242,8 @@ pub struct Editor {
     max_line_width: Pixels,
     autoscroll: bool,
     center_on_next_frame: bool,
+    /// A buffer line to put at the top on the next frame (a restored tab's view).
+    scroll_to_line: Option<usize>,
     /// Like autoscroll, but centers the cursor when it is off screen.
     reveal_primary: bool,
     /// Vim mode's state while the `vim_mode` setting is on.
@@ -330,6 +332,9 @@ pub struct Editor {
     _doc_observer: gpui::Subscription,
     /// A split of a restored tab not read yet: that tab reads the file.
     waiting: bool,
+    /// A waiting split's own caret and top line from the session, set once
+    /// its text is there.
+    waiting_view: Option<(usize, Option<usize>)>,
 }
 
 impl Editor {
@@ -365,6 +370,7 @@ impl Editor {
             seen,
             _doc_observer: doc_observer,
             waiting: false,
+            waiting_view: None,
             mode: EditorMode::Full,
             placeholder: SharedString::default(),
             search_matches: Vec::new(),
@@ -379,6 +385,7 @@ impl Editor {
             max_line_width: px(0.),
             autoscroll: false,
             center_on_next_frame: false,
+            scroll_to_line: None,
             reveal_primary: false,
             vim: None,
             layout: None,
@@ -483,11 +490,14 @@ impl Editor {
             let this = cx.weak_entity();
             cx.defer(move |cx| {
                 this.update(cx, |editor, cx| {
-                    let (focus_handle, waited) = (editor.focus_handle.clone(), editor.waiting);
+                    let (focus_handle, waited, view) = (editor.focus_handle.clone(), editor.waiting, editor.waiting_view.take());
                     *editor = Self::with_document(editor.doc.clone(), cx);
                     editor.focus_handle = focus_handle;
                     // A split of a restored tab: its text is here now too.
                     if waited {
+                        if let Some((cursor, top_line)) = view {
+                            editor.restore_view(cursor, top_line, cx);
+                        }
                         cx.emit(unloaded::EditorLoaded { error: None });
                     }
                     cx.notify();
@@ -789,6 +799,9 @@ impl Editor {
         self.schedule_lint(Duration::ZERO, cx);
         self.schedule_diff(Duration::ZERO, cx);
         self.edited(cx);
+        // The reload dropped them (they were for the old text).
+        self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
         cx.notify();
     }
 
@@ -1063,6 +1076,9 @@ impl Editor {
             EditKind::Typing
         };
         let typed = text.to_string();
+        // Text fields take text as typed: a closing bracket added to a search
+        // would change what it finds.
+        let pairs = !self.is_chromeless();
         self.edit_selections(kind, cx, |doc, sel| {
             let range = sel.range();
             let mut chars = typed.chars();
@@ -1070,7 +1086,7 @@ impl Editor {
                 (Some(c), None) => Some(c),
                 _ => None,
             };
-            if let Some(c) = single {
+            if let Some(c) = single.filter(|_| pairs) {
                 let next = doc.char_at(range.end);
                 // Type over an auto-inserted closing character.
                 if sel.is_empty() && matches!(c, ')' | ']' | '}' | '"' | '\'' | '`') && next == Some(c) {
@@ -1406,8 +1422,25 @@ impl Editor {
     }
 
     /// Recomputes line breaks when the text, width or font changed. Called
-    /// before anything maps between offsets and display rows.
+    /// before anything maps between offsets and display rows. The line at
+    /// the top of the view stays there as rows above it come and go (code
+    /// lenses or problems arriving after a restored tab took its place,
+    /// folds, a new width).
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
+        let top = self.layout.as_ref().map(|layout| {
+            let line = self.line_at_row((self.scroll.y / layout.line_height).floor() as usize, cx);
+            (line, self.first_display_row(line))
+        });
+        self.update_wrap(window, cx);
+        if let (Some((line, before)), Some(layout)) = (top, self.layout.as_ref()) {
+            let after = self.first_display_row(line);
+            if after != before {
+                self.scroll.y = (self.scroll.y + layout.line_height * (after as f32 - before as f32)).max(px(0.));
+            }
+        }
+    }
+
+    fn update_wrap(&mut self, window: &mut Window, cx: &App) {
         let wrap = self.soft_wrap && !self.is_single_line();
         let blocks = self.block_rows(cx);
         // Without wrapping, folds, long lines or blocks, display rows are buffer lines.
@@ -1584,6 +1617,20 @@ impl Editor {
         match &self.wrap {
             Some(w) => w.line_of(drow),
             None => (drow.min(self.doc.read(cx).line_count().saturating_sub(1)), 0),
+        }
+    }
+
+    /// Where buffer line `row`'s rows start, the ones above it that aren't
+    /// text (code lenses) included.
+    fn rows_start(&self, row: usize) -> usize {
+        self.wrap.as_ref().map_or(row, |w| w.rows_start(row))
+    }
+
+    /// The buffer line whose rows (see `rows_start`) hold display row `drow`.
+    fn line_at_row(&self, drow: usize, cx: &App) -> usize {
+        match &self.wrap {
+            Some(w) => w.line_at(drow),
+            None => drow.min(self.doc.read(cx).line_count().saturating_sub(1)),
         }
     }
 
@@ -1795,6 +1842,8 @@ impl Editor {
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         let unit = self.indent_unit.clone();
+        // Text fields don't pair brackets (see `insert`).
+        let pairs = !self.is_chromeless();
         self.edit_selections(EditKind::Deleting, cx, |doc, s| {
             if !s.is_empty() {
                 return (s.range(), String::new(), Some(0));
@@ -1809,7 +1858,8 @@ impl Editor {
             }
             // Delete an auto-inserted pair together.
             let prev = doc.char_before(head);
-            if let (Some(p), Some(n)) = (prev, doc.char_at(head))
+            if pairs
+                && let (Some(p), Some(n)) = (prev, doc.char_at(head))
                 && closing_pair(p) == Some(n)
             {
                 return (head - p.len_utf8()..head + n.len_utf8(), String::new(), Some(0));
@@ -2775,7 +2825,13 @@ impl Editor {
                 self.autoscroll = true;
             }
         }
-        if std::mem::take(&mut self.center_on_next_frame) && !single {
+        if let Some(line) = self.scroll_to_line.take().filter(|_| !single) {
+            // A restored tab's view as it was, wherever its caret is.
+            self.scroll.y = line_height * self.rows_start(line) as f32;
+            self.scroll.x = px(0.);
+            self.center_on_next_frame = false;
+            self.autoscroll = false;
+        } else if std::mem::take(&mut self.center_on_next_frame) && !single {
             let drow = self.display_row_of(self.primary_selection().head, cx);
             self.scroll.y = (line_height * drow as f32 - bounds.size.height / 3.).max(px(0.));
             self.scroll.x = px(0.);
@@ -3449,6 +3505,8 @@ impl Editor {
                         x += line.width + px(16.);
                         frame.inline_texts.push((point(pill.left() + px(5.), y), line));
                         self.conflict_hits.push((pill, c.start, resolution));
+                        // A diagnostic or blame follows the labels.
+                        text_end = pill.right();
                     }
                 } else if let Some(fold) = self.fold_under(row, cx) {
                     let label = self.fold_placeholder(&fold, cx);
@@ -4890,5 +4948,33 @@ mod block_tests {
             e.set_selections(vec![Selection::cursor(0), Selection::cursor(12)], 0, cx);
             assert!(e.caret_problem_rows(cx).is_empty());
         });
+    }
+}
+
+#[cfg(test)]
+mod text_field_tests {
+    use gpui::{AppContext, TestAppContext};
+
+    use super::*;
+
+    #[gpui::test]
+    fn text_fields_take_brackets_and_quotes_as_typed(cx: &mut TestAppContext) {
+        let typed = |editor: &Entity<Editor>, text: &str, cx: &mut TestAppContext| {
+            editor.update(cx, |e, cx| {
+                for c in text.chars() {
+                    e.insert(&c.to_string(), cx);
+                }
+                e.text(cx)
+            })
+        };
+        // A search for `fn new(` finds that, not `fn new()`.
+        let search = cx.new(|cx| Editor::single_line("Find", cx));
+        assert_eq!(typed(&search, "fn new(", cx), "fn new(");
+        assert_eq!(typed(&search, ")", cx), "fn new()");
+        let message = cx.new(|cx| Editor::multi_line("Commit message", cx));
+        assert_eq!(typed(&message, "Fix \"quotes\" [x]", cx), "Fix \"quotes\" [x]");
+        // The code editor pairs them.
+        let code = cx.new(|cx| Editor::new(Document::empty(), cx));
+        assert_eq!(typed(&code, "f(", cx), "f()");
     }
 }

@@ -32,6 +32,8 @@ impl Workspace {
                 self.terminals.update(cx, |p, _| p.set_saved(Some(terminals)));
             }
         }
+        // The run widget shows what this project ran last.
+        self.last_run = session.as_mut().and_then(|s| s.last_run.take());
         // Before any tab's language server starts.
         let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
         crate::python::set_choice(&root, venv);

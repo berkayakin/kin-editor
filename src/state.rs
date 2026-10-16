@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{document::Breakpoint, theme::config_dir};
+use crate::{document::Breakpoint, run::RunTarget, theme::config_dir};
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
@@ -131,6 +131,9 @@ pub struct ProjectSession {
     /// The terminal panel; absent in sessions from before it was saved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminals: Option<TerminalLayout>,
+    /// The configuration the title bar's run widget shows (Run runs it again).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<RunTarget>,
 }
 
 /// The terminal panel's shells, by group (splits side by side).
@@ -191,6 +194,9 @@ pub struct TabSession {
     pub path: Option<PathBuf>,
     /// The caret, as a byte offset.
     pub cursor: usize,
+    /// The line at the top of the view; absent, the caret is centered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_line: Option<usize>,
     /// The whole text, when the buffer had unsaved edits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsaved: Option<String>,
@@ -264,6 +270,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::DebugSpec;
 
     #[test]
     fn session_file_names_are_stable_and_distinct() {
@@ -279,8 +286,8 @@ mod tests {
         let session = ProjectSession {
             root: "/work/kin".into(),
             tabs: vec![
-                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
-                TabSession { path: None, cursor: 0, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new(), encoding: None },
+                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, top_line: Some(40), unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
+                TabSession { path: None, cursor: 0, top_line: None, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new(), encoding: None },
             ],
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
@@ -298,8 +305,28 @@ mod tests {
                 path: "src/a.rs".into(),
                 breakpoints: vec![Breakpoint::at(3), Breakpoint { condition: Some("i > 2".into()), ..Breakpoint::at(9) }],
             }],
+            last_run: Some(RunTarget {
+                name: "Tests in 'tests'".into(),
+                command: "cargo test --bin kin -- tests".into(),
+                cwd: "/work/kin".into(),
+                row: None,
+                rows: 0..0,
+                debug: Some(DebugSpec::Cargo { build: vec!["test".into(), "--no-run".into()], args: vec!["tests".into()] }),
+            }),
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);
+
+        // Every way to debug comes back.
+        let go = RunTarget {
+            name: "Test 'TestA'".into(),
+            command: "go test -run '^TestA$' ./pkg".into(),
+            cwd: "/work/kin".into(),
+            row: None,
+            rows: 0..0,
+            debug: Some(DebugSpec::Go { mode: "test".into(), program: "/work/kin/pkg".into(), args: vec!["-test.run".into()] }),
+        };
+        let json = serde_json::to_string(&go).unwrap();
+        assert_eq!(serde_json::from_str::<RunTarget>(&json).unwrap(), go);
     }
 }

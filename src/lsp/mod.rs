@@ -1065,6 +1065,7 @@ impl FileWatcher {
 /// by its initialization option `greeting` and the `mode` in its `fake`
 /// settings section when it has them), completes with "<name>-item", offers "<name> fix
 /// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
+/// Named "hints", it also gives an inlay hint at the end of the first line.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
@@ -1088,6 +1089,7 @@ def send(msg):
     sys.stdout.buffer.flush()
 init = {}
 last_uri = None
+text = ""
 while True:
     m = read()
     method, id = m.get("method"), m.get("id")
@@ -1104,10 +1106,18 @@ while True:
     elif method == "initialize":
         init = m["params"].get("initializationOptions") or {}
         caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True, "codeLensProvider": {"resolveProvider": True}, "definitionProvider": True, "referencesProvider": True}
+        if name == "hints":
+            caps["inlayHintProvider"] = True
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
+    elif method == "textDocument/didChange":
+        text = m["params"]["contentChanges"][-1]["text"]
+    elif method == "textDocument/inlayHint":
+        first = text.split("\n", 1)[0]
+        send({"jsonrpc": "2.0", "id": id, "result": [{"position": {"line": 0, "character": len(first)}, "label": ": hint"}]})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
         last_uri = uri
+        text = m["params"]["textDocument"]["text"]
         # Asks for its whole section and reads `mode` in it, as basedpyright
         # asks for "basedpyright" and reads its "analysis".
         send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})

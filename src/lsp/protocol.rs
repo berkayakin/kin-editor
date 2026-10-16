@@ -260,6 +260,8 @@ pub struct CompletionItem {
     pub detail: Option<String>,
     pub filter_text: String,
     pub sort_text: String,
+    /// The server's pick for the selection when the menu opens.
+    pub preselect: bool,
     pub edit: Option<TextEdit>,
     pub insert_text: Option<String>,
     pub is_snippet: bool,
@@ -278,6 +280,7 @@ impl CompletionItem {
                 .or_else(|| raw.get("labelDetails").and_then(|l| l.get("description")).and_then(Value::as_str).map(str::to_string)),
             filter_text: str_of("filterText").unwrap_or_else(|| label.clone()),
             sort_text: str_of("sortText").unwrap_or_else(|| label.clone()),
+            preselect: raw.get("preselect").and_then(Value::as_bool).unwrap_or(false),
             edit: raw.get("textEdit").and_then(TextEdit::from_json),
             insert_text: str_of("insertText"),
             is_snippet: raw.get("insertTextFormat").and_then(Value::as_u64) == Some(2),
@@ -752,10 +755,12 @@ mod tests {
     #[test]
     fn parses_completions() {
         let items = completion_items(json!({ "isIncomplete": false, "items": [
-            { "label": "push", "kind": 2, "detail": "fn(&mut self, T)", "insertTextFormat": 2,
-              "textEdit": { "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 4}}, "newText": "push(${1:value})$0" } }
+            { "label": "push", "kind": 2, "detail": "fn(&mut self, T)", "insertTextFormat": 2, "preselect": true,
+              "textEdit": { "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 4}}, "newText": "push(${1:value})$0" } },
+            { "label": "pop" }
         ] }));
         assert_eq!(items[0].kind, Some("method"));
+        assert_eq!((items[0].preselect, items[1].preselect), (true, false));
         assert_eq!(items[0].raw_text(), "push(${1:value})$0");
         assert_eq!(expand_snippet(items[0].raw_text()), ("push(value)".to_string(), vec![vec![5..10], vec![11..11]]));
     }

@@ -191,6 +191,8 @@ impl Workspace {
             Ok(()) => {
                 self.auto_save_warned.remove(&editor.entity_id());
                 self.check_config(cx);
+                // The session may hold the text as unsaved.
+                self.schedule_session_save(cx);
             }
             Err(err) => {
                 let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
