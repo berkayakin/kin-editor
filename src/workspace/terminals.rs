@@ -8,7 +8,14 @@ impl Workspace {
     /// ⌥F12: opens the terminal, focuses it, or (when focused) hides it.
     pub(super) fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
         let focused = self.all_terminals(cx).iter().any(|t| t.focus_handle(cx).contains_focused(window, cx));
-        if self.shows(BottomPanel::Terminal) && focused {
+        self.set_terminal_shown(!(self.shows(BottomPanel::Terminal) && focused), window, cx);
+    }
+
+    /// Shows the terminal panel (focused, its shells started) or hides it.
+    /// The title bar's button calls this directly: lit, it hides the panel,
+    /// even while the editor has focus.
+    pub(super) fn set_terminal_shown(&mut self, show: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !show {
             self.hide_bottom(BottomPanel::Terminal);
             self.focus_active(window, cx);
         } else {

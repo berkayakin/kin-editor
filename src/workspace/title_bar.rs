@@ -181,7 +181,7 @@ impl Workspace {
             )
             .child(
                 toggle("toggle-terminal", Icon::Terminal, self.shows(BottomPanel::Terminal), cx, |ws, window, cx| {
-                    ws.toggle_terminal(&ToggleTerminal, window, cx)
+                    ws.set_terminal_shown(!ws.shows(BottomPanel::Terminal), window, cx)
                 })
                 .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
             )
