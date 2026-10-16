@@ -121,7 +121,11 @@ impl Workspace {
     /// give up their names: the other tab first, then the current one too
     /// (their tooltips still name them). `SIDEBAR_MIN_WIDTH` keeps two icons in.
     pub(super) fn render_sidebar_tabs(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx).clone();
+        let mut theme = Theme::get(cx).clone();
+        // Lit with the tree's island while a drag targets the project folder.
+        if self.tree_root_drop && self.sidebar_mode != SidebarMode::Commit {
+            theme.background = crate::ui::drop_lift(&theme).1.into();
+        }
         let files_on = self.sidebar_mode == SidebarMode::Files;
         let changes = self.git_status.files.len();
         let edge = crate::ui::island_edge(&theme);

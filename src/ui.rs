@@ -372,6 +372,18 @@ pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, c
     focus_ring(field, ("input-focus", editor.entity_id().as_u64()), focused, theme)
 }
 
+/// How an island lights up under a dragged file it would take (an editor pane,
+/// the file tree's project folder): the overlay laid over it (its content shows
+/// through), and the same color as a solid fill for the tab joined to it. A
+/// little whiter on dark themes, a little darker on light ones.
+pub fn drop_lift(theme: &Theme) -> (Hsla, Hsla) {
+    let (tint, amount): (Hsla, f32) = match theme.appearance {
+        Appearance::Dark => (gpui::hsla(0., 0., 1., 1.), 0.05),
+        Appearance::Light => (theme.text.into(), 0.04),
+    };
+    (tint.alpha(amount), mix(Hsla::from(theme.background), tint, amount))
+}
+
 /// The glow of a focused text field, and of a hovered card that looks like one
 /// (the start screen's): a little softer than `focus_glow`, since the accent
 /// border already marks it.

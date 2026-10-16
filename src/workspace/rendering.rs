@@ -223,11 +223,13 @@ impl Workspace {
     pub(super) fn clear_drag_state(&mut self, cx: &mut Context<Self>) {
         // The drop overlays are drag_over styles: they only need a redraw.
         self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
+        self.pane_drop = None;
+        self.tree_root_drop = false;
         cx.notify();
     }
 
     pub(super) fn on_root_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.tree.read(cx).has_drop_target() {
+        if self.tree.read(cx).has_drop_target() || self.pane_drop.is_some() {
             self.clear_drag_state(cx);
         }
         if self.resizing.take().is_some() {
@@ -257,6 +259,9 @@ impl Render for Workspace {
         // A drag that ended without a drop (Escape, left the window) leaves no highlight.
         if !cx.has_active_drag() && self.tree.read(cx).has_drop_target() {
             self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
+        }
+        if !cx.has_active_drag() {
+            self.pane_drop = None;
         }
         self.decorate_tree(cx);
         let git_target = self.context_menu.as_ref().and_then(|m| m.git_target.clone());

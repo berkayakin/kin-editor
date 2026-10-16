@@ -7,7 +7,12 @@ impl Workspace {
     /// island, the current one filled like the island and joined to it.
     /// `edge` is the island's border color, which the current tab continues.
     pub(super) fn render_tab_bar(&self, pane_ix: usize, edge: Hsla, available: Option<f32>, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx).clone();
+        let mut theme = Theme::get(cx).clone();
+        // A file dragged over the pane lights its island up; the current tab,
+        // which is part of it, too.
+        if self.pane_drop == Some(pane_ix) {
+            theme.background = crate::ui::drop_lift(&theme).1.into();
+        }
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
@@ -418,6 +423,13 @@ impl Workspace {
             // Finder files, and files dragged from the file tree, dropped anywhere
             // over the pane (tabs included) open in it.
             .group(drop_group.clone())
+            .on_drag_move(cx.listener(move |ws, ev: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                ws.set_pane_drop(pane_ix, ev.bounds.contains(&ev.event.position), cx)
+            }))
+            .on_drag_move(cx.listener(move |ws, ev: &gpui::DragMoveEvent<crate::project_tree::DraggedEntry>, _, cx| {
+                let over = ev.bounds.contains(&ev.event.position) && !ev.drag(cx).path.is_dir();
+                ws.set_pane_drop(pane_ix, over, cx)
+            }))
             .child(
                 // Shown by GPUI while such files are over the pane, so there's no
                 // state to go stale. Being the drop target also gives it the
@@ -432,28 +444,32 @@ impl Workspace {
                     })
                     .on_drop(cx.listener(move |ws, paths: &gpui::ExternalPaths, window, cx| {
                         cx.stop_propagation();
+                        ws.pane_drop = None;
                         ws.active_pane = pane_ix;
                         ws.open_dropped(paths.paths(), window, cx);
                     }))
                     .on_drop(cx.listener(move |ws, entry: &crate::project_tree::DraggedEntry, window, cx| {
                         cx.stop_propagation();
+                        ws.pane_drop = None;
                         ws.active_pane = pane_ix;
                         ws.open_path(entry.path.clone(), window, cx);
                     }))
                     .absolute()
                     .inset_0()
-                    .p_2()
                     .child(
+                    // The island lights up a little (inside its outline, below the
+                    // tab strip's room); no frame of its own.
                     div()
-                        .size_full()
+                        .absolute()
+                        .top(px(TAB_STRIP_HEIGHT))
+                        .left(px(1.))
+                        .right(px(1.))
+                        .bottom(px(1.))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .rounded(px(10.))
-                        .border_2()
-                        .border_dashed()
-                        .border_color(Hsla::from(theme.accent).alpha(0.8))
-                        .bg(Hsla::from(theme.accent).alpha(0.08))
+                        .rounded(px(crate::ui::ISLAND_RADIUS - 1.))
+                        .bg(crate::ui::drop_lift(&theme).0)
                         .child(
                             div()
                                 .flex()
@@ -473,6 +489,15 @@ impl Workspace {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Notes whether a dragged file is over pane `ix` (for its tab's color).
+    fn set_pane_drop(&mut self, ix: usize, over: bool, cx: &mut Context<Self>) {
+        let now = if over { Some(ix) } else if self.pane_drop == Some(ix) { None } else { self.pane_drop };
+        if now != self.pane_drop {
+            self.pane_drop = now;
+            cx.notify();
+        }
     }
 
     /// Under the tabs: the file's folders and name, then (in text) the

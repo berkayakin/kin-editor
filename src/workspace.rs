@@ -639,6 +639,12 @@ pub struct Workspace {
     debug: Option<(Entity<DebugSession>, Subscription)>,
     last_debug: Option<RunTarget>,
     welcome_scroll: gpui::ScrollHandle,
+    /// The pane a file is being dragged over (from Finder or the tree): its
+    /// current tab lights up with the island (see `ui::drop_lift`).
+    pane_drop: Option<usize>,
+    /// A drag over the file tree targets the project folder: the Files tab
+    /// lights up with the tree's island.
+    tree_root_drop: bool,
     /// Where the debug session is paused (file, 1-based line), to mark it in that file's editor.
     debug_location: Option<(PathBuf, u32)>,
     /// Breakpoints of files that aren't open; open files keep theirs in their documents.
@@ -785,6 +791,10 @@ impl Workspace {
             TreeEvent::CopyIn { paths, into } => ws.drop_into_tree(paths.clone(), into.clone(), window, cx),
             TreeEvent::History { redo } => ws.step_file_history(*redo, window, cx),
             TreeEvent::Toggled => ws.schedule_session_save(cx),
+            TreeEvent::RootDrop(on) => {
+                ws.tree_root_drop = *on;
+                cx.notify();
+            }
         });
         let terminals = cx.new(|_| TerminalPanel::new());
         let terminals_subscription = cx.subscribe_in(&terminals, window, |ws, _, event: &TerminalPanelEvent, window, cx| match event {
@@ -975,6 +985,8 @@ impl Workspace {
             debug: None,
             last_debug: None,
             welcome_scroll: gpui::ScrollHandle::new(),
+            pane_drop: None,
+            tree_root_drop: false,
             debug_location: None,
             breakpoints: HashMap::new(),
             venv_shown: Default::default(),

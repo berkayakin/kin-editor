@@ -54,6 +54,9 @@ pub enum TreeEvent {
     History { redo: bool },
     /// A folder opened or closed (the session keeps which).
     Toggled,
+    /// A drag over the tree started or stopped targeting the project folder
+    /// (the Files tab lights up with the tree).
+    RootDrop(bool),
 }
 
 impl EventEmitter<TreeEvent> for ProjectTree {}
@@ -175,9 +178,17 @@ impl ProjectTree {
 
     pub fn set_drop_target(&mut self, target: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.drop_target != target {
+            let was_root = self.drop_on_root();
             self.drop_target = target;
+            if self.drop_on_root() != was_root {
+                cx.emit(TreeEvent::RootDrop(!was_root));
+            }
             cx.notify();
         }
+    }
+
+    fn drop_on_root(&self) -> bool {
+        self.drop_target.is_some() && self.drop_target == self.root
     }
 
     /// How rows look: Git changes, what Git ignores, the open file, a context
@@ -226,7 +237,7 @@ impl Focusable for ProjectTree {
 impl Render for ProjectTree {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let drop_on_root = self.drop_target.is_some() && self.drop_target == self.root;
+        let drop_on_root = self.drop_on_root();
         let list = uniform_list(
             "file-tree",
             self.entries.len(),
@@ -264,7 +275,7 @@ impl Render for ProjectTree {
                                 .rounded(px(6.))
                                 .cursor_pointer()
                                 .text_color(if selected { theme.text } else { theme.text_muted })
-                                // A lit edge marks the open file.
+                                // The open file has the accent fill.
                                 .when(selected, |el| el.bg(theme.accent_soft))
                                 .row_hover(theme.hover)
                                 .on_click(cx.listener(move |tree, _, _, cx| tree.click(ix, cx)))
@@ -342,8 +353,6 @@ impl Render for ProjectTree {
             let target = ev.bounds.contains(&ev.event.position).then(|| tree.root.clone()).flatten();
             tree.set_drop_target(target, cx);
         }))
-        // The project folder itself has no row: outline the tree instead.
-        .when(drop_on_root, |el| el.border_1().border_color(Hsla::from(theme.accent).alpha(0.7)).rounded(px(6.)))
         .on_drop(cx.listener(|tree, dragged: &DraggedEntry, _, cx| {
             tree.set_drop_target(None, cx);
             if let Some(root) = tree.root.clone() {
@@ -374,7 +383,28 @@ impl Render for ProjectTree {
                 }
             }),
         );
-        div().relative().size_full().child(list).child(crate::ui::list_scrollbar("file-tree-scrollbar", &self.scroll, cx))
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            // The project folder itself has no row: the whole sidebar island
+            // lights up as an editor pane does, without moving anything: out
+            // through the island's inset to just inside its outline (which, at
+            // the top, the Files tab covers in the same color).
+            .when(drop_on_root, |el| {
+                let inset = px(crate::ui::ISLAND_INSET);
+                el.child(
+                    div()
+                        .absolute()
+                        .top(-inset)
+                        .left(-inset)
+                        .right(-inset)
+                        .bottom(-inset)
+                        .rounded(px(crate::ui::ISLAND_RADIUS - 1.))
+                        .bg(crate::ui::drop_lift(&theme).0),
+                )
+            })
+            .child(crate::ui::list_scrollbar("file-tree-scrollbar", &self.scroll, cx))
     }
 }
 
