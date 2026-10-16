@@ -50,7 +50,7 @@ impl Workspace {
                 .child(div().truncate().text_color(theme.text).child(branch))
                 .into_any_element(),
             button("sidebar-fetch", Icon::Refresh, "Fetch", 0, GitOp::Fetch, cx),
-            button("sidebar-pull", Icon::ArrowDown, "Update Project (Pull)", s.behind, GitOp::Pull, cx),
+            button("sidebar-pull", Icon::ArrowDown, "Update Project (Pull)", s.behind, GitOp::Pull(None), cx),
             button("sidebar-push", Icon::ArrowUp, "Push", s.ahead, GitOp::Push, cx),
         ]
     }

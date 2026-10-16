@@ -46,12 +46,27 @@ impl Workspace {
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
+                                .flex_1()
                                 .min_w_0()
                                 .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(t.message.clone()))
                                 .when_some(t.detail.clone(), |el, d| {
                                     el.child(div().text_size(px(12.)).text_color(theme.text_muted).line_clamp(4).child(d))
                                 }),
                         )
+                        // Only while it would still undo what the toast reports.
+                        .when_some(t.undo.filter(|undo| self.undo_applies(*undo)), |el, undo| {
+                            el.child(
+                                crate::ui::text_button(("toast-undo", id), "Undo", false, cx)
+                                    .h(px(24.))
+                                    .px_2p5()
+                                    .text_size(px(12.))
+                                    .on_click(cx.listener(move |ws, _, window, cx| {
+                                        cx.stop_propagation();
+                                        ws.dismiss_toast(id, cx);
+                                        ws.run_toast_undo(undo, window, cx);
+                                    })),
+                            )
+                        })
                         .with_transition(gpui::ElementId::NamedInteger("toast-fade".into(), id as u64), !t.leaving, transition::TOAST, fade)
                         .appear()
                 }))

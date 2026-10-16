@@ -11,6 +11,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use schemars::JsonSchema;
+use serde::Deserialize;
+
 use crate::encoding::TextEncoding;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -92,8 +95,17 @@ impl RepoStatus {
         self.files.iter().filter(|f| f.staged == Some(Change::Conflicted))
     }
 
+    /// Tracked files with changes not staged yet, and conflicts.
     pub fn unstaged(&self) -> impl Iterator<Item = &FileStatus> {
-        self.files.iter().filter(|f| f.unstaged.is_some() || f.staged == Some(Change::Conflicted))
+        self.files
+            .iter()
+            .filter(|f| (f.unstaged.is_some() && f.unstaged != Some(Change::Untracked)) || f.staged == Some(Change::Conflicted))
+    }
+
+    /// Files Git doesn't track (unversioned). A commit takes them only when
+    /// asked to, unlike changes to tracked files.
+    pub fn untracked(&self) -> impl Iterator<Item = &FileStatus> {
+        self.files.iter().filter(|f| f.unstaged == Some(Change::Untracked))
     }
 
     /// Status per path, plus a "contains changes" mark for every ancestor
@@ -398,6 +410,12 @@ pub fn stage(root: &Path, rels: &[String]) -> Result<(), String> {
     run(root, &args).map(drop)
 }
 
+/// Stages every change to tracked files, deletions included, but no
+/// untracked file (as `commit --all` would).
+pub fn stage_tracked(root: &Path) -> Result<(), String> {
+    run(root, &["add", "--update"]).map(drop)
+}
+
 pub fn unstage(root: &Path, rels: &[String], has_head: bool) -> Result<(), String> {
     let mut args: Vec<&str> = if has_head {
         vec!["restore", "--staged", "--"]
@@ -481,8 +499,115 @@ pub fn push_preview(root: &Path) -> Result<PushPreview, String> {
     Ok(PushPreview { branch, upstream: status.upstream, commits, behind: status.behind, has_remote: !remotes.is_empty(), remotes })
 }
 
-pub fn pull(root: &Path) -> Result<String, String> {
-    run(root, &["pull", "--ff", "--no-edit"])
+/// How a pull combines incoming commits with local ones once both branches
+/// have new commits (`pull_strategy` in settings).
+#[derive(Deserialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullStrategy {
+    /// A merge commit joins them.
+    Merge,
+    /// Local commits are replayed on top of the incoming ones.
+    Rebase,
+    /// Only fast-forwards: a branch with commits of its own isn't pulled.
+    FfOnly,
+}
+
+impl PullStrategy {
+    pub const ALL: [PullStrategy; 3] = [PullStrategy::Merge, PullStrategy::Rebase, PullStrategy::FfOnly];
+
+    /// The value in `settings.json`.
+    pub fn key(self) -> &'static str {
+        match self {
+            PullStrategy::Merge => "merge",
+            PullStrategy::Rebase => "rebase",
+            PullStrategy::FfOnly => "ff_only",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PullStrategy::Merge => "Merge",
+            PullStrategy::Rebase => "Rebase",
+            PullStrategy::FfOnly => "Fast-forward only",
+        }
+    }
+
+    /// `git pull`'s options for it; they override the user's Git config.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            // `--ff`: a fast-forward when there's nothing local, else a merge commit.
+            PullStrategy::Merge => &["--no-rebase", "--ff", "--no-edit"],
+            PullStrategy::Rebase => &["--rebase"],
+            PullStrategy::FfOnly => &["--ff-only"],
+        }
+    }
+}
+
+/// What a pull did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pulled {
+    UpToDate,
+    /// This many commits came in: fast-forwarded to, merged with the local
+    /// ones, or with the local ones rebased onto them.
+    FastForwarded(usize),
+    Merged(usize),
+    Rebased(usize),
+    /// A merge or rebase stopped on conflicts (Continue or Abort it).
+    Conflicts,
+    /// Both branches have commits the other doesn't, and the pull only
+    /// fast-forwards: nothing changed.
+    Diverged { branch: String, upstream: String, ahead: u32, behind: u32 },
+}
+
+/// Whether the user's Git config says how a pull combines diverged
+/// branches (`pull.rebase`, `pull.ff` or the branch's own `rebase`).
+pub fn pull_configured(root: &Path, branch: Option<&str>) -> bool {
+    let set = |key: &str| run(root, &["config", "--get", key]).is_ok_and(|value| !value.trim().is_empty());
+    set("pull.rebase") || set("pull.ff") || branch.is_some_and(|b| set(&format!("branch.{b}.rebase")))
+}
+
+/// Pulls the current branch's upstream. Without a `strategy`, the user's Git
+/// config decides if it says how; otherwise only a fast-forward happens, and
+/// branches that both have new commits come back as `Diverged`, so nobody gets
+/// a merge commit they didn't choose.
+pub fn pull(root: &Path, strategy: Option<PullStrategy>) -> Result<Pulled, String> {
+    let head = || run(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).ok().map(|s| s.trim().to_string());
+    let count = |range: &str| run(root, &["rev-list", "--count", range]).ok().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+    let before = head();
+    let args: &[&str] = match strategy {
+        Some(strategy) => strategy.args(),
+        None if pull_configured(root, status(root).ok().and_then(|s| s.branch).as_deref()) => &["--no-edit"],
+        None => PullStrategy::FfOnly.args(),
+    };
+    if let Err(err) = run(root, &[["pull"].as_slice(), args].concat()) {
+        if conflicts_or(root, err.clone()).is_ok() {
+            return Ok(Pulled::Conflicts);
+        }
+        // A fast-forward-only pull fetched before it gave up, so this
+        // compares with what came in.
+        return match status(root) {
+            Ok(s) if args == PullStrategy::FfOnly.args() && s.ahead > 0 && s.behind > 0 => Ok(Pulled::Diverged {
+                branch: s.branch.unwrap_or_default(),
+                upstream: s.upstream.unwrap_or_default(),
+                ahead: s.ahead,
+                behind: s.behind,
+            }),
+            _ => Err(err),
+        };
+    }
+    let Some(after) = head().filter(|after| before.as_ref() != Some(after)) else { return Ok(Pulled::UpToDate) };
+    // A branch without commits of its own gets everything.
+    let Some(before) = before else { return Ok(Pulled::FastForwarded(count("HEAD"))) };
+    let incoming = count(&format!("{before}..@{{upstream}}"));
+    let parents = run(root, &["rev-list", "--parents", "-n", "1", "HEAD"]).unwrap_or_default();
+    let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+    Ok(if parents.len() > 1 && parents.contains(&before.as_str()) {
+        Pulled::Merged(incoming)
+    } else if run(root, &["merge-base", "--is-ancestor", &before, &after]).is_ok() {
+        Pulled::FastForwarded(incoming)
+    } else {
+        Pulled::Rebased(incoming)
+    })
 }
 
 pub fn fetch(root: &Path) -> Result<String, String> {
@@ -1355,22 +1480,59 @@ pub fn stashes(root: &Path) -> Vec<Stash> {
         .collect()
 }
 
-/// Stashes every change, untracked files too.
-pub fn stash(root: &Path, message: Option<&str>) -> Result<(), String> {
-    let mut args = vec!["stash", "push", "--include-untracked"];
+/// Stashes the changes to tracked files, and untracked files too when
+/// `untracked`, with an optional message. `false` when there was nothing to
+/// stash (Git says so but succeeds).
+pub fn stash(root: &Path, message: Option<&str>, untracked: bool) -> Result<bool, String> {
+    let top = || run(root, &["rev-parse", "--verify", "--quiet", "refs/stash"]).ok();
+    let before = top();
+    let mut args = vec!["stash", "push"];
+    if untracked {
+        args.push("--include-untracked");
+    }
     if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
         args.extend(["--message", message]);
     }
-    run(root, &args).map(drop)
+    run(root, &args)?;
+    Ok(top() != before)
 }
 
-/// Applies a stash (and drops it when `pop`). Conflicts leave the files
-/// conflicted and the stash kept: "CONFLICT".
-pub fn unstash(root: &Path, index: usize, pop: bool) -> Result<String, String> {
+/// The untracked files a stash holds that exist in the working tree again.
+/// Git won't write over them, so it would apply the rest of the stash
+/// without them and keep it.
+pub fn stash_blockers(root: &Path, index: usize) -> Vec<String> {
+    // The third parent of a stash commit holds its untracked files.
+    let Ok(out) = run(root, &["ls-tree", "-r", "-z", "--name-only", &format!("stash@{{{index}}}^3")]) else {
+        return Vec::new();
+    };
+    out.split('\0').filter(|rel| !rel.is_empty() && root.join(rel).symlink_metadata().is_ok()).map(str::to_string).collect()
+}
+
+/// What applying a stash did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unstashed {
+    Applied,
+    /// Stopped on conflicts: the files are left conflicted and the stash kept.
+    Conflicts,
+    /// Git failed after applying part of it, and kept the stash: `error`,
+    /// and the untracked files it didn't restore because they exist.
+    Partly { error: String, not_restored: Vec<String> },
+}
+
+/// Applies a stash (and drops it when `pop`).
+pub fn unstash(root: &Path, index: usize, pop: bool) -> Result<Unstashed, String> {
     let name = format!("stash@{{{index}}}");
-    run(root, &["stash", if pop { "pop" } else { "apply" }, &name]).or_else(|e| {
-        if status(root).is_ok_and(|s| s.files.iter().any(|f| f.staged == Some(Change::Conflicted))) { Ok("CONFLICT".into()) } else { Err(e) }
-    })
+    let blockers = stash_blockers(root, index);
+    let before = status(root)?.files;
+    let Err(error) = run(root, &["stash", if pop { "pop" } else { "apply" }, &name]) else { return Ok(Unstashed::Applied) };
+    let after = status(root)?.files;
+    if after.iter().any(|f| f.staged == Some(Change::Conflicted)) {
+        Ok(Unstashed::Conflicts)
+    } else if after != before {
+        Ok(Unstashed::Partly { error, not_restored: blockers })
+    } else {
+        Err(error)
+    }
 }
 
 pub fn drop_stash(root: &Path, index: usize) -> Result<(), String> {
@@ -1850,24 +2012,183 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         assert_eq!(status(&root).unwrap().branch, None);
         checkout(&root, &Branch { name: main.clone(), remote: false, current: false }).unwrap();
 
-        // Stashes, untracked files included.
+        // Stashes take untracked files only when asked to.
         std::fs::write(&file, "changed\n").unwrap();
         std::fs::write(dir.join("new.txt"), "new\n").unwrap();
-        stash(&root, Some("work in progress")).unwrap();
-        assert!(status(&root).unwrap().files.is_empty());
+        assert!(stash(&root, Some("work in progress"), false).unwrap());
+        let left: Vec<String> = status(&root).unwrap().files.into_iter().map(|f| f.rel).collect();
+        assert_eq!(left, ["new.txt"]);
         let list = stashes(&root);
         assert_eq!(list.len(), 1);
         assert_eq!((list[0].index, list[0].message.ends_with("work in progress")), (0, true));
-        unstash(&root, 0, false).unwrap();
+        // Only an untracked file left: nothing to stash without it.
+        assert!(!stash(&root, None, false).unwrap());
         assert_eq!(stashes(&root).len(), 1);
-        assert!(dir.join("new.txt").exists());
-        discard(&root, &status(&root).unwrap().files).unwrap();
-        unstash(&root, 0, true).unwrap();
+        assert_eq!(unstash(&root, 0, false).unwrap(), Unstashed::Applied);
+        assert_eq!(stashes(&root).len(), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed\n");
+        discard(&root, &status(&root).unwrap().unstaged().cloned().collect::<Vec<_>>()).unwrap();
+        assert_eq!(unstash(&root, 0, true).unwrap(), Unstashed::Applied);
         assert!(stashes(&root).is_empty());
-        stash(&root, None).unwrap();
+        assert!(stash(&root, None, true).unwrap());
+        assert!(status(&root).unwrap().files.is_empty());
         drop_stash(&root, 0).unwrap();
         assert!(stashes(&root).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A repository in a fresh temp folder, with a committer and `main` checked out.
+    fn test_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kin-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        run(&dir, &["config", "user.name", "Test"]).unwrap();
+        run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
+        run(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        discover(&dir).unwrap()
+    }
+
+    #[test]
+    fn commits_and_stashes_leave_untracked_files_alone() {
+        if !is_available() {
+            return;
+        }
+        let root = test_repo("untracked");
+        let write = |rel: &str, text: &str| std::fs::write(root.join(rel), text).unwrap();
+        write("a.txt", "one\n");
+        write("gone.txt", "bye\n");
+        stage(&root, &["a.txt".into(), "gone.txt".into()]).unwrap();
+        commit(&root, "first", false).unwrap();
+
+        // Commit All: changes to tracked files (a deletion too), not new files.
+        write("a.txt", "two\n");
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        write("Cargo.lock", "generated\n");
+        let s = status(&root).unwrap();
+        let rels = |files: Vec<&FileStatus>| files.into_iter().map(|f| f.rel.clone()).collect::<Vec<_>>();
+        assert_eq!(rels(s.unstaged().collect()), ["a.txt", "gone.txt"]);
+        assert_eq!(rels(s.untracked().collect()), ["Cargo.lock"]);
+        stage_tracked(&root).unwrap();
+        commit(&root, "second", false).unwrap();
+        let s = status(&root).unwrap();
+        assert_eq!(rels(s.files.iter().collect()), ["Cargo.lock"]);
+        assert_eq!(s.files[0].unstaged, Some(Change::Untracked));
+
+        // A stash with untracked files, popped after one of them came back:
+        // Git applies the rest and keeps the stash, which is reported.
+        write("a.txt", "three\n");
+        write("TODO.txt", "todo\n");
+        assert!(stash(&root, Some("wip"), true).unwrap());
+        assert!(status(&root).unwrap().files.is_empty());
+        assert!(stash_blockers(&root, 0).is_empty());
+        write("Cargo.lock", "regenerated\n");
+        assert_eq!(stash_blockers(&root, 0), ["Cargo.lock"]);
+        match unstash(&root, 0, true).unwrap() {
+            Unstashed::Partly { not_restored, .. } => assert_eq!(not_restored, ["Cargo.lock"]),
+            other => panic!("expected a partly applied stash, got {other:?}"),
+        }
+        assert_eq!(stashes(&root).len(), 1, "the stash is kept");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "three\n");
+        assert!(root.join("TODO.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("Cargo.lock")).unwrap(), "regenerated\n");
+        // Nothing applies a second time: Git refuses and nothing changes.
+        assert!(unstash(&root, 0, true).is_err());
+        assert_eq!(stashes(&root).len(), 1);
+
+        // With the files out of the way, the whole stash applies.
+        discard(&root, &status(&root).unwrap().files).unwrap();
+        assert!(stash_blockers(&root, 0).is_empty());
+        assert_eq!(unstash(&root, 0, true).unwrap(), Unstashed::Applied);
+        assert_eq!(std::fs::read_to_string(root.join("Cargo.lock")).unwrap(), "generated\n");
+        assert!(stashes(&root).is_empty());
+
+        // A stashed untracked folder that's a file now isn't a blocker Git
+        // names, but it stops the restore after the tracked changes applied.
+        std::fs::create_dir_all(root.join("gen")).unwrap();
+        write("gen/out.txt", "x\n");
+        assert!(stash(&root, None, true).unwrap());
+        write("gen", "a file now\n");
+        assert!(stash_blockers(&root, 0).is_empty());
+        match unstash(&root, 0, true).unwrap() {
+            Unstashed::Partly { not_restored, error } => assert!(not_restored.is_empty() && !error.is_empty(), "{error}"),
+            other => panic!("expected a partly applied stash, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "three\n");
+        assert_eq!(stashes(&root).len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pull_strategies() {
+        if !is_available() {
+            return;
+        }
+        // Ours, a bare remote, and a second clone standing in for someone else.
+        let ours = test_repo("pull");
+        let remote = ours.with_extension("remote.git");
+        let theirs = ours.with_extension("theirs");
+        for dir in [&remote, &theirs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        run(&ours, &["init", "--bare", "--quiet", remote.to_str().unwrap()]).unwrap();
+        run(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
+        run(&ours, &["remote", "add", "origin", remote.to_str().unwrap()]).unwrap();
+        let commit_in = |root: &Path, rel: &str, text: &str| {
+            std::fs::write(root.join(rel), text).unwrap();
+            stage(root, &[rel.to_string()]).unwrap();
+            commit(root, &format!("{rel}: {}", text.trim()), false).unwrap();
+        };
+        commit_in(&ours, "a.txt", "one\n");
+        push(&ours, Some(("origin", "main")), false).unwrap();
+        run(&ours, &["clone", "--quiet", remote.to_str().unwrap(), theirs.to_str().unwrap()]).unwrap();
+        run(&theirs, &["config", "user.name", "Them"]).unwrap();
+        run(&theirs, &["config", "user.email", "them@example.com"]).unwrap();
+        let publish = |rel: &str, text: &str| {
+            run(&theirs, &["pull", "--quiet", "--ff-only"]).unwrap();
+            commit_in(&theirs, rel, text);
+            push(&theirs, None, false).unwrap();
+        };
+        let head = || run(&ours, &["rev-parse", "HEAD"]).unwrap();
+
+        assert_eq!(pull(&ours, None).unwrap(), Pulled::UpToDate);
+        publish("b.txt", "theirs\n");
+        assert_eq!(pull(&ours, None).unwrap(), Pulled::FastForwarded(1));
+
+        // Both sides have new commits: a fast-forward-only pull changes nothing.
+        publish("c.txt", "theirs\n");
+        commit_in(&ours, "d.txt", "ours\n");
+        let before = head();
+        let diverged = Pulled::Diverged { branch: "main".into(), upstream: "origin/main".into(), ahead: 1, behind: 1 };
+        assert_eq!(pull(&ours, Some(PullStrategy::FfOnly)).unwrap(), diverged);
+        // Without a strategy, unless this machine's Git config has one.
+        if !pull_configured(&ours, Some("main")) {
+            assert_eq!(pull(&ours, None).unwrap(), diverged);
+        }
+        assert_eq!(head(), before);
+        assert_eq!(pull(&ours, Some(PullStrategy::Merge)).unwrap(), Pulled::Merged(1));
+        assert_eq!(log(&ours, 1, false, None).unwrap()[0].parents.len(), 2);
+        push(&ours, None, false).unwrap();
+
+        // Rebasing keeps the history straight: ours on top of theirs.
+        publish("e.txt", "theirs\n");
+        commit_in(&ours, "f.txt", "ours\n");
+        assert_eq!(pull(&ours, Some(PullStrategy::Rebase)).unwrap(), Pulled::Rebased(1));
+        let history = log(&ours, 2, false, None).unwrap();
+        assert_eq!((history[0].summary.as_str(), history[1].summary.as_str()), ("f.txt: ours", "e.txt: theirs"));
+        assert_eq!(history[0].parents.len(), 1);
+        assert_eq!(pull(&ours, Some(PullStrategy::Rebase)).unwrap(), Pulled::UpToDate);
+
+        // Conflicting changes stop the rebase, to continue or abort.
+        publish("a.txt", "theirs\n");
+        commit_in(&ours, "a.txt", "ours\n");
+        assert_eq!(pull(&ours, Some(PullStrategy::Rebase)).unwrap(), Pulled::Conflicts);
+        assert_eq!(repo_state(&ours), Some(RepoState::Rebasing));
+        abort(&ours, RepoState::Rebasing).unwrap();
+        assert_eq!(std::fs::read_to_string(ours.join("a.txt")).unwrap(), "ours\n");
+        for dir in [&ours, &remote, &theirs] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -1917,7 +2238,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         assert_eq!(s.upstream.as_deref(), Some("origin/feature"));
         assert_eq!((s.ahead, s.behind), (0, 0));
         fetch(&root).unwrap();
-        assert!(pull(&root).unwrap().contains("Already up to date"));
+        assert_eq!(pull(&root, None).unwrap(), Pulled::UpToDate);
         assert!(branches(&root).unwrap().iter().any(|b| b.remote && b.name == "origin/feature"));
         assert_eq!(remote_url(&root).as_deref(), remote.to_str());
         assert_eq!(last_commit(&root).unwrap().summary, "first");

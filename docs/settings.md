@@ -10,7 +10,7 @@ Open it again any time from the Kin menu or Find Action (**Welcome Setup**).
 **Settings…** (⌘, / Ctrl+Alt+S, or the gear at the top right) opens the Settings
 dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
 wrapping), Saving, Languages (per-language options, language server and formatter),
-[Extensions](extensions.md), Keymap, Terminal & Run and Updates. The search field looks through all of them; with it focused, ↑/↓ switch
+[Extensions](extensions.md), Keymap, Terminal & Run, Git, Trust and Updates. The search field looks through all of them; with it focused, ↑/↓ switch
 pages. Changes apply right away. An option you changed has an undo button next to its name,
 which puts the default back.
 
@@ -53,6 +53,7 @@ and theme colors.
 | `trust_all_projects` | `false` | run language servers, formatters and project tools in every folder without asking; see [Project trust](#project-trust) |
 | `native_grammars` | `false` | compile extensions' grammars to native code with your C compiler instead of WebAssembly (only for extensions in trusted folders) |
 | `auto_update` | `true` | download new releases in the background; see [Releases and updates](install.md#updates) |
+| `pull_strategy` | unset | how Update Project combines incoming commits with yours when both branches have new ones: `"merge"`, `"rebase"` or `"ff_only"` (stop instead); unset, Git's `pull.rebase` / `pull.ff` decide, else the first such pull asks and saves the answer; see [Git](git.md) |
 
 ```jsonc
 {

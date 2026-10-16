@@ -122,46 +122,64 @@ fn restore(trashed: &Trashed) -> io::Result<()> {
 }
 
 /// Operations with a cursor: entries before it can be undone, the one at it
-/// redone. Each entry keeps the name of the operation for menus and toasts.
+/// redone. Each entry keeps the name of the operation for menus and toasts,
+/// and an id that stays with it (a toast's Undo button checks it's still next).
 #[derive(Default)]
 pub struct FileHistory {
-    entries: Vec<(String, Change)>,
+    entries: Vec<Entry>,
     cursor: usize,
+    next_id: u64,
+}
+
+struct Entry {
+    id: u64,
+    label: String,
+    change: Change,
 }
 
 impl FileHistory {
     /// Records an operation that just happened; forgets what was undone.
-    pub fn record(&mut self, label: impl Into<String>, change: Change) {
+    /// Returns its id.
+    pub fn record(&mut self, label: impl Into<String>, change: Change) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
         self.entries.truncate(self.cursor);
-        self.entries.push((label.into(), change));
+        self.entries.push(Entry { id, label: label.into(), change });
         if self.entries.len() > LIMIT {
             self.entries.remove(0);
         }
         self.cursor = self.entries.len();
+        id
     }
 
     pub fn undo_label(&self) -> Option<&str> {
-        self.cursor.checked_sub(1).map(|ix| self.entries[ix].0.as_str())
+        self.cursor.checked_sub(1).map(|ix| self.entries[ix].label.as_str())
+    }
+
+    /// The id of the operation undo would undo.
+    pub fn undo_id(&self) -> Option<u64> {
+        self.cursor.checked_sub(1).map(|ix| self.entries[ix].id)
     }
 
     /// The change undo (or redo) would invert.
     pub fn next(&self, redo: bool) -> Option<&Change> {
         let ix = if redo { self.cursor } else { self.cursor.checked_sub(1)? };
-        self.entries.get(ix).map(|(_, change)| change)
+        self.entries.get(ix).map(|entry| &entry.change)
     }
 
     pub fn redo_label(&self) -> Option<&str> {
-        self.entries.get(self.cursor).map(|(label, _)| label.as_str())
+        self.entries.get(self.cursor).map(|entry| entry.label.as_str())
     }
 
     /// Undoes (or redoes) the operation next to the cursor. On failure the
     /// entry is dropped: what's on disk no longer matches it.
     pub fn step(&mut self, redo: bool) -> Option<(String, io::Result<Change>)> {
         let ix = if redo { self.cursor } else { self.cursor.checked_sub(1)? };
-        let (label, change) = self.entries.get(ix).cloned()?;
-        match change.invert() {
+        let entry = self.entries.get(ix)?;
+        let label = entry.label.clone();
+        match entry.change.clone().invert() {
             Ok(done) => {
-                self.entries[ix].1 = done.clone();
+                self.entries[ix].change = done.clone();
                 self.cursor = if redo { ix + 1 } else { ix };
                 Some((label, Ok(done)))
             }
@@ -200,13 +218,15 @@ mod tests {
         std::fs::rename(&a, &b).unwrap();
 
         let mut history = FileHistory::default();
-        history.record("Rename a.txt", Change::Renamed { from: a.clone(), to: b.clone() });
-        assert_eq!(history.undo_label(), Some("Rename a.txt"));
+        let id = history.record("Rename a.txt", Change::Renamed { from: a.clone(), to: b.clone() });
+        assert_eq!((history.undo_label(), history.undo_id()), (Some("Rename a.txt"), Some(id)));
         assert!(history.step(false).unwrap().1.is_ok());
         assert!(a.exists() && !b.exists());
-        assert_eq!((history.undo_label(), history.redo_label()), (None, Some("Rename a.txt")));
+        assert_eq!((history.undo_label(), history.redo_label(), history.undo_id()), (None, Some("Rename a.txt"), None));
         assert!(history.step(true).unwrap().1.is_ok());
         assert!(b.exists() && !a.exists());
+        // Redone, it's the same operation, with the same id.
+        assert_eq!(history.undo_id(), Some(id));
 
         // Something else took the name back: undoing fails and is dropped.
         std::fs::write(&a, "new").unwrap();

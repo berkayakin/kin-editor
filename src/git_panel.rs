@@ -2,10 +2,10 @@
 //! stage/unstage/discard, stashes, a commit message box and push/pull controls.
 //! Operations are emitted as events; the workspace runs them.
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, ops::Range, path::PathBuf, sync::Arc};
 
 use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
     IntoElement, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Window, div,
     prelude::*, px, uniform_list, UniformListScrollHandle,
 };
@@ -29,13 +29,16 @@ pub enum GitOp {
     /// editor's rows), else of the index version.
     UnstageLines { rel: String, text: Option<String>, rows: Range<usize> },
     Discard(Vec<FileStatus>),
-    Commit { message: String, amend: bool, all: bool, push: bool },
+    /// Commits what's staged, or with `all` every change to tracked files,
+    /// plus the `untracked` files the user checked (never others).
+    Commit { message: String, amend: bool, all: bool, untracked: Vec<String>, push: bool },
     /// Opens the Push dialog (the commits to push, then Push or Cancel).
     Push,
     /// Pushes the current branch (from the Push dialog); one without an
     /// upstream goes to `remote` (else the default remote).
     PushNow { force: bool, remote: Option<String> },
-    Pull,
+    /// Pulls with this strategy, else the `pull_strategy` setting's.
+    Pull(Option<git::PullStrategy>),
     Fetch,
     Checkout(Branch),
     CreateBranch(String),
@@ -52,8 +55,9 @@ pub enum GitOp {
     EditRemote { name: String, new_name: String, url: String },
     DeleteBranch { name: String, force: bool },
     RenameBranch { from: String, to: String },
-    /// Stashes every change (untracked files too), with an optional message.
-    Stash(Option<String>),
+    /// Stashes the changes to tracked files (and untracked files when
+    /// `untracked`), with an optional message.
+    Stash { message: Option<String>, untracked: bool },
     /// Applies `stash@{index}`; `pop` drops it afterwards.
     Unstash { index: usize, pop: bool },
     DropStash(usize),
@@ -86,7 +90,7 @@ impl GitOp {
             GitOp::Commit { push: true, .. } => "Committing and pushing…",
             GitOp::Commit { .. } => "Committing…",
             GitOp::Push | GitOp::PushNow { .. } => "Pushing…",
-            GitOp::Pull => "Pulling…",
+            GitOp::Pull(_) => "Pulling…",
             GitOp::Fetch => "Fetching…",
             GitOp::Checkout(_) => "Checking out…",
             GitOp::CreateBranch(_) => "Creating branch…",
@@ -94,7 +98,7 @@ impl GitOp {
             GitOp::AddRemote { .. } | GitOp::RemoveRemote(_) | GitOp::EditRemote { .. } => "Updating remotes…",
             GitOp::DeleteBranch { .. } => "Deleting branch…",
             GitOp::RenameBranch { .. } => "Renaming branch…",
-            GitOp::Stash(_) => "Stashing…",
+            GitOp::Stash { .. } => "Stashing…",
             GitOp::Unstash { .. } => "Applying stash…",
             GitOp::DropStash(_) => "Dropping stash…",
             GitOp::CheckoutCommit(_) => "Checking out…",
@@ -133,10 +137,22 @@ pub struct GitPanel {
     selected: Option<(String, bool)>,
     /// The row whose context menu is open (outlined while it is).
     menu_target: Option<(String, bool)>,
+    /// Unversioned files checked to go into the next commit. Like JetBrains,
+    /// they start unchecked: a commit never takes a new file unasked.
+    include: HashSet<String>,
     scroll: UniformListScrollHandle,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
+
+/// The groups of changed files the panel lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Staged,
+    /// Tracked files with unstaged changes, and conflicts.
+    Changes,
+    Unversioned,
+}
 
 pub fn change_color(theme: &Theme, change: Change) -> Hsla {
     match change {
@@ -164,6 +180,7 @@ impl GitPanel {
             busy: Busy::default(),
             selected: None,
             menu_target: None,
+            include: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
         }
     }
@@ -190,6 +207,8 @@ impl GitPanel {
             })
             .detach();
         }
+        // Checked files that were committed, staged or deleted are done with.
+        self.include.retain(|rel| status.untracked().any(|f| &f.rel == rel));
         self.status = status;
         cx.notify();
     }
@@ -214,6 +233,7 @@ impl GitPanel {
 
     pub fn committed(&mut self, cx: &mut Context<Self>) {
         self.amend = false;
+        self.include.clear();
         self.message.update(cx, |m, cx| m.set_text("", cx));
         cx.notify();
     }
@@ -227,9 +247,11 @@ impl GitPanel {
     }
 
     fn can_commit(&self, cx: &App) -> bool {
+        // Unversioned files count only when checked.
+        let something = self.status.staged().next().is_some() || self.status.unstaged().next().is_some() || !self.include.is_empty();
         !self.busy.is_running()
             && !self.message_text(cx).is_empty()
-            && (self.amend || !self.status.files.is_empty())
+            && (self.amend || something)
             // Unresolved conflicts would be committed with their markers.
             && self.status.conflicted().next().is_none()
     }
@@ -239,12 +261,44 @@ impl GitPanel {
             return;
         }
         let all = self.status.staged().next().is_none();
+        let mut untracked: Vec<String> = self.include.iter().cloned().collect();
+        untracked.sort();
         cx.emit(GitPanelEvent::Run(GitOp::Commit {
             message: self.message_text(cx),
             amend: self.amend,
             all,
+            untracked,
             push,
         }));
+    }
+
+    /// A checkbox for unversioned files: checked when all of `rels` go into
+    /// the commit, partly when some do; clicking checks or clears them all.
+    fn include_checkbox(&self, id: impl Into<gpui::ElementId>, rels: Vec<String>, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx);
+        let (icon, color) = match rels.iter().filter(|rel| self.include.contains(*rel)).count() {
+            0 => (Icon::Square, theme.text_dim),
+            n if n == rels.len() => (Icon::SquareCheck, theme.accent),
+            _ => (Icon::SquareMinus, theme.accent),
+        };
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .cursor_pointer()
+            .tooltip(|_, cx| tooltip_view("Include in the commit", cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let all = rels.iter().all(|rel| this.include.contains(rel));
+                for rel in &rels {
+                    if all {
+                        this.include.remove(rel);
+                    } else {
+                        this.include.insert(rel.clone());
+                    }
+                }
+                cx.notify();
+            }))
+            .child(icon_el(icon, px(14.), color.into()))
     }
 
     fn toggle_amend(&mut self, cx: &mut Context<Self>) {
@@ -289,8 +343,9 @@ impl GitPanel {
             .child(icon_el(icon, px(14.), theme.text_muted.into()))
     }
 
-    fn render_file(&self, file: &FileStatus, staged: bool, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_file(&self, file: &FileStatus, section: Section, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let staged = section == Section::Staged;
         let change = if staged {
             file.staged.unwrap_or(Change::Modified)
         } else if file.staged == Some(Change::Conflicted) {
@@ -304,7 +359,6 @@ impl GitPanel {
         let dir = file.rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
         let is_selected = self.selected.as_ref().is_some_and(|(r, s)| *r == file.rel && *s == staged);
         let is_menu_target = self.menu_target.as_ref().is_some_and(|(r, s)| *r == file.rel && *s == staged);
-        let group = SharedString::from(format!("git-row-{}-{ix}", staged as u8));
         let f = file.clone();
         let f_open = file.clone();
         let f_menu = file.clone();
@@ -312,9 +366,15 @@ impl GitPanel {
         let deleted = change == Change::Deleted;
         let conflicted = change == Change::Conflicted;
 
+        let row_id = match section {
+            Section::Staged => "staged",
+            Section::Changes => "unstaged",
+            Section::Unversioned => "unversioned",
+        };
+        let group = SharedString::from(format!("git-row-{row_id}-{ix}"));
         div().w_full().px_1p5().child(
             div()
-                .id((if staged { "staged" } else { "unstaged" }, ix))
+                .id((row_id, ix))
                 .group(group.clone())
                 .relative()
                 .w_full()
@@ -348,6 +408,7 @@ impl GitPanel {
                     }
                     cx.notify();
                 }))
+                .when(section == Section::Unversioned, |el| el.child(self.include_checkbox(("include", ix), vec![file.rel.clone()], cx)))
                 .child(icon)
                 // The name gives way only when the sidebar is too narrow for it
                 // (the folder goes first); the full path is in its tooltip.
@@ -434,7 +495,36 @@ impl GitPanel {
         )
     }
 
-    fn section_header(&self, title: &str, count: usize, actions: Vec<(&'static str, Icon, &'static str, GitPanelEvent)>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A file section's heading: Stash on the first one, Stage All /
+    /// Unstage All, and a checkbox for all unversioned files.
+    fn file_section_header(&self, section: Section, files: &[&FileStatus], first: bool, cx: &mut Context<Self>) -> AnyElement {
+        let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        let mut actions = Vec::new();
+        if first {
+            actions.push(("stash", Icon::Archive, "Stash Changes…", GitPanelEvent::Stash));
+        }
+        let (title, lead) = match section {
+            Section::Staged => {
+                actions.push(("unstage-all", Icon::Minus, "Unstage All", GitPanelEvent::Run(GitOp::Unstage(rels))));
+                ("Staged", None)
+            }
+            Section::Changes => {
+                actions.push(("stage-all", Icon::Plus, "Stage All", GitPanelEvent::Run(GitOp::Stage(rels))));
+                ("Changes", None)
+            }
+            Section::Unversioned => ("Unversioned Files", Some(self.include_checkbox("include-all", rels, cx).into_any_element())),
+        };
+        self.section_header(title, files.len(), lead, actions, cx).into_any_element()
+    }
+
+    fn section_header(
+        &self,
+        title: &str,
+        count: usize,
+        lead: Option<AnyElement>,
+        actions: Vec<(&'static str, Icon, &'static str, GitPanelEvent)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         div()
             .flex()
@@ -446,6 +536,8 @@ impl GitPanel {
             .text_size(px(11.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text_dim)
+            // Level with the rows' checkboxes.
+            .when_some(lead, |el, lead| el.child(div().mx(px(2.)).child(lead)))
             .child(title.to_uppercase())
             .child(div().px_1p5().rounded_full().bg(theme.active).text_color(theme.text_muted).child(count.to_string()))
             .child(div().flex_1())
@@ -562,7 +654,7 @@ impl GitPanel {
                                 // A merge commit takes the message box's text when there is one.
                                 let message = this.message_text(cx);
                                 let op = if state == RepoState::Merging && !message.is_empty() {
-                                    GitOp::Commit { message, amend: false, all: false, push: false }
+                                    GitOp::Commit { message, amend: false, all: false, untracked: Vec::new(), push: false }
                                 } else {
                                     GitOp::Continue(state)
                                 };
@@ -578,9 +670,10 @@ impl GitPanel {
         let focused = self.message.read(cx).focus_handle(cx).is_focused(window);
         let can_commit = self.can_commit(cx);
         let nothing_staged = self.status.staged().next().is_none();
+        // All changes to tracked files; unversioned ones only when checked.
         let label = if self.amend {
             "Amend Commit"
-        } else if nothing_staged && !self.status.files.is_empty() {
+        } else if nothing_staged && self.status.unstaged().next().is_some() {
             "Commit All"
         } else {
             "Commit"
@@ -717,9 +810,9 @@ impl Render for GitPanel {
                 .into_any_element();
         }
 
-        let (staged_count, unstaged_count) = (self.status.staged().count(), self.status.unstaged().count());
+        let file_counts = [self.status.staged().count(), self.status.unstaged().count(), self.status.untracked().count()];
         let stash_count = self.stashes.len();
-        let list = if staged_count == 0 && unstaged_count == 0 && stash_count == 0 {
+        let list = if file_counts == [0; 3] && stash_count == 0 {
             div()
                 .flex_1()
                 .min_h_0()
@@ -738,16 +831,20 @@ impl Render for GitPanel {
             // A heading and the rows of each non-empty section (a "No changes"
             // row when only stashes are left); only the rows on screen are built.
             let section = |n: usize| if n == 0 { 0 } else { 1 + n };
-            let no_changes = usize::from(staged_count == 0 && unstaged_count == 0);
+            let no_changes = usize::from(file_counts == [0; 3]);
             uniform_list(
                 "git-changes",
-                no_changes + section(staged_count) + section(unstaged_count) + section(stash_count),
+                no_changes + file_counts.into_iter().map(section).sum::<usize>() + section(stash_count),
                 cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                     let theme = Theme::get(cx).clone();
-                    let staged: Vec<&FileStatus> = this.status.staged().collect();
-                    let unstaged: Vec<&FileStatus> = this.status.unstaged().collect();
-                    let (staged_rows, unstaged_rows) = (section(staged.len()), section(unstaged.len()));
-                    let stash = || ("stash", Icon::Archive, "Stash Changes…", GitPanelEvent::Stash);
+                    let status = this.status.clone();
+                    let sections: [(Section, Vec<&FileStatus>); 3] = [
+                        (Section::Staged, status.staged().collect()),
+                        (Section::Changes, status.unstaged().collect()),
+                        (Section::Unversioned, status.untracked().collect()),
+                    ];
+                    // The first heading offers Stash.
+                    let first = sections.iter().position(|(_, files)| !files.is_empty());
                     range
                         .map(|ix| {
                             if no_changes == 1 && ix == 0 {
@@ -762,36 +859,20 @@ impl Render for GitPanel {
                                     .child("No changes")
                                     .into_any_element();
                             }
-                            let ix = ix - no_changes;
-                            if ix >= staged_rows + unstaged_rows {
-                                let ix = ix - staged_rows - unstaged_rows;
-                                return match ix {
-                                    0 => this.section_header("Stashes", this.stashes.len(), Vec::new(), cx).into_any_element(),
-                                    ix => match this.stashes.clone().get(ix - 1) {
-                                        Some(stash) => this.render_stash(stash, cx).into_any_element(),
-                                        None => div().into_any_element(),
-                                    },
-                                };
+                            let mut ix = ix - no_changes;
+                            for (n, (section, files)) in sections.iter().enumerate().filter(|(_, (_, files))| !files.is_empty()) {
+                                if ix == 0 {
+                                    return this.file_section_header(*section, files, first == Some(n), cx);
+                                }
+                                if let Some(file) = files.get(ix - 1) {
+                                    return this.render_file(file, *section, ix - 1, cx).into_any_element();
+                                }
+                                ix -= 1 + files.len();
                             }
-                            let (files, is_staged, ix) = if ix < staged_rows { (&staged, true, ix) } else { (&unstaged, false, ix - staged_rows) };
-                            match (ix, is_staged) {
-                                (0, true) => {
-                                    let rels = files.iter().map(|f| f.rel.clone()).collect();
-                                    let mut actions = vec![("unstage-all", Icon::Minus, "Unstage All", GitPanelEvent::Run(GitOp::Unstage(rels)))];
-                                    // The first heading offers Stash.
-                                    actions.insert(0, stash());
-                                    this.section_header("Staged", files.len(), actions, cx).into_any_element()
-                                }
-                                (0, false) => {
-                                    let rels = files.iter().map(|f| f.rel.clone()).collect();
-                                    let mut actions = vec![("stage-all", Icon::Plus, "Stage All", GitPanelEvent::Run(GitOp::Stage(rels)))];
-                                    if staged.is_empty() {
-                                        actions.insert(0, stash());
-                                    }
-                                    this.section_header("Changes", files.len(), actions, cx).into_any_element()
-                                }
-                                (ix, _) => match files.get(ix - 1) {
-                                    Some(file) => this.render_file(file, is_staged, ix - 1, cx).into_any_element(),
+                            match ix {
+                                0 => this.section_header("Stashes", this.stashes.len(), None, Vec::new(), cx).into_any_element(),
+                                ix => match this.stashes.clone().get(ix - 1) {
+                                    Some(stash) => this.render_stash(stash, cx).into_any_element(),
                                     None => div().into_any_element(),
                                 },
                             }

@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::{
     editorconfig::EditorConfig,
+    git::PullStrategy,
     keymap,
     syntax::Language,
     theme::{self, config_dir},
@@ -75,6 +76,10 @@ pub struct Settings {
     /// The switch `visual_effects` replaced: `true` reads as Minimal. Kept so
     /// a settings.json that has it still works; writing the level removes it.
     pub reduce_visual_effects: Option<bool>,
+    /// How Update Project (pull) combines incoming commits with local ones
+    /// when both branches have new commits. Unset: as the Git config says,
+    /// else asked the first time it happens.
+    pub pull_strategy: Option<PullStrategy>,
 }
 
 /// One language server's settings (`lsp.<id>`).
@@ -325,6 +330,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "icon_theme",
     "visual_effects",
     "reduce_visual_effects",
+    "pull_strategy",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -513,6 +519,7 @@ impl Settings {
             "auto_update" => self.auto_update.is_some(),
             "trust_all_projects" => self.trust_all_projects.is_some(),
             "native_grammars" => self.native_grammars.is_some(),
+            "pull_strategy" => self.pull_strategy.is_some(),
             _ => false,
         }
     }
@@ -821,6 +828,12 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you s
 
   // The terminal's shell; your login shell by default.
   // "terminal_shell": ["/opt/homebrew/bin/fish", "--login"],
+
+  // How Update Project (pull) combines incoming commits with yours when
+  // both branches have new ones: "merge", "rebase" or "ff_only" (stop
+  // instead). Unset, your Git config's pull.rebase / pull.ff decide, else
+  // Update Project asks the first time it happens.
+  // "pull_strategy": "rebase",
 
   // More entries for Run… (detected ones include cargo, npm scripts, go,
   // make and pytest).

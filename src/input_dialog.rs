@@ -1,5 +1,5 @@
 //! A small modal asking for one line of text (new file names, renames,
-//! breakpoint conditions).
+//! breakpoint conditions), optionally with a checkbox under it.
 
 use std::ops::Range;
 
@@ -28,6 +28,8 @@ pub struct InputDialog {
     error: Option<String>,
     /// Empty text is an answer (it clears something) rather than an error.
     allow_empty: bool,
+    /// A checkbox under the field: its label and whether it's checked.
+    option: Option<(SharedString, bool)>,
 }
 
 impl EventEmitter<InputDialogEvent> for InputDialog {}
@@ -58,12 +60,23 @@ impl InputDialog {
             }
         })
         .detach();
-        Self { title: title.into(), icon, hint: hint.into(), input, error: None, allow_empty: false }
+        Self { title: title.into(), icon, hint: hint.into(), input, error: None, allow_empty: false, option: None }
     }
 
     pub fn allow_empty(mut self) -> Self {
         self.allow_empty = true;
         self
+    }
+
+    /// Adds a checkbox ("Include untracked files"), checked or not to start with.
+    pub fn with_option(mut self, label: impl Into<SharedString>, checked: bool) -> Self {
+        self.option = Some((label.into(), checked));
+        self
+    }
+
+    /// Whether the checkbox is there and checked.
+    pub fn option_checked(&self) -> bool {
+        self.option.as_ref().is_some_and(|(_, checked)| *checked)
     }
 
     pub fn set_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -119,5 +132,31 @@ impl Render for InputDialog {
                     .text_color(if self.error.is_some() { theme.error } else { theme.text_dim })
                     .child(self.error.clone().unwrap_or_else(|| self.hint.to_string())),
             )
+            .when_some(self.option.clone(), |el, (label, checked)| {
+                el.child(
+                    div()
+                        .id("input-option")
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.text_color(theme.text))
+                        // Clicking it leaves the keyboard in the field, so Enter still confirms.
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some((_, checked)) = &mut this.option {
+                                *checked = !*checked;
+                            }
+                            cx.notify();
+                        }))
+                        .child(icon_el(
+                            if checked { Icon::SquareCheck } else { Icon::Square },
+                            px(14.),
+                            if checked { theme.accent.into() } else { theme.text_dim.into() },
+                        ))
+                        .child(label),
+                )
+            })
     }
 }

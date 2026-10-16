@@ -15,10 +15,14 @@ message instead of hanging; use an SSH agent or a credential helper.
 - **File tree:** changed files are colored with a status letter; folders containing
   changes are tinted.
 - **Commit panel** (⌘K / ⌘0, or the Commit tab above the sidebar, whose tooltip shows the
-  number of changes): the branch with fetch, pull and push at the top, then staged and unstaged
-  changes with stage, unstage, open and roll back on hover; click a file for its diff. Write a message and press ⌘↩ to commit (with nothing
-  staged, everything is committed), or use **Commit & Push**. **Amend** starts from the
-  previous message. In a folder that isn't a repository it offers **Initialize Repository**.
+  number of changes): the branch with fetch, pull and push at the top, then staged changes,
+  unstaged changes and **Unversioned Files** (new files Git doesn't track), with stage, unstage,
+  open and roll back on hover; click a file for its diff. Write a message and press ⌘↩ to commit
+  (with nothing staged, **Commit All** takes every change to tracked files), or use **Commit &
+  Push**. Unversioned files go into a commit only when you check them, as in JetBrains: each has
+  a checkbox, unchecked to start with, and the section's heading checks or clears them all.
+  **Amend** starts from the previous message. In a folder that isn't a repository it offers
+  **Initialize Repository**.
 - **Diffs** show side by side or unified (the choice is remembered), with syntax colors and the
   changed words within a line highlighted. Each change has **Stage** / **Unstage**; F7 / ⇧F7 step
   through changes; collapsed unchanged lines expand on click. Images show the previous and new
@@ -31,9 +35,14 @@ message instead of hanging; use an SSH agent or a credential helper.
   for **Rename** and **Delete** (Kin says when a branch has commits no other branch has, and
   deletes it anyway only if you confirm).
 - **Stash:** **Stash Changes…** (the archive button on the Commit panel's first section, the Git
-  menu, Find Action) stashes every change, untracked files included, with an optional message.
-  Stashes are listed under the changes; hover one to **Pop** (apply and drop), **Apply** (keep it)
-  or **Drop** it (after asking). A stash that conflicts leaves the files conflicted and the stash kept.
+  menu, Find Action) stashes the changes to tracked files, with an optional message; check
+  **Include untracked files** to stash those too (checked to start with only when they're all
+  there is). Stashes are listed under the changes; hover one to **Pop** (apply and drop),
+  **Apply** (keep it) or **Drop** it (after asking). A stash that conflicts leaves the files
+  conflicted and the stash kept. When untracked files from a stash exist again (a build
+  regenerated them), Git would apply the rest and keep the stash, so applying it again would
+  repeat that: instead you're asked first, and can move the existing copies to the Trash and
+  apply the whole stash. Anything that still applies only in part is reported as such.
 - **Merge conflicts:** a merge or rebase that stops on conflicts shows a banner in the Commit
   panel with **Abort**. Conflicted files open in the editor, where each conflict is tinted
   (current side green, incoming blue) with **Accept Current / Accept Incoming / Accept Both**
@@ -47,9 +56,18 @@ message instead of hanging; use an SSH agent or a credential helper.
   Branch…** or **New Tag…** there, **Cherry-Pick** it onto the current branch, **Revert** it, or
   **Reset Here** soft (changes kept staged), mixed (kept unstaged) or hard (discarded, after
   asking). A cherry-pick or revert that conflicts stops like a merge, with Abort / Continue.
+  Questions about something that can't be undone (a hard reset, rolling back, dropping a stash,
+  deleting a branch with commits no other branch has) have **Cancel** as the default: Return
+  doesn't confirm them.
   **Show History** (editor right-click menu, Git menu) lists one file's commits, following renames.
 - **Push / Pull / Fetch:** from the Commit panel, the keyboard, or Find Action. Pushing a
   new branch sets its upstream. Results appear as notifications.
+- **Update Project** (pull) fast-forwards when only the remote has new commits. When both your
+  branch and its upstream have new commits, the **pull strategy** decides: **Merge** (a merge
+  commit), **Rebase** (yours replayed on top of the incoming ones) or **Fast-forward only**
+  (stop and say so). It's in Settings → Git (`pull_strategy`); unset, your Git config's
+  `pull.rebase` / `pull.ff` decide, and without those the first pull that needs it asks Merge or
+  Rebase and keeps the answer.
 - **Remotes:** **Manage Remotes…** (Git menu, Find Action, or the cloud button in the Push
   dialog) lists each remote with its URL; add one, or hover one to **Edit** its name and URL or
   **Remove** it (after asking; the remote repository isn't touched). A new branch is pushed to

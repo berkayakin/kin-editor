@@ -19,6 +19,7 @@ use crate::{
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp},
     extensions::{self, ExtensionInfo, ExtensionsChanged},
     format,
+    git::PullStrategy,
     lsp::servers,
     settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings, ShowWhitespace, VisualEffects},
     syntax::Language,
@@ -51,12 +52,13 @@ pub enum Page {
     Extensions,
     Keymap,
     Terminal,
+    Git,
     Trust,
     Updates,
 }
 
 impl Page {
-    const ALL: [Page; 9] = [
+    const ALL: [Page; 10] = [
         Page::Appearance,
         Page::Editor,
         Page::Saving,
@@ -64,6 +66,7 @@ impl Page {
         Page::Extensions,
         Page::Keymap,
         Page::Terminal,
+        Page::Git,
         Page::Trust,
         Page::Updates,
     ];
@@ -77,6 +80,7 @@ impl Page {
             Page::Extensions => "Extensions",
             Page::Keymap => "Keymap",
             Page::Terminal => "Terminal & Run",
+            Page::Git => "Git",
             Page::Trust => "Trust",
             Page::Updates => "Updates",
         }
@@ -91,6 +95,7 @@ impl Page {
             Page::Extensions => "More languages, themes and snippets; Zed's extensions work too",
             Page::Keymap => "A base keymap to start from, and shortcuts for every action on top",
             Page::Terminal => "The terminal's shell and your own Run configurations",
+            Page::Git => "How Update Project brings in other people's commits",
             Page::Trust => "Folders whose language servers, formatters and tools Kin may run",
             Page::Updates => "Getting new versions of Kin",
         }
@@ -105,6 +110,7 @@ impl Page {
             Page::Extensions => Icon::Puzzle,
             Page::Keymap => Icon::Keyboard,
             Page::Terminal => Icon::Terminal,
+            Page::Git => Icon::GitBranch,
             Page::Trust => Icon::ShieldCheck,
             Page::Updates => Icon::Download,
         }
@@ -140,10 +146,11 @@ enum Setting {
     TrustAll,
     NativeGrammars,
     AutoUpdate,
+    PullStrategy,
 }
 
 impl Setting {
-    const ALL: [Setting; 25] = [
+    const ALL: [Setting; 26] = [
         Setting::Theme,
         Setting::IconTheme,
         Setting::VisualEffects,
@@ -169,6 +176,7 @@ impl Setting {
         Setting::TrustAll,
         Setting::NativeGrammars,
         Setting::AutoUpdate,
+        Setting::PullStrategy,
     ];
 
     fn page(self) -> Page {
@@ -186,6 +194,7 @@ impl Setting {
             Setting::Shell | Setting::RunConfigurations => Page::Terminal,
             Setting::TrustAll | Setting::NativeGrammars => Page::Trust,
             Setting::AutoUpdate => Page::Updates,
+            Setting::PullStrategy => Page::Git,
         }
     }
 
@@ -207,6 +216,7 @@ impl Setting {
             Setting::RunConfigurations => "Run configurations",
             Setting::TrustAll | Setting::NativeGrammars => "Restricted Mode",
             Setting::AutoUpdate => "Updates",
+            Setting::PullStrategy => "Update Project",
         }
     }
 
@@ -237,6 +247,7 @@ impl Setting {
             Setting::TrustAll => "Trust all folders",
             Setting::NativeGrammars => "Native extension grammars",
             Setting::AutoUpdate => "Update automatically",
+            Setting::PullStrategy => "Pull strategy",
         }
     }
 
@@ -267,6 +278,7 @@ impl Setting {
             Setting::TrustAll => "Run language servers, formatters and project tools in every folder without asking. Not recommended.",
             Setting::NativeGrammars => "Compile extensions' grammars with your C compiler instead of WebAssembly, which runs them sandboxed. Only for extensions in trusted folders.",
             Setting::AutoUpdate => "Download new versions from GitHub in the background. Restart to Update in the status bar installs them.",
+            Setting::PullStrategy => "How incoming commits join yours once both branches have new ones. Until one is picked, your Git config's pull.rebase / pull.ff decide; without them, Update Project asks the first time.",
         }
     }
 
@@ -298,6 +310,7 @@ impl Setting {
             Setting::TrustAll => "trust security restricted mode workspace untrusted safe",
             Setting::NativeGrammars => "extensions grammars tree-sitter native compiler wasm webassembly sandbox",
             Setting::AutoUpdate => "update upgrade version release download",
+            Setting::PullStrategy => "git pull update project merge rebase fast-forward ff only diverged branches version control vcs",
         }
     }
 
@@ -324,6 +337,7 @@ enum Menu {
     BaseKeymap,
     FontFamily,
     VisualEffects,
+    PullStrategy,
     LanguageServer,
     Formatter,
 }
@@ -1357,6 +1371,20 @@ impl Preferences {
                     this.set_or_default("base_keymap", keymap.key().into(), BaseKeymap::default().key().into(), cx);
                 })
             }
+            Setting::PullStrategy => {
+                const ASK: &str = "Ask the first time";
+                let current = settings.pull_strategy;
+                let mut options = vec![(ASK.into(), current.is_none())];
+                options.extend(PullStrategy::ALL.iter().map(|s| (s.label().into(), current == Some(*s))));
+                let label = current.map_or(ASK, PullStrategy::label);
+                self.dropdown(Menu::PullStrategy, label.into(), px(200.), options, cx, move |this, ix, _, cx| {
+                    this.menu = None;
+                    match ix.checked_sub(1) {
+                        Some(ix) => this.write(Settings::set("pull_strategy", PullStrategy::ALL[ix].key().into()), cx),
+                        None => this.reset("pull_strategy", cx),
+                    }
+                })
+            }
             Setting::AutoSave => {
                 let current = settings.auto_save.unwrap_or_default();
                 let modes = [AutoSave::Off, AutoSave::AfterDelay, AutoSave::OnFocusChange, AutoSave::OnWindowChange];
@@ -2297,6 +2325,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::TrustAll => "trust_all_projects",
         Setting::NativeGrammars => "native_grammars",
         Setting::AutoUpdate => "auto_update",
+        Setting::PullStrategy => "pull_strategy",
     }
 }
 

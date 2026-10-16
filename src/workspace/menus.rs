@@ -297,18 +297,25 @@ impl Workspace {
                 ("New Branch", Icon::GitBranch, format!("From {} · checks it out", &sha[..sha.len().min(7)]), String::new(), None)
             }
             PendingInput::Git(GitPrompt::TagAt(sha)) => ("New Tag", Icon::Tag, format!("At {}", &sha[..sha.len().min(7)]), String::new(), None),
-            PendingInput::Git(GitPrompt::Stash) => {
-                ("Stash Changes", Icon::Archive, "A message (optional) · untracked files are stashed too".into(), String::new(), None)
-            }
+            PendingInput::Git(GitPrompt::Stash) => ("Stash Changes", Icon::Archive, "A message (optional)".into(), String::new(), None),
         };
         self.close_modal(window, cx);
-        let optional = matches!(pending, PendingInput::Git(GitPrompt::Stash));
+        let stash = matches!(pending, PendingInput::Git(GitPrompt::Stash));
+        // Untracked files stay out of a stash unless asked for (they're often
+        // build output, which comes back and blocks the stash's own copy);
+        // when they're all there is to stash, they're in from the start.
+        let untracked = self.git_status.untracked().count();
+        let only_untracked = untracked == self.git_status.files.len();
         let dialog = cx.new(|cx| {
             let dialog = InputDialog::new(title, icon, hint, &initial, select, window, cx);
-            if optional { dialog.allow_empty() } else { dialog }
+            match stash {
+                true if untracked > 0 => dialog.allow_empty().with_option(format!("Include untracked files ({untracked})"), only_untracked),
+                true => dialog.allow_empty(),
+                false => dialog,
+            }
         });
         let subscription = cx.subscribe_in(&dialog, window, |ws, dialog, event: &InputDialogEvent, window, cx| match event {
-            InputDialogEvent::Confirm(name) => match ws.apply_name(name, window, cx) {
+            InputDialogEvent::Confirm(name) => match ws.apply_name(name, dialog.read(cx).option_checked(), window, cx) {
                 Ok(()) => {
                     let in_tree = matches!(ws.pending_input, Some(PendingInput::Rename(_) | PendingInput::NewFolder(_)));
                     ws.pending_input = None;
@@ -396,8 +403,9 @@ impl Workspace {
         Ok(())
     }
 
-    /// Creates or renames according to the open input dialog.
-    pub(super) fn apply_name(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
+    /// Creates or renames according to the open input dialog; `checked` is
+    /// its checkbox (Include untracked files).
+    pub(super) fn apply_name(&mut self, name: &str, checked: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<(), String> {
         if matches!(self.pending_input, Some(PendingInput::VimCommand)) {
             let command = name.to_string();
             self.pending_input = None;
@@ -414,7 +422,7 @@ impl Workspace {
         if let Some(prompt) = git_prompt {
             let name = name.trim();
             let op = match prompt {
-                GitPrompt::Stash => GitOp::Stash(Some(name.to_string()).filter(|n| !n.is_empty())),
+                GitPrompt::Stash => GitOp::Stash { message: Some(name.to_string()).filter(|n| !n.is_empty()), untracked: checked },
                 _ if name.is_empty() => return Err("Enter a name".into()),
                 GitPrompt::RenameBranch(from) if from == name => return Ok(()),
                 GitPrompt::RenameBranch(from) => GitOp::RenameBranch { from, to: self.branch_name(name)? },
@@ -522,11 +530,11 @@ impl Workspace {
             return;
         }
         let verb = if redo { "Redo" } else { "Undo" };
-        let trash_name = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
-        let detail = format!("This moves files with unsaved changes to the {trash_name}; the changes will be lost.");
-        let rx = window.prompt(PromptLevel::Warning, &format!("{verb} {label}?"), Some(&detail), &[verb, "Cancel"], cx);
+        let detail = format!("This moves files with unsaved changes to the {}; the changes will be lost.", trash_name());
+        // Unsaved changes don't come back: Cancel is the default.
+        let confirmed = ask(window, &format!("{verb} {label}?"), &detail, verb, false, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if rx.await == Ok(0) {
+            if confirmed.await {
                 this.update_in(cx, |ws, window, cx| ws.apply_file_history(redo, window, cx)).ok();
             }
         })
@@ -767,45 +775,69 @@ impl Workspace {
             doc.is_dirty() && doc.path.as_deref().is_some_and(|p| p.starts_with(&path))
         });
         let mut detail = if path.is_dir() {
-            "The folder and everything in it will be moved to the Trash.".to_string()
+            format!("The folder and everything in it will be moved to the {}.", trash_name())
         } else {
-            "You can restore it from the Trash.".to_string()
+            format!("You can restore it from the {}.", trash_name())
         };
         if dirty {
             detail.push_str(" Unsaved changes in open files will be lost.");
         }
-        let trash_name = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
-        let confirm = format!("Move to {trash_name}");
-        let rx = window.prompt(
-            PromptLevel::Warning,
-            &format!("Move “{name}” to the {trash_name}?"),
-            Some(&detail),
-            &[confirm.as_str(), "Cancel"],
-            cx,
-        );
+        let message = format!("Move “{name}” to the {}?", trash_name());
+        // The Trash gives the file back, but not unsaved changes.
+        let confirmed = ask(window, &message, &detail, &format!("Move to {}", trash_name()), !dirty, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if rx.await != Ok(0) {
-                return;
-            }
-            this.update_in(cx, |ws, window, cx| match crate::file_history::move_to_trash(&path) {
-                Ok(trashed) => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    ws.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
-                    window.focus(&ws.tree.focus_handle(cx));
-                    for editor in ws.tabs.clone() {
-                        if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(&path)) {
-                            ws.remove_tab(&editor, window, cx);
-                        }
-                    }
-                    ws.tree.update(cx, |t, _| t.forget(&path));
-                    ws.recent.retain(|p| !p.starts_with(&path));
-                    ws.after_fs_change(cx);
+            let confirmed = confirmed.await;
+            this.update_in(cx, |ws, window, cx| {
+                if confirmed {
+                    ws.move_to_trash(&path, window, cx);
                 }
-                Err(err) => ws.toast(ToastKind::Error, "Couldn't move to Trash", Some(err.to_string()), cx),
+                // The alert took the keyboard: back to the tree, where ⌘Z undoes it.
+                if ws.show_sidebar && ws.sidebar_mode == SidebarMode::Files {
+                    window.focus(&ws.tree.focus_handle(cx));
+                }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Moves a file or folder to the Trash (undoable), closing its tabs.
+    fn move_to_trash(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let trashed = match crate::file_history::move_to_trash(path) {
+            Ok(trashed) => trashed,
+            Err(err) => {
+                self.toast(ToastKind::Error, format!("Couldn't move to the {}", trash_name()), Some(err.to_string()), cx);
+                return;
+            }
+        };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let id = self.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
+        for editor in self.tabs.clone() {
+            if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                self.remove_tab(&editor, window, cx);
+            }
+        }
+        self.tree.update(cx, |t, _| t.forget(path));
+        self.recent.retain(|p| !p.starts_with(path));
+        self.after_fs_change(cx);
+        let message = format!("Moved “{name}” to the {}", trash_name());
+        self.toast_with_undo(ToastKind::Success, message, None, Some(ToastUndo::File(id)), cx);
+    }
+
+    /// A toast's Undo button, while what it would undo is still next.
+    pub(super) fn undo_applies(&self, undo: ToastUndo) -> bool {
+        match undo {
+            ToastUndo::File(id) => self.file_history.undo_id() == Some(id),
+        }
+    }
+
+    pub(super) fn run_toast_undo(&mut self, undo: ToastUndo, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.undo_applies(undo) {
+            return;
+        }
+        match undo {
+            ToastUndo::File(_) => self.step_file_history(false, window, cx),
+        }
     }
 
     pub(super) fn add_to_gitignore(&mut self, rel: String, cx: &mut Context<Self>) {

@@ -94,7 +94,8 @@ Everything Kin does, in one list. Each area has its own page with the details.
   Reveal in Finder; drag entries onto a folder to move them (open tabs follow); **Select Opened File**
   (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z)
   in the tree, or its right-click menu, undo and redo file operations, deletes included (they come
-  back from the Trash); tabs, custom title bar, IME support
+  back from the Trash; the notification after a delete has **Undo** too); tabs, custom title bar,
+  IME support
 - A Settings dialog for every option, with search across its pages; see [Settings](settings.md)
 - Automatic updates from GitHub Releases (signed), installed with **Restart to Update**; see
   [Releases and updates](install.md#updates)

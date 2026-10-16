@@ -156,18 +156,18 @@ impl Workspace {
                     [one] => format!("{one} still has conflict markers"),
                     many => format!("{} files still have conflict markers", many.len()),
                 };
-                let rx = window.prompt(PromptLevel::Warning, &message, Some("Mark as resolved anyway?"), &["Mark as Resolved", "Cancel"], cx);
+                let confirmed = ask(window, &message, "Mark as resolved anyway?", "Mark as Resolved", true, cx);
                 cx.spawn_in(window, async move |this, cx| {
-                    if rx.await == Ok(0) {
-                        this.update(cx, |ws, cx| ws.execute_git(op, cx)).ok();
+                    if confirmed.await {
+                        this.update_in(cx, |ws, window, cx| ws.execute_git(op, window, cx)).ok();
                     }
                 })
                 .detach();
                 return;
             }
         }
-        if let Some((message, detail, button)) = confirmation(&op) {
-            self.confirm_git(op, &message, detail, button, window, cx);
+        if let Some((message, detail, button, undoable)) = confirmation(&op) {
+            self.confirm_git(op, &message, detail, button, undoable, window, cx);
             return;
         }
         // Deleting a branch whose commits aren't merged loses them, so look first.
@@ -182,7 +182,8 @@ impl Workspace {
                     } else {
                         ("It has commits that aren't in the current branch; they'll be lost unless another branch has them.", true)
                     };
-                    ws.confirm_git(GitOp::DeleteBranch { name: name.clone(), force }, &format!("Delete branch {name}?"), detail, "Delete", window, cx);
+                    let op = GitOp::DeleteBranch { name: name.clone(), force };
+                    ws.confirm_git(op, &format!("Delete branch {name}?"), detail, "Delete", !force, window, cx);
                 })
                 .ok();
             })
@@ -201,30 +202,86 @@ impl Workspace {
             } else {
                 "Local changes will be lost. This can't be undone."
             };
-            let rx = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Roll Back", "Cancel"], cx);
+            self.confirm_git(op, &message, detail, "Roll Back", false, window, cx);
+            return;
+        }
+        // Untracked files a stash holds that exist again would leave it half
+        // applied (Git restores the rest and keeps the stash), so look first.
+        if let (&GitOp::Unstash { index, pop }, Some(repo)) = (&op, self.repo.clone()) {
             cx.spawn_in(window, async move |this, cx| {
-                if rx.await == Ok(0) {
-                    this.update(cx, |ws, cx| ws.execute_git(op, cx)).ok();
-                }
+                let blockers = cx.background_executor().spawn(async move { git::stash_blockers(&repo, index) }).await;
+                this.update_in(cx, |ws, window, cx| {
+                    if blockers.is_empty() {
+                        ws.execute_git(op, window, cx);
+                    } else {
+                        ws.clear_stash_blockers(blockers, index, pop, window, cx);
+                    }
+                })
+                .ok();
             })
             .detach();
             return;
         }
-        self.execute_git(op, cx);
+        self.execute_git(op, window, cx);
     }
 
     /// Asks before `op`, then runs it.
-    fn confirm_git(&mut self, op: GitOp, message: &str, detail: &str, button: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = window.prompt(PromptLevel::Warning, message, Some(detail), &[button, "Cancel"], cx);
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_git(&mut self, op: GitOp, message: &str, detail: &str, button: &str, undoable: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let confirmed = ask(window, message, detail, button, undoable, cx);
         cx.spawn_in(window, async move |this, cx| {
-            if rx.await == Ok(0) {
-                this.update(cx, |ws, cx| ws.execute_git(op, cx)).ok();
+            if confirmed.await {
+                this.update_in(cx, |ws, window, cx| ws.execute_git(op, window, cx)).ok();
             }
         })
         .detach();
     }
 
-    pub(super) fn execute_git(&mut self, op: GitOp, cx: &mut Context<Self>) {
+    /// Untracked files of a stash exist in the working tree again: offers to
+    /// move them to the Trash so the whole stash applies, instead of Git
+    /// applying the rest and keeping the stash.
+    fn clear_stash_blockers(&mut self, blockers: Vec<String>, index: usize, pop: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else { return };
+        let verb = if pop { "Pop" } else { "Apply" };
+        let (message, detail) = match blockers.as_slice() {
+            [one] => (
+                format!("“{one}” already exists"),
+                format!(
+                    "The stash has its own copy, and Git won't replace the file: it would apply the rest of the stash and keep it. Move the existing file to the {}, then {} the stash?",
+                    trash_name(),
+                    verb.to_lowercase(),
+                ),
+            ),
+            many => (
+                format!("{} files from the stash already exist", many.len()),
+                format!(
+                    "{}\n\nThe stash has its own copies, and Git won't replace the files: it would apply the rest of the stash and keep it. Move the existing files to the {}, then {} the stash?",
+                    list_some(many),
+                    trash_name(),
+                    verb.to_lowercase(),
+                ),
+            ),
+        };
+        let confirmed = ask(window, &message, &detail, &format!("Move to {} and {verb}", trash_name()), true, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if !confirmed.await {
+                return;
+            }
+            this.update_in(cx, |ws, window, cx| {
+                for rel in &blockers {
+                    if let Err(err) = crate::file_history::move_to_trash(&repo.join(rel)) {
+                        ws.toast(ToastKind::Error, format!("Couldn't move {rel} to the {}", trash_name()), Some(err.to_string()), cx);
+                        return;
+                    }
+                }
+                ws.execute_git(GitOp::Unstash { index, pop }, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn execute_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {
         let dir = match (&op, &self.repo, &self.root) {
             (GitOp::Init, _, Some(root)) => root.clone(),
             (_, Some(repo), _) => repo.clone(),
@@ -234,18 +291,23 @@ impl Workspace {
             self.toast(ToastKind::Error, "Another Git operation is still running", None, cx);
             return;
         }
+        // Without a strategy of its own, a pull takes the setting's.
+        let op = match op {
+            GitOp::Pull(None) => GitOp::Pull(Settings::get(cx).pull_strategy),
+            op => op,
+        };
         let label = op.busy_label();
         self.git_busy.set(Some(label.into()), |ws: &mut Self| &mut ws.git_busy, cx);
         self.git_panel.update(cx, |p, cx| p.set_busy(Some(label.into()), cx));
         let status = self.git_status.clone();
         let op2 = op.clone();
-        self.git_op_task = Some(cx.spawn(async move |this, cx| {
+        self.git_op_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx.background_executor().spawn(async move { perform_git(&dir, op2, &status) }).await;
-            this.update(cx, |ws, cx| {
+            this.update_in(cx, |ws, window, cx| {
                 ws.git_busy.set(None, |ws: &mut Self| &mut ws.git_busy, cx);
                 ws.git_panel.update(cx, |p, cx| p.set_busy(None, cx));
                 match result {
-                    Ok(message) => {
+                    Ok(Outcome::Done(message)) => {
                         if let Some(message) = message {
                             // A merge or rebase that stopped on conflicts isn't done yet.
                             let kind = if message.contains("conflicts") { ToastKind::Info } else { ToastKind::Success };
@@ -261,10 +323,33 @@ impl Workspace {
                             _ => {}
                         }
                     }
+                    Ok(Outcome::Nothing(message)) => ws.toast(ToastKind::Info, message, None, cx),
+                    Ok(Outcome::Diverged { branch, upstream, ahead, behind }) => match &op {
+                        // Nothing says how to combine them (the setting or the Git config): ask, once.
+                        GitOp::Pull(None) => ws.choose_pull_strategy(&branch, &upstream, ahead, behind, window, cx),
+                        _ => {
+                            let detail = format!(
+                                "{branch} has {} that {upstream} doesn't. Merge or rebase it from Branches…, or change the pull strategy in Settings → Git.",
+                                commits(ahead),
+                            );
+                            ws.toast(ToastKind::Error, format!("Can't fast-forward {branch} to {upstream}"), Some(detail), cx);
+                        }
+                    },
+                    Ok(Outcome::PartlyApplied { not_restored, error }) => {
+                        // Git applies the changes to tracked files first, then restores
+                        // untracked ones, skipping those that exist (or stopping).
+                        let what = match not_restored.as_slice() {
+                            [] => format!("Tracked files are updated; restoring untracked ones stopped ({error})."),
+                            [one] => format!("{one} wasn't restored: it already exists. The rest is applied."),
+                            many => format!("{} untracked files weren't restored: they already exist. The rest is applied.", many.len()),
+                        };
+                        let detail = format!("{what} The stash is kept: don't apply it again, drop it when you're done.");
+                        ws.toast(ToastKind::Error, "The stash was only partly applied", Some(detail), cx);
+                    }
                     Err(err) => {
                         let title = match &op {
                             GitOp::Push | GitOp::PushNow { .. } | GitOp::Commit { push: true, .. } => "Push failed",
-                            GitOp::Pull => "Update failed",
+                            GitOp::Pull(_) => "Update failed",
                             GitOp::Fetch => "Fetch failed",
                             GitOp::Commit { .. } => "Commit failed",
                             GitOp::Checkout(_) | GitOp::CreateBranch(_) | GitOp::CheckoutCommit(_) | GitOp::BranchAt { .. } => {
@@ -273,7 +358,7 @@ impl Workspace {
                             GitOp::CherryPick(_) => "Cherry-pick failed",
                             GitOp::Revert(_) => "Revert failed",
                             GitOp::Reset { .. } => "Reset failed",
-                            GitOp::Stash(_) => "Stash failed",
+                            GitOp::Stash { .. } => "Stash failed",
                             GitOp::Unstash { .. } => "Couldn't apply the stash",
                             _ => "Git operation failed",
                         };
@@ -283,13 +368,13 @@ impl Workspace {
                 if matches!(
                     op,
                     GitOp::Discard(_)
-                        | GitOp::Pull
+                        | GitOp::Pull(_)
                         | GitOp::Checkout(_)
                         | GitOp::Merge(_)
                         | GitOp::Rebase(_)
                         | GitOp::Abort(_)
                         | GitOp::Continue(_)
-                        | GitOp::Stash(_)
+                        | GitOp::Stash { .. }
                         | GitOp::Unstash { .. }
                         | GitOp::CheckoutCommit(_)
                         | GitOp::BranchAt { .. }
@@ -304,7 +389,7 @@ impl Workspace {
                         op,
                         GitOp::Commit { .. }
                             | GitOp::Fetch
-                            | GitOp::Pull
+                            | GitOp::Pull(_)
                             | GitOp::Push
                             | GitOp::PushNow { .. }
                             | GitOp::Checkout(_)
@@ -317,7 +402,7 @@ impl Workspace {
                             | GitOp::EditRemote { .. }
                             | GitOp::DeleteBranch { .. }
                             | GitOp::RenameBranch { .. }
-                            | GitOp::Stash(_)
+                            | GitOp::Stash { .. }
                             | GitOp::CheckoutCommit(_)
                             | GitOp::BranchAt { .. }
                             | GitOp::TagAt { .. }
@@ -354,14 +439,27 @@ impl Workspace {
     }
 
     pub(super) fn toast(&mut self, kind: ToastKind, message: impl Into<SharedString>, detail: Option<String>, cx: &mut Context<Self>) {
+        self.toast_with_undo(kind, message, detail, None, cx);
+    }
+
+    /// A toast with an Undo button for what it reports.
+    pub(super) fn toast_with_undo(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        detail: Option<String>,
+        undo: Option<ToastUndo>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_toast;
         self.next_toast += 1;
-        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into), leaving: false });
+        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into), undo, leaving: false });
         let shown: Vec<usize> = self.toasts.iter().filter(|t| !t.leaving).map(|t| t.id).collect();
         if let Some(&oldest) = shown.first().filter(|_| shown.len() > 4) {
             self.dismiss_toast(oldest, cx);
         }
-        let seconds = if kind == ToastKind::Error { 9 } else { 4 };
+        // Long enough to reach for its button.
+        let seconds = if kind == ToastKind::Error || undo.is_some() { 9 } else { 4 };
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(seconds)).await;
             this.update(cx, |ws, cx| ws.dismiss_toast(id, cx)).ok();
@@ -395,7 +493,41 @@ impl Workspace {
     }
 
     pub(super) fn git_pull(&mut self, _: &GitPull, window: &mut Window, cx: &mut Context<Self>) {
-        self.run_git(GitOp::Pull, window, cx);
+        self.run_git(GitOp::Pull(None), window, cx);
+    }
+
+    /// A pull found commits on both sides and nothing that says how to
+    /// combine them: asks (like JetBrains' first Update Project), saves the
+    /// answer as the pull strategy and pulls with it.
+    fn choose_pull_strategy(&mut self, branch: &str, upstream: &str, ahead: u32, behind: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let message = format!("{branch} and {upstream} both have new commits");
+        let detail = format!(
+            "{upstream} has {} that {branch} doesn't, and {branch} has {} of its own. Merge them with a merge commit, or rebase yours on top of the incoming ones?\n\nThe answer is kept as the pull strategy (Settings → Git).",
+            commits(behind),
+            commits(ahead),
+        );
+        let answer = window.prompt(PromptLevel::Info, &message, Some(&detail), &["Merge", "Rebase", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let strategy = match answer.await {
+                Ok(0) => git::PullStrategy::Merge,
+                Ok(1) => git::PullStrategy::Rebase,
+                _ => return,
+            };
+            this.update_in(cx, |ws, window, cx| {
+                let mut problems: Vec<String> = Settings::set("pull_strategy", strategy.key().into())
+                    .err()
+                    .map(|e| format!("settings.json: {e}"))
+                    .into_iter()
+                    .collect();
+                problems.extend(settings::reload_now(cx));
+                if !problems.is_empty() {
+                    ws.report_config_problems(problems, cx);
+                }
+                ws.run_git(GitOp::Pull(Some(strategy)), window, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn git_fetch(&mut self, _: &GitFetch, window: &mut Window, cx: &mut Context<Self>) {
@@ -588,26 +720,57 @@ impl Workspace {
 
 
 
-/// What to ask before an operation that loses something: message, detail, button.
-fn confirmation(op: &GitOp) -> Option<(String, &'static str, &'static str)> {
+/// What to ask before an operation that loses something: message, detail,
+/// button, and whether it can be undone (else Cancel is the default).
+fn confirmation(op: &GitOp) -> Option<(String, &'static str, &'static str, bool)> {
     match op {
         GitOp::RemoveRemote(name) => Some((
             format!("Remove remote {name}?"),
             "Its remote-tracking branches go too; the remote repository itself isn't touched.",
             "Remove",
+            true,
         )),
-        GitOp::DropStash(index) => Some((format!("Drop stash@{{{index}}}?"), "Its changes will be lost.", "Drop")),
+        GitOp::DropStash(index) => Some((format!("Drop stash@{{{index}}}?"), "Its changes will be lost.", "Drop", false)),
         GitOp::Reset { sha, mode: git::ResetMode::Hard } => Some((
             format!("Hard reset to {}?", &sha[..sha.len().min(7)]),
             "Commits after it leave the branch, and every uncommitted change is lost. This can't be undone.",
             "Reset",
+            false,
         )),
         _ => None,
     }
 }
 
-/// Runs one Git operation; blocking. Returns a message for a success toast.
-pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Option<String>, String> {
+/// How a Git operation ended, for the workspace to report.
+pub(super) enum Outcome {
+    /// Finished; the message for a notification, if any.
+    Done(Option<String>),
+    /// Nothing to do, and why.
+    Nothing(String),
+    /// A fast-forward-only pull found commits on both sides; nothing changed.
+    Diverged { branch: String, upstream: String, ahead: u32, behind: u32 },
+    /// A stash applied in part and kept (see `git::Unstashed::Partly`).
+    PartlyApplied { not_restored: Vec<String>, error: String },
+}
+
+/// "1 commit", "3 commits".
+fn commits(n: impl Into<u64>) -> String {
+    let n = n.into();
+    format!("{n} commit{}", if n == 1 { "" } else { "s" })
+}
+
+/// Up to a few names, one per line, and how many more there are.
+fn list_some(names: &[String]) -> String {
+    const SHOWN: usize = 6;
+    let mut list = names.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("\n");
+    if names.len() > SHOWN {
+        list.push_str(&format!("\nand {} more", names.len() - SHOWN));
+    }
+    list
+}
+
+/// Runs one Git operation; blocking.
+pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<Outcome, String> {
     let push = |dir: &Path, force: bool, remote: Option<String>| -> Result<String, String> {
         let Some(remote) = remote.or_else(|| git::default_remote(dir)) else {
             return Err("No remote is configured. Add one in Git → Manage Remotes….".into());
@@ -623,7 +786,7 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
     };
     let short = |sha: &str| sha[..sha.len().min(7)].to_string();
     let stopped = |out: &str, what: &str, done: String| Some(if out == "CONFLICT" { format!("{what} stopped on conflicts") } else { done });
-    match op {
+    let message = match op {
         GitOp::Stage(rels) => git::stage(dir, &rels).map(|_| None),
         GitOp::Unstage(rels) => git::unstage(dir, &rels, status.head_oid.is_some()).map(|_| None),
         GitOp::StageLines { rel, text, rows } => git::stage_lines(dir, &rel, &text, rows).map(|_| None),
@@ -652,9 +815,14 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
             let n = files.len();
             git::discard(dir, &files).map(|_| Some(format!("Rolled back {n} file{}", if n == 1 { "" } else { "s" })))
         }
-        GitOp::Commit { message, amend, all, push: and_push } => {
+        GitOp::Commit { message, amend, all, untracked, push: and_push } => {
+            // Untracked files only when checked: a commit of "everything"
+            // mustn't pick up build output or notes nobody chose.
             if all {
-                git::run(dir, &["add", "--all"])?;
+                git::stage_tracked(dir)?;
+            }
+            if !untracked.is_empty() {
+                git::stage(dir, &untracked)?;
             }
             let summary = git::commit(dir, &message, amend)?;
             if and_push {
@@ -667,9 +835,16 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
         // `Push` opens the dialog before it gets here; treat it as a plain push.
         GitOp::Push => push(dir, false, None).map(Some),
         GitOp::PushNow { force, remote } => push(dir, force, remote).map(Some),
-        GitOp::Pull => git::pull(dir).map(|out| {
-            Some(if out.contains("Already up to date") { "Already up to date".into() } else { "Project updated".into() })
-        }),
+        GitOp::Pull(strategy) => {
+            return git::pull(dir, strategy).map(|pulled| match pulled {
+                git::Pulled::UpToDate => Outcome::Done(Some("Already up to date".into())),
+                git::Pulled::FastForwarded(n) => Outcome::Done(Some(format!("Pulled {}", commits(n as u64)))),
+                git::Pulled::Merged(n) => Outcome::Done(Some(format!("Pulled {} and merged", commits(n as u64)))),
+                git::Pulled::Rebased(n) => Outcome::Done(Some(format!("Pulled {}, yours rebased on top", commits(n as u64)))),
+                git::Pulled::Conflicts => Outcome::Done(Some("Update stopped on conflicts".into())),
+                git::Pulled::Diverged { branch, upstream, ahead, behind } => Outcome::Diverged { branch, upstream, ahead, behind },
+            });
+        }
         GitOp::Fetch => git::fetch(dir).map(|_| Some("Fetched all remotes".into())),
         GitOp::Checkout(branch) => git::checkout(dir, &branch).map(|_| Some(format!("Switched to {}", branch.name))),
         GitOp::CreateBranch(name) => git::create_branch(dir, &name).map(|_| Some(format!("Created and switched to {name}"))),
@@ -685,9 +860,21 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
         }
         GitOp::DeleteBranch { name, force } => git::delete_branch(dir, &name, force).map(|_| Some(format!("Deleted branch {name}"))),
         GitOp::RenameBranch { from, to } => git::rename_branch(dir, &from, &to).map(|_| Some(format!("Renamed {from} to {to}"))),
-        GitOp::Stash(message) => git::stash(dir, message.as_deref()).map(|_| Some("Stashed changes".into())),
-        GitOp::Unstash { index, pop } => git::unstash(dir, index, pop)
-            .map(|out| stopped(&out, "Applying the stash", if pop { "Popped stash".into() } else { "Applied stash".into() })),
+        GitOp::Stash { message, untracked } => {
+            return git::stash(dir, message.as_deref(), untracked).map(|stashed| match stashed {
+                true => Outcome::Done(Some("Stashed changes".into())),
+                false if untracked => Outcome::Nothing("No changes to stash".into()),
+                false => Outcome::Nothing("No changes to stash besides untracked files".into()),
+            });
+        }
+        GitOp::Unstash { index, pop } => {
+            return git::unstash(dir, index, pop).map(|unstashed| match unstashed {
+                git::Unstashed::Applied => Outcome::Done(Some(if pop { "Popped stash".into() } else { "Applied stash".into() })),
+                // Git keeps a stash that didn't apply cleanly.
+                git::Unstashed::Conflicts => Outcome::Done(Some("Applying the stash stopped on conflicts; it's kept".into())),
+                git::Unstashed::Partly { error, not_restored } => Outcome::PartlyApplied { not_restored, error },
+            });
+        }
         GitOp::DropStash(index) => git::drop_stash(dir, index).map(|_| Some("Dropped stash".into())),
         GitOp::CheckoutCommit(sha) => git::checkout_commit(dir, &sha).map(|_| Some(format!("Checked out {} (detached HEAD)", short(&sha)))),
         GitOp::BranchAt { name, sha } => git::create_branch_at(dir, &name, &sha).map(|_| Some(format!("Created and switched to {name}"))),
@@ -695,5 +882,6 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
         GitOp::CherryPick(sha) => git::cherry_pick(dir, &sha).map(|out| stopped(&out, "Cherry-pick", format!("Cherry-picked {}", short(&sha)))),
         GitOp::Revert(sha) => git::revert(dir, &sha).map(|out| stopped(&out, "Revert", format!("Reverted {}", short(&sha)))),
         GitOp::Reset { sha, mode } => git::reset(dir, &sha, mode).map(|_| Some(format!("Reset to {}", short(&sha)))),
-    }
+    };
+    message.map(Outcome::Done)
 }

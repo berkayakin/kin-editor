@@ -244,8 +244,34 @@ struct Toast {
     kind: ToastKind,
     message: SharedString,
     detail: Option<SharedString>,
+    /// A button that takes back what the toast reports.
+    undo: Option<ToastUndo>,
     /// Dismissed, fading out before it's removed.
     leaving: bool,
+}
+
+/// What a toast's Undo button undoes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastUndo {
+    /// A file operation, by its id in the file history; shown only while
+    /// it's still the one ⌘Z in the tree would undo.
+    File(u64),
+}
+
+/// Asks whether to go ahead with `action`, resolving to `true` if so. One
+/// that can't be undone (`undoable` false) lists Cancel first, which makes it
+/// the default button on Windows and on macOS leaves no button on Return
+/// (Escape cancels): Return never confirms it.
+fn ask(window: &mut Window, message: &str, detail: &str, action: &str, undoable: bool, cx: &mut App) -> impl Future<Output = bool> + use<> {
+    let answers = if undoable { [action, "Cancel"] } else { ["Cancel", action] };
+    let rx = window.prompt(PromptLevel::Warning, message, Some(detail), &answers, cx);
+    let yes = usize::from(!undoable);
+    async move { rx.await == Ok(yes) }
+}
+
+/// Where deleted files go, as the platform calls it.
+fn trash_name() -> &'static str {
+    if cfg!(windows) { "Recycle Bin" } else { "Trash" }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
