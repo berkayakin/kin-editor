@@ -312,7 +312,7 @@ impl TerminalView {
         match event {
             // A Run tab keeps its configuration's name.
             TermEvent::Title(title) if self.run.is_none() => {
-                self.title = title.into();
+                self.title = short_title(&title).into();
                 cx.emit(TerminalEvent::TitleChanged);
             }
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
@@ -1001,6 +1001,29 @@ fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// A shell's title with a program's path in it shortened to the program's
+/// name. The Windows console titles itself with its program's path:
+/// `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe`, and
+/// `C:\WINDOWS\system32\cmd.exe - npm test` while cmd runs a command.
+fn short_title(title: &str) -> String {
+    let Some(end) = title.to_ascii_lowercase().find(".exe").map(|i| i + 4) else { return title.into() };
+    // `.exe` ends the name (not `.exec`, `.exe.txt`).
+    if !title[end..].chars().next().is_none_or(char::is_whitespace) {
+        return title.into();
+    }
+    // The path starts at a drive (`C:\`), which may come after other text.
+    let bytes = title.as_bytes();
+    let drive = (0..end - 2).rev().find(|&i| {
+        bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && matches!(bytes[i + 2], b'\\' | b'/')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+    });
+    let Some(start) = drive else { return title.into() };
+    let name = title[start..end - 4].rsplit(['\\', '/']).next().unwrap_or_default();
+    format!("{}{name}{}", &title[..start], &title[end..])
+}
+
 /// A URL, or a file that exists (relative to `cwd`) with an optional
 /// `:line` and `:column`, as compilers and test runners print them.
 fn parse_link(text: &str, cwd: &Path) -> Option<Link> {
@@ -1384,6 +1407,18 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_name_programs_without_their_folders() {
+        assert_eq!(short_title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"), "powershell");
+        assert_eq!(short_title(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
+        assert_eq!(short_title("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"), "powershell");
+        assert_eq!(short_title(r"C:\WINDOWS\system32\cmd.exe - npm test"), "cmd - npm test");
+        assert_eq!(short_title(r"Administrator: C:\WINDOWS\system32\cmd.exe"), "Administrator: cmd");
+        for kept in ["zsh", "me@mac: ~/dev/kuana", r"C:\Users\me\project", "vim notes.exe.txt", "make.exec", "setup.exe"] {
+            assert_eq!(short_title(kept), kept);
+        }
+    }
 
     /// A Run tab ends with its command's exit code (a failed test or build
     /// must not show as finished fine).
