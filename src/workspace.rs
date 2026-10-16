@@ -104,7 +104,10 @@ use self::{
     welcome::*,
     windows::*,
 };
-pub use self::windows::{modal_max_height, open_window, quit};
+pub use self::{
+    sessions::update_recent_projects,
+    windows::{modal_max_height, open_window, quit},
+};
 
 actions!(
     workspace,

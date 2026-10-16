@@ -6,10 +6,13 @@ impl Workspace {
     // ---- File tree --------------------------------------------------------------
 
     pub fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.update_recent_projects(|list| {
-            list.retain(|p| p != &root);
-            list.insert(0, root.clone());
-        });
+        self.update_recent_projects(
+            |list| {
+                list.retain(|p| p != &root);
+                list.insert(0, root.clone());
+            },
+            cx,
+        );
         self.breakpoints.clear();
         self.problems.update(cx, |p, cx| {
             p.set_run(None, cx);

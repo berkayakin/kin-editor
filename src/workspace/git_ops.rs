@@ -615,7 +615,7 @@ impl Workspace {
     }
 
     pub(super) fn remove_recent_project(&mut self, path: &Path, cx: &mut Context<Self>) {
-        self.update_recent_projects(|list| list.retain(|p| p != path));
+        self.update_recent_projects(|list| list.retain(|p| p != path), cx);
         cx.notify();
     }
 

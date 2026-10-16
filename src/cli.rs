@@ -17,6 +17,54 @@ pub fn paths_from_urls(urls: &[String]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Lists the recent projects where the system lists an app's recent items,
+/// to open Kuana in one from there: the Dock icon's menu on macOS (also while
+/// Kuana isn't running; a click comes back as an open-file event) and the
+/// taskbar's jump list on Windows (a click starts `kuana <folder>`). Linux
+/// desktops have no such list. Returns the folders the user removed from the
+/// jump list, for Kuana's list to drop too.
+pub fn show_recent_projects(projects: &[PathBuf], cx: &mut gpui::App) -> Vec<PathBuf> {
+    let projects: Vec<PathBuf> = projects.iter().filter(|p| p.is_dir()).cloned().collect();
+    #[cfg(target_os = "macos")]
+    show_in_dock(projects.clone(), cx);
+    let entries = projects.into_iter().map(|p| std::iter::once(p).collect()).collect();
+    cx.update_jump_list(Vec::new(), entries).into_iter().flatten().collect()
+}
+
+/// Replaces the system's recent items for Kuana, which the Dock lists.
+#[cfg(target_os = "macos")]
+fn show_in_dock(projects: Vec<PathBuf>, cx: &mut gpui::App) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Which call last changed the list.
+    static SHOWN: AtomicUsize = AtomicUsize::new(0);
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    // Cleared first, so folders Kuana dropped or that were deleted go too.
+    // Safety: the sender can be nil; it's for menu commands.
+    unsafe { objc2_app_kit::NSDocumentController::sharedDocumentController(mtm).clearRecentDocuments(None) };
+    add_to_dock(&projects, cx);
+    // Cleared at launch, the list loses the first folder added after it;
+    // adding them again a moment later (unless the list changed meanwhile)
+    // puts it back in its place.
+    let shown = SHOWN.fetch_add(1, Ordering::Relaxed) + 1;
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+        if SHOWN.load(Ordering::Relaxed) == shown {
+            cx.update(|cx| add_to_dock(&projects, cx)).ok();
+        }
+    })
+    .detach();
+}
+
+/// Oldest first: each one goes to the end, and the Dock shows the newest at
+/// the bottom, nearest the icon (like VS Code), keeping the newest when the
+/// system's limit on recent items is lower.
+#[cfg(target_os = "macos")]
+fn add_to_dock(projects: &[PathBuf], cx: &mut gpui::App) {
+    for path in projects.iter().rev() {
+        cx.add_recent_document(path);
+    }
+}
+
 /// The `kuana` script for this copy of Kuana: through `open` when it runs from
 /// an app bundle (paths reach the running app), else the binary itself.
 pub fn script(exe: &Path) -> String {

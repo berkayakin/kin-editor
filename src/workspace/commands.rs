@@ -79,7 +79,7 @@ impl Workspace {
         let path = path.canonicalize().unwrap_or(path);
         if !path.is_dir() {
             self.toast(ToastKind::Error, "Folder not found", Some(clone_dialog::display_path(&path)), cx);
-            self.update_recent_projects(|list| list.retain(|p| p != &path));
+            self.update_recent_projects(|list| list.retain(|p| p != &path), cx);
             cx.notify();
             return;
         }

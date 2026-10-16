@@ -53,6 +53,9 @@ Each window holds one project folder, so several projects can be open side by si
 - **Recent Projects…** (also opened by clicking the project name in the title bar) lists recent
   folders. Enter opens one in this window; ⌘↩ / Ctrl+Enter or ⌘/Ctrl-click opens it in a new
   window. The welcome screen's Recent Projects list works the same way.
+- The same recent projects are in the Dock icon's right-click menu on macOS (also while Kuana
+  isn't running) and in the taskbar icon's jump list on Windows. Choosing one opens it in Kuana,
+  bringing forward a window that already has it.
 - **New Window** (⌘⇧N) opens an empty window.
 - Opening a folder that's already open in another window brings that window forward.
 - Files and folders dragged from Finder go where you drop them: onto the editor area they open

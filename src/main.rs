@@ -316,6 +316,9 @@ fn main() {
         cx.set_menus(menus());
         // Menu items show their shortcuts; another keymap changes them.
         cx.observe_global::<keymap::Installed>(|cx| cx.set_menus(menus())).detach();
+        // The Dock menu and jump list list recent projects, ones opened by
+        // Kuanas from before they did too.
+        workspace::update_recent_projects(|_| {}, cx);
 
         // Each folder on the command line gets its own window, like Zed;
         // files open in the first one. Without paths, reopen the last project.

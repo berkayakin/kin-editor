@@ -206,16 +206,9 @@ impl Workspace {
         self.active_pane = self.active_pane.min(self.panes.len() - 1);
     }
 
-    /// Changes the recent projects list shared by all windows. It's re-read
-    /// from disk first so one window doesn't drop another's entries.
-    pub(super) fn update_recent_projects(&mut self, f: impl FnOnce(&mut Vec<PathBuf>)) {
-        let mut state = SessionState::load();
-        f(&mut state.recent_projects);
-        state.recent_projects.truncate(MAX_RECENT_PROJECTS);
-        self.recent_projects = state.recent_projects.clone();
-        if let Err(err) = state.save() {
-            eprintln!("couldn't save recent projects: {err}");
-        }
+    /// Changes the recent projects list shared by all windows.
+    pub(super) fn update_recent_projects(&mut self, f: impl FnOnce(&mut Vec<PathBuf>), cx: &mut App) {
+        self.recent_projects = update_recent_projects(f, cx);
     }
 
     /// Remembers layout and the open folder for the next launch.
@@ -304,6 +297,26 @@ impl Workspace {
         self.focus_active(window, cx);
         cx.notify();
     }
+}
+
+/// Changes the recent projects list shared by all windows and returns it.
+/// It's re-read from disk first so one window doesn't drop another's
+/// entries, and shown where the system lists recent items (the Dock, the
+/// jump list: `cli::show_recent_projects`).
+pub fn update_recent_projects(f: impl FnOnce(&mut Vec<PathBuf>), cx: &mut App) -> Vec<PathBuf> {
+    let mut state = SessionState::load();
+    let before = state.recent_projects.clone();
+    f(&mut state.recent_projects);
+    state.recent_projects.truncate(MAX_RECENT_PROJECTS);
+    // What the user removed from the jump list goes from here too.
+    let removed = crate::cli::show_recent_projects(&state.recent_projects, cx);
+    state.recent_projects.retain(|p| !removed.contains(p));
+    if state.recent_projects != before
+        && let Err(err) = state.save()
+    {
+        eprintln!("couldn't save recent projects: {err}");
+    }
+    state.recent_projects
 }
 
 

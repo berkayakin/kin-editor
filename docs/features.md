@@ -61,7 +61,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
 - 31 built-in themes (24 dark, 7 light) and JSON user themes with live preview
 - Multiple windows, one project each (like Zed), with a Recent Projects picker; on macOS the
-  Window menu and the Dock icon's menu list them
+  Window menu and the Dock icon's menu list them. Recent projects are also in the Dock icon's
+  menu (macOS) and the taskbar's jump list (Windows)
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste, Find in the output and scrollback; shell keys
   like Ctrl+R reach the shell; split groups, renamable tabs, and each project's terminals come back
