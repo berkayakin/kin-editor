@@ -5,7 +5,7 @@
 # Kin
 
 **A fast, beautiful code editor, written in Rust and drawn by your GPU.**
-JetBrains-style comfort, native speed, Zed extensions. Free and open source.
+JetBrains-style comfort, native speed, works with Zed extensions. Free and open source.
 
 [Download](https://github.com/berkayakin/kin-editor/releases/latest) ·
 [Features](docs/features.md) ·
@@ -124,5 +124,8 @@ dual licensed as above, without any additional terms or conditions.
 Bundled third-party assets keep their own licenses: file-type icons from
 [Charmed Icons](https://github.com/littensy/charmed-icons) by littensy and jmesrje (MIT,
 [`assets/file-icons/LICENSE`](assets/file-icons/LICENSE)) and the Vidaloka font (SIL Open Font
-License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)). Kin reads Zed's extension format for
-compatibility; it isn't affiliated with or endorsed by Zed Industries.
+License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)).
+
+Zed, JetBrains, Visual Studio Code and Sublime Text are trademarks of their respective owners.
+Kin is an independent project, not affiliated with or endorsed by any of them; it mentions them
+only to describe compatibility.
