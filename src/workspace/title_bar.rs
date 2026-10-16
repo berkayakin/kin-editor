@@ -53,9 +53,7 @@ impl Workspace {
     pub(super) fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mac = cfg!(target_os = "macos");
         let theme = Theme::get(cx).clone();
-        let width = f32::from(window.viewport_size().width);
-        // Long project and branch names are cut shorter in narrow windows.
-        let narrow = width < 900.;
+        let fit = BarFit::for_width(f32::from(window.viewport_size().width));
         div()
             .id("titlebar")
             .flex()
@@ -87,10 +85,10 @@ impl Workspace {
                     .overflow_hidden()
                     .items_center()
                     .gap_1p5()
-                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
-                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
-                    .when_some(self.render_sync_counts(window, cx), |el, counts| el.child(counts))
-                    .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
+                    .when(self.root.is_some(), |el| el.child(self.render_project_chip(fit, cx)))
+                    .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(fit, cx)))
+                    .when_some(self.render_sync_counts(window, cx).filter(|_| fit.counts), |el, counts| el.child(counts))
+                    .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(fit, cx))),
             ))
             .child(window_drag_area("titlebar-middle").flex_1().min_w(px(GAP)))
             .child(
@@ -99,12 +97,12 @@ impl Workspace {
                     .flex_shrink_0()
                     .items_center()
                     .gap_2p5()
-                    .child(self.render_run_widget(width >= 820., window, cx))
+                    .child(self.render_run_widget(fit, window, cx))
                     .child(separator(&theme))
-                    .child(self.render_panel_dock(window, cx))
+                    .child(self.render_panel_dock(fit, cx))
                     .child(separator(&theme))
-                    .child(self.render_search_button(window, cx))
-                    .child(self.render_extensions_button(window, cx))
+                    .when(fit.search, |el| el.child(self.render_search_button(window, cx)))
+                    .when(fit.extensions, |el| el.child(self.render_extensions_button(window, cx)))
                     .child(self.render_settings_button(window, cx)),
             )
             .map(|el| match mac {
@@ -116,7 +114,7 @@ impl Workspace {
     /// The selected run configuration (the last one launched, run or
     /// debugged) with Run, Debug and, while something runs, Stop; like
     /// JetBrains' run widget.
-    pub(super) fn render_run_widget(&self, labeled: bool, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_run_widget(&self, fit: BarFit, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let selected = self.last_run.clone();
         let terminals = self.all_terminals(cx);
@@ -151,7 +149,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(px(2.))
-            .when_some(selected.filter(|_| labeled), |el, target| {
+            .when_some(selected.filter(|_| fit.run_label), |el, target| {
                 el.child(
                     div()
                         .id("run-configuration")
@@ -186,13 +184,13 @@ impl Workspace {
                 })
                 .tooltip(move |_, cx| tooltip_view(run_tip.clone(), cx)),
             )
-            .child(
+            .when(fit.debug, |el| el.child(
                 self.bar_button("debug", Icon::Bug, theme.text_dim.into(), Some(theme.text.into()), cx, |ws, _, window, cx| match ws.last_run.clone() {
                     Some(target) if target.debug.is_some() => ws.debug_target(target, window, cx),
                     _ => ws.debug_configuration(&DebugConfiguration, window, cx),
                 })
                 .tooltip(move |_, cx| tooltip_view(debug_tip.clone(), cx)),
-            )
+            ))
             .when(running, |el| {
                 el.child(
                     self.bar_button("stop", Icon::Stop, theme.error.into(), None, cx, |ws, _, window, cx| ws.stop_run(&StopRun, window, cx))
@@ -202,8 +200,9 @@ impl Workspace {
     }
 
     /// Show/hide toggles for the sidebar and the bottom panels: an open
-    /// one's icon takes the accent color.
-    pub(super) fn render_panel_dock(&self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// one's icon takes the accent color. In narrow windows the less used ones
+    /// show only while their panel is open (so it can be closed from here).
+    pub(super) fn render_panel_dock(&self, fit: BarFit, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let toggle = |id, icon, on: bool, cx: &mut Context<Self>, f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
             let (rest, hover) = if on { (theme.accent, None) } else { (theme.text_dim, Some(theme.text.into())) };
@@ -223,13 +222,13 @@ impl Workspace {
                 })
                 .tooltip(|window, cx| status_tooltip("Terminal", &ToggleTerminal, window, cx)),
             )
-            .child(
+            .when(fit.problems || self.shows(BottomPanel::Problems), |el| el.child(
                 toggle("toggle-problems", Icon::PanelBottom, self.shows(BottomPanel::Problems), cx, |ws, window, cx| {
                     ws.toggle_problems(&ToggleProblems, window, cx)
                 })
                 .tooltip(|window, cx| status_tooltip("Problems", &ToggleProblems, window, cx)),
-            )
-            .when(self.repo.is_some(), |el| {
+            ))
+            .when(self.repo.is_some() && (fit.git_log || self.shows(BottomPanel::GitLog)), |el| {
                 el.child(
                     toggle("toggle-git-log", Icon::GitCommit, self.shows(BottomPanel::GitLog), cx, |ws, window, cx| {
                         ws.toggle_git_log(&ToggleGitLog, window, cx)
@@ -237,7 +236,7 @@ impl Workspace {
                     .tooltip(|window, cx| status_tooltip("Git Log", &ToggleGitLog, window, cx)),
                 )
             })
-            .when(self.debug.is_some(), |el| {
+            .when(self.debug.is_some() && (fit.git_log || self.shows(BottomPanel::Debug)), |el| {
                 el.child(
                     toggle("toggle-debug", Icon::Bug, self.shows(BottomPanel::Debug), cx, |ws, window, cx| {
                         ws.toggle_debug_panel(&ToggleDebugPanel, window, cx)
@@ -315,7 +314,7 @@ impl Workspace {
 
     /// The open project: a pill like the branch chip beside it, with a round
     /// tinted monogram and the folder name. Clicking lists recent projects.
-    pub(super) fn render_project_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_project_chip(&self, fit: BarFit, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let name = self.root.as_deref().map(folder_name).unwrap_or_default();
         let initial = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_default();
@@ -337,7 +336,7 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
-            .max_w(px(if narrow { 180. } else { 300. }))
+            .max_w(px(fit.project_chars as f32 * 9. + 40.))
             .child(
                 div()
                     .size(px(CHIP_HEIGHT - 8.))
@@ -362,12 +361,15 @@ impl Workspace {
                     .text_color(gpui::hsla(0., 0., 0., 0.78))
                     .child(initial),
             )
-            .child(div().min_w_0().truncate().child(ellipsize(&name, if narrow { 16 } else { 30 })))
+            .child(div().min_w_0().truncate().child(ellipsize(&name, fit.project_chars)))
     }
 
     /// The current branch beside the project name. Clicking opens Branches….
-    pub(super) fn render_branch_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_branch_chip(&self, fit: BarFit, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
+        let branch = self.branch_label();
+        // Just the icon in the narrowest windows; the tooltip names the branch.
+        let tip = if fit.branch_chars.is_some() { "Branches…".to_string() } else { format!("{branch} · Branches…") };
         // Uncommitted changes aren't marked here: the Commit tab counts them.
         div()
             .id("branch-chip")
@@ -375,9 +377,9 @@ impl Workspace {
             .items_center()
             .gap_1p5()
             .h(px(CHIP_HEIGHT))
-            .max_w(px(if narrow { 150. } else { 280. }))
+            .max_w(px(fit.branch_chars.unwrap_or(0) as f32 * 9. + 40.))
             .pl(px(10.))
-            .pr(px(12.))
+            .pr(px(if fit.branch_chars.is_some() { 12. } else { 10. }))
             .rounded_full()
             .cursor_pointer()
             // The same size as the project's name beside it.
@@ -387,9 +389,9 @@ impl Workspace {
             .hover(|st| st.text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
-            .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
+            .tooltip(move |window, cx| status_tooltip(&tip, &GitBranches, window, cx))
             .child(icon_el(Icon::GitBranch, px(14.), theme.text_dim.into()))
-            .child(div().min_w_0().truncate().child(ellipsize(&self.branch_label(), if narrow { 12 } else { 28 })))
+            .when_some(fit.branch_chars, |el, chars| el.child(div().min_w_0().truncate().child(ellipsize(&branch, chars))))
     }
 
     /// Commits to push and to pull, beside the branch pill: Push… when there
@@ -451,7 +453,7 @@ impl Workspace {
     }
 
     /// Shown while the project isn't trusted; opens the trust dialog.
-    pub(super) fn render_restricted_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_restricted_chip(&self, fit: BarFit, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         div()
             .id("restricted-chip")
@@ -462,7 +464,7 @@ impl Workspace {
             // A pill like the branch chip beside it: it's a button too.
             .h(px(CHIP_HEIGHT))
             .pl(px(10.))
-            .pr(px(12.))
+            .pr(px(if fit.counts { 12. } else { 10. }))
             .rounded_full()
             .cursor_pointer()
             .text_size(px(12.5))
@@ -472,7 +474,7 @@ impl Workspace {
             .on_click(cx.listener(|ws, _, window, cx| ws.open_trust_dialog(window, cx)))
             .tooltip(|_, cx| tooltip_view("Language servers, formatters and project tools are off until you trust this folder", cx))
             .child(icon_el(Icon::ShieldAlert, px(14.), theme.warning.into()))
-            .child("Restricted Mode")
+            .when(fit.counts, |el| el.child("Restricted Mode"))
     }
 
     /// The checked-out branch, or what HEAD is when it isn't one.
@@ -527,6 +529,51 @@ impl Workspace {
 /// The project, branch and Restricted Mode pills' height.
 const CHIP_HEIGHT: f32 = 28.;
 
+/// What the title bar shows at the window's width. As it narrows, the less
+/// used tools go first (each is also in a menu, Find Action or a shortcut),
+/// then the chips' names shorten; Run, Stop, the sidebar and terminal toggles
+/// and Settings always stay.
+#[derive(Clone, Copy)]
+pub(super) struct BarFit {
+    run_label: bool,
+    extensions: bool,
+    /// The Git Log and Debug panel toggles (shown anyway while open).
+    git_log: bool,
+    /// The Problems toggle (shown anyway while open); the status bar's counts open it too.
+    problems: bool,
+    debug: bool,
+    /// The commits to push/pull beside the branch, and Restricted Mode's label.
+    counts: bool,
+    search: bool,
+    project_chars: usize,
+    /// `None`: the branch chip is just its icon.
+    branch_chars: Option<usize>,
+}
+
+impl BarFit {
+    fn for_width(width: f32) -> Self {
+        Self {
+            run_label: width >= 1000.,
+            extensions: width >= 860.,
+            git_log: width >= 860.,
+            problems: width >= 760.,
+            debug: width >= 760.,
+            counts: width >= 760.,
+            search: width >= 640.,
+            project_chars: if width >= 900. { 30 } else if width >= 640. { 16 } else { 10 },
+            branch_chars: if width >= 900. {
+                Some(28)
+            } else if width >= 640. {
+                Some(12)
+            } else if width >= 560. {
+                Some(8)
+            } else {
+                None
+            },
+        }
+    }
+}
+
 /// A short hairline between groups of title bar buttons.
 fn separator(theme: &Theme) -> Div {
     div().w(px(1.)).h(px(18.)).flex_shrink_0().bg(theme.border)
@@ -537,4 +584,27 @@ pub(super) fn monogram_color(name: &str, theme: &Theme) -> Hsla {
     let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     palette[hash as usize % palette.len()].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BarFit;
+
+    /// Narrowing the window only ever takes things away.
+    #[test]
+    fn narrower_windows_only_drop_things() {
+        let shown = |f: BarFit| {
+            [f.run_label, f.extensions, f.git_log, f.problems, f.debug, f.counts, f.search].map(usize::from).iter().sum::<usize>()
+                + f.project_chars
+                + f.branch_chars.unwrap_or(0)
+        };
+        let mut last = shown(BarFit::for_width(2000.));
+        for width in (480..2000).rev().step_by(10) {
+            let now = shown(BarFit::for_width(width as f32));
+            assert!(now <= last, "more shows at {width} px than wider");
+            last = now;
+        }
+        let smallest = BarFit::for_width(480.);
+        assert!(!smallest.search && !smallest.extensions && smallest.branch_chars.is_none());
+    }
 }
