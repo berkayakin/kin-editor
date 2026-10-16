@@ -3,7 +3,11 @@
 //! and the requests behind Go to Declaration, Find Usages, Rename and
 //! Show Context Actions (whose results the workspace presents).
 
-use std::{cmp::Reverse, path::PathBuf, sync::Arc};
+use std::{
+    cmp::Reverse,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::{App, 
     AnyElement, Context, FontWeight, HighlightStyle, MouseButton, Pixels, Point, SharedString, StyledText, Task,
@@ -1065,11 +1069,13 @@ impl Editor {
     /// Declaration jumps there.
     fn is_declaration_at(&self, offset: usize, locations: &[Location], encoding: Encoding, cx: &App) -> bool {
         let doc = self.doc.read(cx);
+        let Some(path) = doc.path.as_deref() else { return false };
+        // By its real path: servers spell paths their own way (on Windows
+        // `c:\…` for Kuana's `\\?\C:\…`).
+        let here = |p: &Path| p == path || crate::document_store::key(p) == crate::document_store::key(path);
         let word = super::word_range(doc, offset);
         !locations.is_empty()
-            && locations.iter().all(|l| {
-                doc.path.as_ref() == Some(&l.path) && word.contains(&protocol::range_to_offsets(doc.rope(), l.range, encoding).start)
-            })
+            && locations.iter().all(|l| here(&l.path) && word.contains(&protocol::range_to_offsets(doc.rope(), l.range, encoding).start))
     }
 
     pub(super) fn rename_symbol(&mut self, _: &super::RenameSymbol, _: &mut Window, cx: &mut Context<Self>) {
@@ -1517,6 +1523,44 @@ mod tests {
         editor.update(cx, |e, cx| e.navigate_from(3, cx));
         wait_for(cx, "the usages", |_| events.borrow().len() == 2);
         assert_eq!(*events.borrow(), [("Declaration".to_string(), 1), ("Usages of a".to_string(), 2)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Kuana opens files by their real path; a server may name them its own
+    /// way (Windows: `c:\…` for Kuana's `\\?\C:\…`; macOS: `/var` for `/private/var`).
+    #[gpui::test]
+    fn a_server_naming_the_file_its_own_way_still_means_this_file(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-respell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() { a() }\n").unwrap();
+        let path = dir.join("a.rs").canonicalize().unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("respell", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        // Its diagnostics reach it.
+        wait_for(cx, "the server's diagnostics", |cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&editor, move |_, event: &EditorLspEvent, _| {
+                if let EditorLspEvent::Navigate { title, .. } = event {
+                    seen.borrow_mut().push(title.to_string());
+                }
+            })
+        });
+        // ⌘/Ctrl-click on the declaration's name: its usages, not a jump to itself.
+        editor.update(cx, |e, cx| e.navigate_from(3, cx));
+        wait_for(cx, "an answer", |_| !events.borrow().is_empty());
+        assert_eq!(*events.borrow(), ["Usages of a"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

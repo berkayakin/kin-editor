@@ -136,6 +136,9 @@ impl Progress {
 
 struct OpenDocument {
     doc: WeakEntity<Document>,
+    /// Its real path (`document_store::key`), which a server's name for it
+    /// leads to too (`registered_path`).
+    real: PathBuf,
     /// The editor that gets its diagnostics. None for a document without a
     /// tab (edited by a workspace edit): diagnostics wait for one (`register`).
     editor: Option<WeakEntity<Editor>>,
@@ -335,6 +338,7 @@ impl LspStore {
             path.clone(),
             OpenDocument {
                 doc: doc.downgrade(),
+                real: crate::document_store::key(&path),
                 editor: editor.map(Entity::downgrade),
                 servers: Vec::new(),
                 language_id: servers::language_id(language, &path),
@@ -596,6 +600,7 @@ impl LspStore {
                     let Some(path) = params.get("uri").and_then(Value::as_str).and_then(protocol::uri_to_path) else {
                         return;
                     };
+                    let path = self.registered_path(path);
                     self.diagnostics.insert((path.clone(), key.clone()), params);
                     self.apply_diagnostics(&path, key, cx);
                 }
@@ -738,6 +743,18 @@ impl LspStore {
         if let Some(client) = self.client(key) {
             client.respond(request_id, result);
         }
+    }
+
+    /// The path a document is registered under, for a path a server named it
+    /// by: servers spell paths their own way (on Windows a lowercase drive
+    /// letter and no `\\?\`, which `canonicalize` gives Kuana's; a path
+    /// through a symlink). A file that isn't open goes by its real path.
+    fn registered_path(&self, path: PathBuf) -> PathBuf {
+        if self.documents.contains_key(&path) {
+            return path;
+        }
+        let real = crate::document_store::key(&path);
+        self.documents.iter().find(|(_, d)| d.real == real).map_or(real, |(registered, _)| registered.clone())
     }
 
     /// Gives the editor of `path` one server's diagnostics for it (the
@@ -1164,7 +1181,9 @@ impl FileWatcher {
             // A RelativePattern: a base folder (a URI or a workspace folder) and a glob.
             _ => {
                 let base = pattern.get("baseUri").and_then(|b| b.as_str().or_else(|| b.get("uri")?.as_str()))?;
-                (Some(protocol::uri_to_path(base)?), pattern.get("pattern")?.as_str()?)
+                // Its real path, as the watcher's are (see `registered_path`).
+                let base = crate::document_store::key(&protocol::uri_to_path(base)?);
+                (Some(base), pattern.get("pattern")?.as_str()?)
             }
         };
         let glob = globset::GlobBuilder::new(glob).literal_separator(true).build().ok()?.compile_matcher();
@@ -1194,11 +1213,21 @@ impl FileWatcher {
 /// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
 /// Named "hints", it also gives an inlay hint at the end of the first line, and on a
 /// save checks the file as rust-analyzer does: "hints checked <first line>".
+/// Named "respell", it names the file in its answers as other servers may.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
 name = sys.argv[1]
 triggers = [t for t in sys.argv[2].split(",") if t] if len(sys.argv) > 2 else []
+def spelled(uri):
+    # Named "respell", it names files as other servers may: vscode-uri's
+    # lowercase drive letter and encoded colon, or not through macOS's /private.
+    if name != "respell":
+        return uri
+    uri = uri.replace("file:///private/", "file:///")
+    if uri[8:9].isalpha() and uri[9:10] == ":":
+        uri = uri[:8] + uri[8].lower() + "%3A" + uri[10:]
+    return uri
 def read():
     headers = {}
     while True:
@@ -1260,7 +1289,7 @@ while True:
         extra = [str(v) for v in (init.get("greeting"), section.get("mode")) if v is not None]
         message = " ".join([name + " problem"] + extra)
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
-        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": [problem]}})
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": spelled(uri), "diagnostics": [problem]}})
     elif method == "textDocument/codeLens":
         # Unresolved: the title comes with codeLens/resolve.
         lens_range = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
@@ -1272,14 +1301,14 @@ while True:
         lens["command"] = {"title": name + " lens", "command": "editor.action.showReferences", "arguments": [uri, lens["range"]["start"], [location]]}
         send({"jsonrpc": "2.0", "id": id, "result": lens})
     elif method == "textDocument/definition":
-        uri = m["params"]["textDocument"]["uri"]
+        uri = spelled(m["params"]["textDocument"]["uri"])
         # Nothing from the third line on has a declaration.
         if m["params"]["position"]["line"] >= 2:
             send({"jsonrpc": "2.0", "id": id, "result": None})
         else:
             send({"jsonrpc": "2.0", "id": id, "result": {"uri": uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}}})
     elif method == "textDocument/references":
-        uri = m["params"]["textDocument"]["uri"]
+        uri = spelled(m["params"]["textDocument"]["uri"])
         at = lambda line, ch: {"uri": uri, "range": {"start": {"line": line, "character": ch}, "end": {"line": line, "character": ch + 1}}}
         send({"jsonrpc": "2.0", "id": id, "result": [at(0, 3), at(1, 9)]})
     elif method == "textDocument/completion":
