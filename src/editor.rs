@@ -1526,7 +1526,15 @@ impl Editor {
         let problems = self.caret_problem_rows(cx);
         if !problems.is_empty() {
             let row = doc.row_of(self.primary_selection().head);
-            blocks.push(Block { line: row + 1, kind: BlockKind::Problems(problems) });
+            // Under the line's fold when it's folded: above the first line it
+            // doesn't hide (blocks above hidden lines take no rows).
+            let mut below = row + 1;
+            for fold in doc.folds() {
+                if (doc.row_of(fold.start)..=doc.row_of(fold.end)).contains(&below) {
+                    below = doc.row_of(fold.end) + 1;
+                }
+            }
+            blocks.push(Block { line: below, kind: BlockKind::Problems { of: row, rows: problems } });
         }
         if self.file_settings.code_lens {
             for lens in doc.code_lenses() {
@@ -1540,7 +1548,7 @@ impl Editor {
         // Above a line: the problems of the line before it, then deleted
         // lines, then the line's own lenses.
         let rank = |kind: &BlockKind| match kind {
-            BlockKind::Problems(_) => 0,
+            BlockKind::Problems { .. } => 0,
             BlockKind::Deleted(_) => 1,
             BlockKind::Lenses(_) => 2,
         };
@@ -2973,6 +2981,11 @@ impl Editor {
             let mut used: HashMap<usize, usize> = HashMap::new();
             let run = |text: &str, font: Font, color: Hsla| TextRun { len: text.len(), font, color, background_color: None, underline: None, strikethrough: None };
             for block in self.blocks(cx) {
+                // A fold hides the blocks above the lines it hides (no rows
+                // for them in the map; drawn, they'd cover the lines below).
+                if block.line < line_count && map.hidden(block.line) {
+                    continue;
+                }
                 let offset = used.entry(block.line).or_insert(0);
                 let start = map.block_start(block.line) + *offset;
                 *offset += block.rows();
@@ -3014,9 +3027,9 @@ impl Editor {
                         }
                     }
                     BlockKind::Lenses(_) => {}
-                    BlockKind::Problems(rows) => {
+                    BlockKind::Problems { of, rows } => {
                         // Under the caret line, in the hint's colors, lined up with its text.
-                        let line = self.doc.read(cx).line_text(block.line.saturating_sub(1));
+                        let line = self.doc.read(cx).line_text(*of);
                         let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
                         let msg_size = px(theme.ui_font_size - 0.5);
                         for (i, (severity, text)) in rows.iter().enumerate().filter(|(i, _)| visible(start + i)) {
@@ -3029,7 +3042,7 @@ impl Editor {
                             let shaped = text_system.shape_line(SharedString::from(text.clone()), msg_size, &[run(text, ui_font.clone(), color.alpha(0.9))], None);
                             frame.lines.push((point(text_left - self.scroll.x + char_width * indent as f32, y + (line_height - msg_size) / 4.), shaped));
                         }
-                        problems_row = Some(block.line.saturating_sub(1));
+                        problems_row = Some(*of);
                     }
                 }
             }
@@ -4728,8 +4741,9 @@ impl Editor {
 /// What block rows show (see `Editor::blocks`).
 #[derive(Clone)]
 enum BlockKind {
-    /// The caret line's problems in full, a row each (under that line).
-    Problems(Vec<(lint::Severity, String)>),
+    /// The problems of line `of` (the caret's) in full, a row each, under
+    /// that line or its fold.
+    Problems { of: usize, rows: Vec<(lint::Severity, String)> },
     /// An opened hunk's deleted lines, a row each.
     Deleted(Vec<String>),
     /// A line's code lenses, on one row.
@@ -4747,7 +4761,7 @@ impl Block {
     fn rows(&self) -> usize {
         match &self.kind {
             BlockKind::Deleted(lines) => lines.len(),
-            BlockKind::Problems(rows) => rows.len(),
+            BlockKind::Problems { rows, .. } => rows.len(),
             BlockKind::Lenses(_) => 1,
         }
     }
@@ -4971,6 +4985,10 @@ mod block_tests {
             let rows: Vec<String> = e.caret_problem_rows(cx).into_iter().map(|(_, t)| t).collect();
             assert_eq!(rows, ["mismatched types", "expected `i32`"]);
             assert_eq!(e.block_rows(cx), [(1, 2)]);
+            // Folded, the line's problems go under the lines its fold hides.
+            e.doc.as_mut(cx).fold_rows(1, 1);
+            assert_eq!(e.block_rows(cx), [(2, 2)]);
+            e.doc.as_mut(cx).unfold_where(|_| true);
             // Two problems on the line: both.
             e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(0, "first"), problem(4, "second")]);
             assert_eq!(e.caret_problem_rows(cx).len(), 2);
