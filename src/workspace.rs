@@ -48,7 +48,7 @@ use crate::{
     lint::Severity,
     lsp::{
         FileChange, LspEvent, LspStatus, LspStore, Server,
-        protocol::{self, CodeAction, Encoding, Location, Position, TextEdit},
+        protocol::{self, CodeAction, Encoding, Location, Position},
     },
     picker::{ActionEntry, GoToLine as GoToLineModal, GoToLineEvent, LocationRow, Picker, PickerEvent, PickerMode},
     project_search::{ProjectSearch, ProjectSearchEvent},
@@ -662,6 +662,9 @@ pub struct Workspace {
     recent_projects: Vec<PathBuf>,
     /// The running Git operation (one at a time), shown in the status bar.
     git_busy: Busy,
+    /// Operations started while another ran: they run next, in order (Git
+    /// takes one at a time; Zed queues them too).
+    git_queue: std::collections::VecDeque<GitOp>,
     status_task: Option<Task<()>>,
     git_op_task: Option<Task<()>>,
     toasts: Vec<Toast>,
@@ -696,6 +699,8 @@ pub struct Workspace {
     /// The Preferences page shown last, to reopen there.
     preferences_page: preferences::Page,
     _subscriptions: Vec<Subscription>,
+    /// Each tab's subscriptions, dropped with the tab (they'd pile up).
+    tab_subscriptions: HashMap<gpui::EntityId, Vec<Subscription>>,
 }
 
 impl Workspace {
@@ -873,12 +878,14 @@ impl Workspace {
             }
         })
         .detach();
+        // Git status follows the project watcher (and window activation); a
+        // poll is only the fallback for a folder that couldn't be watched.
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(4)).await;
                 let alive = this
                     .update_in(cx, |ws, window, cx| {
-                        if window.is_window_active() {
+                        if window.is_window_active() && ws.watcher.is_none() {
                             ws.refresh_git(cx);
                         }
                     })
@@ -953,6 +960,7 @@ impl Workspace {
             last_commit: None,
             recent_projects: state.recent_projects.clone(),
             git_busy: Busy::default(),
+            git_queue: Default::default(),
             status_task: None,
             git_op_task: None,
             toasts: Vec::new(),
@@ -974,6 +982,7 @@ impl Workspace {
             symbol_task: None,
             lsp,
             preferences_page: preferences::Page::Appearance,
+            tab_subscriptions: HashMap::new(),
             _subscriptions: vec![
                 find_subscription,
                 git_subscription,
@@ -1064,32 +1073,40 @@ impl Workspace {
 
     /// Adds a tab to the active pane without showing it; returns its index.
     fn insert_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        self._subscriptions.push(cx.observe(&editor, |_, _, cx| cx.notify()));
-        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| {
+        let mut subscriptions = Vec::new();
+        // What a shown tab draws in the window (its title, the status bar,
+        // breadcrumbs) follows it; a tab out of sight doesn't wake the window.
+        subscriptions.push(cx.observe(&editor, |ws, editor, cx| {
+            if ws.panes.iter().any(|pane| pane.tabs.get(pane.active) == Some(&editor)) {
+                cx.notify();
+            }
+        }));
+        subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| {
             ws.schedule_auto_save(&editor, cx);
             ws.schedule_session_save(cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
             ws.open_editor_menu(editor.clone(), event.0, window, cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
             ws.on_editor_lsp_event(event, window, cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
             ws.on_run_event(event, window, cx);
         }));
-        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
+        subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
             ws.breakpoints_changed(&editor, cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
             ws.open_breakpoint_menu(editor.clone(), event.row, event.position, window, cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
             ws.run_git(event.0.clone(), window, cx);
         }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorLoaded, window, cx| {
+        subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorLoaded, window, cx| {
             ws.tab_loaded(editor, event, window, cx);
         }));
+        self.tab_subscriptions.insert(editor.entity_id(), subscriptions);
         if editor.read(cx).is_loaded() {
             self.file_opened(&editor, cx);
         }

@@ -488,9 +488,10 @@ pub(crate) fn queries(language: Language) -> Option<&'static LanguageQueries> {
     }
 }
 
-/// The highlighting for an embedded language named in an injection query:
-/// a built-in language, an extension's, or one known by its file extension.
-fn injected_config(name: &str) -> Option<&'static LangConfig> {
+/// The highlighting for an embedded language named in an injection query
+/// (a built-in language, an extension's, or one known by its file
+/// extension), with its queries for what it embeds in turn.
+fn injected(name: &str) -> Option<(&'static LangConfig, Option<&'static LanguageQueries>)> {
     let name = name.trim().to_lowercase();
     let builtin = match name.as_str() {
         "javascript" | "js" | "jsx" => Language::JavaScript,
@@ -507,7 +508,7 @@ fn injected_config(name: &str) -> Option<&'static LangConfig> {
         "yaml" | "yml" => Language::Yaml,
         "toml" => Language::Toml,
         "markdown" | "md" => Language::Markdown,
-        "markdown_inline" | "markdown-inline" => return Some(&MARKDOWN_INLINE),
+        "markdown_inline" | "markdown-inline" => return Some((&MARKDOWN_INLINE, None)),
         _ => {
             let extension = crate::extensions::languages().into_iter().map(Language::Extension).find(|l| {
                 l.extension().is_some_and(|d| d.name.to_lowercase() == name || d.id == name)
@@ -515,15 +516,35 @@ fn injected_config(name: &str) -> Option<&'static LangConfig> {
             extension.unwrap_or_else(|| Language::from_path(Path::new(&format!("file.{name}"))))
         }
     };
-    config(builtin)
+    Some((config(builtin)?, queries(builtin)))
 }
 
-/// An embedded language's tree: every range of that language, parsed as one.
+/// An embedded language's tree, as in Zed: one per region (a code fence, a
+/// `<script>`), or one for all of a language's regions in its host when the
+/// query says `injection.combined` (the HTML around PHP). Injections nest:
+/// an injected tree has injections of its own (HTML in Markdown, then the
+/// CSS in that HTML), up to `MAX_INJECTION_DEPTH`.
 struct Injection {
     config: &'static LangConfig,
-    parser: PooledParser,
+    /// Its language's queries, for the injections inside it.
+    queries: Option<&'static LanguageQueries>,
     tree: Option<Tree>,
+    /// The text it parses, sorted and apart; edits move it like the tree.
+    ranges: Vec<Range<usize>>,
+    combined: bool,
+    /// 1 inside the file's own language, 2 inside one of those…
+    depth: u8,
+    /// Its ranges changed: parse it again.
+    dirty: bool,
 }
+
+impl Injection {
+    fn copy(&self) -> Self {
+        Injection { tree: self.tree.clone(), ranges: self.ranges.clone(), ..*self }
+    }
+}
+
+const MAX_INJECTION_DEPTH: u8 = 4;
 
 /// Parsers kept for reuse. A parser for a WASM grammar needs a `WasmStore`,
 /// and making one compiles tree-sitter's WASM runtime again; short-lived
@@ -582,8 +603,11 @@ pub struct Syntax {
     /// None for plain text (or a grammar that failed to load).
     parser: Option<PooledParser>,
     tree: Option<Tree>,
-    /// Embedded languages (see the languages' injection queries).
+    /// Embedded languages (see the languages' injection queries), by depth.
     injections: Vec<Injection>,
+    /// What edits touched since the last full parse: injections are looked
+    /// for again there, not in the whole file (as Zed does).
+    pending: Vec<Range<usize>>,
 }
 
 impl Syntax {
@@ -602,7 +626,7 @@ impl Syntax {
 
     fn unparsed(language: Language) -> Self {
         let parser = config(language).and_then(|config| PooledParser::new(&config.language));
-        Self { language, parser, tree: None, injections: Vec::new() }
+        Self { language, parser, tree: None, injections: Vec::new(), pending: Vec::new() }
     }
 
     pub fn language(&self) -> Language {
@@ -613,14 +637,13 @@ impl Syntax {
     /// edited since their last parse) and `rope`.
     pub fn parse_job(&self, rope: &Rope) -> impl FnOnce() -> Syntax + Send + 'static {
         let (language, rope, tree) = (self.language, rope.clone(), self.tree.clone());
-        let injections: Vec<(&'static LangConfig, Option<Tree>)> = self.injections.iter().map(|i| (i.config, i.tree.clone())).collect();
+        let injections: Vec<Injection> = self.injections.iter().map(Injection::copy).collect();
+        let pending = self.pending.clone();
         move || {
             let mut syntax = Syntax::unparsed(language);
             syntax.tree = tree;
-            syntax.injections = injections
-                .into_iter()
-                .filter_map(|(config, tree)| Some(Injection { config, parser: PooledParser::new(&config.language)?, tree }))
-                .collect();
+            syntax.injections = injections;
+            syntax.pending = pending;
             syntax.reparse(&rope);
             syntax
         }
@@ -641,6 +664,10 @@ impl Syntax {
         for tree in self.tree.iter_mut().chain(self.injections.iter_mut().filter_map(|i| i.tree.as_mut())) {
             tree.edit(edit);
         }
+        for range in self.injections.iter_mut().flat_map(|i| &mut i.ranges).chain(&mut self.pending) {
+            *range = shift_range(range.clone(), edit);
+        }
+        self.pending.push(edit.start_byte..edit.new_end_byte);
     }
 
     pub fn reparse(&mut self, rope: &Rope) {
@@ -652,11 +679,13 @@ impl Syntax {
     pub fn reparse_within(&mut self, rope: &Rope, budget: Option<Duration>) -> bool {
         let Some(parser) = self.parser.as_mut() else { return true };
         let started = Instant::now();
-        let mut in_time = |_: &tree_sitter::ParseState| match budget {
+        let in_time = move |_: &tree_sitter::ParseState| match budget {
             Some(budget) if started.elapsed() > budget => ControlFlow::Break(()),
             _ => ControlFlow::Continue(()),
         };
-        let options = ParseOptions::new().progress_callback(&mut in_time);
+        let old = self.tree.clone();
+        let mut callback = in_time;
+        let options = ParseOptions::new().progress_callback(&mut callback);
         match parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), self.tree.as_ref(), Some(options)) {
             Some(tree) => self.tree = Some(tree),
             None if budget.is_some() => {
@@ -666,42 +695,102 @@ impl Syntax {
             }
             None => self.tree = None,
         }
+        let Some(tree) = self.tree.clone() else {
+            self.injections.clear();
+            self.pending.clear();
+            return true;
+        };
+        // Where injections may differ: what edits touched and what the new
+        // tree says changed, widened to whole top-level nodes (a code fence's
+        // language and its text belong together).
+        let mut changed = std::mem::take(&mut self.pending);
+        match &old {
+            Some(old) => changed.extend(old.changed_ranges(&tree).map(|r| r.start_byte..r.end_byte)),
+            None => changed = vec![0..rope.len_bytes()],
+        }
+        let changed = widen_to_top_level(&tree, changed, rope.len_bytes());
+        if changed.is_empty() && !self.injections.iter().any(|i| i.dirty) {
+            return true;
+        }
+        if !self.update_injections(&tree, rope, &changed, &mut callback) {
+            self.pending = changed;
+            return false;
+        }
+        true
+    }
 
-        let wanted = self.tree.as_ref().map(|tree| injected_ranges(self.language, tree, rope)).unwrap_or_default();
-        let mut old = std::mem::take(&mut self.injections);
-        for (config, ranges) in wanted {
-            let mut injection = match old.iter().position(|i| std::ptr::eq(i.config, config)) {
-                Some(ix) => old.swap_remove(ix),
-                None => {
-                    let Some(parser) = PooledParser::new(&config.language) else { continue };
-                    Injection { config, parser, tree: None }
-                }
-            };
-            if injection.parser.set_included_ranges(&ranges).is_err() {
-                injection.tree = None;
-                self.injections.push(injection);
+    /// Finds the injections in `changed` again (in the file's tree, then in
+    /// the injected trees parsed meanwhile) and parses what's new or moved;
+    /// injections elsewhere stay as they are. False when out of time.
+    fn update_injections(
+        &mut self,
+        tree: &Tree,
+        rope: &Rope,
+        changed: &[Range<usize>],
+        in_time: &mut dyn FnMut(&tree_sitter::ParseState) -> ControlFlow<()>,
+    ) -> bool {
+        // Separate injections in what changed are found again (their trees
+        // kept for reuse); combined ones lose just the ranges there.
+        let (mut reusable, kept): (Vec<Injection>, Vec<Injection>) =
+            std::mem::take(&mut self.injections).into_iter().partition(|i| !i.combined && intersects(&i.ranges, changed));
+        self.injections = kept;
+        for injection in self.injections.iter_mut().filter(|i| i.combined) {
+            let before = injection.ranges.len();
+            injection.ranges.retain(|r| !intersects(std::slice::from_ref(r), changed));
+            injection.dirty |= injection.ranges.len() != before;
+        }
+        // Each host: its language's queries, its own config (no injecting
+        // itself), its tree, and the depth of what it injects.
+        let mut hosts = vec![(queries(self.language), config(self.language), tree.clone(), 1u8)];
+        while let Some((host_queries, own, host_tree, depth)) = hosts.pop() {
+            if depth > MAX_INJECTION_DEPTH {
                 continue;
             }
-            // Reuses the old tree, edited like the main one; changed ranges are fine.
-            let mut in_time = |_: &tree_sitter::ParseState| match budget {
-                Some(budget) if started.elapsed() > budget => ControlFlow::Break(()),
-                _ => ControlFlow::Continue(()),
-            };
-            let options = ParseOptions::new().progress_callback(&mut in_time);
-            let parsed = injection.parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), injection.tree.as_ref(), Some(options));
-            let halted = parsed.is_none() && budget.is_some();
-            if halted {
-                injection.parser.reset();
-            } else {
-                injection.tree = parsed;
+            let Some(query) = host_queries.and_then(|q| q.injections.as_ref()) else { continue };
+            for found in find_injections(query, own, &host_tree, rope, changed) {
+                if found.combined {
+                    match self.injections.iter_mut().find(|i| i.combined && i.depth == depth && std::ptr::eq(i.config, found.config)) {
+                        Some(injection) => {
+                            injection.ranges.extend(found.ranges);
+                            injection.dirty = true;
+                        }
+                        None => self.injections.push(Injection { config: found.config, queries: found.queries, tree: None, ranges: found.ranges, combined: true, depth, dirty: true }),
+                    }
+                    continue;
+                }
+                // The same region as before (edited inside): reuse its tree.
+                let same = reusable.iter().position(|i| {
+                    i.depth == depth && std::ptr::eq(i.config, found.config) && i.ranges.first().map(|r| r.start) == found.ranges.first().map(|r| r.start)
+                });
+                let tree = same.and_then(|ix| reusable.swap_remove(ix).tree);
+                self.injections.push(Injection { config: found.config, queries: found.queries, tree, ranges: found.ranges, combined: false, depth, dirty: true });
             }
-            self.injections.push(injection);
-            if halted {
-                // The rest keep their edited trees too.
-                self.injections.append(&mut old);
-                return false;
+            for injection in self.injections.iter_mut().filter(|i| i.dirty) {
+                normalize(&mut injection.ranges);
+                let ranges: Vec<tree_sitter::Range> = injection.ranges.iter().map(|r| ts_range(rope, r.clone())).collect();
+                let Some(mut parser) = PooledParser::new(&injection.config.language) else {
+                    injection.dirty = false;
+                    continue;
+                };
+                if ranges.is_empty() || parser.set_included_ranges(&ranges).is_err() {
+                    injection.tree = None;
+                    injection.dirty = false;
+                    continue;
+                }
+                let mut in_time = &mut *in_time;
+                let options = ParseOptions::new().progress_callback(&mut in_time);
+                match parser.parse_with_options(&mut |byte, _| rope_chunk(rope, byte), injection.tree.as_ref(), Some(options)) {
+                    Some(parsed) => injection.tree = Some(parsed),
+                    // Out of time: the rest is finished later (it stays dirty).
+                    None => return false,
+                }
+                injection.dirty = false;
+                if let Some(tree) = &injection.tree {
+                    hosts.push((injection.queries, Some(injection.config), tree.clone(), injection.depth + 1));
+                }
             }
         }
+        self.injections.sort_by_key(|i| (i.depth, i.ranges.first().map_or(0, |r| r.start)));
         true
     }
 
@@ -875,7 +964,8 @@ impl Syntax {
             return Vec::new();
         };
         apply_query(config, tree.root_node(), rope, range.clone(), &mut map);
-        for injection in &self.injections {
+        // Deeper injections last: the innermost language colors its text.
+        for injection in self.injections.iter().filter(|i| intersects(&i.ranges, std::slice::from_ref(&range))) {
             if let Some(tree) = injection.tree.as_ref() {
                 apply_query(injection.config, tree.root_node(), rope, range.clone(), &mut map);
             }
@@ -969,49 +1059,123 @@ fn apply_query(
     }
 }
 
-/// Embedded ranges per language: what the language's `injections.scm` finds (by `injection.language`, captured or `#set!`).
-fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> {
-    let Some(injections) = queries(language).and_then(|q| q.injections.as_ref()) else { return Vec::new() };
-    let own = config(language);
-    let mut out: Vec<(&'static LangConfig, Vec<tree_sitter::Range>)> = Vec::new();
-    let mut found: HashMap<String, Option<&'static LangConfig>> = HashMap::new();
+/// An injection a query found: the language and the text it covers.
+struct Found {
+    config: &'static LangConfig,
+    queries: Option<&'static LanguageQueries>,
+    ranges: Vec<Range<usize>>,
+    combined: bool,
+}
+
+/// The injections `query` finds in `tree` within `within` (each match one
+/// region; `injection.combined` ones joined later by language).
+fn find_injections(
+    query: &InjectionQuery,
+    own: Option<&'static LangConfig>,
+    tree: &Tree,
+    rope: &Rope,
+    within: &[Range<usize>],
+) -> Vec<Found> {
+    let mut out: Vec<Found> = Vec::new();
+    let mut known: HashMap<String, Option<(&'static LangConfig, Option<&'static LanguageQueries>)>> = HashMap::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&injections.query, tree.root_node(), RopeProvider(rope));
-    while let Some(m) = matches.next() {
-        let named = m.captures.iter().find(|c| Some(c.index) == injections.language).map(|c| rope.byte_slice(c.node.byte_range()).to_string());
-        let set = || {
-            injections.query.property_settings(m.pattern_index).iter().find_map(|p| {
-                matches!(p.key.as_ref(), "injection.language" | "language").then(|| p.value.as_deref().map(str::to_string)).flatten()
-            })
-        };
-        // Looked up once per name: comments (JSDoc) and regexes match often,
-        // and are usually languages Kuana doesn't have.
-        let Some(config) = named.or_else(set).and_then(|name| *found.entry(name).or_insert_with_key(|name| injected_config(name))) else {
-            continue;
-        };
-        if own.is_some_and(|own| std::ptr::eq(own, config)) {
-            continue;
-        }
-        let ranges = m.captures.iter().filter(|c| Some(c.index) == injections.content).map(|c| c.node.range());
-        match out.iter_mut().find(|(c, _)| std::ptr::eq(*c, config)) {
-            Some((_, list)) => list.extend(ranges),
-            None => out.push((config, ranges.collect())),
-        }
-    }
-    // A parser takes ranges in order and without overlaps.
-    for (_, ranges) in &mut out {
-        ranges.sort_by_key(|r| r.start_byte);
-        let mut end = 0;
-        ranges.retain(|r| {
-            let keep = r.start_byte >= end && r.end_byte > r.start_byte;
-            if keep {
-                end = r.end_byte;
+    for range in within {
+        cursor.set_byte_range(range.clone());
+        let mut matches = cursor.matches(&query.query, tree.root_node(), RopeProvider(rope));
+        while let Some(m) = matches.next() {
+            let named = m.captures.iter().find(|c| Some(c.index) == query.language).map(|c| rope.byte_slice(c.node.byte_range()).to_string());
+            let settings = query.query.property_settings(m.pattern_index);
+            let set = || {
+                settings.iter().find_map(|p| matches!(p.key.as_ref(), "injection.language" | "language").then(|| p.value.as_deref().map(str::to_string)).flatten())
+            };
+            // Looked up once per name: comments (JSDoc) and regexes match often,
+            // and are usually languages Kuana doesn't have.
+            let Some((config, queries)) = named.or_else(set).and_then(|name| *known.entry(name).or_insert_with_key(|name| injected(name))) else {
+                continue;
+            };
+            if own.is_some_and(|own| std::ptr::eq(own, config)) {
+                continue;
             }
-            keep
-        });
+            let ranges: Vec<Range<usize>> =
+                m.captures.iter().filter(|c| Some(c.index) == query.content).map(|c| c.node.byte_range()).filter(|r| !r.is_empty()).collect();
+            if ranges.is_empty() || out.iter().any(|f| std::ptr::eq(f.config, config) && f.ranges.first() == ranges.first()) {
+                continue;
+            }
+            let combined = settings.iter().any(|p| p.key.as_ref() == "injection.combined");
+            out.push(Found { config, queries, ranges, combined });
+        }
     }
-    out.retain(|(_, ranges)| !ranges.is_empty());
     out
+}
+
+/// Sorts ranges and drops overlaps: a parser takes them in order and apart.
+fn normalize(ranges: &mut Vec<Range<usize>>) {
+    ranges.sort_by_key(|r| r.start);
+    let mut end = 0;
+    ranges.retain(|r| {
+        let keep = r.start >= end && r.end > r.start;
+        if keep {
+            end = r.end;
+        }
+        keep
+    });
+}
+
+/// Whether any of `a` touches any of `b` (both sorted or not, small).
+fn intersects(a: &[Range<usize>], b: &[Range<usize>]) -> bool {
+    a.iter().any(|x| b.iter().any(|y| x.start <= y.end && y.start <= x.end))
+}
+
+/// `ranges` grown to the top-level nodes of `tree` they touch, merged.
+fn widen_to_top_level(tree: &Tree, ranges: Vec<Range<usize>>, len: usize) -> Vec<Range<usize>> {
+    let root = tree.root_node();
+    let mut out: Vec<Range<usize>> = ranges
+        .into_iter()
+        .map(|r| {
+            let (start, end) = (r.start.min(len), r.end.min(len).max(r.start.min(len)));
+            let mut node = root.descendant_for_byte_range(start, end).unwrap_or(root);
+            while let Some(parent) = node.parent().filter(|p| p.id() != root.id()) {
+                node = parent;
+            }
+            let wide = node.byte_range();
+            wide.start.min(start)..wide.end.max(end)
+        })
+        .collect();
+    out.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(out.len());
+    for r in out {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// Where a range of the text before `edit` is after it: moved by an edit
+/// before it; an end inside the replaced text goes to the end of the new.
+fn shift_range(range: Range<usize>, edit: &InputEdit) -> Range<usize> {
+    let map = |x: usize| {
+        if x <= edit.start_byte {
+            x
+        } else if x >= edit.old_end_byte {
+            x - edit.old_end_byte + edit.new_end_byte
+        } else {
+            edit.new_end_byte
+        }
+    };
+    let start = map(range.start);
+    start..map(range.end).max(start)
+}
+
+/// A byte range as tree-sitter wants it, with rows and columns.
+fn ts_range(rope: &Rope, range: Range<usize>) -> tree_sitter::Range {
+    let point = |byte: usize| {
+        let byte = byte.min(rope.len_bytes());
+        let row = rope.byte_to_line(byte);
+        tree_sitter::Point::new(row, byte - rope.line_to_byte(row))
+    };
+    tree_sitter::Range { start_byte: range.start, end_byte: range.end, start_point: point(range.start), end_point: point(range.end) }
 }
 
 pub fn rope_chunk(rope: &Rope, byte: usize) -> &[u8] {
@@ -1151,6 +1315,53 @@ mod tests {
         assert_eq!(sexp(&syntax), sexp(&fresh));
         let number = |s: &Syntax| s.injections[0].tree.as_ref().unwrap().root_node().descendant_for_byte_range(at, at).map(|n| n.byte_range());
         assert_eq!(number(&syntax), number(&fresh));
+    }
+
+    /// Each fenced block is its own tree (an unclosed brace in one doesn't
+    /// spill into the next), injections nest (CSS in HTML in Markdown), and
+    /// PHP's HTML pieces are one tree (`injection.combined`), as in Zed.
+    #[test]
+    fn injections_are_per_region_nested_or_combined() {
+        let md = highlights_of("a.md", "```js\nfunction f() {\n```\n\n```js\nconst x = 1;\n```\n");
+        assert!(has(&md, "const", Highlight::Keyword), "{md:?}");
+        let nested = highlights_of("a.md", "```html\n<style>body { color: red }</style>\n```\n");
+        assert!(has(&nested, "color", Highlight::Property), "{nested:?}");
+        let rope = Rope::from_str("<p>a</p>\n<?php echo 1; ?>\n<b>b</b>\n");
+        let php = Syntax::new(Language::Php, &rope);
+        let html: Vec<&Injection> = php.injections.iter().filter(|i| i.combined).collect();
+        assert_eq!(html.len(), 1, "one tree for the HTML around PHP");
+        assert!(html[0].ranges.len() >= 2);
+    }
+
+    /// After an edit, injections are looked for again only around it, and
+    /// come out as a fresh parse has them.
+    #[test]
+    fn injections_follow_edits_like_a_fresh_parse() {
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("## Part {i}\n\n```rust\nfn f{i}() {{}}\n```\n\n"));
+        }
+        let mut rope = Rope::from_str(&text);
+        let mut syntax = Syntax::new(Language::Markdown, &rope);
+        let layers = |s: &Syntax| {
+            let mut l: Vec<(String, Vec<(usize, usize)>, u8)> = s
+                .injections
+                .iter()
+                .map(|i| (i.tree.as_ref().map(|t| t.root_node().to_sexp()).unwrap_or_default(), i.ranges.iter().map(|r| (r.start, r.end)).collect(), i.depth))
+                .collect();
+            l.sort();
+            l
+        };
+        // Typing in one fence, then turning one into another language.
+        for (find, insert) in [("fn f7", "pub "), ("```rust\nfn f20", "```js\n")] {
+            let at = text.find(find).unwrap();
+            let edit = input_edit(&rope, at..at, insert);
+            text.insert_str(at, insert);
+            rope = Rope::from_str(&text);
+            syntax.edit(&edit);
+            assert!(syntax.reparse_within(&rope, None));
+            assert_eq!(layers(&syntax), layers(&Syntax::new(Language::Markdown, &rope)), "after inserting {insert:?}");
+        }
     }
 
     #[test]

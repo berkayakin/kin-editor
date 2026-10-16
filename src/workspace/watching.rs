@@ -45,6 +45,17 @@ impl Workspace {
         // For language servers watching files.
         let mut file_changes = Vec::new();
         let mut paths = HashSet::new();
+        // The watcher lost events: everything may have changed.
+        if changes.iter().any(|c| c.path == root) {
+            self.tree.update(cx, |t, cx| t.rebuild(cx));
+            self.refresh_file_index(cx);
+            self.refresh_git(cx);
+            for editor in self.tabs.clone() {
+                editor.update(cx, |e, cx| e.reload_if_changed(cx));
+            }
+            cx.notify();
+            return;
+        }
         for change in changes {
             match watcher::git_path(&change.path) {
                 GitPath::Metadata => git = true,
@@ -59,9 +70,13 @@ impl Workspace {
                     if change.path.file_name().is_some_and(|n| n == ".gitignore") {
                         self.ignore = project_ignore(&root);
                     }
+                    // By the project's rules, or inside what Git reported as
+                    // ignored (nested .gitignore files and global excludes
+                    // included): build output churning there needs no status.
                     let ignored = |path: &Path| {
                         path.starts_with(&root)
-                            && self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(path, false).is_ignore())
+                            && (self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(path, false).is_ignore())
+                                || path.ancestors().skip(1).any(|p| self.git_ignored.contains(p)))
                     };
                     if change.structural {
                         structural.push(change.path.clone());
@@ -147,7 +162,9 @@ impl Workspace {
     }
 
     fn project_updated(&mut self, snapshot: ProjectSnapshot, cx: &mut Context<Self>) {
-        self.project = Arc::new(snapshot);
+        // Freeing a big project's paths takes a while: not on the UI thread.
+        let old = std::mem::replace(&mut self.project, Arc::new(snapshot));
+        cx.background_executor().spawn(async move { drop(old) }).detach();
         if let Some(Modal::Picker(picker)) = &self.modals.current {
             let files = self.project.openable();
             picker.update(cx, |p, cx| p.set_files(files, cx));

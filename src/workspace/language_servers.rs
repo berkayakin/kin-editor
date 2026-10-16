@@ -76,28 +76,55 @@ impl Workspace {
     }
 
     /// Applies a language server's edits, opening files that aren't open;
-    /// each file's edits are one undo step. Returns whether all applied.
-    pub(super) fn apply_workspace_edit(&mut self, edits: Vec<(PathBuf, Vec<TextEdit>)>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// each file's edits are one undo step. Edits computed for an older
+    /// version of a file (a slow rename while typing) are read in that
+    /// version's text and moved to today's; a file they can't be applied
+    /// to is left alone. Returns whether all applied.
+    pub(super) fn apply_workspace_edit(&mut self, edits: Vec<protocol::FileEdits>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let active = self.active_editor().cloned();
-        let mut applied = true;
-        for (path, file_edits) in edits {
-            if self.tab_for(&path, cx).is_none() {
-                self.open_path(path.clone(), window, cx);
+        let mut skipped = Vec::new();
+        for file in edits {
+            if self.tab_for(&file.path, cx).is_none() {
+                self.open_path(file.path.clone(), window, cx);
             }
-            let Some(editor) = self.tab_for(&path, cx) else {
-                applied = false;
+            let Some(editor) = self.tab_for(&file.path, cx) else {
+                skipped.push(file.path);
                 continue;
             };
-            editor.update(cx, |e, cx| {
-                let resolved = protocol::resolve_edits(e.doc.read(cx).rope(), &file_edits, encoding);
-                e.replace_ranges(resolved, cx);
+            // A restored tab not shown yet holds no text: read it first, or
+            // the edits would go to an empty stand-in and be lost.
+            self.load_tab(&editor, cx);
+            if !editor.read(cx).is_loaded() {
+                skipped.push(file.path);
+                continue;
+            }
+            let resolved = editor.update(cx, |e, cx| {
+                let doc = e.doc.read(cx);
+                match file.version {
+                    Some(version) if version != doc.version() => {
+                        let text = doc.text_at_lsp_version(version)?;
+                        protocol::resolve_edits(text, &file.edits, encoding)
+                            .into_iter()
+                            .map(|(range, text)| Some((doc.offset_since(version, range.start)?..doc.offset_since(version, range.end)?, text)))
+                            .collect::<Option<Vec<_>>>()
+                    }
+                    _ => Some(protocol::resolve_edits(doc.rope(), &file.edits, encoding)),
+                }
             });
+            match resolved {
+                Some(resolved) => editor.update(cx, |e, cx| e.replace_ranges(resolved, cx)),
+                None => skipped.push(file.path),
+            }
         }
         // Opening files switched tabs; go back to where the user was.
         if let Some(active) = active {
             self.activate_editor(&active, window, cx);
         }
-        applied
+        if !skipped.is_empty() {
+            let names: Vec<String> = skipped.iter().map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
+            self.toast(ToastKind::Error, "Some changes weren't applied", Some(format!("{} changed meanwhile or couldn't be opened", names.join(", "))), cx);
+        }
+        skipped.is_empty()
     }
 
     pub(super) fn rename_symbol(&mut self, server: Arc<Server>, path: PathBuf, position: Position, new_name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -111,7 +138,7 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| match result {
                 Ok(value) => {
                     let edits = protocol::workspace_edit(&value);
-                    let (files, count) = (edits.len(), edits.iter().map(|(_, e)| e.len()).sum::<usize>());
+                    let (files, count) = (edits.len(), edits.iter().map(|f| f.edits.len()).sum::<usize>());
                     if count == 0 {
                         ws.toast(ToastKind::Info, "Nothing to rename here", None, cx);
                     } else if ws.apply_workspace_edit(edits, server.encoding, window, cx) {
@@ -119,6 +146,8 @@ impl Workspace {
                         ws.toast(ToastKind::Success, format!("Renamed {count} occurrence{} in {files}", plural(count)), None, cx);
                     }
                 }
+                // The server dropped it (the text changed meanwhile): not an error.
+                Err(err) if err.is_cancelled() => {}
                 Err(err) => ws.toast(ToastKind::Error, "Couldn't rename", Some(err.message), cx),
             })
             .ok();
@@ -146,6 +175,7 @@ impl Workspace {
                         ws.apply_code_action(server, resolved, window, cx);
                     }
                     Ok(_) => {}
+                    Err(err) if err.is_cancelled() => {}
                     Err(err) => ws.toast(ToastKind::Error, "Couldn't apply the action", Some(err.message), cx),
                 })
                 .ok();
@@ -169,7 +199,9 @@ impl Workspace {
             "arguments": command.get("arguments").cloned().unwrap_or_else(|| serde_json::json!([])),
         });
         cx.spawn(async move |this, cx| {
-            if let Err(err) = server.request("workspace/executeCommand", params).await {
+            if let Err(err) = server.request("workspace/executeCommand", params).await
+                && !err.is_cancelled()
+            {
                 this.update(cx, |ws, cx| ws.toast(ToastKind::Error, "The action failed", Some(err.message), cx)).ok();
             }
         })

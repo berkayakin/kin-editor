@@ -94,6 +94,10 @@ const LINE_EDIT_LOG: usize = 10_000;
 /// catch up with (each editor catches up when it's notified, so a few).
 const PATCH_LOG: usize = 512;
 
+/// How many texts sent to language servers are kept (see `lsp_versions`):
+/// a server answers for a version some edits back, seldom hundreds.
+const MAX_LSP_VERSIONS: usize = 256;
+
 static NEXT_DOCUMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// How long an edit may parse on the UI thread; a longer parse finishes in
@@ -125,7 +129,14 @@ pub struct Document {
     pub diagnostics: Vec<Diagnostic>,
     builtin_diagnostics: Vec<Diagnostic>,
     external_diagnostics: Vec<Diagnostic>,
-    lsp_diagnostics: Vec<Diagnostic>,
+    /// Each language server's diagnostics (by server id), apart: a publish
+    /// replaces only its own server's, which the others' keep following
+    /// edits meanwhile.
+    lsp_diagnostics: Vec<(String, Vec<Diagnostic>)>,
+    /// The text at the versions language servers were sent last (oldest
+    /// first), so what they computed for one of them (diagnostics, edits)
+    /// can be read in that text and moved to today's.
+    lsp_versions: std::collections::VecDeque<(u64, Rope)>,
     pub uses_crlf: bool,
     /// The file's encoding, used again when saving.
     pub encoding: TextEncoding,
@@ -133,9 +144,6 @@ pub struct Document {
     pub large: bool,
     /// Edits since the language server last heard about this document.
     lsp_changes: LspChanges,
-    /// Folded (hidden) text: from the start of the first hidden line to the
-    /// end of the last. Edits that touch a fold open it.
-    folds: Vec<Range<usize>>,
     /// Line breakpoints with the offsets their lines start at (sorted), so
     /// they stay on their lines as text is edited above them.
     breakpoints: Vec<(usize, Breakpoint)>,
@@ -166,8 +174,6 @@ pub struct Document {
     /// Changes whenever the trees do (an edit, a parse finishing), for
     /// caches of what's derived from them.
     tree_version: u64,
-    /// The tab stops of a snippet being filled in; they follow edits.
-    pub snippet: Option<crate::snippets::SnippetStops>,
     /// The language server's inlay hints (sorted); they follow edits until
     /// the next answer replaces them.
     inlay_hints: Vec<InlayHint>,
@@ -270,11 +276,11 @@ impl Document {
             builtin_diagnostics: Vec::new(),
             external_diagnostics: Vec::new(),
             lsp_diagnostics: Vec::new(),
+            lsp_versions: std::collections::VecDeque::new(),
             uses_crlf,
             encoding: TextEncoding::UTF8,
             large,
             lsp_changes: LspChanges::default(),
-            folds: Vec::new(),
             breakpoints: Vec::new(),
             debug_line: None,
             line_edits: Vec::new(),
@@ -287,7 +293,6 @@ impl Document {
             parsed_version: parsed.then_some(0),
             parse_budget: PARSE_BUDGET,
             tree_version: 0,
-            snippet: None,
             inlay_hints: Vec::new(),
             code_lenses: Vec::new(),
             disk_mtime: None,
@@ -399,7 +404,7 @@ impl Document {
 
     /// Replaces all text, as when the file changed on disk. Returns whether
     /// anything changed; undo history goes since it no longer applies.
-    /// What follows the text (diagnostics, folds, breakpoints, the debug
+    /// What follows the text (diagnostics, editors' folds, breakpoints, the debug
     /// line, inlay hints, code lenses, other editors' carets) moves as
     /// through an edit made of the lines that changed (`changed_ranges`):
     /// on lines that stayed it follows them, in changed text it goes.
@@ -688,7 +693,9 @@ impl Document {
             steps.push(patch);
         }
         self.version += 1;
-        self.log_patches(steps);
+        // One patch for the version, however many records: other editors
+        // catch up through a log of limited length.
+        self.log_patch(Patch::compose(&steps));
         self.reparse();
         let selections = t.before.clone();
         self.redo_stack.push(t);
@@ -707,7 +714,7 @@ impl Document {
             steps.push(patch);
         }
         self.version += 1;
-        self.log_patches(steps);
+        self.log_patch(Patch::compose(&steps));
         self.reparse();
         let selections = t.after.clone();
         self.undo_stack.push(t);
@@ -838,22 +845,16 @@ impl Document {
         Some(self.line_edits[first..].iter().map(|(_, edit)| edit))
     }
 
-    /// Moves what follows the text (folds, breakpoints, the debug line, a
-    /// snippet's stops, inlay hints, diagnostics) across a transaction's
+    /// Moves what follows the text (breakpoints, the debug line, inlay
+    /// hints, code lenses, diagnostics) across a transaction's
     /// edits, once for all of them. Runs after the rope changed; `old` is
     /// the text before.
     fn shift_tracked(&mut self, patch: &Patch, old: &Rope) {
         if patch.edits.is_empty() {
             return;
         }
-        self.shift_folds(patch);
         self.shift_breakpoints(patch, old);
         self.debug_line = self.debug_line.and_then(|offset| self.shift_line(offset, patch, old));
-        if let Some(snippet) = &mut self.snippet
-            && !snippet.shift(patch)
-        {
-            self.snippet = None;
-        }
         self.shift_inlay_hints(patch);
         self.code_lenses = std::mem::take(&mut self.code_lenses)
             .into_iter()
@@ -861,7 +862,10 @@ impl Document {
             .collect();
         // The merged list too: shifting keeps its order, so it needn't be
         // built and sorted again.
-        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.lsp_diagnostics, &mut self.diagnostics] {
+        for list in [&mut self.builtin_diagnostics, &mut self.external_diagnostics, &mut self.diagnostics] {
+            shift_diagnostics(list, patch);
+        }
+        for (_, list) in &mut self.lsp_diagnostics {
             shift_diagnostics(list, patch);
         }
     }
@@ -913,32 +917,65 @@ impl Document {
         self.merge_diagnostics();
     }
 
+    /// Diagnostics from one unnamed language server (tests).
+    #[cfg(test)]
     pub fn set_lsp_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
-        self.lsp_diagnostics = diagnostics;
+        self.set_server_diagnostics("", diagnostics);
+    }
+
+    /// Replaces one language server's diagnostics (already in today's text).
+    pub fn set_server_diagnostics(&mut self, server: &str, diagnostics: Vec<Diagnostic>) {
+        match self.lsp_diagnostics.iter_mut().find(|(id, _)| id == server) {
+            Some((_, list)) => *list = diagnostics,
+            None => self.lsp_diagnostics.push((server.to_string(), diagnostics)),
+        }
         self.merge_diagnostics();
     }
 
-    pub fn folds(&self) -> &[Range<usize>] {
-        &self.folds
+    /// Drops a server's diagnostics (it stopped or restarted).
+    pub fn clear_server_diagnostics(&mut self, server: &str) {
+        let before = self.lsp_diagnostics.len();
+        self.lsp_diagnostics.retain(|(id, _)| id != server);
+        if self.lsp_diagnostics.len() != before {
+            self.merge_diagnostics();
+        }
     }
 
-    /// Hides rows `start..=end` (byte offsets of whole lines).
-    pub fn fold_rows(&mut self, start: usize, end: usize) {
-        if start == 0 || start >= self.line_count() {
+    /// Notes the text as language servers are told it is now (the version
+    /// sent with `didOpen` / `didChange`).
+    pub fn note_lsp_version(&mut self) {
+        if self.lsp_versions.back().is_some_and(|(v, _)| *v == self.version) {
             return;
         }
-        let range = self.line_start(start)..self.line_end(end.min(self.line_count() - 1));
-        if !range.is_empty() && !self.folds.contains(&range) {
-            self.folds.push(range);
-            self.folds.sort_by_key(|f| f.start);
+        // Past what the patch log can map from, an old text is no use.
+        while self.lsp_versions.front().is_some_and(|(v, _)| *v < self.patches_base) || self.lsp_versions.len() >= MAX_LSP_VERSIONS {
+            self.lsp_versions.pop_front();
         }
+        self.lsp_versions.push_back((self.version, self.rope.clone()));
     }
 
-    /// Opens the folds `unfold` matches; returns whether any opened.
-    pub fn unfold_where(&mut self, mut unfold: impl FnMut(&Range<usize>) -> bool) -> bool {
-        let before = self.folds.len();
-        self.folds.retain(|f| !unfold(f));
-        self.folds.len() != before
+    /// The text language servers were sent as `version`; None when it's too
+    /// old (or never was).
+    pub fn text_at_lsp_version(&self, version: u64) -> Option<&Rope> {
+        if version == self.version {
+            return Some(&self.rope);
+        }
+        self.lsp_versions.iter().find(|(v, _)| *v == version).map(|(_, rope)| rope)
+    }
+
+    /// Moves diagnostics found in the text of `version` to today's text, as
+    /// they would have followed the edits since: the ones those edits touched
+    /// go. None when the edits since aren't kept any more.
+    pub fn diagnostics_since(&self, version: u64, mut diagnostics: Vec<Diagnostic>) -> Option<Vec<Diagnostic>> {
+        for patch in self.patches_since(version)? {
+            shift_diagnostics(&mut diagnostics, patch);
+        }
+        Some(diagnostics)
+    }
+
+    /// An offset in the text of `version`, in today's text (see `Patch::map`).
+    pub fn offset_since(&self, version: u64, offset: usize) -> Option<usize> {
+        Some(self.patches_since(version)?.fold(offset, |offset, patch| patch.map(offset)))
     }
 
     /// The breakpoints, by row.
@@ -1046,22 +1083,6 @@ impl Document {
         self.debug_line = row.filter(|&r| r < self.line_count()).map(|r| self.line_start(r));
     }
 
-    /// Folds move with edits before them; an edit touching one opens it.
-    fn shift_folds(&mut self, patch: &Patch) {
-        self.folds.retain_mut(|f| {
-            let (mut delta, near) = patch.around(f.clone());
-            for (range, new_len) in near {
-                if range.end < f.start {
-                    delta += Patch::change(range, *new_len);
-                } else if range.start <= f.end {
-                    return false;
-                }
-            }
-            *f = moved(f.start, delta)..moved(f.end, delta);
-            true
-        });
-    }
-
     /// Edits not yet sent to the language server, oldest first; each is
     /// relative to the text after the previous one, as LSP expects.
     pub fn take_lsp_changes(&mut self) -> LspChanges {
@@ -1073,7 +1094,7 @@ impl Document {
             .builtin_diagnostics
             .iter()
             .chain(&self.external_diagnostics)
-            .chain(&self.lsp_diagnostics)
+            .chain(self.lsp_diagnostics.iter().flat_map(|(_, list)| list))
             .cloned()
             .collect();
         self.diagnostics
@@ -1283,6 +1304,39 @@ impl Patch {
         new_len as isize - range.len() as isize
     }
 
+    /// Patches applied one after another as one: ranges in the text before
+    /// the first, new lengths in the text after the last. Edits that touch
+    /// merge, so a position inside the merged range maps to its end.
+    pub fn compose(steps: &[Patch]) -> Patch {
+        // (range in the text before, range in the text now), sorted, apart.
+        let mut done: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+        for step in steps {
+            // From the last: the earlier ranges stay valid in the text now.
+            for (range, new_len) in step.edits.iter().rev() {
+                let first = done.partition_point(|(_, now)| now.end < range.start);
+                let last = first + done[first..].partition_point(|(_, now)| now.start <= range.end);
+                let delta_before: isize = done[..first].iter().map(|(old, now)| now.len() as isize - old.len() as isize).sum();
+                let touched = &done[first..last];
+                let (now_start, old_start) = match touched.first() {
+                    Some((old, now)) if now.start <= range.start => (now.start, old.start),
+                    _ => (range.start, (range.start as isize - delta_before) as usize),
+                };
+                let (now_end, old_end) = match touched.last() {
+                    Some((old, now)) if now.end >= range.end => (now.end, old.end),
+                    Some((old, now)) => (range.end, old.end + (range.end - now.end)),
+                    None => (range.end, (range.end as isize - delta_before) as usize),
+                };
+                let change = *new_len as isize - range.len() as isize;
+                let merged = (old_start..old_end, now_start..(now_end as isize + change) as usize);
+                for (_, now) in &mut done[last..] {
+                    *now = (now.start as isize + change) as usize..(now.end as isize + change) as usize;
+                }
+                done.splice(first..last, [merged]);
+            }
+        }
+        Patch::new(done.into_iter().map(|(old, now)| (old, now.len())).collect())
+    }
+
     /// Where `offset` is after the edits: moved by the ones before it; inside
     /// a replaced range, the end of the new text; at an insertion, before it.
     pub fn map(&self, offset: usize) -> usize {
@@ -1392,7 +1446,6 @@ mod tests {
             doc.set_inlay_hints(vec![hint(4), hint(16), hint(34)]);
             doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(4), Breakpoint::at(6)]);
             doc.set_debug_row(Some(4));
-            doc.fold_rows(4, 5);
             doc
         };
         let snapshot = |doc: &Document| {
@@ -1402,7 +1455,6 @@ mod tests {
                 doc.inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>(),
                 doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(),
                 doc.debug_row(),
-                doc.folds().to_vec(),
             )
         };
         // Multi-caret edits: a new line at a line start, typing in a
@@ -1425,6 +1477,68 @@ mod tests {
             together.merge_diagnostics();
             assert_eq!(merged, together.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>());
         }
+    }
+
+    /// A language server answers for the version it was sent; what it found
+    /// is read in that text and moved to today's (Zed does the same).
+    #[test]
+    fn results_for_an_older_version_move_to_todays_text() {
+        let problem = |range: Range<usize>| Diagnostic { range, severity: crate::lint::Severity::Error, message: "m".into(), rule: "r".into() };
+        let mut doc = Document::from_text("let a = 1;\nlet b = 2;\n".into(), None);
+        doc.note_lsp_version();
+        let sent = doc.version();
+        // The user types above (and over a later spot) before the answer comes.
+        doc.edit(vec![(0..0, "// new\n".into())], &[], EditKind::Other);
+        doc.note_lsp_version();
+        doc.edit(vec![(7 + 15..7 + 16, "x".into())], &[], EditKind::Other);
+        doc.note_lsp_version();
+        let old_text = doc.text_at_lsp_version(sent).unwrap().to_string();
+        assert_eq!(old_text, "let a = 1;\nlet b = 2;\n");
+        // `b` (15..16 then) was retyped: its problem goes; `a` moves down.
+        let moved = doc.diagnostics_since(sent, vec![problem(4..5), problem(15..16)]).unwrap();
+        assert_eq!(moved.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [11..12]);
+        assert_eq!(doc.offset_since(sent, 4), Some(11));
+        assert!(doc.text_at_lsp_version(999).is_none());
+
+        // Each server's diagnostics stay apart: one publishing doesn't touch
+        // the other's, and a stopped server's go.
+        doc.set_server_diagnostics("ts", vec![problem(0..2)]);
+        doc.set_server_diagnostics("eslint", vec![problem(3..4)]);
+        doc.set_server_diagnostics("ts", vec![problem(5..6)]);
+        assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [3..4, 5..6]);
+        doc.clear_server_diagnostics("eslint");
+        assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [5..6]);
+    }
+
+    /// Composed patches move positions outside the edits like the steps one
+    /// after another, and a large undo stays one entry of the patch log, so
+    /// another editor of the document can still follow it.
+    #[test]
+    fn composed_patches_map_like_their_steps() {
+        let steps = [
+            Patch::new(vec![(2..4, 3), (10..10, 2)]),
+            Patch::new(vec![(0..1, 0), (5..9, 1)]),
+            Patch::new(vec![(1..1, 4), (12..14, 0)]),
+        ];
+        let composed = Patch::compose(&steps);
+        for offset in [0, 1, 5, 9, 11, 13, 16, 20, 30] {
+            let one_by_one = steps.iter().fold(offset, |o, p| p.map(o));
+            // Positions the edits didn't touch land in the same place.
+            if !composed.edits.iter().any(|(r, _)| r.start < offset && offset < r.end) {
+                assert_eq!(composed.map(offset), one_by_one, "offset {offset}");
+            }
+        }
+        let total: isize = steps.iter().map(|p| p.before[p.edits.len()]).sum();
+        assert_eq!(composed.before[composed.edits.len()], total);
+
+        let mut doc = Document::from_text("x\n".repeat(700), None);
+        let all: Vec<(Range<usize>, String)> = (0..700).map(|i| (i * 2..i * 2 + 1, "yy".into())).collect();
+        doc.edit(all, &[], EditKind::Other);
+        let before_undo = doc.version();
+        doc.undo();
+        assert!(doc.patches_since(before_undo).is_some_and(|mut p| p.next().is_some()), "the undo's patch is kept");
+        // Line 1 started at 3 ("yy\n" above it), and at 2 again after the undo.
+        assert_eq!(doc.offset_since(before_undo, 3), Some(2));
     }
 
     #[test]
@@ -1458,19 +1572,26 @@ mod tests {
         assert!(!doc.toggle_breakpoint(0));
     }
 
+    /// An editor's folds follow the document's edits (through its patches).
     #[test]
     fn folds_follow_edits() {
         let mut doc = Document::from_text("a {\n  b\n  c\n}\nz\n".into(), None);
-        doc.fold_rows(1, 3);
-        assert_eq!(doc.folds(), [4..13]);
+        let mut folds = crate::fold::Folds::default();
+        folds.fold_rows(&doc, 1, 3);
+        assert_eq!(folds.ranges(), [4..13]);
+        let edit = |doc: &mut Document, folds: &mut crate::fold::Folds, at: usize, text: &str| {
+            let version = doc.version();
+            doc.edit(vec![(at..at, text.into())], &[], EditKind::Other);
+            folds.follow(doc, version);
+        };
         // An edit above moves the fold.
-        doc.edit(vec![(0..0, "x".into())], &[], EditKind::Other);
-        assert_eq!(doc.folds(), [5..14]);
+        edit(&mut doc, &mut folds, 0, "x");
+        assert_eq!(folds.ranges(), [5..14]);
         // An edit after it leaves it alone; one inside opens it.
-        doc.edit(vec![(15..15, "y".into())], &[], EditKind::Other);
-        assert_eq!(doc.folds(), [5..14]);
-        doc.edit(vec![(8..8, "!".into())], &[], EditKind::Other);
-        assert!(doc.folds().is_empty());
+        edit(&mut doc, &mut folds, 15, "y");
+        assert_eq!(folds.ranges(), [5..14]);
+        edit(&mut doc, &mut folds, 8, "!");
+        assert!(folds.is_empty());
     }
 
     #[test]
@@ -1683,8 +1804,9 @@ mod tests {
         let condition = Some("x > 1".to_string());
         doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(2), Breakpoint::at(3), Breakpoint { condition: condition.clone(), ..Breakpoint::at(5) }]);
         doc.set_debug_row(Some(5));
-        doc.fold_rows(1, 3);
-        doc.fold_rows(5, 6);
+        let mut folds = crate::fold::Folds::default();
+        folds.fold_rows(&doc, 1, 3);
+        folds.fold_rows(&doc, 5, 6);
         doc.take_lsp_changes();
         let version = doc.version();
 
@@ -1701,7 +1823,8 @@ mod tests {
         assert_eq!(doc.breakpoint(6).and_then(|b| b.condition.clone()), condition);
         assert_eq!(doc.debug_row(), Some(6));
         // The fold over changed lines opened; the other moved.
-        assert_eq!(doc.folds(), [doc.line_start(6)..doc.line_end(7)]);
+        folds.follow(&doc, version);
+        assert_eq!(folds.ranges(), [doc.line_start(6)..doc.line_end(7)]);
 
         // Other editors' carets follow too: `two` and a caret in `gone();`.
         let patches = doc.patches_since(version).expect("kept").collect::<Vec<_>>();

@@ -4,7 +4,11 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use regex::{Regex, RegexBuilder};
@@ -92,22 +96,34 @@ pub struct ProjectMatch {
     pub relative: String,
     /// Zero-based line number.
     pub line: usize,
+    /// Where that line starts in the file.
+    pub line_start: usize,
+    /// The match's line around it, at most `SNIPPET_BEFORE` +
+    /// `SNIPPET_AFTER` bytes beside the match: a minified file's line can be
+    /// megabytes long, and every match would copy it.
     pub line_text: String,
     /// Match range within `line_text`.
     pub line_range: Range<usize>,
     /// Match range within the whole file.
     pub range: Range<usize>,
+    /// The file's text, shared by its matches, for the preview.
     pub contents: Arc<str>,
 }
 
-pub struct ProjectResults {
-    pub matches: Vec<ProjectMatch>,
-    pub files: usize,
+/// How a search ended.
+pub struct SearchEnd {
+    /// It stopped at `MAX_FILES` or `MAX_MATCHES`.
     pub truncated: bool,
 }
 
-const MAX_MATCHES: usize = 2000;
+/// The most files and matches a search lists (Zed's limits too).
+pub const MAX_FILES: usize = 5_000;
+pub const MAX_MATCHES: usize = 10_000;
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
+const SNIPPET_BEFORE: usize = 80;
+const SNIPPET_AFTER: usize = 200;
+/// How often found matches go to the list while a search runs.
+const BATCH_EVERY: Duration = Duration::from_millis(50);
 
 /// Every file under `root`, honoring .gitignore. Paths are absolute.
 pub fn project_files(root: &Path) -> Vec<PathBuf> {
@@ -132,17 +148,29 @@ fn walker(root: &Path) -> ignore::Walk {
 
 /// Searches every text file of `paths` (the project's, see
 /// `crate::project`). `overrides` supplies the contents of unsaved open
-/// buffers so results reflect what the user sees.
+/// buffers so results reflect what the user sees. Matches go to `found` in
+/// batches as they're found (with the number of files with matches so
+/// far), so the list fills while it runs; `cancel` stops it between files
+/// (a newer query took over).
 pub fn search_project(
     root: &Path,
     paths: Vec<PathBuf>,
     query: &SearchQuery,
     overrides: &HashMap<PathBuf, Arc<str>>,
-) -> ProjectResults {
-    let mut matches = Vec::new();
-    let mut files = 0;
-    let mut truncated = false;
+    cancel: &AtomicBool,
+    mut found: impl FnMut(Vec<ProjectMatch>, usize),
+) -> SearchEnd {
+    let mut batch = Vec::new();
+    let (mut files, mut total) = (0, 0);
+    let mut last_batch = Instant::now();
     for path in paths {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if files >= MAX_FILES || total >= MAX_MATCHES {
+            found(batch, files);
+            return SearchEnd { truncated: true };
+        }
         let contents: Arc<str> = match overrides.get(&path) {
             Some(text) => text.clone(),
             None => {
@@ -159,20 +187,16 @@ pub fn search_project(
                 }
             }
         };
-        let found = query.find_all(&contents);
-        if found.is_empty() {
+        let ranges = query.find_all(&contents);
+        if ranges.is_empty() {
             continue;
         }
         files += 1;
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
         let mut line = 0;
         let mut line_start = 0;
         let mut scanned = 0;
-        for range in found {
+        for range in ranges.into_iter().take(MAX_MATCHES - total) {
             // Advance line counters incrementally.
             for (i, b) in contents.as_bytes()[scanned..range.start].iter().enumerate() {
                 if *b == b'\n' {
@@ -181,33 +205,51 @@ pub fn search_project(
                 }
             }
             scanned = range.start;
-            let line_end = contents[line_start..]
-                .find('\n')
-                .map_or(contents.len(), |e| line_start + e);
+            let line_end = contents[line_start..].find('\n').map_or(contents.len(), |e| line_start + e);
             let match_end = range.end.min(line_end);
-            matches.push(ProjectMatch {
+            let from = contents.floor_char_boundary(range.start.saturating_sub(SNIPPET_BEFORE).max(line_start));
+            let to = contents.ceil_char_boundary((match_end + SNIPPET_AFTER).min(line_end));
+            batch.push(ProjectMatch {
                 path: path.clone(),
                 relative: relative.clone(),
                 line,
-                line_text: contents[line_start..line_end].to_string(),
-                line_range: range.start - line_start..match_end - line_start,
+                line_start,
+                line_text: contents[from..to].to_string(),
+                line_range: range.start - from..match_end - from,
                 range,
                 contents: contents.clone(),
             });
-            if matches.len() >= MAX_MATCHES {
-                truncated = true;
-                break;
-            }
+            total += 1;
         }
-        if truncated {
+        if last_batch.elapsed() >= BATCH_EVERY {
+            found(std::mem::take(&mut batch), files);
+            last_batch = Instant::now();
+        }
+    }
+    found(batch, files);
+    SearchEnd { truncated: total >= MAX_MATCHES }
+}
+
+/// The lines around line `line` (which starts at `line_start`), `context`
+/// on each side, each cut at `max_len` bytes: (line number, text). Only
+/// those lines are looked at, however big the file.
+pub fn context_lines(contents: &str, line_start: usize, line: usize, context: usize, max_len: usize) -> Vec<(usize, &str)> {
+    let mut first = (line, line_start);
+    while first.0 + context > line && first.1 > 0 {
+        let start = contents[..first.1 - 1].rfind('\n').map_or(0, |i| i + 1);
+        first = (first.0 - 1, start);
+    }
+    let mut out = Vec::new();
+    let (mut row, mut at) = first;
+    while row <= line + context && at <= contents.len() {
+        let end = contents[at..].find('\n').map_or(contents.len(), |i| at + i);
+        out.push((row, &contents[at..contents.floor_char_boundary(end.min(at + max_len))]));
+        if end == contents.len() {
             break;
         }
+        (row, at) = (row + 1, end + 1);
     }
-    ProjectResults {
-        matches,
-        files,
-        truncated,
-    }
+    out
 }
 
 #[cfg(test)]
@@ -245,6 +287,34 @@ mod tests {
         };
         assert_eq!(names(project_files(&dir)), [".gitignore", "config/partners.yml.example"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn project_search_keeps_short_snippets_and_stops_when_cancelled() {
+        let q = SearchQuery::new("x", SearchOptions::default()).unwrap().unwrap();
+        // One long line (minified): each match keeps a little of it.
+        let long: Arc<str> = format!("{}x{}x", "a".repeat(5000), "b".repeat(5000)).into();
+        let path = PathBuf::from("/p/min.js");
+        let overrides = HashMap::from([(path.clone(), long.clone())]);
+        let mut all = Vec::new();
+        let end = search_project(Path::new("/p"), vec![path.clone()], &q, &overrides, &AtomicBool::new(false), |batch, _| all.extend(batch));
+        assert!(!end.truncated);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|m| m.line_text.len() <= SNIPPET_BEFORE + 1 + SNIPPET_AFTER));
+        assert_eq!(&all[1].line_text[all[1].line_range.clone()], "x");
+        // Cancelled before it starts: nothing.
+        let mut none = Vec::new();
+        search_project(Path::new("/p"), vec![path], &q, &overrides, &AtomicBool::new(true), |batch, _| none.extend(batch));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn context_lines_look_only_near_the_match() {
+        let text = "zero\none\ntwo\nthree\nfour\nfive";
+        let lines = context_lines(text, text.find("three").unwrap(), 3, 1, 3);
+        assert_eq!(lines, [(2, "two"), (3, "thr"), (4, "fou")]);
+        assert_eq!(context_lines(text, 0, 0, 2, 99), [(0, "zero"), (1, "one"), (2, "two")]);
+        assert_eq!(context_lines(text, text.find("five").unwrap(), 5, 1, 99), [(4, "four"), (5, "five")]);
     }
 
     #[test]

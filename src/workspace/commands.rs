@@ -118,6 +118,7 @@ impl Workspace {
         self.show_find = false;
         self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
         self.tabs.clear();
+        self.tab_subscriptions.clear();
         self.panes = vec![Pane::new()];
         self.active_pane = 0;
         self.pane_sizes = vec![1.0];

@@ -996,10 +996,7 @@ pub fn change_shortcut(name: &str, action: &dyn Action, change: ShortcutChange, 
         .collect();
     apply_shortcut_change(&mut sections, refers, name, &defaults, &change);
     let json = serde_json::to_string_pretty(&sections).map_err(|e| e.to_string())?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, format!("{KEYMAP_HEADER}{json}\n")).map_err(|e| e.to_string())
+    crate::state::write_atomic(&path, format!("{KEYMAP_HEADER}{json}\n").as_bytes()).map_err(|e| e.to_string())
 }
 
 /// The bindings object of the section for `context`, added when missing.

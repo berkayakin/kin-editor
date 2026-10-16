@@ -1,21 +1,23 @@
 //! JSON-RPC over a language server's stdin/stdout. A reader thread parses
 //! `Content-Length` frames: responses complete the matching request's
 //! future, everything else goes to the `incoming` channel. A writer thread
-//! sends, so a full pipe never blocks the UI.
+//! sends, so a full pipe never blocks the UI, and fails requests that go
+//! unanswered for too long.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     pin::Pin,
-    process::{Child, ChildStdin, Stdio},
+    process::{Child, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicI64, Ordering},
         mpsc,
     },
     task::Poll,
+    time::{Duration, Instant},
 };
 
 use futures::channel::{mpsc as async_mpsc, oneshot};
@@ -33,7 +35,23 @@ pub enum Incoming {
 
 #[derive(Debug, Clone)]
 pub struct RpcError {
+    /// The JSON-RPC error code; None when no answer came (`STOPPED`,
+    /// `TIMED_OUT`).
+    pub code: Option<i64>,
     pub message: String,
+}
+
+impl RpcError {
+    fn new(message: &str) -> Self {
+        RpcError { code: None, message: message.into() }
+    }
+
+    /// The server dropped the request itself: the text changed meanwhile
+    /// (`ContentModified`) or it cancelled it (`RequestCancelled`,
+    /// `ServerCancelled`). Nothing to tell the user about.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.code, Some(-32802..=-32800))
+    }
 }
 
 impl std::fmt::Display for RpcError {
@@ -44,12 +62,25 @@ impl std::fmt::Display for RpcError {
 
 /// The error for requests still waiting when the server exits.
 pub const STOPPED: &str = "The language server stopped";
+/// The error for a request still unanswered after `REQUEST_TIMEOUT`.
+pub const TIMED_OUT: &str = "The language server didn't answer in time";
+
+/// How long a request waits for its answer (Zed's default too); then it
+/// fails, and the server is told to stop working on it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
+/// What the writer thread does: send a frame, or note when a request it
+/// sent times out.
+enum Outgoing {
+    Frame(Vec<u8>),
+    Deadline(Instant, i64),
+}
+
 pub struct Client {
     child: Mutex<Child>,
-    writer: mpsc::Sender<Vec<u8>>,
+    writer: mpsc::Sender<Outgoing>,
     next_id: AtomicI64,
     pending: Pending,
 }
@@ -77,14 +108,16 @@ impl Client {
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("no stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("no stderr"))?;
 
-        let (writer, to_write) = mpsc::channel::<Vec<u8>>();
-        std::thread::Builder::new().name("lsp-writer".into()).spawn(move || write_loop(stdin, to_write))?;
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, to_write) = mpsc::channel::<Outgoing>();
+        let timeouts = pending.clone();
+        std::thread::Builder::new().name("lsp-writer".into()).spawn(move || write_loop(stdin, to_write, timeouts))?;
 
         // Keep the end of stderr to explain a crash.
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         let tail = stderr_tail.clone();
         std::thread::Builder::new().name("lsp-stderr".into()).spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            for_each_line(stderr, |line| {
                 let mut tail = tail.lock().unwrap();
                 tail.push_str(&line);
                 tail.push('\n');
@@ -93,10 +126,9 @@ impl Client {
                     let cut = tail.ceil_char_boundary(cut);
                     tail.drain(..cut);
                 }
-            }
+            })
         })?;
 
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (incoming_tx, incoming) = async_mpsc::unbounded();
         let reader_pending = pending.clone();
         std::thread::Builder::new()
@@ -108,12 +140,14 @@ impl Client {
     }
 
     /// Sends a request; the future resolves with the result. Dropping it
-    /// before the answer comes tells the server to stop working on it.
+    /// before the answer comes tells the server to stop working on it, and
+    /// one unanswered after `REQUEST_TIMEOUT` fails with `TIMED_OUT`.
     pub fn request(&self, method: &str, params: Value) -> Request {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        self.writer.send(Outgoing::Deadline(Instant::now() + REQUEST_TIMEOUT, id)).ok();
         Request { id, rx, pending: self.pending.clone(), writer: self.writer.clone() }
     }
 
@@ -133,22 +167,29 @@ impl Client {
     /// Asks the server to exit, then makes sure it does. Blocks for up to a
     /// second, so call it off the main thread.
     pub fn shutdown(&self) {
-        // `exit` comes after the answer to `shutdown`, as the protocol asks
-        // (a server may still be saving state); one that doesn't answer in
-        // time gets it anyway.
+        self.stop(Duration::from_secs(1));
+    }
+
+    /// Asks the server to exit and kills it if it's still running after
+    /// `wait`: half of it for the answer to `shutdown` (`exit` comes after
+    /// it, as the protocol asks: a server may still be saving state), half
+    /// to exit. Blocks, so call it off the main thread.
+    pub fn stop(&self, wait: Duration) {
         let shutdown = self.request("shutdown", Value::Null);
         let (answered, answer) = mpsc::channel();
         std::thread::spawn(move || answered.send(futures::executor::block_on(shutdown)).ok());
-        answer.recv_timeout(std::time::Duration::from_millis(500)).ok();
+        answer.recv_timeout(wait / 2).ok();
         self.notify("exit", Value::Null);
-        for _ in 0..20 {
+        let deadline = Instant::now() + wait / 2;
+        while Instant::now() < deadline {
             if self.child.lock().ok().and_then(|mut c| c.try_wait().ok().flatten()).is_some() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(5));
         }
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -158,14 +199,14 @@ pub struct Request {
     id: i64,
     rx: oneshot::Receiver<Result<Value, RpcError>>,
     pending: Pending,
-    writer: mpsc::Sender<Vec<u8>>,
+    writer: mpsc::Sender<Outgoing>,
 }
 
 impl Future for Request {
     type Output = Result<Value, RpcError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.rx).poll(cx).map(|answer| answer.unwrap_or_else(|_| Err(RpcError { message: STOPPED.into() })))
+        Pin::new(&mut self.rx).poll(cx).map(|answer| answer.unwrap_or_else(|_| Err(RpcError::new(STOPPED))))
     }
 }
 
@@ -173,17 +214,44 @@ impl Drop for Request {
     fn drop(&mut self) {
         // Still pending: no answer came, so the server may still be at it.
         if self.pending.lock().unwrap().remove(&self.id).is_some() {
-            send(&self.writer, json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": self.id } }));
+            send(&self.writer, cancel(self.id));
         }
     }
 }
 
-fn send(writer: &mpsc::Sender<Vec<u8>>, message: Value) {
+fn cancel(id: i64) -> Value {
+    json!({ "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": id } })
+}
+
+fn frame(message: &Value) -> Vec<u8> {
     let body = message.to_string();
     let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     frame.extend_from_slice(body.as_bytes());
+    frame
+}
+
+fn send(writer: &mpsc::Sender<Outgoing>, message: Value) {
     // Fails only once the writer thread is gone (server exited).
-    writer.send(frame).ok();
+    writer.send(Outgoing::Frame(frame(&message))).ok();
+}
+
+/// Calls `f` with each line of `stream` (without its line break) until it
+/// ends. Read as bytes: a line that isn't UTF-8 (a file name, binary noise)
+/// mustn't stop the reading, or the program would die writing to a pipe
+/// nobody reads.
+pub(crate) fn for_each_line(stream: impl Read, mut f: impl FnMut(String)) {
+    let mut reader = BufReader::new(stream);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&line);
+                f(text.trim_end_matches(['\n', '\r']).to_string());
+            }
+        }
+    }
 }
 
 impl Drop for Client {
@@ -195,10 +263,38 @@ impl Drop for Client {
     }
 }
 
-fn write_loop(mut stdin: ChildStdin, frames: mpsc::Receiver<Vec<u8>>) {
-    for frame in frames {
-        if stdin.write_all(&frame).and_then(|_| stdin.flush()).is_err() {
-            break;
+/// Writes frames to the server and fails requests unanswered by their
+/// deadline (telling the server to stop working on them too).
+fn write_loop(mut stdin: impl Write, outgoing: mpsc::Receiver<Outgoing>, pending: Pending) {
+    let mut write = |frame: &[u8]| stdin.write_all(frame).and_then(|_| stdin.flush()).is_ok();
+    // Requests by deadline: they all get the same timeout, so in order.
+    let mut deadlines: VecDeque<(Instant, i64)> = VecDeque::new();
+    loop {
+        let next = match deadlines.front() {
+            Some(&(at, _)) => outgoing.recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => outgoing.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match next {
+            Ok(Outgoing::Frame(frame)) => {
+                if !write(&frame) {
+                    return;
+                }
+            }
+            Ok(Outgoing::Deadline(at, id)) => deadlines.push_back((at, id)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                while let Some(&(_, id)) = deadlines.front().filter(|(at, _)| *at <= now) {
+                    deadlines.pop_front();
+                    // Answered (or dropped) meanwhile: nothing to do.
+                    let Some(tx) = pending.lock().unwrap().remove(&id) else { continue };
+                    let written = write(&frame(&cancel(id)));
+                    let _ = tx.send(Err(RpcError::new(TIMED_OUT)));
+                    if !written {
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -215,7 +311,7 @@ fn read_loop(
     }
     // Whatever is still waiting will never get an answer.
     for (_, tx) in pending.lock().unwrap().drain() {
-        let _ = tx.send(Err(RpcError { message: STOPPED.into() }));
+        let _ = tx.send(Err(RpcError::new(STOPPED)));
     }
     // Let stderr catch up so the tail explains the exit.
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -269,6 +365,7 @@ fn dispatch(mut message: Value, pending: &Pending, incoming: &async_mpsc::Unboun
             let Some(tx) = pending.lock().unwrap().remove(&id) else { return };
             let result = match message.get_mut("error") {
                 Some(error) => Err(RpcError {
+                    code: error.get("code").and_then(Value::as_i64),
                     message: error.get("message").and_then(Value::as_str).unwrap_or("Request failed").to_string(),
                 }),
                 None => Ok(message.get_mut("result").map(Value::take).unwrap_or(Value::Null)),
@@ -303,10 +400,61 @@ mod tests {
         // Dropped while waiting: the server hears $/cancelRequest, and a
         // late answer goes nowhere.
         drop(request(2));
-        let frame = String::from_utf8(written.try_recv().unwrap()).unwrap();
+        let Ok(Outgoing::Frame(frame)) = written.try_recv() else { panic!("a frame") };
+        let frame = String::from_utf8(frame).unwrap();
         assert!(frame.ends_with(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}"#), "{frame}");
         assert!(pending.lock().unwrap().is_empty());
         dispatch(json!({ "jsonrpc": "2.0", "id": 2, "result": null }), &pending, &incoming);
+    }
+
+    /// What the writer thread wrote, for tests.
+    #[derive(Clone, Default)]
+    struct Written(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Written {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unanswered_requests_time_out() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (writer, outgoing) = mpsc::channel();
+        let written = Written::default();
+        let (out, timeouts) = (written.clone(), pending.clone());
+        let thread = std::thread::spawn(move || write_loop(out, outgoing, timeouts));
+        let (incoming, _) = async_mpsc::unbounded();
+        let request = |id: i64| {
+            let (tx, rx) = oneshot::channel();
+            pending.lock().unwrap().insert(id, tx);
+            writer.send(Outgoing::Deadline(Instant::now() + Duration::from_millis(30), id)).unwrap();
+            Request { id, rx, pending: pending.clone(), writer: writer.clone() }
+        };
+        // One answered in time, one never: only the second fails, and the
+        // server is told to stop working on it.
+        let (answered, silent) = (request(1), request(2));
+        dispatch(json!({ "jsonrpc": "2.0", "id": 1, "result": 7 }), &pending, &incoming);
+        assert_eq!(futures::executor::block_on(answered).unwrap(), 7);
+        let err = futures::executor::block_on(silent).unwrap_err();
+        assert_eq!((err.message.as_str(), err.code), (TIMED_OUT, None));
+        let text = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
+        assert!(text.ends_with(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}"#), "{text}");
+        assert!(!text.contains(r#""id":1}"#), "{text}");
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn reads_lines_that_are_not_utf8() {
+        let stream: &[u8] = b"first\n\xff\xfe broken\r\nlast";
+        let mut lines = Vec::new();
+        for_each_line(stream, |line| lines.push(line));
+        assert_eq!(lines, ["first", "\u{fffd}\u{fffd} broken", "last"]);
     }
 
     #[test]
@@ -331,7 +479,13 @@ mod tests {
         pending.lock().unwrap().insert(7, tx);
         let (incoming_tx, mut incoming) = async_mpsc::unbounded();
         dispatch(json!({"id": 7, "error": {"code": -1, "message": "nope"}}), &pending, &incoming_tx);
-        assert_eq!(rx.try_recv().unwrap().unwrap().unwrap_err().message, "nope");
+        let err = rx.try_recv().unwrap().unwrap().unwrap_err();
+        assert_eq!((err.message.as_str(), err.code, err.is_cancelled()), ("nope", Some(-1), false));
+        // `ContentModified`: the text changed under the request.
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().insert(8, tx);
+        dispatch(json!({"id": 8, "error": {"code": -32801, "message": "content modified"}}), &pending, &incoming_tx);
+        assert!(rx.try_recv().unwrap().unwrap().unwrap_err().is_cancelled());
         dispatch(json!({"id": "a", "method": "workspace/configuration", "params": {}}), &pending, &incoming_tx);
         assert!(matches!(incoming.try_recv(), Ok(Incoming::Request { method, .. }) if method == "workspace/configuration"));
     }

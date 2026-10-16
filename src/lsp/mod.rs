@@ -31,7 +31,7 @@ use crate::{
     settings::Settings,
     syntax::Language,
 };
-use protocol::{Encoding, TextEdit, path_to_uri};
+use protocol::{Encoding, path_to_uri};
 use rpc::{Client, Incoming, RpcError};
 
 /// Servers are shared by documents of the same kind under the same root.
@@ -187,7 +187,7 @@ pub struct LspDiagnostics {
 pub enum LspEvent {
     /// A server asked to change files (`workspace/applyEdit`); answer with
     /// [`LspStore::respond`].
-    ApplyEdit { key: ServerKey, request_id: Value, encoding: Encoding, edits: Vec<(PathBuf, Vec<TextEdit>)> },
+    ApplyEdit { key: ServerKey, request_id: Value, encoding: Encoding, edits: Vec<protocol::FileEdits> },
     /// An error message from a server.
     Message(String),
     /// Kuana installed this server.
@@ -219,8 +219,17 @@ pub struct LspStore {
     /// Tests: the servers every document gets, instead of its language's.
     #[cfg(test)]
     pub(crate) test_specs: Option<Vec<&'static servers::ServerSpec>>,
+    /// Every server process started, so the ones still running (shutting
+    /// down already or not) are stopped when the app quits.
+    started: Vec<std::sync::Weak<Client>>,
+    /// Stops them as the app quits; registered with the first server.
+    quit_hook: Option<gpui::Subscription>,
     _tasks: Vec<Task<()>>,
 }
+
+/// How long the app's quit waits for servers to exit before killing them
+/// (GPUI itself waits only a moment for quit hooks).
+const QUIT_WAIT: std::time::Duration = std::time::Duration::from_millis(80);
 
 impl LspStore {
     pub fn new() -> Self {
@@ -236,6 +245,8 @@ impl LspStore {
             next_generation: 0,
             #[cfg(test)]
             test_specs: None,
+            started: Vec::new(),
+            quit_hook: None,
             _tasks: Vec::new(),
         }
     }
@@ -410,6 +421,14 @@ impl LspStore {
                 s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec));
                 s.configs.insert(key.clone(), (spec, command.program.clone(), config));
                 s.listen(key.clone(), generation, incoming, cx);
+                s.started.retain(|c| c.strong_count() > 0);
+                s.started.push(Arc::downgrade(&client));
+                if s.quit_hook.is_none() {
+                    s.quit_hook = Some(cx.on_app_quit(|s, _| {
+                        s.stop_all_for_quit();
+                        async {}
+                    }));
+                }
                 true
             });
             if !started.unwrap_or(false) {
@@ -508,7 +527,7 @@ impl LspStore {
                         return;
                     };
                     self.diagnostics.insert((path.clone(), key.clone()), params);
-                    self.apply_diagnostics(&path, cx);
+                    self.apply_diagnostics(&path, key, cx);
                 }
                 "$/progress" => {
                     let token = match params.get("token") {
@@ -618,6 +637,8 @@ impl LspStore {
                 if !matches!(self.servers.get(key), Some(ServerState::Failed(_))) {
                     self.fail(key, message, cx);
                 }
+                // What it found is no longer kept up to date.
+                self.forget_diagnostics(key, cx);
                 for doc in self.documents.values_mut() {
                     doc.set_opened(key, false);
                 }
@@ -649,23 +670,35 @@ impl LspStore {
         }
     }
 
-    /// Gives the editor every running server's diagnostics for `path`.
-    fn apply_diagnostics(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(doc) = self.documents.get(path) else { return };
-        let sources: Vec<LspDiagnostics> = doc
-            .servers
-            .iter()
-            .filter_map(|(key, _)| {
-                let ServerState::Running(server) = self.servers.get(key)? else { return None };
-                let params = self.diagnostics.get(&(path.to_path_buf(), key.clone()))?;
-                Some(LspDiagnostics { id: server.id.clone(), server: server.name.clone(), encoding: server.encoding, params: params.clone() })
-            })
-            .collect();
-        if sources.is_empty() {
-            return;
-        }
+    /// Gives the editor of `path` one server's diagnostics for it (the
+    /// others' stay as they are, following edits).
+    fn apply_diagnostics(&mut self, path: &Path, key: &ServerKey, cx: &mut Context<Self>) {
+        let Some(doc) = self.documents.get(path).filter(|d| d.has(key)) else { return };
+        let Some(ServerState::Running(server)) = self.servers.get(key) else { return };
+        let Some(params) = self.diagnostics.get(&(path.to_path_buf(), key.clone())) else { return };
+        let source = LspDiagnostics { id: server.id.clone(), server: server.name.clone(), encoding: server.encoding, params: params.clone() };
         let Some(editor) = doc.editor.upgrade() else { return };
-        editor.update(cx, |e, cx| e.set_lsp_diagnostics(sources, cx));
+        editor.update(cx, |e, cx| e.set_server_diagnostics(source, cx));
+    }
+
+    /// What server `id` last published for `path` (raw LSP diagnostics),
+    /// for code action requests: a server gets its own back.
+    pub fn published(&self, path: &Path, id: &str) -> Vec<Value> {
+        self.diagnostics
+            .iter()
+            .filter(|((p, key), _)| p == path && key.id == id)
+            .filter_map(|(_, params)| params.get("diagnostics")?.as_array().cloned())
+            .flatten()
+            .collect()
+    }
+
+    /// A server stopped (or restarts): its diagnostics go, everywhere.
+    fn forget_diagnostics(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
+        self.diagnostics.retain(|(_, k), _| k != key);
+        let editors: Vec<Entity<Editor>> = self.documents.values().filter(|d| d.has(key)).filter_map(|d| d.editor.upgrade()).collect();
+        for editor in editors {
+            editor.update(cx, |e, cx| e.clear_server_diagnostics(&key.id, cx));
+        }
     }
 
     fn open_document(&mut self, path: &Path, key: &ServerKey, server: &Arc<Server>, cx: &mut Context<Self>) {
@@ -681,6 +714,7 @@ impl LspStore {
             if first {
                 e.doc.as_mut(cx).take_lsp_changes();
             }
+            e.doc.as_mut(cx).note_lsp_version();
             (e.doc.read(cx).rope().to_string(), e.doc.read(cx).version())
         });
         server.client.notify(
@@ -690,7 +724,7 @@ impl LspStore {
             } }),
         );
         doc.set_opened(key, true);
-        self.apply_diagnostics(path, cx);
+        self.apply_diagnostics(path, key, cx);
     }
 
     /// The running server for an open document.
@@ -879,6 +913,7 @@ impl LspStore {
             if let Some(client) = self.client(key) {
                 std::thread::spawn(move || client.shutdown());
             }
+            self.forget_diagnostics(key, cx);
             self.servers.remove(key);
             self.progress.remove(key);
             self.configs.remove(key);
@@ -917,15 +952,28 @@ impl LspStore {
         })
     }
 
-    /// Stops every server (window closing or app quitting).
+    /// Stops every server (a window closing, trust withdrawn), all at once
+    /// and off the main thread.
     pub fn shutdown_all(&mut self) {
         let clients: Vec<Arc<Client>> = self.servers.keys().cloned().collect::<Vec<_>>().iter().filter_map(|k| self.client(k)).collect();
         self.servers.clear();
         self.configs.clear();
         self.generations.clear();
         self.documents.clear();
-        if !clients.is_empty() {
-            std::thread::spawn(move || clients.iter().for_each(|c| c.shutdown()));
+        for client in clients {
+            std::thread::spawn(move || client.shutdown());
+        }
+    }
+
+    /// The app is quitting: every server process still running (shutting
+    /// down already or not) gets `shutdown` and `exit` at once and a moment
+    /// to go, then is killed, so none outlives Kuana. Blocks for about
+    /// `QUIT_WAIT`.
+    fn stop_all_for_quit(&mut self) {
+        let clients: Vec<Arc<Client>> = self.started.drain(..).filter_map(|c| c.upgrade()).collect();
+        let stopping: Vec<_> = clients.into_iter().map(|client| std::thread::spawn(move || client.stop(QUIT_WAIT))).collect();
+        for thread in stopping {
+            let _ = thread.join();
         }
     }
 }

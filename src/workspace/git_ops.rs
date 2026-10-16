@@ -42,9 +42,7 @@ impl Workspace {
                     p.set_status(Arc::new(RepoStatus::default()), cx);
                 });
                 ws.refresh_git(cx);
-                for editor in ws.tabs.clone() {
-                    ws.load_diff_base(&editor, cx);
-                }
+                ws.load_diff_bases(ws.tabs.clone(), cx);
                 cx.notify();
             })
             .ok();
@@ -90,46 +88,65 @@ impl Workspace {
                     ws.git_ignored = Arc::new(status.ignored.iter().cloned().collect());
                 }
                 ws.decorate_tree(cx);
-                ws.git_status = Arc::new(status);
-                let status = ws.git_status.clone();
-                ws.git_panel.update(cx, |p, cx| p.set_status(status, cx));
-                // HEAD or the index may have moved (commits, staging, checkouts).
-                for editor in ws.tabs.clone() {
-                    ws.load_diff_base(&editor, cx);
-                }
+                // Diff bases are read again only where HEAD or a file's index
+                // blob moved (commits, staging, checkouts), not for every
+                // change in the working tree, as Zed does.
+                let old = std::mem::replace(&mut ws.git_status, Arc::new(status));
+                let new = ws.git_status.clone();
+                let blobs = |status: &git::RepoStatus, path: &Path| status.files.iter().find(|f| f.path == path).and_then(|f| f.blobs.clone());
+                let stale: Vec<Entity<Editor>> = if old.head_oid != new.head_oid {
+                    ws.tabs.clone()
+                } else {
+                    ws.tabs
+                        .iter()
+                        .filter(|t| t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| blobs(&old, p) != blobs(&new, p)))
+                        .cloned()
+                        .collect()
+                };
+                ws.load_diff_bases(stale, cx);
+                ws.git_panel.update(cx, |p, cx| p.set_status(new, cx));
                 cx.notify();
             })
             .ok();
         }));
     }
 
-    /// Loads the file's HEAD text so the editor can show changed lines.
+    /// Loads the file's HEAD and index text so the editor can show changed lines.
     pub(super) fn load_diff_base(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        self.load_diff_bases(vec![editor.clone()], cx);
+    }
+
+    /// Loads several files' HEAD and index text with one `git cat-file`.
+    pub(super) fn load_diff_bases(&mut self, editors: Vec<Entity<Editor>>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
-        // A tab not read yet gets it when it is (`file_opened`).
-        let Some(path) = editor.read(cx).doc.read(cx).path.clone().filter(|_| editor.read(cx).is_loaded()) else { return };
-        // Images have no lines to mark.
-        if editor.read(cx).doc.read(cx).image.is_some() {
+        let mut wanted = Vec::new();
+        for editor in editors {
+            // A tab not read yet gets it when it is (`file_opened`); images have no lines to mark.
+            let (e, doc) = (editor.read(cx), editor.read(cx).doc.read(cx));
+            let Some(path) = doc.path.clone().filter(|_| e.is_loaded() && doc.image.is_none()) else { continue };
+            let Ok(rel) = path.strip_prefix(&repo) else {
+                editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            // Compared as the editor holds the file: decoded like it, LF line ends.
+            wanted.push((editor.downgrade(), rel, doc.encoding));
+        }
+        if wanted.is_empty() {
             return;
         }
-        let Ok(rel) = path.strip_prefix(&repo) else {
-            editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
-            return;
-        };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        let git_file = GitFile { root: repo.clone(), rel: rel.clone(), user_name: self.git_user.clone() };
-        // Compared as the editor holds the file: decoded like it, LF line ends.
-        let encoding = editor.read(cx).doc.read(cx).encoding;
-        let editor = editor.downgrade();
+        let user = self.git_user.clone();
         cx.spawn(async move |_, cx| {
-            let (base, index) = cx
-                .background_executor()
-                .spawn(async move {
-                    let text = |bytes: Option<Vec<u8>>| bytes.map(|b| git::BlobText::new(&b, Some(encoding)).text);
-                    (text(git::head_blob(&repo, &rel)), text(git::index_blob(&repo, &rel)))
-                })
-                .await;
-            editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, index, cx)).ok();
+            let specs: Vec<String> = wanted.iter().flat_map(|(_, rel, _)| [format!("HEAD:{rel}"), format!(":{rel}")]).collect();
+            let repo2 = repo.clone();
+            let blobs = cx.background_executor().spawn(async move { git::read_blobs(&repo2, &specs) }).await.unwrap_or_default();
+            let mut blobs = blobs.into_iter();
+            for (editor, rel, encoding) in wanted {
+                let text = |bytes: Option<Option<Vec<u8>>>| bytes.flatten().map(|b| git::BlobText::new(&b, Some(encoding)).text);
+                let (base, index) = (text(blobs.next()), text(blobs.next()));
+                let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone() };
+                editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, index, cx)).ok();
+            }
         })
         .detach();
     }
@@ -293,7 +310,7 @@ impl Workspace {
             _ => return,
         };
         if self.git_busy.is_running() {
-            self.toast(ToastKind::Error, "Another Git operation is still running", None, cx);
+            self.git_queue.push_back(op);
             return;
         }
         // Without a strategy of its own, a pull takes the setting's.
@@ -420,9 +437,7 @@ impl Workspace {
                 }
                 // Staging part of a file may leave its status as it was.
                 if matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
-                    for editor in ws.tabs.clone() {
-                        ws.load_diff_base(&editor, cx);
-                    }
+                    ws.load_diff_bases(ws.tabs.clone(), cx);
                 }
                 match &ws.modals.current {
                     Some(Modal::Diff(view)) => view.update(cx, |v, cx| v.reload(cx)),
@@ -436,6 +451,14 @@ impl Workspace {
                 }
                 ws.status_task = None;
                 ws.refresh_git(cx);
+                // Then what was started meanwhile (this task is running: let
+                // it finish rather than drop it for the next one's).
+                if let Some(next) = ws.git_queue.pop_front() {
+                    if let Some(task) = ws.git_op_task.take() {
+                        task.detach();
+                    }
+                    ws.execute_git(next, window, cx);
+                }
                 cx.notify();
             })
             .ok();

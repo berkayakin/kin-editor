@@ -303,6 +303,10 @@ pub struct Editor {
     fold_regions: derived::Derived<(u64, usize, crate::syntax::Language), Vec<crate::fold::FoldRegion>>,
     /// `⋯` placeholders on screen last frame, for clicks: (bounds, fold start).
     fold_pills: Vec<(Bounds<Pixels>, usize)>,
+    /// This editor's folds: another editor of the file folds apart.
+    folds: crate::fold::Folds,
+    /// The tab stops of a snippet being filled in here (they follow edits).
+    snippet: Option<crate::snippets::SnippetStops>,
     /// File Structure's symbols for a document version (breadcrumbs, sticky scroll).
     outline: derived::Derived<(u64, crate::syntax::Language), Vec<crate::syntax::Symbol>>,
     /// Markdown: the rendered preview shows beside the text.
@@ -428,6 +432,8 @@ impl Editor {
             bracket_cache: None,
             fold_regions: derived::Derived::new(),
             fold_pills: Vec::new(),
+            folds: Default::default(),
+            snippet: None,
             outline: derived::Derived::new(),
             md_preview: false,
             md_blocks: derived::Derived::new(),
@@ -448,9 +454,9 @@ impl Editor {
     /// A second editor for the same document (a split): it starts where
     /// this one is, then has carets and scrolling of its own.
     pub fn view_of(other: &Entity<Editor>, cx: &mut Context<Self>) -> Self {
-        let (doc, selections, scroll) = {
+        let (doc, selections, scroll, folds) = {
             let other = other.read(cx);
-            (other.doc.clone(), other.selections.clone(), other.scroll)
+            (other.doc.clone(), other.selections.clone(), other.scroll, other.folds.clone())
         };
         let waiting = doc.read(cx).is_stand_in();
         let mut this = Self::blank_in(doc, cx);
@@ -459,6 +465,8 @@ impl Editor {
         this.detect_external_linter(cx);
         this.selections = selections;
         this.scroll = scroll;
+        // It starts folded like the view it splits from, then folds apart.
+        this.folds = folds;
         this
     }
 
@@ -472,8 +480,25 @@ impl Editor {
     fn change_doc<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Document) -> R) -> R {
         let result = f(&mut self.doc.as_mut(cx));
         let doc = self.doc.read(cx);
+        if doc.id() == self.seen.0 {
+            self.follow_edits(self.seen.1, cx);
+        }
+        let doc = self.doc.read(cx);
         self.seen = (doc.id(), doc.version());
         result
+    }
+
+    /// Moves what this editor keeps in the text (folds, a snippet's stops)
+    /// across the document's edits since `version`.
+    fn follow_edits(&mut self, version: u64, cx: &App) {
+        let doc = self.doc.read(cx);
+        self.folds.follow(doc, version);
+        if let Some(snippet) = &mut self.snippet {
+            let kept = doc.patches_since(version).is_some_and(|mut patches| patches.all(|patch| snippet.shift(patch)));
+            if !kept {
+                self.snippet = None;
+            }
+        }
     }
 
     /// The document changed: another editor of it edited (carets here move
@@ -512,6 +537,7 @@ impl Editor {
         }
         let selections = self.moved_since(self.seen.1, &self.selections, cx);
         self.selections = self.clamp_selections(selections, cx);
+        self.follow_edits(self.seen.1, cx);
         self.seen = (id, version);
         self.schedule_diff(Duration::from_millis(120), cx);
         cx.notify();
@@ -986,7 +1012,7 @@ impl Editor {
         self.cursor_visible = true;
         self.blink_epoch += 1;
         self.blink_task = None;
-        self.unfold_at_carets(cx);
+        self.unfold_at_carets();
         self.schedule_symbol_highlights(cx);
         self.lsp_selection_changed(cx);
         cx.notify();
@@ -1164,8 +1190,10 @@ impl Editor {
             this.update(cx, |editor, cx| {
                 if editor.doc.read(cx).version() == version {
                     let mut diagnostics = diagnostics;
-                    // The language server reports syntax errors itself.
-                    if editor.lsp.active {
+                    // A language server reports syntax errors itself. Asked
+                    // of the document's servers, not this editor: a split
+                    // showing the file never gets the diagnostics itself.
+                    if editor.lsp.active || !editor.lsp_servers(cx).is_empty() {
                         diagnostics.retain(|d| d.rule != "syntax");
                     }
                     editor.doc.as_mut(cx).set_builtin_diagnostics(diagnostics);
@@ -1476,20 +1504,22 @@ impl Editor {
         let wrap = self.soft_wrap && !self.is_single_line();
         let blocks = self.block_rows(cx);
         // Without wrapping, folds, long lines or blocks, display rows are buffer lines.
-        if !wrap && blocks.is_empty() && self.doc.read(cx).folds().is_empty() && !self.doc.read(cx).has_long_lines() {
+        if !wrap && blocks.is_empty() && self.folds.is_empty() && !self.doc.read(cx).has_long_lines() {
             self.wrap = None;
             return;
         }
         let Some(layout) = self.layout.as_ref() else { return };
         let font = self.editor_font(cx);
         let key = WrapKey {
-            width: layout.wrap_width,
+            // Without soft wrap only long lines break, at a fixed column, so
+            // resizing the view mustn't measure every line again.
+            width: if wrap { layout.wrap_width } else { px(0.) },
             font_family: font.family.clone(),
             font_size: self.font_size(cx),
             tab_size: self.tab_size,
             wrap,
         };
-        let (char_width, version, folds, rope) = (layout.char_width, self.doc.read(cx).version(), self.doc.read(cx).folds(), self.doc.read(cx).rope());
+        let (char_width, version, folds, rope) = (layout.char_width, self.doc.read(cx).version(), self.folds.ranges(), self.doc.read(cx).rope());
         // Edits re-measure only their lines; a new width, font or tab size
         // measures them all.
         if let Some(map) = self.wrap.as_mut().filter(|map| map.key == key) {
@@ -1529,7 +1559,7 @@ impl Editor {
             // Under the line's fold when it's folded: above the first line it
             // doesn't hide (blocks above hidden lines take no rows).
             let mut below = row + 1;
-            for fold in doc.folds() {
+            for fold in self.folds.ranges() {
                 if (doc.row_of(fold.start)..=doc.row_of(fold.end)).contains(&below) {
                     below = doc.row_of(fold.end) + 1;
                 }
@@ -2311,7 +2341,7 @@ impl Editor {
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         // Escape leaves a snippet's stops (and still does the rest below).
-        self.doc.as_mut(cx).snippet = None;
+        self.snippet = None;
         if self.open_hunk.take().is_some() {
             cx.notify();
             return;
@@ -2514,7 +2544,7 @@ impl Editor {
             }
             // The `⋯` placeholder unfolds.
             if let Some(&(_, start)) = self.fold_pills.iter().find(|(b, _)| b.contains(&event.position)) {
-                self.doc.as_mut(cx).unfold_where(|f| f.start == start);
+                self.folds.unfold_where(|f| f.start == start);
                 cx.notify();
                 return;
             }
@@ -2918,7 +2948,7 @@ impl Editor {
         self.fold_pills.clear();
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
-        let fold_regions = (!single && (self.gutter_hovered || !self.doc.read(cx).folds().is_empty())).then(|| self.shown_fold_regions(cx));
+        let fold_regions = (!single && (self.gutter_hovered || !self.folds.is_empty())).then(|| self.shown_fold_regions(cx));
         let run_rows: Vec<usize> =
             if single { Vec::new() } else { self.shown_run_targets(cx).iter().filter_map(|t| t.row).collect() };
         let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
@@ -5010,9 +5040,9 @@ mod block_tests {
             assert_eq!(rows, ["mismatched types", "expected `i32`"]);
             assert_eq!(e.block_rows(cx), [(1, 2)]);
             // Folded, the line's problems go under the lines its fold hides.
-            e.doc.as_mut(cx).fold_rows(1, 1);
+            e.folds.fold_rows(e.doc.read(cx), 1, 1);
             assert_eq!(e.block_rows(cx), [(2, 2)]);
-            e.doc.as_mut(cx).unfold_where(|_| true);
+            e.folds.unfold_where(|_| true);
             // Two problems on the line: both.
             e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(0, "first"), problem(4, "second")]);
             assert_eq!(e.caret_problem_rows(cx).len(), 2);

@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,7 +21,7 @@ use crate::{
     assets::Icon,
     editor::{Cancel, Editor, EditorEvent, Indent, MoveDown, MoveUp, Newline, Outdent, PageDown, PageUp},
     project::ProjectSnapshot,
-    search::{ProjectMatch, SearchOptions, SearchQuery, project_files, search_project},
+    search::{ProjectMatch, SearchOptions, SearchQuery, context_lines, project_files, search_project},
     theme::Theme,
     ui::{HoverFill, icon_el, input_box, kbd, modal_panel, text_button, toggle},
 };
@@ -46,6 +49,8 @@ pub struct ProjectSearch {
     selected: usize,
     scroll: UniformListScrollHandle,
     task: Option<Task<()>>,
+    /// Stops the running search's walk (a newer query took over).
+    cancel: Arc<AtomicBool>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -84,6 +89,7 @@ impl ProjectSearch {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             task: None,
+            cancel: Arc::new(AtomicBool::new(false)),
             _subscriptions: vec![subscription],
         };
         this.search(cx);
@@ -91,6 +97,8 @@ impl ProjectSearch {
     }
 
     fn search(&mut self, cx: &mut Context<Self>) {
+        // Whatever ran before stops at its next file.
+        self.cancel.store(true, Ordering::Relaxed);
         let query = match SearchQuery::new(&self.query.read(cx).text(cx), self.options) {
             Ok(Some(q)) => q,
             Ok(None) => {
@@ -114,27 +122,52 @@ impl ProjectSearch {
         self.searching = true;
         let (root, project) = (self.root.clone(), self.project.clone());
         let overrides = self.overrides.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
+            use futures::StreamExt as _;
             // Debounce typing.
             cx.background_executor().timer(Duration::from_millis(120)).await;
-            let results = cx
-                .background_executor()
-                .spawn(async move {
-                    // The project's files under the folder searched, else a walk of it.
-                    let files = match project {
-                        Some(project) => project.searchable().into_iter().filter(|p| p.starts_with(&root)).collect(),
-                        None => project_files(&root),
-                    };
-                    search_project(&root, files, &query, &overrides)
+            // Matches stream in as they're found (as in Zed), in batches.
+            let (found_tx, mut found) = futures::channel::mpsc::unbounded();
+            let search = cx.background_executor().spawn(async move {
+                // The project's files under the folder searched, else a walk of it.
+                let files = match project {
+                    Some(project) => project.searchable().into_iter().filter(|p| p.starts_with(&root)).collect(),
+                    None => project_files(&root),
+                };
+                search_project(&root, files, &query, &overrides, &cancel, |batch, files| {
+                    let _ = found_tx.unbounded_send((batch, files));
                 })
-                .await;
+            });
+            let mut first = true;
+            while let Some((mut batch, mut files)) = found.next().await {
+                while let Ok((more, count)) = found.try_recv() {
+                    batch.extend(more);
+                    files = count;
+                }
+                let start = std::mem::take(&mut first);
+                this.update(cx, |this, cx| {
+                    // The old results stay until the first new ones are in.
+                    if start {
+                        this.matches = Arc::new(Vec::new());
+                        this.selected = 0;
+                        this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                    }
+                    Arc::make_mut(&mut this.matches).extend(batch);
+                    this.files = files;
+                    cx.notify();
+                })
+                .ok();
+            }
+            let end = search.await;
             this.update(cx, |this, cx| {
-                this.matches = Arc::new(results.matches);
-                this.files = results.files;
-                this.truncated = results.truncated;
+                if first {
+                    this.matches = Arc::new(Vec::new());
+                    this.files = 0;
+                }
+                this.truncated = end.truncated;
                 this.searching = false;
-                this.selected = 0;
-                this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 cx.notify();
             })
             .ok();
@@ -235,9 +268,10 @@ impl ProjectSearch {
             return div().flex_1().into_any_element();
         };
         const CONTEXT: usize = 6;
-        let lines: Vec<&str> = m.contents.split('\n').collect();
-        let first = m.line.saturating_sub(CONTEXT);
-        let last = (m.line + CONTEXT + 1).min(lines.len());
+        // Only the lines around the match, each cut short: the file may be
+        // huge, or one minified line.
+        let lines = context_lines(&m.contents, m.line_start, m.line, CONTEXT, 1000);
+        let highlight = m.range.start - m.line_start..m.range.end - m.line_start;
         let mono = theme.mono_font.clone();
         div()
             .id("preview")
@@ -249,12 +283,12 @@ impl ProjectSearch {
             .overflow_hidden()
             .font_family(mono)
             .text_size(px(12.5))
-            .children((first..last).map(|row| {
-                let text: SharedString = lines[row].replace('\t', "    ").into();
+            .children(lines.into_iter().map(|(row, line)| {
+                let text: SharedString = line.replace('\t', "    ").into();
                 let is_match = row == m.line;
-                let styled = if is_match && m.line_range.end <= lines[row].len() && !lines[row].contains('\t') {
+                let styled = if is_match && highlight.end <= line.len() && !line.contains('\t') {
                     StyledText::new(text).with_highlights([(
-                        m.line_range.clone(),
+                        highlight.clone(),
                         HighlightStyle {
                             background_color: Some(theme.search_active.into()),
                             color: Some(theme.text.into()),

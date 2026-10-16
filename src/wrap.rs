@@ -29,6 +29,8 @@ pub struct Break {
 /// (Edits and folds update the map in place.)
 #[derive(Clone, PartialEq)]
 pub struct WrapKey {
+    /// The width to wrap at; zero without soft wrap (long lines break at a
+    /// fixed column then).
     pub width: Pixels,
     pub font_family: SharedString,
     pub font_size: Pixels,
@@ -191,21 +193,31 @@ impl WrapMap {
         if line < lines { self.row_starts[line] } else { self.row_count() - self.blocks_above(lines) }
     }
 
+    /// The block rows above buffer line `row` (`blocks` is sorted by line).
     fn blocks_above(&self, row: usize) -> usize {
-        self.blocks.iter().filter(|(line, _)| *line == row).map(|(_, n)| n).sum()
+        let first = self.blocks.partition_point(|&(line, _)| line < row);
+        self.blocks[first..].iter().take_while(|&&(line, _)| line == row).map(|(_, n)| n).sum()
     }
 
     /// The block row on display row `drow`: (the line it's above, which of
-    /// its rows).
+    /// its block rows, counting all of that line's blocks).
     pub fn block_at(&self, drow: usize) -> Option<(usize, usize)> {
         let lines = self.row_starts.len().saturating_sub(1);
-        self.blocks.iter().find_map(|&(line, rows)| {
-            if line < lines && self.hidden(line) {
-                return None;
-            }
-            let start = if line < lines { self.row_starts[line] } else { self.row_count() - rows };
-            (start..start + rows).contains(&drow).then(|| (line, drow - start))
-        })
+        let total = self.row_count();
+        if drow >= total {
+            return None;
+        }
+        // Blocks after the last line end the map.
+        let trailing = self.blocks_above(lines);
+        if drow >= total - trailing {
+            return Some((lines, drow - (total - trailing)));
+        }
+        let line = self.line_at(drow);
+        if line >= lines || self.hidden(line) {
+            return None;
+        }
+        let start = self.row_starts[line];
+        (drow < start + self.blocks_above(line)).then(|| (line, drow - start))
     }
 
     /// Display rows from buffer line `from` on (the ones before it stand).
@@ -223,14 +235,21 @@ impl WrapMap {
         let mut rows = self.row_starts.get(from).copied().unwrap_or(0);
         self.row_starts.truncate(from);
         let (mut next, mut hidden_to) = (0, None);
+        // Blocks are sorted by line: walk them alongside the lines.
+        let mut block = self.blocks.partition_point(|&(line, _)| line < from);
         for row in from..lines {
             while let Some(&(_, last)) = hidden.get(next).filter(|(first, _)| *first <= row) {
                 hidden_to = hidden_to.max(Some(last));
                 next += 1;
             }
+            let mut above = 0;
+            while let Some(&(_, n)) = self.blocks.get(block).filter(|&&(line, _)| line == row) {
+                above += n;
+                block += 1;
+            }
             self.row_starts.push(rows);
             if hidden_to.is_none_or(|to| row > to) {
-                rows += self.blocks_above(row) + 1 + self.breaks[row].len();
+                rows += above + 1 + self.breaks[row].len();
             }
         }
         // Blocks after the last line count in the total.
@@ -339,8 +358,9 @@ mod tests {
         let text: String = (0..30).map(|i| if i % 3 == 0 { format!("{i} {long}\n") } else { format!("line {i}\n") }).collect();
         for wrap in [true, false] {
             let mut doc = Document::from_text(text.clone(), None);
-            doc.fold_rows(10, 12);
-            let mut map = WrapMap::new(key(wrap), doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+            let mut folds = crate::fold::Folds::default();
+            folds.fold_rows(&doc, 10, 12);
+            let mut map = WrapMap::new(key(wrap), doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
             assert_eq!(wrap, map.breaks.iter().any(|b| !b.is_empty()), "long lines wrap");
             let line = |doc: &Document, row: usize| doc.line_start(row);
             let steps: Vec<Box<dyn Fn(&mut Document)>> = vec![
@@ -355,11 +375,13 @@ mod tests {
             ];
             for step in steps {
                 // Two versions at a time, as when frames are skipped.
+                let before = doc.version();
                 step(&mut doc);
                 step(&mut doc);
+                folds.follow(&doc, before);
                 let edits = doc.line_edits_since(map.version).expect("kept");
-                assert!(map.update(edits, doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.)));
-                let fresh = WrapMap::new(key(wrap), doc.version(), doc.folds(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+                assert!(map.update(edits, doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.)));
+                let fresh = WrapMap::new(key(wrap), doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
                 assert_eq!((&map.breaks, &map.row_starts), (&fresh.breaks, &fresh.row_starts));
             }
         }
@@ -374,7 +396,7 @@ mod tests {
         let json = format!("[{}é]", "1,".repeat(649));
         let mut doc = Document::from_text(format!("short\n{json}\n"), None);
         assert!(doc.has_long_lines());
-        let map = WrapMap::new(key.clone(), doc.version(), doc.folds(), doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
+        let map = WrapMap::new(key.clone(), doc.version(), &[], doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
         assert!(map.breaks(0).is_empty());
         assert_eq!(map.breaks(1), [Break { ix: 512, byte: 512, indent: 0 }, Break { ix: 1024, byte: 1024, indent: 0 }]);
         assert_eq!(map.row_count(), 1 + 3 + 1);
@@ -440,6 +462,39 @@ mod tests {
         assert_eq!(map.line_of(3), (1, 0));
         map.set_blocks(&[], &rope);
         assert_eq!((map.row_count(), map.first_display_row(1)), (4, 1));
+    }
+
+    /// Lookups by binary search and the walk in `count_rows` agree with
+    /// counting every row: several blocks on one line, blocks above folded
+    /// lines (no rows) and after the last line.
+    #[gpui::test]
+    fn block_lookups_match_counting_rows(cx: &mut gpui::TestAppContext) {
+        let rope = Rope::from_str(&"x\n".repeat(12));
+        let key = WrapKey { width: gpui::px(0.), font_family: "Menlo".into(), font_size: gpui::px(13.), tab_size: 4, wrap: false };
+        // Lines 5 and 6 folded away (the fold covers them whole).
+        let fold = rope.line_to_byte(5)..rope.line_to_byte(7) - 1;
+        let mut map = cx.update(|cx| WrapMap::new(key, 0, std::slice::from_ref(&fold), &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
+        let blocks = [(0, 1), (2, 2), (2, 1), (5, 3), (9, 1), (13, 2)];
+        map.set_blocks(&blocks, &rope);
+        // Every display row by hand: (line, Some(block row)) or (line, None)
+        // for its text; one past the last line holds the blocks after it.
+        let lines = rope.len_lines();
+        let mut rows: Vec<(usize, Option<usize>)> = Vec::new();
+        for line in (0..=lines).filter(|line| !(5..=6).contains(line)) {
+            let above: usize = blocks.iter().filter(|(l, _)| *l == line).map(|(_, n)| n).sum();
+            rows.extend((0..above).map(|i| (line, Some(i))));
+            if line < lines {
+                rows.push((line, None));
+            }
+        }
+        assert_eq!(map.row_count(), rows.len());
+        for (drow, &(line, block)) in rows.iter().enumerate() {
+            assert_eq!(map.block_at(drow), block.map(|i| (line, i)), "row {drow}");
+            if block.is_none() {
+                assert_eq!(map.first_display_row(line), drow, "line {line}");
+            }
+        }
+        assert_eq!(map.block_at(rows.len()), None);
     }
 
     #[test]

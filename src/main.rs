@@ -27,6 +27,7 @@ mod format;
 mod git;
 mod git_log;
 mod git_panel;
+mod instance;
 mod input_dialog;
 mod keymap;
 mod languages;
@@ -271,6 +272,8 @@ fn main() {
         std::process::exit(cli::extension_command(&raw[1..]));
     }
     let args: Vec<PathBuf> = raw.into_iter().map(PathBuf::from).collect();
+    // A Kuana already running takes the paths; this launch is done.
+    let Ok(instance) = instance::claim(&args) else { return };
 
     #[cfg(target_os = "macos")]
     set_app_name();
@@ -279,6 +282,14 @@ fn main() {
     // open-file events; they're handled once the app is running.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let app = Application::new().with_assets(assets::Assets);
+    // Later launches' paths come the same way (none: just come to the front).
+    if let Some(instance) = instance {
+        let open_tx = open_tx.clone();
+        instance.serve(move |paths| {
+            let urls = paths.iter().filter_map(|p| url::Url::from_file_path(p).ok()).map(String::from).collect();
+            let _ = open_tx.unbounded_send(urls);
+        });
+    }
     app.on_open_urls(move |urls| {
         let _ = open_tx.unbounded_send(urls);
     });
@@ -287,7 +298,13 @@ fn main() {
             use futures::StreamExt as _;
             while let Some(urls) = open_rx.next().await {
                 let paths = cli::paths_from_urls(&urls);
-                if !paths.is_empty() && cx.update(|cx| open_external(paths, cx)).is_err() {
+                let opened = match (urls.is_empty(), paths.is_empty()) {
+                    // A launch without paths: show the running Kuana.
+                    (true, _) => cx.update(|cx| cx.activate(true)),
+                    (false, true) => Ok(()),
+                    (false, false) => cx.update(|cx| open_external(paths, cx)),
+                };
+                if opened.is_err() {
                     break;
                 }
             }

@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     net::{SocketAddr, TcpStream},
     path::Path,
     process::{Child, Command, Stdio},
@@ -175,7 +175,7 @@ fn keep_tail(stream: impl Read + Send + 'static, forward: Option<async_mpsc::Unb
     std::thread::Builder::new()
         .name("dap-stderr".into())
         .spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            crate::lsp::rpc::for_each_line(stream, |line| {
                 if let Some(tx) = &forward {
                     let _ = tx.unbounded_send(Incoming::Output(line.clone()));
                 }
@@ -186,7 +186,7 @@ fn keep_tail(stream: impl Read + Send + 'static, forward: Option<async_mpsc::Unb
                     let cut = tail.ceil_char_boundary(tail.len() - 2000);
                     tail.drain(..cut);
                 }
-            }
+            })
         })
         .ok();
     tail

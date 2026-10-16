@@ -1,6 +1,6 @@
 //! Code folding in the editor: Collapse / Expand actions, the gutter's fold
-//! arrows and the `⋯` placeholder. Regions come from `crate::fold`; folded
-//! text lives in the document so edits keep it in place.
+//! arrows and the `⋯` placeholder. Regions come from `crate::fold`; each
+//! editor keeps its own folds (`Folds`), which follow the document's edits.
 
 use std::{ops::Range, sync::Arc};
 
@@ -37,11 +37,11 @@ impl Editor {
     /// The fold whose header is `row`.
     pub(super) fn fold_under(&self, row: usize, cx: &App) -> Option<Range<usize>> {
         let start = self.doc.read(cx).line_start(row + 1);
-        self.doc.read(cx).folds().iter().find(|f| f.start == start).cloned()
+        self.folds.ranges().iter().find(|f| f.start == start).cloned()
     }
 
     fn fold(&mut self, region: &FoldRegion, cx: &mut Context<Self>) {
-        self.doc.as_mut(cx).fold_rows(region.start + 1, region.end);
+        self.folds.fold_rows(self.doc.read(cx), region.start + 1, region.end);
         // Carets inside move to the end of the header line.
         let header_end = self.doc.read(cx).line_end(region.start);
         let hidden = self.doc.read(cx).line_start(region.start + 1)..self.doc.read(cx).line_end(region.end);
@@ -60,7 +60,7 @@ impl Editor {
     /// Opens the fold under header `row`, or folds the region starting there.
     pub(super) fn toggle_fold_at(&mut self, row: usize, cx: &mut Context<Self>) {
         if let Some(fold) = self.fold_under(row, cx) {
-            self.doc.as_mut(cx).unfold_where(|f| *f == fold);
+            self.folds.unfold_where(|f| *f == fold);
             self.after_fold_change(cx);
         } else if let Some(region) = self.fold_regions(cx).iter().find(|r| r.start == row).cloned() {
             self.fold(&region, cx);
@@ -68,12 +68,12 @@ impl Editor {
     }
 
     /// Opens folds a caret moved into (Go to Line, search, arrow keys).
-    pub(super) fn unfold_at_carets(&mut self, cx: &mut App) {
-        if self.doc.read(cx).folds().is_empty() {
+    pub(super) fn unfold_at_carets(&mut self) {
+        if self.folds.is_empty() {
             return;
         }
         let offsets: Vec<usize> = self.selections.iter().flat_map(|s| [s.anchor, s.head]).collect();
-        self.doc.as_mut(cx).unfold_where(|f| offsets.iter().any(|o| f.contains(o) || *o == f.end));
+        self.folds.unfold_where(|f| offsets.iter().any(|o| f.contains(o) || *o == f.end));
     }
 
     /// Collapse (⌘-): the region at the caret's line, or the innermost open
@@ -97,7 +97,7 @@ impl Editor {
     pub(super) fn expand_region(&mut self, _: &super::ExpandRegion, _: &mut Window, cx: &mut Context<Self>) {
         let row = self.doc.read(cx).row_of(self.primary_selection().head);
         if let Some(fold) = self.fold_under(row, cx) {
-            self.doc.as_mut(cx).unfold_where(|f| *f == fold);
+            self.folds.unfold_where(|f| *f == fold);
             self.after_fold_change(cx);
         }
     }
@@ -112,14 +112,14 @@ impl Editor {
     }
 
     pub(super) fn expand_all(&mut self, _: &super::ExpandAllRegions, _: &mut Window, cx: &mut Context<Self>) {
-        if self.doc.as_mut(cx).unfold_where(|_| true) {
+        if self.folds.unfold_where(|_| true) {
             self.after_fold_change(cx);
         }
     }
 
     /// Folds as (header row, last hidden row), for the session.
     pub fn folded_rows(&self, cx: &App) -> Vec<[usize; 2]> {
-        self.doc.read(cx).folds().iter().map(|f| [self.doc.read(cx).row_of(f.start).saturating_sub(1), self.doc.read(cx).row_of(f.end)]).collect()
+        self.folds.ranges().iter().map(|f| [self.doc.read(cx).row_of(f.start).saturating_sub(1), self.doc.read(cx).row_of(f.end)]).collect()
     }
 
     /// Folds saved rows again, where the file still has those regions.

@@ -23,10 +23,21 @@ pub struct Watcher {
 
 impl Watcher {
     /// Starts watching `root` recursively; changes come out of the receiver.
+    /// When the system lost track (its queue overflowed, it asks for a
+    /// rescan), the batch holds `root` itself: anything may have changed.
     pub fn new(root: &Path) -> notify::Result<(Watcher, UnboundedReceiver<Vec<FsChange>>)> {
         let (tx, rx) = unbounded();
+        let everything = root.to_path_buf();
         let mut inner = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let Ok(event) = event else { return };
+            let event = match event {
+                Ok(event) if !event.need_rescan() => event,
+                // Events were lost: like Zed, look at everything again
+                // (rather than polling Git all the time to catch this).
+                _ => {
+                    let _ = tx.unbounded_send(vec![FsChange { path: everything.clone(), structural: true }]);
+                    return;
+                }
+            };
             let structural = match event.kind {
                 // Reads and attribute changes don't change anything shown.
                 EventKind::Access(_) | EventKind::Modify(ModifyKind::Metadata(_)) => return,

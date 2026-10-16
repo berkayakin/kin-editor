@@ -485,10 +485,7 @@ impl Settings {
         if updated == text {
             return Ok(());
         }
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, updated)
+        crate::state::write_atomic(&path, updated.as_bytes())
     }
 
     /// Whether `key` is set in the top level of `settings.json`.

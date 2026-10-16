@@ -3,6 +3,71 @@
 //! bracket or tag at the region's own indent folds with it, so a folded
 //! function reads `fn main() { ⋯ }`.
 
+use std::ops::Range;
+
+use crate::document::{Document, Patch};
+
+/// One editor's folded text (two editors of a file fold apart, as in Zed):
+/// from the start of the first hidden line to the end of the last, sorted.
+/// Edits move folds; an edit touching one opens it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Folds(Vec<Range<usize>>);
+
+impl Folds {
+    pub fn ranges(&self) -> &[Range<usize>] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Hides rows `start..=end` of `doc` (never the first line).
+    pub fn fold_rows(&mut self, doc: &Document, start: usize, end: usize) {
+        if start == 0 || start >= doc.line_count() {
+            return;
+        }
+        let range = doc.line_start(start)..doc.line_end(end.min(doc.line_count() - 1));
+        if !range.is_empty() && !self.0.contains(&range) {
+            self.0.push(range);
+            self.0.sort_by_key(|f| f.start);
+        }
+    }
+
+    /// Opens the folds `unfold` matches; returns whether any opened.
+    pub fn unfold_where(&mut self, mut unfold: impl FnMut(&Range<usize>) -> bool) -> bool {
+        let before = self.0.len();
+        self.0.retain(|f| !unfold(f));
+        self.0.len() != before
+    }
+
+    /// Follows a transaction's edits: folds after them move, ones they touch open.
+    pub fn shift(&mut self, patch: &Patch) {
+        self.0.retain_mut(|f| {
+            let (mut delta, near) = patch.around(f.clone());
+            for (range, new_len) in near {
+                if range.end < f.start {
+                    delta += Patch::change(range, *new_len);
+                } else if range.start <= f.end {
+                    return false;
+                }
+            }
+            let moved = |offset: usize| (offset as isize + delta).max(0) as usize;
+            *f = moved(f.start)..moved(f.end);
+            true
+        });
+    }
+
+    /// Catches up with `doc`'s edits since `version`; all open when those
+    /// aren't kept any more.
+    pub fn follow(&mut self, doc: &Document, version: u64) {
+        match doc.patches_since(version) {
+            Some(patches) => patches.for_each(|patch| self.shift(patch)),
+            None => self.0.clear(),
+        }
+    }
+}
+
 /// Lines that can fold under a header line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldRegion {

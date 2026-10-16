@@ -60,6 +60,10 @@ pub struct FileStatus {
     pub staged: Option<Change>,
     /// Change in the working tree not yet staged, if any.
     pub unstaged: Option<Change>,
+    /// The file's blob ids at HEAD and in the index ("hH hI"; for a conflict
+    /// its stages'): staging part of it elsewhere (`git add -p`) changes
+    /// these even when the kind of change stays the same. None if untracked.
+    pub blobs: Option<String>,
 }
 
 impl FileStatus {
@@ -153,11 +157,35 @@ const REPOSITORY_VARS: &[&str] = &[
     "GIT_PREFIX",
 ];
 
-fn command(root: &Path) -> Command {
+/// What a repository's own config may name to run, turned off where the
+/// folder isn't trusted (Restricted Mode), as Zed does: hooks, an SSH command,
+/// credential helpers, the `ext::` transport and external diff programs.
+const UNTRUSTED_CONFIG: &[&str] =
+    &["core.hooksPath=/dev/null", "core.sshCommand=ssh", "credential.helper=", "protocol.ext.allow=never", "diff.external="];
+
+/// `git <args>` in `root`.
+fn command(root: &Path, args: &[&str]) -> Command {
+    command_in(root, args, crate::trust::is_trusted(root))
+}
+
+/// `git <args>` in `root`, a folder trusted or not.
+fn command_in(root: &Path, args: &[&str], trusted: bool) -> Command {
     let mut cmd = crate::process::command("git");
-    // A repository's config can name a program for `git status` to run.
-    if !crate::trust::is_trusted(root) {
-        cmd.args(["-c", "core.fsmonitor=false"]);
+    // A repository's config can name a program for `git status` to run; and
+    // signature lines (`log.showSignature`) run gpg and break --format output.
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "log.showSignature=false"]);
+    if !trusted {
+        for setting in UNTRUSTED_CONFIG {
+            cmd.args(["-c", setting]);
+        }
+    }
+    if let Some((subcommand, rest)) = args.split_first() {
+        cmd.arg(subcommand);
+        // Right after the subcommand: after `--` it would be a path.
+        if !trusted && *subcommand == "diff" {
+            cmd.arg("--no-ext-diff");
+        }
+        cmd.args(rest);
     }
     cmd.current_dir(root)
         // Never block on an interactive prompt: fail fast instead.
@@ -186,8 +214,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Runs git and returns stdout as it is (file contents in any encoding).
 fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = command(root)
-        .args(args)
+    let output = command(root, args)
         .output()
         .map_err(|e| format!("couldn't run git: {e}"))?;
     if output.status.success() {
@@ -198,8 +225,7 @@ fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn run_with_stdin(root: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
-    let mut child = command(root)
-        .args(args)
+    let mut child = command(root, args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -296,11 +322,12 @@ fn change_for(c: char) -> Option<Change> {
 fn parse_status(root: &Path, out: &str) -> RepoStatus {
     let mut status = RepoStatus::default();
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
-    let file = |rel: &str, staged, unstaged| FileStatus {
+    let file = |rel: &str, staged, unstaged, blobs: Option<String>| FileStatus {
         path: root.join(rel),
         rel: rel.to_string(),
         staged,
         unstaged,
+        blobs,
     };
     while let Some(entry) = fields.next() {
         if let Some(header) = entry.strip_prefix("# ") {
@@ -332,7 +359,7 @@ fn parse_status(root: &Path, out: &str) -> RepoStatus {
                     continue;
                 }
                 let xy: Vec<char> = parts[1].chars().collect();
-                status.files.push(file(parts[n], change_for(xy[0]), change_for(xy[1])));
+                status.files.push(file(parts[n], change_for(xy[0]), change_for(xy[1]), Some(parts[6..8].join(" "))));
                 if kind == '2' {
                     fields.next(); // the original path of a rename
                 }
@@ -340,11 +367,11 @@ fn parse_status(root: &Path, out: &str) -> RepoStatus {
             'u' => {
                 let parts: Vec<&str> = entry.splitn(11, ' ').collect();
                 if let Some(rel) = parts.get(10) {
-                    status.files.push(file(rel, Some(Change::Conflicted), Some(Change::Conflicted)));
+                    status.files.push(file(rel, Some(Change::Conflicted), Some(Change::Conflicted), Some(parts[7..10].join(" "))));
                 }
             }
             '?' => {
-                status.files.push(file(&entry[2..], None, Some(Change::Untracked)));
+                status.files.push(file(&entry[2..], None, Some(Change::Untracked), None));
             }
             // A folder ends with a slash.
             '!' => status.ignored.push(root.join(entry[2..].trim_end_matches('/'))),
@@ -373,6 +400,49 @@ pub fn head_blob(root: &Path, rel: &str) -> Option<Vec<u8>> {
 /// A file's bytes in the index.
 pub fn index_blob(root: &Path, rel: &str) -> Option<Vec<u8>> {
     run_bytes(root, &["show", &format!(":{rel}")]).ok()
+}
+
+/// Several objects' bytes from one `git cat-file --batch` (as Zed loads
+/// open files' diff bases), e.g. `HEAD:src/a.rs` and `:src/a.rs` (the
+/// index): one process however many files. None for what doesn't exist.
+pub fn read_blobs(root: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut child = command(root, &["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("couldn't run git: {e}"))?;
+    // Written on another thread: git answers as it reads, and a long list
+    // could fill both pipes.
+    let input: String = specs.iter().map(|s| if s.contains('\n') { "\n".to_string() } else { format!("{s}\n") }).collect();
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = writer.join();
+    parse_batch(&output.stdout, specs.len())
+}
+
+/// `cat-file --batch` output: per object `<oid> <type> <size>\n<bytes>\n`, or
+/// `<spec> missing\n` (also for an empty line).
+fn parse_batch(mut out: &[u8], count: usize) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let mut blobs = Vec::with_capacity(count);
+    while blobs.len() < count {
+        let end = out.iter().position(|&b| b == b'\n').ok_or("git cat-file stopped early")?;
+        let header = String::from_utf8_lossy(&out[..end]).into_owned();
+        out = &out[end + 1..];
+        let mut words = header.rsplitn(3, ' ');
+        match (words.next().and_then(|n| n.parse::<usize>().ok()), words.next()) {
+            (Some(size), Some(_kind)) if out.len() > size => {
+                blobs.push(Some(out[..size].to_vec()));
+                out = &out[size + 1..];
+            }
+            _ => blobs.push(None),
+        }
+    }
+    Ok(blobs)
 }
 
 /// A file's text as an editor holds it (decoded, LF line ends), and how to
@@ -748,8 +818,7 @@ pub fn start_clone(parent: &Path, url: &str, name: &str, shallow: bool) -> Resul
         args.extend(["--depth", "1"]);
     }
     args.extend(["--", url, name]);
-    let mut child = command(parent)
-        .args(&args)
+    let mut child = command(parent, &args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1667,7 +1736,7 @@ fn parse_name_status(out: &str) -> Vec<CommitFile> {
 /// The raw bytes of a file version (`HEAD:path`, `:path` for the index),
 /// `None` if it isn't there. For images and other binary files.
 pub fn blob_bytes(root: &Path, spec: &str) -> Option<Vec<u8>> {
-    let output = command(root).args(["show", spec]).stderr(Stdio::null()).output().ok()?;
+    let output = command(root, &["show", spec]).stderr(Stdio::null()).output().ok()?;
     output.status.success().then_some(output.stdout)
 }
 
@@ -1839,12 +1908,58 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
 
     #[test]
     fn git_runs_on_the_given_folder_whatever_the_environment_says() {
-        let cmd = command(Path::new("/some/project"));
+        let cmd = command(Path::new("/some/project"), &["status"]);
         let removed: Vec<_> = cmd.get_envs().filter(|(_, value)| value.is_none()).map(|(key, _)| key.to_string_lossy().into_owned()).collect();
         for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
             assert!(removed.iter().any(|r| r == var), "{var} isn't cleared: {removed:?}");
         }
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/some/project")));
+    }
+
+    /// In a folder that isn't trusted, what the repository's config names
+    /// to run is turned off (as in Zed), and diffs use no external program.
+    #[test]
+    fn reads_cat_file_batches() {
+        let out = b"abc blob 5\nhello\nHEAD:gone.rs missing\ndef blob 0\n\n";
+        assert_eq!(parse_batch(out, 3).unwrap(), [Some(b"hello".to_vec()), None, Some(Vec::new())]);
+        assert!(parse_batch(b"abc blob 5\nhel", 1).unwrap() == [None] || parse_batch(b"abc blob 5\nhel", 1).is_err());
+        if !is_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kuana-git-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init(&dir).unwrap();
+        for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com")] {
+            run(&dir, &["config", k, v]).unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run(&dir, &["add", "a.txt"]).unwrap();
+        run(&dir, &["commit", "-m", "first"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        run(&dir, &["add", "a.txt"]).unwrap();
+        let specs = ["HEAD:a.txt", ":a.txt", "HEAD:none.txt"].map(String::from);
+        let blobs = read_blobs(&dir, &specs).unwrap();
+        assert_eq!(blobs, [Some(b"one\n".to_vec()), Some(b"two\n".to_vec()), None]);
+        // The status keeps each file's HEAD and index blobs.
+        let status = status(&dir).unwrap();
+        assert!(status.files[0].blobs.as_deref().is_some_and(|b| b.split(' ').count() == 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn untrusted_repositories_run_none_of_their_programs() {
+        let args = |cmd: &Command| cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let untrusted = Path::new("/kuana-untrusted-test/repo");
+        let diff = args(&command_in(untrusted, &["diff", "--", "a.rs"], false));
+        for setting in UNTRUSTED_CONFIG.iter().chain(&["core.fsmonitor=false", "log.showSignature=false"]) {
+            assert!(diff.iter().any(|a| a == setting), "{setting} missing: {diff:?}");
+        }
+        let at = |name: &str| diff.iter().position(|a| a == name).unwrap();
+        assert_eq!(at("--no-ext-diff"), at("diff") + 1, "{diff:?}");
+        assert!(at("--no-ext-diff") < at("--"));
+        assert!(!args(&command_in(untrusted, &["status"], false)).iter().any(|a| a == "--no-ext-diff"));
+        assert!(!args(&command_in(untrusted, &["diff"], true)).iter().any(|a| a == "--no-ext-diff" || a == "credential.helper="));
     }
 
     #[test]

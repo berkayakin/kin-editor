@@ -6,7 +6,6 @@
 //! Attach to Process lists.
 
 use std::{
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -542,7 +541,7 @@ pub type Build = Arc<Mutex<Option<std::process::Child>>>;
 /// Builds with cargo (`build …` or `test --no-run …`) and returns the
 /// executable it made. Cargo's progress and compiler messages go to
 /// `on_line` as they come. Blocks: run it off the main thread.
-pub fn cargo_build(cwd: &Path, args: &[String], build: &Build, mut on_line: impl FnMut(String) + Send + 'static) -> Result<PathBuf, String> {
+pub fn cargo_build(cwd: &Path, args: &[String], build: &Build, on_line: impl FnMut(String) + Send + 'static) -> Result<PathBuf, String> {
     let mut command = crate::process::command("cargo");
     command
         .args(args)
@@ -558,17 +557,18 @@ pub fn cargo_build(cwd: &Path, args: &[String], build: &Build, mut on_line: impl
     let stderr = child.stderr.take().ok_or("no output from cargo")?;
     *build.lock().unwrap() = Some(child);
     // Progress and rendered diagnostics come on stderr.
-    let progress = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            on_line(line);
+    // Read to the end even past a line that isn't UTF-8: cargo would fail
+    // writing to a pipe nobody reads.
+    let progress = std::thread::spawn(move || crate::lsp::rpc::for_each_line(stderr, on_line));
+    let mut artifacts: Vec<Value> = Vec::new();
+    crate::lsp::rpc::for_each_line(stdout, |line| {
+        if let Ok(message) = serde_json::from_str::<Value>(&line)
+            && message["reason"] == "compiler-artifact"
+            && message["executable"].is_string()
+        {
+            artifacts.push(message);
         }
     });
-    let artifacts: Vec<Value> = BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|m| m["reason"] == "compiler-artifact" && m["executable"].is_string())
-        .collect();
     let _ = progress.join();
     let status = build.lock().unwrap().take().map(|mut child| child.wait());
     match status {

@@ -80,7 +80,7 @@ impl Workspace {
         let python_venv = crate::python::choice(&root).map(|c| c.to_saved());
         let terminals = Some(self.terminal_layout(cx));
         let last_run = self.last_run.clone();
-        let session = ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals, last_run };
+        let session = ProjectSession { root, tabs, active, layout, expanded, breakpoints, python_venv, terminals, last_run, other: Default::default() };
         Some(SessionSnapshot { session, unsaved })
     }
 
@@ -104,7 +104,12 @@ impl Workspace {
 
     /// Reopens the tabs the project had last time, with their unsaved edits.
     pub(super) fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.root.as_deref().and_then(ProjectSession::load) else {
+        let session = self.root.as_deref().and_then(ProjectSession::load);
+        // A session or state file that didn't read was kept aside: say where.
+        for problem in crate::state::take_problems() {
+            self.toast(ToastKind::Error, "Couldn't read a saved session", Some(problem), cx);
+        }
+        let Some(session) = session else {
             return;
         };
         // Tabs read their files when first shown (see `Editor::load`): the

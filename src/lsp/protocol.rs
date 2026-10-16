@@ -179,25 +179,36 @@ pub fn workspace_symbols(value: &Value) -> Vec<(String, Option<String>, Location
         .collect()
 }
 
+/// One file's part of a WorkspaceEdit.
+#[derive(Clone, Debug)]
+pub struct FileEdits {
+    pub path: PathBuf,
+    /// The document version the edits were computed for (`documentChanges`
+    /// carry it): they apply to that text, which may be older than today's.
+    pub version: Option<u64>,
+    pub edits: Vec<TextEdit>,
+}
+
 /// The text edits of a WorkspaceEdit, per file. File creation, renames and
-/// deletions are not supported and skipped.
-pub fn workspace_edit(value: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
-    let mut out: Vec<(PathBuf, Vec<TextEdit>)> = Vec::new();
+/// deletions are not supported (the client doesn't announce them) and skipped.
+pub fn workspace_edit(value: &Value) -> Vec<FileEdits> {
+    let mut out: Vec<FileEdits> = Vec::new();
     if let Some(changes) = value.get("documentChanges").and_then(Value::as_array) {
         for change in changes {
             let (Some(doc), Some(edits)) = (change.get("textDocument"), change.get("edits")) else { continue };
             if let Some(path) = doc.get("uri").and_then(Value::as_str).and_then(uri_to_path) {
-                out.push((path, text_edits(Some(edits))));
+                let version = doc.get("version").and_then(Value::as_u64);
+                out.push(FileEdits { path, version, edits: text_edits(Some(edits)) });
             }
         }
     } else if let Some(changes) = value.get("changes").and_then(Value::as_object) {
         for (uri, edits) in changes {
             if let Some(path) = uri_to_path(uri) {
-                out.push((path, text_edits(Some(edits))));
+                out.push(FileEdits { path, version: None, edits: text_edits(Some(edits)) });
             }
         }
     }
-    out.retain(|(_, edits)| !edits.is_empty());
+    out.retain(|f| !f.edits.is_empty());
     out
 }
 
@@ -719,10 +730,14 @@ mod tests {
         assert_eq!(locs[0].range.start, Position { line: 1, character: 3 });
         assert!(locations(&Value::Null).is_empty());
 
-        let edit = json!({ "changes": { a_uri: [{ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x" }] } });
+        let edit = json!({ "changes": { a_uri.clone(): [{ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x" }] } });
         let files = workspace_edit(&edit);
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].1[0].new_text, "x");
+        assert_eq!((files[0].edits[0].new_text.as_str(), files[0].version), ("x", None));
+        // `documentChanges` say which version of the file they're for.
+        let edit = json!({ "documentChanges": [{ "textDocument": { "uri": a_uri, "version": 7 },
+            "edits": [{ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "y" }] }] });
+        assert_eq!(workspace_edit(&edit)[0].version, Some(7));
     }
 
     #[test]

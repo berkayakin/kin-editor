@@ -330,6 +330,7 @@ impl Workspace {
         let Some(ix) = self.tabs.iter().position(|t| t == editor) else { return };
         self.tabs.remove(ix);
         self.pinned.remove(&editor.entity_id());
+        self.tab_subscriptions.remove(&editor.entity_id());
         let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
         if let Some(sibling) = self.siblings(editor, cx).into_iter().next() {
             // The document stays open in another tab: it takes over.

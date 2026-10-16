@@ -32,7 +32,7 @@ impl Editor {
             self.set_selections(vec![Selection::cursor(base + len)], 0, cx);
             return;
         };
-        self.doc.as_mut(cx).snippet = (stops.len() > 1).then_some(SnippetStops { stops, current: 0 });
+        self.snippet = (stops.len() > 1).then_some(SnippetStops { stops, current: 0 });
         self.select_stop(&first, cx);
     }
 
@@ -45,7 +45,7 @@ impl Editor {
     /// reaching the last ends it. False when no snippet is being filled in
     /// here, so the key does its usual thing.
     pub(super) fn snippet_tab(&mut self, step: isize, cx: &mut Context<Self>) -> bool {
-        let Some(mut snippet) = self.doc.as_mut(cx).snippet.take() else { return false };
+        let Some(mut snippet) = self.snippet.take() else { return false };
         let head = self.primary_selection().head;
         // The caret left the snippet: it's done.
         if !snippet.stops[snippet.current].iter().any(|r| r.start <= head && head <= r.end) {
@@ -55,7 +55,7 @@ impl Editor {
         snippet.current = (snippet.current as isize + step).clamp(0, last as isize) as usize;
         let ranges = snippet.stops[snippet.current].clone();
         if snippet.current < last {
-            self.doc.as_mut(cx).snippet = Some(snippet);
+            self.snippet = Some(snippet);
         }
         self.select_stop(&ranges, cx);
         true

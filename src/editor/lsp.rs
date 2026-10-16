@@ -112,9 +112,6 @@ pub(super) struct EditorLsp {
     link_none: Option<std::ops::Range<usize>>,
     pub(super) signature: Option<SignatureHelp>,
     signature_task: Option<Task<()>>,
-    /// Each server's diagnostics as received (by `Server::id`), for code
-    /// action requests: a server gets its own back.
-    raw_diagnostics: Vec<(String, Vec<Value>)>,
     /// The server reports diagnostics, so the built-in syntax check is redundant.
     pub(super) active: bool,
     /// Other uses of the symbol at the caret (`textDocument/documentHighlight`),
@@ -238,6 +235,10 @@ impl Editor {
         self.schedule_parse(cx);
         if let (Some(store), Some(path)) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.read(cx).path.clone()) {
             let changes = self.doc.as_mut(cx).take_lsp_changes();
+            if !changes.is_empty() {
+                // What servers answer for this version is read in this text.
+                self.doc.as_mut(cx).note_lsp_version();
+            }
             store.read(cx).did_change(&path, self.doc.read(cx).version(), changes, self.doc.read(cx).rope());
         }
         self.lsp.hover = None;
@@ -253,18 +254,24 @@ impl Editor {
         }
     }
 
-    /// The document's diagnostics from its servers, all of them together.
-    pub fn set_lsp_diagnostics(&mut self, sources: Vec<crate::lsp::LspDiagnostics>, cx: &mut Context<Self>) {
-        let mut diagnostics = Vec::new();
-        self.lsp.raw_diagnostics.clear();
-        for source in sources {
-            let name = diagnostic_source(&source.server);
-            diagnostics.extend(protocol::diagnostics(&source.params, self.doc.read(cx).rope(), source.encoding, name));
-            let raw = source.params.get("diagnostics").and_then(Value::as_array).cloned().unwrap_or_default();
-            self.lsp.raw_diagnostics.push((source.id, raw));
-        }
+    /// One server's diagnostics for the document, as it published them.
+    /// They're read in the text of the version they were computed for (the
+    /// server may be some edits behind) and moved to today's text, as Zed
+    /// does; one for a version no longer known is dropped (a newer one
+    /// follows). The other servers' diagnostics stay as they are.
+    pub fn set_server_diagnostics(&mut self, source: crate::lsp::LspDiagnostics, cx: &mut Context<Self>) {
+        let name = diagnostic_source(&source.server);
+        let doc = self.doc.read(cx);
+        let diagnostics = match source.params.get("version").and_then(Value::as_u64) {
+            Some(version) => doc
+                .text_at_lsp_version(version)
+                .map(|text| protocol::diagnostics(&source.params, text, source.encoding, name))
+                .and_then(|found| doc.diagnostics_since(version, found)),
+            None => Some(protocol::diagnostics(&source.params, doc.rope(), source.encoding, name)),
+        };
+        let Some(mut diagnostics) = diagnostics else { return };
         diagnostics.sort_by_key(|d| d.range.start);
-        self.doc.as_mut(cx).set_lsp_diagnostics(diagnostics);
+        self.doc.as_mut(cx).set_server_diagnostics(&source.id, diagnostics);
         // The server has (re)analysed the file: its hints may have changed too.
         self.schedule_inlay_hints(cx);
         self.schedule_code_lenses(cx);
@@ -274,6 +281,12 @@ impl Editor {
             self.linted_version = None;
             self.schedule_lint(std::time::Duration::ZERO, cx);
         }
+        cx.notify();
+    }
+
+    /// A server stopped or restarts: what it found goes.
+    pub fn clear_server_diagnostics(&mut self, server: &str, cx: &mut Context<Self>) {
+        self.doc.as_mut(cx).clear_server_diagnostics(server);
         cx.notify();
     }
 
@@ -756,11 +769,9 @@ impl Editor {
     /// in the meantime).
     pub(super) fn schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
         if self.mode != EditorMode::Full || self.doc.read(cx).large || !self.file_settings.inlay_hints {
+            // Off here: another editor of the file may show the document's
+            // hints, so they stay (this one just doesn't draw them).
             self.lsp.inlay_task = None;
-            if !self.doc.read(cx).inlay_hints().is_empty() {
-                self.doc.as_mut(cx).set_inlay_hints(Vec::new());
-                cx.notify();
-            }
             return;
         }
         self.lsp.inlay_task = Some(cx.spawn(async move |this, cx| {
@@ -1047,6 +1058,8 @@ impl Editor {
                         cx.emit(EditorLspEvent::Navigate { title, locations, encoding: server.encoding });
                     }
                 }
+                // The server dropped it (the text changed meanwhile): not an error.
+                Err(err) if err.is_cancelled() => {}
                 Err(err) => cx.emit(EditorLspEvent::Message(err.message.into())),
             })
             .ok();
@@ -1088,16 +1101,18 @@ impl Editor {
         let range = self.primary_selection().range();
         let rope = self.doc.read(cx).rope().clone();
         let Some(document) = self.text_document(cx) else { return };
-        // Each server is asked for fixes for its own problems under the caret.
+        let (store, path) = (self.lsp.store.as_ref().and_then(|s| s.upgrade()), self.doc.read(cx).path.clone());
+        // Each server is asked for fixes for its own problems under the caret,
+        // as it published them (kept by the store, for every editor of the file).
         let requests: Vec<(Arc<Server>, Value)> = servers
             .into_iter()
             .map(|server| {
-                let diagnostics: Vec<Value> = self
-                    .lsp
-                    .raw_diagnostics
+                let published = match (&store, &path) {
+                    (Some(store), Some(path)) => store.read(cx).published(path, &server.id),
+                    _ => Vec::new(),
+                };
+                let diagnostics: Vec<Value> = published
                     .iter()
-                    .filter(|(id, _)| *id == server.id)
-                    .flat_map(|(_, raw)| raw)
                     .filter(|d| {
                         protocol::LspRange::from_json(d.get("range").unwrap_or(&Value::Null))
                             .map(|r| protocol::range_to_offsets(&rope, r, server.encoding))
@@ -1628,9 +1643,8 @@ mod tests {
             let mut messages: Vec<&str> = e.doc.read(cx).diagnostics.iter().map(|d| &*d.message).filter(|m| m.ends_with(" problem")).collect();
             messages.sort();
             assert_eq!(messages, ["extra problem", "main problem"]);
-            let ids: Vec<&str> = e.lsp.raw_diagnostics.iter().map(|(id, raw)| (id.as_str(), raw.len())).map(|(id, _)| id).collect();
-            assert_eq!(ids.len(), 2);
-            assert!(ids.contains(&"fake-main") && ids.contains(&"fake-extra"));
+            let store = store.read(cx);
+            assert_eq!((store.published(&path, "fake-main").len(), store.published(&path, "fake-extra").len()), (1, 1));
         });
         store.read_with(cx, |s, _| assert_eq!(s.status(&path), Some(LspStatus::Ready("python3, python3".into()))));
 

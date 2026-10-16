@@ -2,11 +2,102 @@
 //! project's open tabs). Kept separate from `settings.json`, which holds user
 //! preferences.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 
 use crate::{document::Breakpoint, run::RunTarget, theme::config_dir};
+
+/// Writes a file whole or not at all: to a temporary file in the same
+/// folder, flushed to disk, then renamed over it, so a crash or a full disk
+/// mid-write never leaves it truncated. A symlinked file (dotfiles repos)
+/// stays a link: its target is written.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // Its own temporary file: writes can overlap (background session saves,
+    // another window), and one mustn't rename another's half-written file.
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = target.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()));
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    if let Err(err) = written.and_then(|_| std::fs::rename(&temp, &target)) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Problems reading Kuana's own files (a session or state that didn't
+/// parse and was kept aside), for the next window to show.
+static PROBLEMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What went wrong reading Kuana's files since last asked.
+pub fn take_problems() -> Vec<String> {
+    PROBLEMS.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default()
+}
+
+/// Moves an unreadable file aside (`<name>.corrupt-<unix time>`) instead of
+/// letting the next save overwrite it, and notes it for the user.
+pub fn set_aside(path: &Path, what: &str, error: impl std::fmt::Display) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let aside = path.with_file_name(format!("{name}.corrupt-{secs}"));
+    let message = match std::fs::rename(path, &aside) {
+        Ok(()) => format!("{what} couldn't be read ({error}); it was kept as {}", aside.display()),
+        Err(err) => format!("{what} couldn't be read ({error}) or kept aside ({err})"),
+    };
+    eprintln!("{message}");
+    if let Ok(mut problems) = PROBLEMS.lock() {
+        problems.push(message);
+    }
+}
+
+/// Reads JSON a newer or older Kuana may have written: a value of the wrong
+/// shape costs only its own key (and keys this version doesn't know are
+/// ignored or kept in a flattened map), never the whole file. Err only when
+/// the text isn't a JSON object at all.
+pub fn read_lenient<T: DeserializeOwned + Default>(text: &str) -> Result<T, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(map) = value else { return Err("not a JSON object".into()) };
+    if let Ok(whole) = serde_json::from_value(serde_json::Value::Object(map.clone())) {
+        return Ok(whole);
+    }
+    let mut kept = serde_json::Map::new();
+    for (key, value) in map {
+        kept.insert(key.clone(), value);
+        if serde_json::from_value::<T>(serde_json::Value::Object(kept.clone())).is_err() {
+            kept.remove(&key);
+        }
+    }
+    Ok(serde_json::from_value(serde_json::Value::Object(kept)).unwrap_or_default())
+}
+
+/// A list where an entry that doesn't read (written by another version) is
+/// skipped instead of failing the rest.
+fn skip_bad<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(values.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
+}
+
+/// An optional value that doesn't read (another version's) becomes None.
+fn none_if_bad<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
 
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
@@ -90,19 +181,21 @@ impl SessionState {
         }
     }
 
+    /// The saved state; a value that doesn't read costs only its key, and a
+    /// file that isn't JSON at all is kept aside (and reported) rather than
+    /// overwritten with defaults.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Some(path) = Self::path() else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
+        read_lenient(&text).unwrap_or_else(|err| {
+            set_aside(&path, "Kuana's window state (state.json)", err);
+            Self::default()
+        })
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)? + "\n")
+        write_atomic(&path, (serde_json::to_string_pretty(self)? + "\n").as_bytes())
     }
 }
 
@@ -112,28 +205,36 @@ impl SessionState {
 #[serde(default)]
 pub struct ProjectSession {
     pub root: PathBuf,
+    /// A tab another Kuana version wrote in a way this one can't read is
+    /// skipped, never the others (they hold unsaved text).
+    #[serde(deserialize_with = "skip_bad")]
     pub tabs: Vec<TabSession>,
     /// Index into `tabs` of the focused tab.
     pub active: usize,
     /// Split panes; absent for a single pane.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "none_if_bad")]
     pub layout: Option<PaneLayout>,
     /// Expanded folders in the file tree, relative to `root`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "skip_bad")]
     pub expanded: Vec<PathBuf>,
     /// Line breakpoints per file, open or not.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", deserialize_with = "skip_bad")]
     pub breakpoints: Vec<FileBreakpoints>,
     /// The Python venv picked for the project (a path, or "off"); detected
     /// when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "none_if_bad")]
     pub python_venv: Option<String>,
     /// The terminal panel; absent in sessions from before it was saved.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "none_if_bad")]
     pub terminals: Option<TerminalLayout>,
-    /// The configuration the title bar's run widget shows (Run runs it again).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The configuration the title bar's run widget shows (Run runs it
+    /// again); one from a newer Kuana (a new way to debug) is dropped.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "none_if_bad")]
     pub last_run: Option<RunTarget>,
+    /// Keys this version doesn't know (a newer Kuana wrote them), kept so
+    /// that saving here doesn't drop them.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The terminal panel's shells, by group (splits side by side).
@@ -240,27 +341,49 @@ impl ProjectSession {
         config_dir().map(|d| d.join("sessions").join(Self::file_name(root)))
     }
 
+    /// The project's last session. It may hold the only copy of unsaved
+    /// text, so it's read leniently (a part another Kuana version wrote
+    /// differently is skipped, not the rest), and a file that doesn't read
+    /// at all is kept aside and reported instead of being overwritten by
+    /// the next save.
     pub fn load(root: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(Self::path(root)?).ok()?;
-        serde_json::from_str::<Self>(&text).ok().filter(|s| s.root == root)
+        let path = Self::path(root)?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        match read_lenient::<Self>(&text) {
+            Ok(session) => {
+                if !session.other.is_empty()
+                    && let Ok(mut kept) = KEPT_KEYS.lock()
+                {
+                    kept.insert(root.to_path_buf(), session.other.clone());
+                }
+                Some(session).filter(|s| s.root == root)
+            }
+            Err(err) => {
+                set_aside(&path, &format!("The session of {}", root.display()), err);
+                None
+            }
+        }
     }
 
-    /// Written to a temporary file first, so a crash mid-write can't leave
-    /// a truncated session (and lose the unsaved text in it).
+    /// Written whole or not at all (see `write_atomic`), so a crash
+    /// mid-write can't lose the unsaved text in it.
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::path(&self.root).ok_or_else(|| std::io::Error::other("no config directory"))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        let mut value = serde_json::to_value(self)?;
+        // Keys a newer Kuana wrote, read with the session, go back with it.
+        if let (Some(map), Some(kept)) = (value.as_object_mut(), KEPT_KEYS.lock().ok().and_then(|k| k.get(&self.root).cloned())) {
+            for (key, old) in kept {
+                map.entry(key).or_insert(old);
+            }
         }
-        // Its own temporary file: saves can overlap now that they run in
-        // the background, and one mustn't rename another's half-written file.
-        static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_extension(format!("json.{}-{n}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)? + "\n")?;
-        std::fs::rename(tmp, path)
+        write_atomic(&path, (serde_json::to_string_pretty(&value)? + "\n").as_bytes())
     }
 }
+
+/// Per project, the session keys this version doesn't know (see
+/// `ProjectSession::other`), kept from its load for its saves.
+static KEPT_KEYS: Mutex<std::collections::BTreeMap<PathBuf, serde_json::Map<String, serde_json::Value>>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// FNV-1a: a hash that, unlike std's, is stable across Rust versions.
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -313,6 +436,7 @@ mod tests {
                 rows: 0..0,
                 debug: Some(DebugSpec::Cargo { build: vec!["test".into(), "--no-run".into()], args: vec!["tests".into()] }),
             }),
+            other: Default::default(),
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);
@@ -328,5 +452,59 @@ mod tests {
         };
         let json = serde_json::to_string(&go).unwrap();
         assert_eq!(serde_json::from_str::<RunTarget>(&json).unwrap(), go);
+    }
+
+    /// A session written by another Kuana version still brings back its
+    /// unsaved text: a way to debug this one doesn't know, a tab of a newer
+    /// shape and a new key cost only themselves.
+    #[test]
+    fn sessions_from_other_versions_keep_their_unsaved_text() {
+        let text = r#"{
+            "root": "/work/p",
+            "tabs": [
+                { "path": "/work/p/a.rs", "cursor": 3, "unsaved": "draft" },
+                { "path": 7 },
+                { "cursor": 0, "unsaved": "untitled" }
+            ],
+            "active": 1,
+            "expanded": "not a list",
+            "last_run": { "name": "x", "command": "x", "cwd": "/", "debug": { "Wasm": { "module": "m" } } },
+            "minimap": { "on": true }
+        }"#;
+        let session: ProjectSession = read_lenient(text).unwrap();
+        let unsaved: Vec<_> = session.tabs.iter().map(|t| t.unsaved.as_deref()).collect();
+        assert_eq!(unsaved, [Some("draft"), Some("untitled")]);
+        assert!(session.expanded.is_empty() && session.last_run.is_none());
+        assert_eq!(session.other.get("minimap"), Some(&serde_json::json!({ "on": true })));
+        assert!(read_lenient::<ProjectSession>("{ truncated").is_err());
+        // State with one bad value keeps the rest.
+        let state: SessionState = read_lenient(r#"{ "sidebar_width": "wide", "welcome_done": true }"#).unwrap();
+        assert_eq!((state.sidebar_width, state.welcome_done), (None, Some(true)));
+    }
+
+    #[test]
+    fn atomic_writes_replace_whole_files_and_keep_links() {
+        let dir = std::env::temp_dir().join(format!("kuana-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("deep/state.json");
+        write_atomic(&file, b"one").unwrap();
+        write_atomic(&file, b"two").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        // No temporary files left behind.
+        assert_eq!(std::fs::read_dir(dir.join("deep")).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            let link = dir.join("settings.json");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            write_atomic(&link, b"three").unwrap();
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&file).unwrap(), b"three");
+        }
+        // An unreadable file is kept aside, not lost.
+        set_aside(&file, "test file", "bad");
+        assert!(!file.exists());
+        assert!(std::fs::read_dir(dir.join("deep")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-")));
+        assert!(take_problems().iter().any(|p| p.starts_with("test file couldn't be read")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

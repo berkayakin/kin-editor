@@ -74,10 +74,15 @@ fn file_path() -> Option<PathBuf> {
 /// from before it existed (moved over right away, before an older Kuana can
 /// rewrite `state.json` without them).
 fn load() -> Vec<PathBuf> {
-    let file: TrustFile = file_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    // One that doesn't read is kept aside: rewriting it with only the next
+    // trusted folder would forget all the others for good.
+    let file: TrustFile = match file_path().and_then(|p| Some((std::fs::read_to_string(&p).ok()?, p))) {
+        Some((text, path)) => crate::state::read_lenient(&text).unwrap_or_else(|err| {
+            crate::state::set_aside(&path, "The list of trusted folders (trust.json)", err);
+            TrustFile::default()
+        }),
+        None => TrustFile::default(),
+    };
     let legacy = SessionState::load().trusted_folders;
     let moving = !legacy.is_empty();
     let folders = merged(file.folders, legacy);
@@ -101,13 +106,8 @@ fn merged(mut folders: Vec<PathBuf>, legacy: Vec<PathBuf>) -> Vec<PathBuf> {
 /// of it) and empties `state.json`'s old list, which `load` would merge back.
 fn save(folders: &[PathBuf]) -> std::io::Result<()> {
     let path = file_path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let json = serde_json::to_string_pretty(&TrustFile { folders: folders.to_vec() })? + "\n";
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, json)?;
-    std::fs::rename(&temp, &path)?;
+    crate::state::write_atomic(&path, json.as_bytes())?;
     let mut state = SessionState::load();
     if !state.trusted_folders.is_empty() {
         state.trusted_folders.clear();

@@ -5,12 +5,12 @@
 //! searches `searchable` (not ignored).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use ignore::gitignore::Gitignore;
+use ignore::{Match, gitignore::Gitignore};
 
 #[derive(Clone, Default)]
 pub struct ProjectSnapshot {
@@ -18,8 +18,12 @@ pub struct ProjectSnapshot {
     /// Every file in a folder that isn't ignored, and whether it's ignored
     /// itself (a `.env` in the project folder is).
     files: BTreeMap<PathBuf, bool>,
-    /// The project's .gitignore (and .git/info/exclude), for changes.
-    ignore: Option<Gitignore>,
+    /// Each folder's own .gitignore (None: it has none), read as changes
+    /// need them: a path is ignored by the rules of every folder above it,
+    /// as in the scan (and in Zed), not only the project's.
+    ignores: HashMap<PathBuf, Option<Arc<Gitignore>>>,
+    /// `.git/info/exclude` and the user's global excludes, below them all.
+    excludes: Vec<Arc<Gitignore>>,
     openable: Arc<Vec<PathBuf>>,
 }
 
@@ -28,7 +32,7 @@ pub struct ProjectSnapshot {
 pub enum Applied {
     Unchanged,
     Changed,
-    /// The ignore rules changed: scan again.
+    /// The project's own ignore rules changed: scan again.
     Rescan,
 }
 
@@ -37,7 +41,14 @@ impl ProjectSnapshot {
     pub fn scan(root: &Path) -> Self {
         let mut files = BTreeMap::new();
         add_tree(root, &mut files);
-        let mut snapshot = Self { root: root.to_path_buf(), files, ignore: project_ignore(root), openable: Arc::default() };
+        // Both read relative to the project folder (their patterns are).
+        let mut excludes = Vec::new();
+        let mut exclude = ignore::gitignore::GitignoreBuilder::new(root);
+        exclude.add(root.join(".git/info/exclude"));
+        excludes.extend(exclude.build().ok().map(Arc::new));
+        let (global, _) = ignore::gitignore::GitignoreBuilder::new(root).build_global();
+        excludes.push(Arc::new(global));
+        let mut snapshot = Self { root: root.to_path_buf(), files, ignores: HashMap::new(), excludes, openable: Arc::default() };
         snapshot.openable = Arc::new(snapshot.files.keys().cloned().collect());
         snapshot
     }
@@ -64,8 +75,25 @@ impl ProjectSnapshot {
             if !path.starts_with(&self.root) || path == self.root || skipped(&self.root, path) {
                 continue;
             }
-            if path.file_name().is_some_and(|n| n == ".gitignore") || path.ends_with(".git/info/exclude") {
-                return Applied::Rescan;
+            if path.file_name().is_some_and(|n| n == ".gitignore") {
+                let dir = path.parent().unwrap_or(&self.root).to_path_buf();
+                // The project's own rules: everything may change.
+                if dir == self.root {
+                    return Applied::Rescan;
+                }
+                self.ignores.remove(&dir);
+                // In a folder that's ignored anyway (a tool's cache): nothing changes.
+                if self.ignored(&dir, true) {
+                    continue;
+                }
+                // A folder's rules changed: only what's in it is read again.
+                let under: Vec<PathBuf> = self.files.range(dir.clone()..).take_while(|(p, _)| p.starts_with(&dir)).map(|(p, _)| p.clone()).collect();
+                for p in under {
+                    self.files.remove(&p);
+                }
+                add_tree(&dir, &mut self.files);
+                changed = true;
+                continue;
             }
             // Gone (or renamed away): it and anything under it.
             let under: Vec<PathBuf> = self.files.range(path.to_path_buf()..).take_while(|(p, _)| p.starts_with(path)).map(|(p, _)| p.clone()).collect();
@@ -84,7 +112,8 @@ impl ProjectSnapshot {
                     changed = true;
                 }
             } else if meta.is_file() && path.file_name().is_some_and(|n| n != ".DS_Store") {
-                self.files.insert(path.to_path_buf(), self.ignored(path, false));
+                let ignored = self.ignored(path, false);
+                self.files.insert(path.to_path_buf(), ignored);
                 changed = true;
             }
         }
@@ -96,8 +125,27 @@ impl ProjectSnapshot {
         }
     }
 
-    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
-        self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(path, is_dir).is_ignore())
+    /// Whether Git ignores `path`, by the .gitignore files of the folders
+    /// above it (the nearest decides), then `.git/info/exclude` and the
+    /// global excludes, as Git (and the scan) see it.
+    fn ignored(&mut self, path: &Path, is_dir: bool) -> bool {
+        let root = self.root.clone();
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| d.starts_with(&root)) {
+            let ignore = self.ignores.entry(d.to_path_buf()).or_insert_with(|| {
+                let file = d.join(".gitignore");
+                file.is_file().then(|| Arc::new(Gitignore::new(file).0))
+            });
+            if let Some(ignore) = ignore {
+                match ignore.matched_path_or_any_parents(path, is_dir) {
+                    Match::Ignore(_) => return true,
+                    Match::Whitelist(_) => return false,
+                    Match::None => {}
+                }
+            }
+            dir = d.parent();
+        }
+        self.excludes.iter().any(|i| i.matched_path_or_any_parents(path, is_dir).is_ignore())
     }
 }
 
@@ -191,7 +239,24 @@ mod tests {
         snapshot.apply(moved.iter().map(PathBuf::as_path));
         assert_eq!(names(&snapshot.openable(), &root), [".env", ".gitignore", "src/c.rs", "vendor/deep/b.rs"]);
 
-        // New ignore rules mean scanning again.
+        // A folder's own .gitignore counts for what's created in it later
+        // (build output in a package of a monorepo).
+        std::fs::create_dir_all(root.join("pkg/dist")).unwrap();
+        std::fs::write(root.join("pkg/.gitignore"), "dist/\n").unwrap();
+        std::fs::write(root.join("pkg/index.js"), "").unwrap();
+        std::fs::write(root.join("pkg/dist/bundle.js"), "").unwrap();
+        snapshot.apply([root.join("pkg")].iter().map(PathBuf::as_path));
+        std::fs::create_dir_all(root.join("pkg/dist/chunks")).unwrap();
+        std::fs::write(root.join("pkg/dist/chunks/1.js"), "").unwrap();
+        snapshot.apply([root.join("pkg/dist/chunks"), root.join("pkg/dist/chunks/1.js")].iter().map(PathBuf::as_path));
+        assert_eq!(names(&snapshot.searchable(), &root), [".gitignore", "pkg/.gitignore", "pkg/index.js", "src/c.rs", "vendor/deep/b.rs"]);
+
+        // A nested .gitignore changing reads only its folder again.
+        std::fs::write(root.join("pkg/.gitignore"), "").unwrap();
+        assert_eq!(snapshot.apply([root.join("pkg/.gitignore")].iter().map(PathBuf::as_path)), Applied::Changed);
+        assert!(names(&snapshot.searchable(), &root).contains(&"pkg/dist/chunks/1.js".to_string()));
+
+        // New project-wide ignore rules mean scanning again.
         let gitignore = [root.join(".gitignore")];
         assert_eq!(snapshot.apply(gitignore.iter().map(PathBuf::as_path)), Applied::Rescan);
         std::fs::remove_dir_all(&root).ok();

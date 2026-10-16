@@ -74,10 +74,10 @@ wins over both: `indent_style`, `indent_size`, `tab_width`, `trim_trailing_white
 
 A cloned repository can make an editor run its code without asking: a language server builds it,
 ESLint and Prettier load its JavaScript config, `node_modules/.bin` and venv tools are its own
-programs, and Git runs a `core.fsmonitor` command from its config. So the first time you open a
+programs, and Git runs commands its config names (an fsmonitor, hooks, an SSH command, diff programs). So the first time you open a
 folder, Kuana asks whether you trust it. Until you do, it stays in **Restricted Mode** (shown in the
 title bar): language servers don't start, formatters and ESLint don't run, the folder's own tools
-aren't used, terminals don't activate its venv, and Git ignores its fsmonitor. Editing, Git, Run
+aren't used, terminals don't activate its venv, and Git leaves out what the folder's own config would run (its fsmonitor, hooks, SSH command, credential helper and external diff, as in Zed). Editing, Git, Run
 and Debug work as usual.
 
 **Trust Folder** remembers the folder; tick **Trust every project in …** to trust its parent

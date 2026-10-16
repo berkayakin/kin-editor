@@ -1047,7 +1047,7 @@ pub struct TerminalFrame {
 fn run_script(command: &str) -> String {
     let shown = command.replace('\'', r"'\''");
     format!(
-        "trap : INT\nprintf '\\033[2m$ %s\\033[0m\\n' '{shown}'\n(\n{command}\n)\nkin_code=$?\nprintf '\\n\\033[2mProcess finished with exit code %s\\033[0m\\n' \"$kuana_code\"\nexit $kuana_code\n"
+        "trap : INT\nprintf '\\033[2m$ %s\\033[0m\\n' '{shown}'\n(\n{command}\n)\nkuana_code=$?\nprintf '\\n\\033[2mProcess finished with exit code %s\\033[0m\\n' \"$kuana_code\"\nexit $kuana_code\n"
     )
 }
 
@@ -1384,6 +1384,16 @@ impl Element for TerminalElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Run tab ends with its command's exit code (a failed test or build
+    /// must not show as finished fine).
+    #[cfg(unix)]
+    #[test]
+    fn run_script_ends_with_the_commands_exit_code() {
+        let output = std::process::Command::new("/bin/sh").arg("-c").arg(run_script("exit 3")).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("exit code 3"));
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]

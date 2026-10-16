@@ -292,6 +292,9 @@ impl Workspace {
                 let text = match e.unloaded() {
                     // Not read yet: its unsaved text, else the file on disk.
                     Some(u) => u.unsaved.as_ref()?.to_string(),
+                    // Saved: the search reads the same text from disk, in the
+                    // background, instead of a copy made here of every tab.
+                    None if !e.doc.read(cx).is_dirty() => return None,
                     None => e.doc.read(cx).rope().to_string(),
                 };
                 Some((e.doc.read(cx).path.clone()?, Arc::from(text)))
