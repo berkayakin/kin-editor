@@ -60,7 +60,7 @@ The table below is the JetBrains keymap.
 | Collapse / expand (fold) | ⌘- / ⌘= | Ctrl+- / Ctrl+= |
 | Collapse all / expand all | ⌘⇧- / ⌘⇧= | Ctrl+Shift+- / Ctrl+Shift+= |
 | Basic completion | ⌃Space | Ctrl+Space |
-| Go to Declaration | ⌘B or ⌘-click | Ctrl+B or Ctrl+click |
+| Go to Declaration (on the declaration itself: its usages) | ⌘B or ⌘-click | Ctrl+B or Ctrl+click |
 | Go to Implementation | ⌥⌘B | Ctrl+Alt+B |
 | Go to Type Definition | ⌃⇧B | Ctrl+Shift+B |
 | Go to Symbol (project) | Find Action | Ctrl+Alt+Shift+N |

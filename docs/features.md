@@ -22,7 +22,8 @@ Everything Kin does, in one list. Each area has its own page with the details.
   - **CSS, Rust, Go, Python, PHP, shell, JSON, YAML, TOML** — syntax errors from the tree-sitter parser
     (unexpected and missing tokens)
 - Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
-  signature help, Go to Declaration / Implementation / Type Definition, Find Usages, highlighted
+  signature help, Go to Declaration / Implementation / Type Definition (on a declaration, ⌘B and
+  ⌘/Ctrl-click list its usages, as in JetBrains), Find Usages, highlighted
   uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
   (quick fixes and refactorings); see [Language servers](languages.md#language-servers)
 - Inlay hints from the language server (types, parameter names), rulers, visible whitespace,

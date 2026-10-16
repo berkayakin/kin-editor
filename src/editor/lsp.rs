@@ -833,30 +833,39 @@ impl Editor {
         self.navigate_from(head, cx);
     }
 
-    /// Go to Declaration from an offset (⌘/Ctrl-click passes the click's).
+    /// Go to Declaration from an offset (⌘/Ctrl-click passes the click's). On
+    /// the declaration itself it lists the usages instead, like JetBrains' Go to
+    /// Declaration or Usages (and VS Code's ⌘-click on a definition).
     pub(super) fn navigate_from(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.locations_request("textDocument/definition", offset, "Declaration", "No declaration found", Value::Null, cx);
+        self.locations_request("textDocument/definition", offset, "Declaration", "No declaration found", Value::Null, true, cx);
     }
 
     pub(super) fn go_to_implementation(&mut self, _: &super::GoToImplementation, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
         let name = self.doc.read(cx).slice(super::word_range(self.doc.read(cx), head));
         let title = format!("Implementations of {name}");
-        self.locations_request("textDocument/implementation", head, &title, "No implementations found", Value::Null, cx);
+        self.locations_request("textDocument/implementation", head, &title, "No implementations found", Value::Null, false, cx);
     }
 
     pub(super) fn go_to_type_definition(&mut self, _: &super::GoToTypeDefinition, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        self.locations_request("textDocument/typeDefinition", head, "Type Definition", "No type definition found", Value::Null, cx);
+        self.locations_request("textDocument/typeDefinition", head, "Type Definition", "No type definition found", Value::Null, false, cx);
     }
 
     pub(super) fn find_usages(&mut self, _: &super::FindUsages, _: &mut Window, cx: &mut Context<Self>) {
         let head = self.primary_selection().head;
-        let name = self.doc.read(cx).slice(super::word_range(self.doc.read(cx), head));
-        let context = json!({ "includeDeclaration": true });
-        self.locations_request("textDocument/references", head, &format!("Usages of {name}"), "No usages found", context, cx);
+        self.find_usages_at(head, cx);
     }
 
+    fn find_usages_at(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let name = self.doc.read(cx).slice(super::word_range(self.doc.read(cx), offset));
+        let context = json!({ "includeDeclaration": true });
+        self.locations_request("textDocument/references", offset, &format!("Usages of {name}"), "No usages found", context, false, cx);
+    }
+
+    /// `or_usages`: when the answer is where the request was made (the
+    /// declaration itself), list the usages there instead.
+    #[allow(clippy::too_many_arguments)]
     fn locations_request(
         &mut self,
         method: &'static str,
@@ -864,6 +873,7 @@ impl Editor {
         title: &str,
         none: &'static str,
         context: Value,
+        or_usages: bool,
         cx: &mut Context<Self>,
     ) {
         // `textDocument/definition` → `definitionProvider`.
@@ -879,10 +889,12 @@ impl Editor {
         let title: SharedString = title.to_string().into();
         cx.spawn(async move |this, cx| {
             let result = server.request(method, params).await;
-            this.update(cx, |_, cx| match result {
+            this.update(cx, |this, cx| match result {
                 Ok(value) => {
                     let locations = protocol::locations(&value);
-                    if locations.is_empty() {
+                    if or_usages && this.is_declaration_at(offset, &locations, server.encoding, cx) {
+                        this.find_usages_at(offset, cx);
+                    } else if locations.is_empty() {
                         cx.emit(EditorLspEvent::Message(none.into()));
                     } else {
                         cx.emit(EditorLspEvent::Navigate { title, locations, encoding: server.encoding });
@@ -893,6 +905,18 @@ impl Editor {
             .ok();
         })
         .detach();
+    }
+
+    /// Whether `locations` are just the name at `offset`. A server that answers
+    /// with the whole item (from its first keyword) isn't recognized, and Go to
+    /// Declaration jumps there.
+    fn is_declaration_at(&self, offset: usize, locations: &[Location], encoding: Encoding, cx: &App) -> bool {
+        let doc = self.doc.read(cx);
+        let word = super::word_range(doc, offset);
+        !locations.is_empty()
+            && locations.iter().all(|l| {
+                doc.path.as_ref() == Some(&l.path) && word.contains(&protocol::range_to_offsets(doc.rope(), l.range, encoding).start)
+            })
     }
 
     pub(super) fn rename_symbol(&mut self, _: &super::RenameSymbol, _: &mut Window, cx: &mut Context<Self>) {
@@ -1224,6 +1248,44 @@ mod tests {
         });
         editor.update(cx, |e, cx| e.run_code_lens(lens, cx));
         assert_eq!(*events.borrow(), [("lens lens".to_string(), 1)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn go_to_declaration_on_the_declaration_lists_its_usages(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kin-lsp-decl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {}\nfn b() { a() }\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("decl", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        wait_for(cx, "the server", |cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&editor, move |_, event: &EditorLspEvent, _| {
+                if let EditorLspEvent::Navigate { title, locations, .. } = event {
+                    seen.borrow_mut().push((title.to_string(), locations.len()));
+                }
+            })
+        });
+        // On a usage: the declaration.
+        editor.update(cx, |e, cx| e.navigate_from(19, cx));
+        wait_for(cx, "the declaration", |_| events.borrow().len() == 1);
+        // On the declaration's name: its usages.
+        editor.update(cx, |e, cx| e.navigate_from(3, cx));
+        wait_for(cx, "the usages", |_| events.borrow().len() == 2);
+        assert_eq!(*events.borrow(), [("Declaration".to_string(), 1), ("Usages of a".to_string(), 2)]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

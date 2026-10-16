@@ -1063,8 +1063,8 @@ impl FileWatcher {
 /// A language server for tests: `python3 -c FAKE_SERVER <name> <trigger chars>`.
 /// It publishes one diagnostic per opened file ("<name> problem", followed
 /// by its initialization option `greeting` and the `mode` in its `fake`
-/// settings section when it has them), completes with "<name>-item", and offers "<name> fix
-/// (<diagnostics sent>)".
+/// settings section when it has them), completes with "<name>-item", offers "<name> fix
+/// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
@@ -1103,7 +1103,7 @@ while True:
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
     elif method == "initialize":
         init = m["params"].get("initializationOptions") or {}
-        caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True, "codeLensProvider": {"resolveProvider": True}}
+        caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True, "codeLensProvider": {"resolveProvider": True}, "definitionProvider": True, "referencesProvider": True}
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
@@ -1129,6 +1129,13 @@ while True:
         location = {"uri": uri, "range": lens["range"]}
         lens["command"] = {"title": name + " lens", "command": "editor.action.showReferences", "arguments": [uri, lens["range"]["start"], [location]]}
         send({"jsonrpc": "2.0", "id": id, "result": lens})
+    elif method == "textDocument/definition":
+        uri = m["params"]["textDocument"]["uri"]
+        send({"jsonrpc": "2.0", "id": id, "result": {"uri": uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}}})
+    elif method == "textDocument/references":
+        uri = m["params"]["textDocument"]["uri"]
+        at = lambda line, ch: {"uri": uri, "range": {"start": {"line": line, "character": ch}, "end": {"line": line, "character": ch + 1}}}
+        send({"jsonrpc": "2.0", "id": id, "result": [at(0, 3), at(1, 9)]})
     elif method == "textDocument/completion":
         send({"jsonrpc": "2.0", "id": id, "result": [{"label": name + "-item"}]})
     elif method == "textDocument/codeAction":
