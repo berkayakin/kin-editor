@@ -580,8 +580,25 @@ impl Workspace {
             let path = editor.read(cx).doc.read(cx).path.clone();
             if let Some((path, moved)) = path.as_deref().and_then(|p| Some((p, remap(p)?))) {
                 editor.update(cx, |e, cx| e.set_path(moved, cx));
+                let doc = editor.read(cx).doc.clone();
+                self.documents.update(cx, |s, cx| s.add(&doc, cx));
                 self.lsp.update(cx, |s, cx| s.moved(path, &editor, cx));
                 self.load_diff_base(&editor, cx);
+            }
+        }
+        // Changed without a tab: saved later, it goes to the new place.
+        for doc in self.documents.read(cx).kept(cx) {
+            let path = doc.read(cx).path.clone();
+            if let Some((path, moved)) = path.as_deref().and_then(|p| Some((p, remap(p)?))) {
+                doc.update(cx, |d, cx| {
+                    d.set_path(moved);
+                    cx.notify();
+                });
+                self.documents.update(cx, |s, cx| s.add(&doc, cx));
+                self.lsp.update(cx, |s, cx| {
+                    s.did_close(path);
+                    s.register_document(&doc, None, cx);
+                });
             }
         }
         self.tree.update(cx, |t, _| t.remap(remap));
@@ -821,22 +838,25 @@ impl Workspace {
         self.recent.retain(|p| !p.starts_with(path));
         self.after_fs_change(cx);
         let message = format!("Moved “{name}” to the {}", trash_name());
-        self.toast_with_undo(ToastKind::Success, message, None, Some(ToastUndo::File(id)), cx);
+        self.toast_with_button(ToastKind::Success, message, None, Some(ToastButton::UndoFile(id)), cx);
     }
 
-    /// A toast's Undo button, while what it would undo is still next.
-    pub(super) fn undo_applies(&self, undo: ToastUndo) -> bool {
-        match undo {
-            ToastUndo::File(id) => self.file_history.undo_id() == Some(id),
+    /// A toast's button, while what it does still applies (what it would
+    /// undo is still next; there are files to save).
+    pub(super) fn toast_button_applies(&self, button: ToastButton, cx: &App) -> bool {
+        match button {
+            ToastButton::UndoFile(id) => self.file_history.undo_id() == Some(id),
+            ToastButton::SaveBackground => !self.documents.read(cx).kept(cx).is_empty(),
         }
     }
 
-    pub(super) fn run_toast_undo(&mut self, undo: ToastUndo, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.undo_applies(undo) {
+    pub(super) fn run_toast_button(&mut self, button: ToastButton, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.toast_button_applies(button, cx) {
             return;
         }
-        match undo {
-            ToastUndo::File(_) => self.step_file_history(false, window, cx),
+        match button {
+            ToastButton::UndoFile(_) => self.step_file_history(false, window, cx),
+            ToastButton::SaveBackground => self.save_background(false, cx),
         }
     }
 

@@ -116,21 +116,30 @@ impl Workspace {
         self.load_diff_bases(vec![editor.clone()], cx);
     }
 
-    /// Loads several files' HEAD and index text with one `git cat-file`.
+    /// Loads several files' HEAD and index text with one `git cat-file`,
+    /// once per document however many tabs show it (they share its diff).
     pub(super) fn load_diff_bases(&mut self, editors: Vec<Entity<Editor>>, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
         let mut wanted = Vec::new();
+        let mut seen = HashSet::new();
         for editor in editors {
             // A tab not read yet gets it when it is (`file_opened`); images have no lines to mark.
-            let (e, doc) = (editor.read(cx), editor.read(cx).doc.read(cx));
-            let Some(path) = doc.path.clone().filter(|_| e.is_loaded() && doc.image.is_none()) else { continue };
+            let doc = editor.read(cx).doc.clone();
+            let d = doc.read(cx);
+            let Some(path) = d.path.clone().filter(|_| editor.read(cx).is_loaded() && d.image.is_none()) else { continue };
+            let encoding = d.encoding;
+            let diff = self.documents.update(cx, |s, cx| s.diff_for(&doc, cx));
+            editor.update(cx, |e, cx| e.set_git_diff(diff.clone(), cx));
+            if !seen.insert(doc.entity_id()) {
+                continue;
+            }
             let Ok(rel) = path.strip_prefix(&repo) else {
-                editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
+                diff.update(cx, |d, cx| d.set_base(None, None, None, cx));
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
             // Compared as the editor holds the file: decoded like it, LF line ends.
-            wanted.push((editor.downgrade(), rel, doc.encoding));
+            wanted.push((diff.downgrade(), rel, encoding));
         }
         if wanted.is_empty() {
             return;
@@ -141,11 +150,11 @@ impl Workspace {
             let repo2 = repo.clone();
             let blobs = cx.background_executor().spawn(async move { git::read_blobs(&repo2, &specs) }).await.unwrap_or_default();
             let mut blobs = blobs.into_iter();
-            for (editor, rel, encoding) in wanted {
+            for (diff, rel, encoding) in wanted {
                 let text = |bytes: Option<Option<Vec<u8>>>| bytes.flatten().map(|b| git::BlobText::new(&b, Some(encoding)).text);
                 let (base, index) = (text(blobs.next()), text(blobs.next()));
                 let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone() };
-                editor.update(cx, |e, cx| e.set_diff_base(Some(git_file), base, index, cx)).ok();
+                diff.update(cx, |d, cx| d.set_base(Some(git_file), base, index, cx)).ok();
             }
         })
         .detach();
@@ -467,27 +476,27 @@ impl Workspace {
     }
 
     pub(super) fn toast(&mut self, kind: ToastKind, message: impl Into<SharedString>, detail: Option<String>, cx: &mut Context<Self>) {
-        self.toast_with_undo(kind, message, detail, None, cx);
+        self.toast_with_button(kind, message, detail, None, cx);
     }
 
-    /// A toast with an Undo button for what it reports.
-    pub(super) fn toast_with_undo(
+    /// A toast with a button for what it reports.
+    pub(super) fn toast_with_button(
         &mut self,
         kind: ToastKind,
         message: impl Into<SharedString>,
         detail: Option<String>,
-        undo: Option<ToastUndo>,
+        button: Option<ToastButton>,
         cx: &mut Context<Self>,
     ) {
         let id = self.next_toast;
         self.next_toast += 1;
-        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into), undo, leaving: false });
+        self.toasts.push(Toast { id, kind, message: message.into(), detail: detail.map(Into::into), button, leaving: false });
         let shown: Vec<usize> = self.toasts.iter().filter(|t| !t.leaving).map(|t| t.id).collect();
         if let Some(&oldest) = shown.first().filter(|_| shown.len() > 4) {
             self.dismiss_toast(oldest, cx);
         }
         // Long enough to reach for its button.
-        let seconds = if kind == ToastKind::Error || undo.is_some() { 9 } else { 4 };
+        let seconds = if kind == ToastKind::Error || button.is_some() { 9 } else { 4 };
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(seconds)).await;
             this.update(cx, |ws, cx| ws.dismiss_toast(id, cx)).ok();

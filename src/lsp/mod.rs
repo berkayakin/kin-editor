@@ -26,7 +26,7 @@ use ropey::Rope;
 use serde_json::{Value, json};
 
 use crate::{
-    document::LspChanges,
+    document::{Document, LspChanges},
     editor::Editor,
     settings::Settings,
     syntax::Language,
@@ -135,11 +135,20 @@ impl Progress {
 }
 
 struct OpenDocument {
-    editor: WeakEntity<Editor>,
+    doc: WeakEntity<Document>,
+    /// The editor that gets its diagnostics. None for a document without a
+    /// tab (edited by a workspace edit): diagnostics wait for one (`register`).
+    editor: Option<WeakEntity<Editor>>,
     /// Its servers, the main one first, and whether each got `didOpen` (a
     /// server may still be starting).
     servers: Vec<(ServerKey, bool)>,
     language_id: &'static str,
+    /// Registered without a tab, it skipped servers that weren't running
+    /// (nobody looks at it); a tab showing it starts them.
+    partial: bool,
+    /// Closes it with the servers when the document goes (a tab-less one
+    /// that was saved, see `DocumentStore::keep`).
+    _released: gpui::Subscription,
 }
 
 impl OpenDocument {
@@ -257,53 +266,114 @@ impl LspStore {
 
     /// Starts tracking an editor's document with its language's server.
     pub fn register(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        // An unloaded tab registers once its file is read.
+        if !editor.read(cx).is_loaded() {
+            return;
+        }
+        let doc = editor.read(cx).doc.clone();
+        self.register_document(&doc, Some(editor), cx);
+    }
+
+    /// Starts tracking a document, shown by `editor` or by no tab at all (a
+    /// workspace edit changed it): servers have to know its text either way,
+    /// or they'd answer for what's on disk. Without a tab it goes only to
+    /// servers already running; a tab showing it later starts the others.
+    pub fn register_document(&mut self, doc: &Entity<Document>, editor: Option<&Entity<Editor>>, cx: &mut Context<Self>) {
         let (path, language) = {
-            let e = editor.read(cx);
-            match e.doc.read(cx).path.clone() {
-                // An unloaded tab registers once its file is read.
-                Some(path) if e.is_loaded() => (path, e.doc.read(cx).language),
+            let d = doc.read(cx);
+            match d.path.clone() {
+                Some(path) if !d.is_stand_in() => (path, d.language),
                 _ => return,
             }
         };
-        if self.documents.get(&path).is_some_and(|d| d.editor.upgrade().as_ref() == Some(editor)) {
-            return;
-        }
-        // Another editor of the same document (a split): the servers know it
-        // already, and this one sends its edits through the same store.
-        let shown = self.documents.get(&path).and_then(|d| d.editor.upgrade());
-        if shown.is_some_and(|shown| shown.read(cx).shares_document(editor.read(cx))) {
-            let store = cx.weak_entity();
+        let store = cx.weak_entity();
+        if let Some(open) = self.documents.get_mut(&path).filter(|d| d.doc == doc.downgrade()) {
+            // Known already (a split, or a document a tab shows now): the
+            // servers have it, and this editor sends its edits through the
+            // same store.
+            let Some(editor) = editor else { return };
             editor.update(cx, |e, _| e.set_lsp(store));
+            if open.editor.as_ref().and_then(WeakEntity::upgrade).is_some() {
+                return;
+            }
+            open.editor = Some(editor.downgrade());
+            let partial = std::mem::take(&mut open.partial);
+            // What its servers published while it had no tab.
+            let keys: Vec<ServerKey> = open.servers.iter().filter(|(_, opened)| *opened).map(|(k, _)| k.clone()).collect();
+            for key in keys {
+                self.apply_diagnostics(&path, &key, cx);
+            }
+            if partial {
+                let keys = self.server_keys(language, &path, cx);
+                self.connect(&path, language, keys, cx);
+            }
             return;
         }
         // Servers run the project's code (build scripts, plugins, its own binaries).
         if !crate::trust::is_trusted(&path) {
             return;
         }
-        let keys = self.server_keys(language, &path, cx);
+        let mut keys = self.server_keys(language, &path, cx);
+        let all = keys.len();
+        if editor.is_none() {
+            keys.retain(|(key, _, _)| self.servers.contains_key(key));
+        }
         if keys.is_empty() {
             return;
         }
-        let store = cx.weak_entity();
-        editor.update(cx, |e, _| e.set_lsp(store));
+        if let Some(editor) = editor {
+            editor.update(cx, |e, _| e.set_lsp(store));
+        }
+        let id = doc.entity_id();
+        let released_path = path.clone();
+        let released = cx.observe_release(doc, move |store: &mut Self, _, _| {
+            if store.documents.get(&released_path).is_some_and(|d| d.doc.entity_id() == id) {
+                store.did_close(&released_path);
+            }
+        });
         self.documents.insert(
             path.clone(),
             OpenDocument {
-                editor: editor.downgrade(),
-                servers: keys.iter().map(|(key, _, _)| (key.clone(), false)).collect(),
+                doc: doc.downgrade(),
+                editor: editor.map(Entity::downgrade),
+                servers: Vec::new(),
                 language_id: servers::language_id(language, &path),
+                partial: keys.len() < all,
+                _released: released,
             },
         );
+        self.connect(&path, language, keys, cx);
+    }
+
+    /// Opens a tracked document with those of `keys` it isn't with yet,
+    /// starting servers that aren't running.
+    fn connect(&mut self, path: &Path, language: Language, keys: Vec<(ServerKey, Option<Vec<String>>, &'static servers::ServerSpec)>, cx: &mut Context<Self>) {
         for (key, custom, spec) in keys {
+            let Some(doc) = self.documents.get_mut(path).filter(|d| !d.has(&key)) else { continue };
+            doc.servers.push((key.clone(), false));
             match self.servers.get(&key) {
                 Some(ServerState::Running(server)) => {
                     let server = server.clone();
-                    self.open_document(&path, &key, &server, cx);
+                    self.open_document(path, &key, &server, cx);
                 }
                 Some(_) => {}
-                None => self.start(key, spec, custom, language, path.clone(), cx),
+                None => self.start(key, spec, custom, language, path.to_path_buf(), cx),
             }
         }
+    }
+
+    /// Sends a document's edits since they were last sent (a document
+    /// without a tab; editors send their own, `Editor::edited`).
+    pub fn send_edits(&self, doc: &Entity<Document>, cx: &mut App) {
+        let Some(path) = doc.read(cx).path.clone() else { return };
+        let changes = doc.update(cx, |d, _| d.take_lsp_changes());
+        if changes.is_empty() {
+            return;
+        }
+        // What servers answer for this version is read in this text.
+        doc.update(cx, |d, _| d.note_lsp_version());
+        let d = doc.read(cx);
+        self.did_change(&path, d.version(), changes, d.rope());
     }
 
     /// The servers for `language` at `path`, the main one first (see
@@ -677,7 +747,8 @@ impl LspStore {
         let Some(ServerState::Running(server)) = self.servers.get(key) else { return };
         let Some(params) = self.diagnostics.get(&(path.to_path_buf(), key.clone())) else { return };
         let source = LspDiagnostics { id: server.id.clone(), server: server.name.clone(), encoding: server.encoding, params: params.clone() };
-        let Some(editor) = doc.editor.upgrade() else { return };
+        // Without a tab, they wait for one: `register` applies them then.
+        let Some(editor) = doc.editor.as_ref().and_then(WeakEntity::upgrade) else { return };
         editor.update(cx, |e, cx| e.set_server_diagnostics(source, cx));
     }
 
@@ -695,27 +766,30 @@ impl LspStore {
     /// A server stopped (or restarts): its diagnostics go, everywhere.
     fn forget_diagnostics(&mut self, key: &ServerKey, cx: &mut Context<Self>) {
         self.diagnostics.retain(|(_, k), _| k != key);
-        let editors: Vec<Entity<Editor>> = self.documents.values().filter(|d| d.has(key)).filter_map(|d| d.editor.upgrade()).collect();
-        for editor in editors {
-            editor.update(cx, |e, cx| e.clear_server_diagnostics(&key.id, cx));
+        let docs: Vec<Entity<Document>> = self.documents.values().filter(|d| d.has(key)).filter_map(|d| d.doc.upgrade()).collect();
+        for doc in docs {
+            doc.update(cx, |d, cx| {
+                d.clear_server_diagnostics(&key.id);
+                cx.notify();
+            });
         }
     }
 
     fn open_document(&mut self, path: &Path, key: &ServerKey, server: &Arc<Server>, cx: &mut Context<Self>) {
         let Some(doc) = self.documents.get_mut(path) else { return };
-        let Some(editor) = doc.editor.upgrade() else {
+        let Some(document) = doc.doc.upgrade() else {
             self.documents.remove(path);
             return;
         };
         // The server gets the current text, so earlier edits don't matter
         // (unless another server still has to hear about them).
         let first = !doc.servers.iter().any(|(_, opened)| *opened);
-        let (text, version) = editor.update(cx, |e, cx| {
+        let (text, version) = document.update(cx, |d, _| {
             if first {
-                e.doc.as_mut(cx).take_lsp_changes();
+                d.take_lsp_changes();
             }
-            e.doc.as_mut(cx).note_lsp_version();
-            (e.doc.read(cx).rope().to_string(), e.doc.read(cx).version())
+            d.note_lsp_version();
+            (d.rope().to_string(), d.version())
         });
         server.client.notify(
             "textDocument/didOpen",
@@ -814,7 +888,7 @@ impl LspStore {
     /// editor of the same document stays: track it through that one.
     pub fn rebind(&mut self, path: &Path, editor: &Entity<Editor>) {
         if let Some(doc) = self.documents.get_mut(path) {
-            doc.editor = editor.downgrade();
+            doc.editor = Some(editor.downgrade());
         }
     }
 
@@ -899,10 +973,15 @@ impl LspStore {
 
     /// Registers again the documents `which` picks (their servers changed).
     fn reregister(&mut self, which: impl Fn(&OpenDocument) -> bool, cx: &mut Context<Self>) {
-        let editors: Vec<Entity<Editor>> = self.documents.values().filter(|d| which(d)).filter_map(|d| d.editor.upgrade()).collect();
+        let docs: Vec<(Entity<Document>, Option<Entity<Editor>>)> = self
+            .documents
+            .values()
+            .filter(|d| which(d))
+            .filter_map(|d| Some((d.doc.upgrade()?, d.editor.as_ref().and_then(WeakEntity::upgrade))))
+            .collect();
         self.documents.retain(|_, d| !which(d));
-        for editor in editors {
-            self.register(&editor, cx);
+        for (doc, editor) in docs {
+            self.register_document(&doc, editor.as_ref(), cx);
         }
     }
 
@@ -1242,6 +1321,69 @@ mod tests {
         store.servers.insert(ServerKey { id: spec.id.to_string(), root: PathBuf::from("/work/project") }, ServerState::Finding);
         assert_eq!(root_of(&store, "/deps/serde/src/lib.rs", cx), PathBuf::from("/work/project"));
         assert_eq!(root_of(&store, "/work/project/src/main.rs", cx), PathBuf::from("/work/project"));
+    }
+
+    #[gpui::test]
+    fn documents_without_a_tab_reach_their_servers(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+
+        use crate::document::{Document, EditKind};
+        if servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-tabless-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (shown, hidden) = (dir.join("a.rs"), dir.join("b.rs"));
+        std::fs::write(&shown, "fn a() {}\n").unwrap();
+        std::fs::write(&hidden, "fn old() {}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("hints", "")]);
+            store.set_root(Some(dir.clone()));
+            store
+        });
+        let wait = |cx: &mut gpui::TestAppContext, what: &str, done: &dyn Fn(&mut gpui::TestAppContext) -> bool| {
+            let started = std::time::Instant::now();
+            while !done(cx) {
+                assert!(started.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                cx.run_until_parked();
+            }
+        };
+        // Without a running server, a document without a tab starts none.
+        let doc = cx.new(|_| Document::open(&hidden).unwrap());
+        store.update(cx, |s, cx| s.register_document(&doc, None, cx));
+        assert!(store.read_with(cx, |s, _| s.servers.is_empty() && s.documents.is_empty()));
+        // A tab starts it.
+        let editor = cx.new(|cx| Editor::new(Document::open(&shown).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        wait(cx, "the server", &|cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+
+        // Now the tab-less one goes to it, and its edits follow.
+        store.update(cx, |s, cx| s.register_document(&doc, None, cx));
+        // (The fake server reads nothing else until it has its configuration.)
+        wait(cx, "its first diagnostics", &|cx| store.read_with(cx, |s, _| s.diagnostics.keys().any(|(p, _)| *p == hidden)));
+        doc.update(cx, |d, _| d.edit(vec![(3..6, "new".into())], &[], EditKind::Other));
+        store.update(cx, |s, cx| s.send_edits(&doc, cx));
+        let rope = doc.read_with(cx, |d, _| d.rope().clone());
+        store.read_with(cx, |s, _| s.did_save(&hidden, &rope));
+        cx.run_until_parked();
+        // What its server says waits for a tab, which gets it.
+        assert!(doc.read_with(cx, |d, _| d.diagnostics.is_empty()));
+        let tab = cx.new(|cx| Editor::with_document(doc.clone(), cx));
+        wait(cx, "the server's check", &|cx| {
+            store.update(cx, |s, cx| s.register(&tab, cx));
+            doc.read_with(cx, |d, _| d.diagnostics.iter().any(|d| &*d.message == "hints checked fn new() {}"))
+        });
+
+        // Gone with its document.
+        drop((tab, doc));
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(store.read_with(cx, |s, _| !s.documents.contains_key(&hidden) && s.documents.contains_key(&shown)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::{
     assets::{self, Icon},
     busy::Busy,
     document::{Breakpoint, Document},
+    document_store::{DocumentStore, DocumentStoreEvent},
     branch_picker::{BranchPicker, BranchPickerEvent},
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
     context_menu::{ContextMenu, ContextMenuEvent, MenuEntry},
@@ -73,6 +74,7 @@ use crate::ui::{
     GAP, chrome_bg, soft_shadow, file_icon, island,
 };
 
+mod background;
 mod commands;
 mod file_tree;
 mod git_ops;
@@ -247,18 +249,29 @@ struct Toast {
     kind: ToastKind,
     message: SharedString,
     detail: Option<SharedString>,
-    /// A button that takes back what the toast reports.
-    undo: Option<ToastUndo>,
+    /// A button for what the toast reports (Undo, Save All).
+    button: Option<ToastButton>,
     /// Dismissed, fading out before it's removed.
     leaving: bool,
 }
 
-/// What a toast's Undo button undoes.
+/// What a toast's button does.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ToastUndo {
-    /// A file operation, by its id in the file history; shown only while
-    /// it's still the one ⌘Z in the tree would undo.
-    File(u64),
+enum ToastButton {
+    /// Undo a file operation, by its id in the file history; shown only
+    /// while it's still the one ⌘Z in the tree would undo.
+    UndoFile(u64),
+    /// Save the files changed without a tab; shown while there are any.
+    SaveBackground,
+}
+
+impl ToastButton {
+    fn label(self) -> &'static str {
+        match self {
+            ToastButton::UndoFile(_) => "Undo",
+            ToastButton::SaveBackground => "Save All",
+        }
+    }
 }
 
 /// Asks whether to go ahead with `action`, resolving to `true` if so. One
@@ -442,6 +455,10 @@ enum MenuAction {
     Terminal(Entity<TerminalView>),
     /// A terminal tab's right-click menu.
     TerminalTab(TerminalTabAction, Entity<TerminalView>),
+    /// Status bar: a file changed without a tab.
+    OpenFile(PathBuf),
+    /// Status bar: save the files changed without a tab.
+    SaveBackground,
 }
 
 /// What a terminal tab's menu does with it.
@@ -483,6 +500,8 @@ impl Clone for MenuAction {
             MenuAction::ChooseVenv => MenuAction::ChooseVenv,
             MenuAction::Terminal(terminal) => MenuAction::Terminal(terminal.clone()),
             MenuAction::TerminalTab(action, terminal) => MenuAction::TerminalTab(*action, terminal.clone()),
+            MenuAction::OpenFile(path) => MenuAction::OpenFile(path.clone()),
+            MenuAction::SaveBackground => MenuAction::SaveBackground,
         }
     }
 }
@@ -696,6 +715,9 @@ pub struct Workspace {
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
     /// Language servers for this window's files.
     lsp: Entity<LspStore>,
+    /// This window's documents by path, with a tab or without (edited by a
+    /// workspace edit or Replace in Files, and not saved yet).
+    documents: Entity<DocumentStore>,
     /// The Preferences page shown last, to reopen there.
     preferences_page: preferences::Page,
     _subscriptions: Vec<Subscription>,
@@ -827,11 +849,15 @@ impl Workspace {
             this.update(cx, |ws, cx| ws.prepare_to_close(CloseIntent::CloseWindow, window, cx)).unwrap_or(true)
         });
         let lsp = cx.new(|_| LspStore::new());
-        let lsp_subscription = cx.subscribe_in(&lsp, window, |ws, _, event: &LspEvent, window, cx| match event {
+        let lsp_subscription = cx.subscribe(&lsp, |ws, _, event: &LspEvent, cx| match event {
             LspEvent::ApplyEdit { key, request_id, encoding, edits } => {
-                let applied = ws.apply_workspace_edit(edits.clone(), *encoding, window, cx);
+                let applied = ws.apply_workspace_edit(edits.clone(), *encoding, cx);
                 let (key, id) = (key.clone(), request_id.clone());
-                ws.lsp.read(cx).respond(&key, id, serde_json::json!({ "applied": applied }));
+                cx.spawn(async move |ws, cx| {
+                    let applied = applied.await;
+                    ws.update(cx, |ws, cx| ws.lsp.read(cx).respond(&key, id, serde_json::json!({ "applied": applied }))).ok();
+                })
+                .detach();
             }
             LspEvent::Message(message) => ws.toast(ToastKind::Error, message.clone(), None, cx),
             LspEvent::Installed(command) => ws.toast(ToastKind::Success, format!("Installed {command}"), None, cx),
@@ -840,6 +866,13 @@ impl Workspace {
         let servers_observer =
             cx.observe_global::<crate::lsp::install::ServersInstalled>(|ws, cx| ws.lsp.update(cx, |s, cx| s.retry_missing(cx)));
         let lsp_observer = cx.observe(&lsp, |_, _, cx| cx.notify());
+        let documents = cx.new(|_| DocumentStore::new());
+        let documents_subscription = cx.subscribe(&documents, |ws, _, event: &DocumentStoreEvent, cx| match event {
+            DocumentStoreEvent::KeptChanged => {
+                ws.schedule_session_save(cx);
+                cx.notify();
+            }
+        });
         let settings = Settings::get(cx).clone();
         // Settings changed (saved settings.json): re-apply everywhere.
         let settings_observer = cx.observe_global::<Settings>(|ws, cx| {
@@ -981,6 +1014,7 @@ impl Workspace {
             git_refresh_again: false,
             symbol_task: None,
             lsp,
+            documents,
             preferences_page: preferences::Page::Appearance,
             tab_subscriptions: HashMap::new(),
             _subscriptions: vec![
@@ -997,6 +1031,7 @@ impl Workspace {
                 extensions_observer,
                 trust_observer,
                 lsp_subscription,
+                documents_subscription,
                 lsp_observer,
                 servers_observer,
                 cx.observe_window_bounds(window, |ws, window, cx| ws.remember_placement(window, cx)),
@@ -1029,6 +1064,13 @@ impl Workspace {
         }
         if let Some(editor) = self.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())).cloned() {
             self.activate_editor(&editor, window, cx);
+            return;
+        }
+        // Open without a tab already (a workspace edit changed it): that one,
+        // edits and undo history included.
+        if let Some(doc) = self.documents.read(cx).get(&path, cx) {
+            let editor = cx.new(|cx| Editor::with_document(doc, cx));
+            self.add_tab(editor, window, cx);
             return;
         }
         match Document::open(&path) {
@@ -1107,6 +1149,12 @@ impl Workspace {
             ws.tab_loaded(editor, event, window, cx);
         }));
         self.tab_subscriptions.insert(editor.entity_id(), subscriptions);
+        // A tab holds it now; the store finds it by its path.
+        let doc = editor.read(cx).doc.clone();
+        self.documents.update(cx, |s, cx| {
+            s.add(&doc, cx);
+            s.release(&doc, cx);
+        });
         if editor.read(cx).is_loaded() {
             self.file_opened(&editor, cx);
         }
@@ -1123,10 +1171,12 @@ impl Workspace {
     /// restored tab is first shown): breakpoints, language server, Git changes.
     fn file_opened(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         // Another editor of the document has what's per document already
-        // (breakpoints, the language server); this one needs its own gutter.
+        // (breakpoints, the language server, the Git changes): this one shows them.
         if self.siblings(editor, cx).iter().any(|s| s.read(cx).is_loaded()) {
             self.lsp.update(cx, |s, cx| s.register(editor, cx));
-            self.load_diff_base(editor, cx);
+            let doc = editor.read(cx).doc.clone();
+            let diff = self.documents.update(cx, |s, cx| s.diff_for(&doc, cx));
+            editor.update(cx, |e, cx| e.set_git_diff(diff, cx));
             return;
         }
         // Breakpoints it had while closed, and the paused line if it's here.

@@ -63,6 +63,14 @@ impl Workspace {
             }
             pane_active.push(active_in_pane);
         }
+        // Changed without a tab and not saved: they come back as tabs.
+        let last_pane = self.panes.len().saturating_sub(1);
+        for doc in self.documents.read(cx).kept(cx) {
+            let d = doc.read(cx);
+            let encoding = (d.encoding != TextEncoding::UTF8).then(|| d.encoding.key());
+            unsaved.push((tabs.len(), d.rope().clone()));
+            tabs.push(TabSession { path: d.path.clone(), pane: last_pane, encoding, ..TabSession::default() });
+        }
         let layout = (self.panes.len() > 1).then(|| PaneLayout {
             column: self.pane_axis == PaneAxis::Column,
             sizes: self.pane_sizes.clone(),

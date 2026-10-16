@@ -263,6 +263,7 @@ impl Workspace {
                         .child(busy),
                 )
             })
+            .when_some(self.render_background_documents(&theme, cx), |el, item| el.child(item))
             .child(div().flex_1())
             .when_some(self.render_downloads(&theme), |el, downloads| el.child(downloads))
             .when_some(updater::pending_version(cx).map(|v| format!("Kuana {v} is downloaded")), |el, tip| {

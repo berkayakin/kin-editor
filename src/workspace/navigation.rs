@@ -283,8 +283,14 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Current text of every open document, so searches see unsaved edits.
+    /// Current text of every open document, so searches see unsaved edits
+    /// (those made without a tab too).
     pub(super) fn open_buffers(&self, cx: &App) -> HashMap<PathBuf, Arc<str>> {
+        // Changed without a tab (kept only while unsaved).
+        let background = self.documents.read(cx).kept(cx).into_iter().filter_map(|doc| {
+            let d = doc.read(cx);
+            Some((d.path.clone()?, Arc::from(d.rope().to_string())))
+        });
         self.tabs
             .iter()
             .filter_map(|t| {
@@ -299,6 +305,7 @@ impl Workspace {
                 };
                 Some((e.doc.read(cx).path.clone()?, Arc::from(text)))
             })
+            .chain(background)
             .collect()
     }
 
@@ -369,44 +376,41 @@ impl Workspace {
             files.len(),
             if files.len() == 1 { "" } else { "s" }
         );
-        let rx = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some("Changes to open files can be undone. Other files are rewritten on disk."),
-            &["Replace All", "Cancel"],
-            cx,
-        );
+        // Files that aren't open change without a tab: undoable once opened,
+        // until they're saved (auto-save saves them right away).
+        let detail = match self.auto_save {
+            AutoSave::Off => "Files that aren't open stay unsaved until you save them (from the status bar). Changes can be undone.",
+            _ => "Changes to open files can be undone. Other files are saved right away.",
+        };
+        let rx = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Replace All", "Cancel"], cx);
         cx.spawn_in(window, async move |this, cx| {
             if rx.await != Ok(0) {
                 return;
             }
+            let Ok(loads) = this.update(cx, |ws, cx| files.iter().map(|path| (path.clone(), ws.document_to_edit(path, cx))).collect::<Vec<_>>()) else {
+                return;
+            };
+            let mut docs = Vec::with_capacity(loads.len());
+            for (path, load) in loads {
+                docs.push((path, load.await));
+            }
             this.update_in(cx, |ws, window, cx| {
-                let mut failures = Vec::new();
-                for path in &files {
-                    if let Some(editor) = ws.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())) {
-                        editor.update(cx, |e, cx| {
-                            // A restored tab not shown yet is read first, like any open file.
-                            if e.load(cx).is_err() {
-                                return;
-                            }
-                            let text = e.text(cx);
-                            let edits = query
-                                .find_all(&text)
-                                .into_iter()
-                                .map(|r| (r.clone(), query.replacement_for(&text, r, &replacement)))
-                                .collect();
-                            e.replace_ranges(edits, cx);
-                        });
-                    } else {
-                        let result = std::fs::read_to_string(path).and_then(|text| {
-                            let (new, _) = query.replace_all(&text, &replacement);
-                            std::fs::write(path, new)
-                        });
-                        if let Err(err) = result {
+                let (mut failures, mut background) = (Vec::new(), Vec::new());
+                for (path, doc) in docs {
+                    let doc = match doc {
+                        Ok(doc) => doc,
+                        Err(err) => {
                             failures.push(format!("{}: {err}", path.display()));
+                            continue;
                         }
+                    };
+                    let text = doc.read(cx).rope().to_string();
+                    let edits = query.find_all(&text).into_iter().map(|r| (r.clone(), query.replacement_for(&text, r, &replacement))).collect();
+                    if ws.edit_document(&doc, edits, cx) {
+                        background.push(doc);
                     }
                 }
+                ws.edited_in_background(background, cx);
                 if !failures.is_empty() {
                     let _ = window.prompt(PromptLevel::Critical, "Some files couldn't be changed", Some(&failures.join("\n")), &["OK"], cx);
                 }

@@ -75,56 +75,40 @@ impl Workspace {
         }
     }
 
-    /// Applies a language server's edits, opening files that aren't open;
-    /// each file's edits are one undo step. Edits computed for an older
-    /// version of a file (a slow rename while typing) are read in that
-    /// version's text and moved to today's; a file they can't be applied
-    /// to is left alone. Returns whether all applied.
-    pub(super) fn apply_workspace_edit(&mut self, edits: Vec<protocol::FileEdits>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let active = self.active_editor().cloned();
-        let mut skipped = Vec::new();
-        for file in edits {
-            if self.tab_for(&file.path, cx).is_none() {
-                self.open_path(file.path.clone(), window, cx);
+    /// Applies a language server's edits: in a file's tab if it has one,
+    /// else in the document store without opening a tab (listed to save,
+    /// see `edited_in_background`); each file's edits are one undo step.
+    /// Edits computed for an older version of a file (a slow rename while
+    /// typing) are read in that version's text and moved to today's; a file
+    /// they can't be applied to is left alone. Resolves to whether all applied.
+    pub(super) fn apply_workspace_edit(&mut self, edits: Vec<protocol::FileEdits>, encoding: Encoding, cx: &mut Context<Self>) -> Task<bool> {
+        let loads: Vec<_> = edits.into_iter().map(|file| (self.document_to_edit(&file.path, cx), file)).collect();
+        cx.spawn(async move |this, cx| {
+            let mut docs = Vec::with_capacity(loads.len());
+            for (load, file) in loads {
+                docs.push((load.await, file));
             }
-            let Some(editor) = self.tab_for(&file.path, cx) else {
-                skipped.push(file.path);
-                continue;
-            };
-            // A restored tab not shown yet holds no text: read it first, or
-            // the edits would go to an empty stand-in and be lost.
-            self.load_tab(&editor, cx);
-            if !editor.read(cx).is_loaded() {
-                skipped.push(file.path);
-                continue;
-            }
-            let resolved = editor.update(cx, |e, cx| {
-                let doc = e.doc.read(cx);
-                match file.version {
-                    Some(version) if version != doc.version() => {
-                        let text = doc.text_at_lsp_version(version)?;
-                        protocol::resolve_edits(text, &file.edits, encoding)
-                            .into_iter()
-                            .map(|(range, text)| Some((doc.offset_since(version, range.start)?..doc.offset_since(version, range.end)?, text)))
-                            .collect::<Option<Vec<_>>>()
+            this.update(cx, |ws, cx| {
+                let (mut skipped, mut background) = (Vec::new(), Vec::new());
+                for (doc, file) in docs {
+                    let Some(resolved) = doc.as_ref().ok().and_then(|doc| resolve_file_edits(doc.read(cx), &file, encoding)) else {
+                        skipped.push(file.path);
+                        continue;
+                    };
+                    let doc = doc.expect("resolved above");
+                    if ws.edit_document(&doc, resolved, cx) {
+                        background.push(doc);
                     }
-                    _ => Some(protocol::resolve_edits(doc.rope(), &file.edits, encoding)),
                 }
-            });
-            match resolved {
-                Some(resolved) => editor.update(cx, |e, cx| e.replace_ranges(resolved, cx)),
-                None => skipped.push(file.path),
-            }
-        }
-        // Opening files switched tabs; go back to where the user was.
-        if let Some(active) = active {
-            self.activate_editor(&active, window, cx);
-        }
-        if !skipped.is_empty() {
-            let names: Vec<String> = skipped.iter().map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
-            self.toast(ToastKind::Error, "Some changes weren't applied", Some(format!("{} changed meanwhile or couldn't be opened", names.join(", "))), cx);
-        }
-        skipped.is_empty()
+                ws.edited_in_background(background, cx);
+                if !skipped.is_empty() {
+                    let names: Vec<String> = skipped.iter().map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
+                    ws.toast(ToastKind::Error, "Some changes weren't applied", Some(format!("{} changed meanwhile or couldn't be opened", names.join(", "))), cx);
+                }
+                skipped.is_empty()
+            })
+            .unwrap_or(false)
+        })
     }
 
     pub(super) fn rename_symbol(&mut self, server: Arc<Server>, path: PathBuf, position: Position, new_name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -135,15 +119,22 @@ impl Workspace {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = server.request("textDocument/rename", params).await;
-            this.update_in(cx, |ws, window, cx| match result {
+            this.update(cx, |ws, cx| match result {
                 Ok(value) => {
                     let edits = protocol::workspace_edit(&value);
                     let (files, count) = (edits.len(), edits.iter().map(|f| f.edits.len()).sum::<usize>());
                     if count == 0 {
                         ws.toast(ToastKind::Info, "Nothing to rename here", None, cx);
-                    } else if ws.apply_workspace_edit(edits, server.encoding, window, cx) {
-                        let files = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
-                        ws.toast(ToastKind::Success, format!("Renamed {count} occurrence{} in {files}", plural(count)), None, cx);
+                    } else {
+                        let applied = ws.apply_workspace_edit(edits, server.encoding, cx);
+                        cx.spawn(async move |ws, cx| {
+                            if applied.await {
+                                let files = if files == 1 { "1 file".to_string() } else { format!("{files} files") };
+                                let message = format!("Renamed {count} occurrence{} in {files}", plural(count));
+                                ws.update(cx, |ws, cx| ws.toast(ToastKind::Success, message, None, cx)).ok();
+                            }
+                        })
+                        .detach();
                     }
                 }
                 // The server dropped it (the text changed meanwhile): not an error.
@@ -184,7 +175,7 @@ impl Workspace {
             return;
         }
         if let Some(edit) = edit {
-            self.apply_workspace_edit(protocol::workspace_edit(edit), server.encoding, window, cx);
+            self.apply_workspace_edit(protocol::workspace_edit(edit), server.encoding, cx).detach();
         }
         if let Some(command) = command.cloned() {
             self.execute_command(server, command, cx);
@@ -254,5 +245,20 @@ impl Workspace {
 
     pub(super) fn open_keymap(&mut self, _: &OpenKeymap, window: &mut Window, cx: &mut Context<Self>) {
         self.open_config_file(keymap::keymap_path(), keymap::KEYMAP_TEMPLATE, window, cx);
+    }
+}
+
+/// A file's edits as byte ranges in the document's text today, or None when
+/// they were computed for a version that's no longer known.
+fn resolve_file_edits(doc: &Document, file: &protocol::FileEdits, encoding: Encoding) -> Option<Vec<(std::ops::Range<usize>, String)>> {
+    match file.version {
+        Some(version) if version != doc.version() => {
+            let text = doc.text_at_lsp_version(version)?;
+            protocol::resolve_edits(text, &file.edits, encoding)
+                .into_iter()
+                .map(|(range, text)| Some((doc.offset_since(version, range.start)?..doc.offset_since(version, range.end)?, text)))
+                .collect()
+        }
+        _ => Some(protocol::resolve_edits(doc.rope(), &file.edits, encoding)),
     }
 }
