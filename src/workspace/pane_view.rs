@@ -334,7 +334,10 @@ impl Workspace {
         let share = relative(self.pane_sizes.get(pane_ix).copied().unwrap_or(1.));
         let content: AnyElement = match pane.tabs.get(pane.active) {
             Some(item) => cached_view(item.view()).into_any_element(),
-            None if self.panes.len() == 1 => self.render_welcome(window, cx).into_any_element(),
+            // The start screen is for when there's no project yet; with one
+            // open, a lone pane without tabs suggests ways to open a file.
+            None if self.panes.len() == 1 && self.root.is_none() => self.render_welcome(window, cx).into_any_element(),
+            None if self.panes.len() == 1 => self.render_no_open_files(window, cx).into_any_element(),
             None => div()
                 .size_full()
                 .flex()
@@ -412,19 +415,30 @@ impl Workspace {
             .when(!pane.tabs.is_empty() && self.diff_view().is_none(), |el| {
                 el.child(self.render_tab_bar(pane_ix, edge, self.tab_strip_width(pane_ix), window, cx))
             })
-            // Finder files dragged anywhere over the pane (tabs included) open in it.
+            // Finder files, and files dragged from the file tree, dropped anywhere
+            // over the pane (tabs included) open in it.
             .group(drop_group.clone())
             .child(
-                // Shown by GPUI while Finder files are over the pane, so there's no
+                // Shown by GPUI while such files are over the pane, so there's no
                 // state to go stale. Being the drop target also gives it the
                 // hitbox GPUI needs to apply drag styles; hidden, it takes no events.
                 div()
                     .invisible()
-                    .group_drag_over::<gpui::ExternalPaths>(drop_group, |s| s.visible())
+                    .group_drag_over::<gpui::ExternalPaths>(drop_group.clone(), |s| s.visible())
+                    .group_drag_over::<crate::project_tree::DraggedEntry>(drop_group, |s| s.visible())
+                    // A tree folder isn't opened by dropping it here.
+                    .can_drop(|dragged, _, _| {
+                        dragged.downcast_ref::<crate::project_tree::DraggedEntry>().is_none_or(|entry| !entry.path.is_dir())
+                    })
                     .on_drop(cx.listener(move |ws, paths: &gpui::ExternalPaths, window, cx| {
                         cx.stop_propagation();
                         ws.active_pane = pane_ix;
                         ws.open_dropped(paths.paths(), window, cx);
+                    }))
+                    .on_drop(cx.listener(move |ws, entry: &crate::project_tree::DraggedEntry, window, cx| {
+                        cx.stop_propagation();
+                        ws.active_pane = pane_ix;
+                        ws.open_path(entry.path.clone(), window, cx);
                     }))
                     .absolute()
                     .inset_0()

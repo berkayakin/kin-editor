@@ -3,6 +3,53 @@
 use super::*;
 
 impl Workspace {
+    /// A project's editor area with no file open: the quickest ways to open
+    /// one, each clickable with its shortcut, like JetBrains' empty editor.
+    pub(super) fn render_no_open_files(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::get(cx).clone();
+        let hint = |id: &'static str, label: &'static str, keys: Option<String>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .w(px(300.))
+                .h(px(28.))
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .hover(|s| s.text_color(theme.text))
+                .child(label)
+                .when_some(keys, |el, keys| el.child(kbd(keys, cx)))
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .bg(theme.background)
+            .text_size(px(13.))
+            .child(
+                hint("empty-search", "Search Everywhere", Some(double_shift_label().to_string()))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.search_everywhere(&SearchEverywhere, window, cx))),
+            )
+            .child(
+                hint("empty-go-to-file", "Go to File", binding_label(&GoToFile, window))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.go_to_file(&GoToFile, window, cx))),
+            )
+            .child(
+                hint("empty-recent", "Recent Files", binding_label(&RecentFiles, window))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.recent_files(&RecentFiles, window, cx))),
+            )
+            .child(
+                hint("empty-new-file", "New File", binding_label(&NewFile, window))
+                    .on_click(cx.listener(|ws, _, window, cx| ws.new_file(&NewFile, window, cx))),
+            )
+            .child(div().mt_3().text_size(px(12.)).text_color(theme.text_dim).child("Drop files here to open them"))
+    }
+
     pub(super) fn render_welcome(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         // Lay out for the space the welcome screen actually gets.
