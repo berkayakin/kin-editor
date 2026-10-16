@@ -149,7 +149,7 @@ mod tests {
     use super::*;
 
     fn temp_file(name: &str, text: &[u8]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kin-unloaded-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-unloaded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, text).unwrap();
@@ -305,7 +305,7 @@ mod tests {
 
     #[gpui::test]
     fn a_missing_file_fails_unless_there_is_unsaved_text(cx: &mut TestAppContext) {
-        let gone = std::env::temp_dir().join("kin-unloaded-missing/nothing.txt");
+        let gone = std::env::temp_dir().join("kuana-unloaded-missing/nothing.txt");
         let editor = cx.new(|cx| Editor::new_unloaded(Some(gone.clone()), unloaded(0, None), cx));
         assert!(editor.update(cx, |e, cx| e.load(cx)).is_err());
         editor.read_with(cx, |e, _| assert!(!e.is_loaded()));

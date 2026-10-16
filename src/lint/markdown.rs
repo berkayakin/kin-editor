@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn honors_project_config() {
-        let dir = std::env::temp_dir().join(format!("kin-md-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-md-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".markdownlint.json"), r#"{ "MD001": false }"#).unwrap();
         let file = dir.join("README.md");

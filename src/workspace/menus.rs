@@ -398,7 +398,7 @@ impl Workspace {
             }
             "qa" | "qa!" | "qall" => cx.defer(quit),
             "" => {}
-            other => return Err(format!("Not a command Kin knows: {other}")),
+            other => return Err(format!("Not a command Kuana knows: {other}")),
         }
         Ok(())
     }
@@ -699,23 +699,23 @@ impl Workspace {
         }
     }
 
-    /// Opens what another app asked Kin to open (Finder, the `kin` command).
+    /// Opens what another app asked Kuana to open (Finder, the `kuana` command).
     pub fn open_external(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         window.activate_window();
         self.open_dropped(&paths, window, cx);
     }
 
-    /// Installs the `kin` command (it may ask for an administrator password).
+    /// Installs the `kuana` command (it may ask for an administrator password).
     pub(super) fn install_shell_command(&mut self, _: &InstallShellCommand, _: &mut Window, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async { crate::cli::install() }).await;
             this.update(cx, |ws, cx| match result {
                 Ok(()) => {
-                    let detail = format!("{} opens files and folders here: kin . or kin file.rs", crate::cli::COMMAND_PATH);
-                    ws.toast(ToastKind::Success, "Installed the kin command", Some(detail), cx);
+                    let detail = format!("{} opens files and folders here: kuana . or kuana file.rs", crate::cli::COMMAND_PATH);
+                    ws.toast(ToastKind::Success, "Installed the kuana command", Some(detail), cx);
                 }
                 Err(err) if err == "Cancelled" => {}
-                Err(err) => ws.toast(ToastKind::Error, "Couldn't install the kin command", Some(err), cx),
+                Err(err) => ws.toast(ToastKind::Error, "Couldn't install the kuana command", Some(err), cx),
             })
             .ok();
         })

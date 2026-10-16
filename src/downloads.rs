@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(parse_curl_progress("\r##### 100.0%\n"), Some(1.0));
         assert_eq!(parse_curl_progress("curl: (22) The requested URL returned error: 404\n"), None);
 
-        let dir = std::env::temp_dir().join(format!("kin-download-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-download-{}", std::process::id()));
         std::fs::write(&dir, vec![0u8; 2_000_000]).unwrap();
         // A known size gives the fraction; otherwise curl's percentage does.
         let tracker = start("wasi-sdk", &dir, Some(4_000_000));

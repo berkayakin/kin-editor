@@ -1,6 +1,6 @@
 //! What a debug session runs: the adapter for a [`DebugSpec`] (lldb-dap for
 //! Rust and other native code, Delve for Go, debugpy for Python, js-debug
-//! for JavaScript; found on PATH, through Xcode or in Kin's config folder,
+//! for JavaScript; found on PATH, through Xcode or in Kuana's config folder,
 //! never downloaded), the cargo build that makes a Rust executable, the
 //! `launch` or `attach` arguments each adapter expects, and the processes
 //! Attach to Process lists.
@@ -29,7 +29,7 @@ pub struct Adapter {
     pub port: Option<u16>,
 }
 
-/// A debug adapter Kin can start: built in (lldb-dap, Delve, debugpy,
+/// A debug adapter Kuana can start: built in (lldb-dap, Delve, debugpy,
 /// js-debug) or from an extension.
 pub trait DebugAdapter: Sync {
     /// Its `adapterID`.
@@ -132,7 +132,7 @@ pub fn set_extension_adapters(adapters: Vec<&'static ExtensionAdapter>) {
     *EXTENSION_ADAPTERS.write().unwrap() = adapters;
 }
 
-/// The adapter a configuration names, by id or alias: Kin's, then extensions'.
+/// The adapter a configuration names, by id or alias: Kuana's, then extensions'.
 pub fn find_adapter(name: &str) -> Option<&'static dyn DebugAdapter> {
     let built_in: [&'static dyn DebugAdapter; 4] = [&LldbDap, &Delve, &Debugpy, &JsDebug];
     let named = |a: &&'static dyn DebugAdapter| a.id() == name || a.aliases().contains(&name);
@@ -171,7 +171,7 @@ fn adapter_for(spec: &DebugSpec) -> Option<&'static dyn DebugAdapter> {
 pub fn adapter(spec: &DebugSpec, cwd: &Path) -> Result<Adapter, String> {
     match (adapter_for(spec), spec) {
         (Some(adapter), _) => adapter.start(cwd),
-        (None, DebugSpec::Config { adapter, .. }) => Err(format!("Kin has no debugger for \"{adapter}\"")),
+        (None, DebugSpec::Config { adapter, .. }) => Err(format!("Kuana has no debugger for \"{adapter}\"")),
         (None, _) => Err("This can't be debugged".into()),
     }
 }
@@ -217,7 +217,7 @@ fn js_debug() -> Result<Adapter, String> {
     let server = crate::theme::config_dir().map(|d| d.join("debug-adapters/js-debug/src/dapDebugServer.js")).filter(|p| p.is_file());
     let Some(server) = server else {
         return Err("Debugging JavaScript needs js-debug: unpack js-debug-dap-*.tar.gz from github.com/microsoft/vscode-js-debug/releases \
-                    into ~/.config/kin/debug-adapters (or put js-debug-adapter on PATH)."
+                    into ~/.config/kuana/debug-adapters (or put js-debug-adapter on PATH)."
             .into());
     };
     let node = servers::which("node").ok_or("Debugging JavaScript needs Node.js on PATH.")?;
@@ -250,11 +250,11 @@ fn python_for(cwd: &Path) -> Option<PathBuf> {
     crate::python::venv(cwd).map(|v| crate::python::interpreter(&v)).filter(|p| p.is_file()).or_else(|| servers::which("python3"))
 }
 
-/// `initialize` arguments (what Kin supports as a client).
+/// `initialize` arguments (what Kuana supports as a client).
 pub fn initialize_arguments(adapter_id: &str) -> Value {
     json!({
-        "clientID": "kin",
-        "clientName": "Kin",
+        "clientID": "kuana",
+        "clientName": "Kuana",
         "adapterID": adapter_id,
         "pathFormat": "path",
         "linesStartAt1": true,
@@ -301,7 +301,7 @@ pub fn launch_arguments(spec: &DebugSpec, cwd: &Path, program: Option<&Path>, ad
             // Program output as DAP output events, not Delve's own stdout.
             "outputMode": "remote",
             // The build goes to the temp folder, not the project (Delve removes it after).
-            "output": std::env::temp_dir().join(format!("kin-debug-{}-{}", std::process::id(), unique())),
+            "output": std::env::temp_dir().join(format!("kuana-debug-{}-{}", std::process::id(), unique())),
         }),
         DebugSpec::Python { program, module, args } => {
             let mut launch = json!({
@@ -489,7 +489,7 @@ pub struct Process {
     pub program: PathBuf,
 }
 
-/// The user's processes, newest first (from `ps`), without Kin itself.
+/// The user's processes, newest first (from `ps`), without Kuana itself.
 pub fn processes() -> Vec<Process> {
     let column = |name: &str| -> Vec<(u32, String)> {
         let Ok(output) = crate::process::command("ps").args(["x", "-o", "pid=", "-o"]).arg(format!("{name}=")).output() else { return Vec::new() };
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn reads_vs_code_and_zed_debug_configurations() {
-        let root = std::env::temp_dir().join(format!("kin-debug-configs-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kuana-debug-configs-{}", std::process::id()));
         std::fs::create_dir_all(root.join(".vscode")).unwrap();
         std::fs::create_dir_all(root.join(".zed")).unwrap();
         std::fs::write(
@@ -606,7 +606,7 @@ mod tests {
               "version": "0.2.0",
               "configurations": [
                 { "type": "node", "request": "launch", "name": "Server", "program": "${workspaceFolder}/server.js",
-                  "env": { "HOME_DIR": "${env:KIN_TEST_DEBUG_VAR}" }, "preLaunchTask": "build", },
+                  "env": { "HOME_DIR": "${env:KUANA_TEST_DEBUG_VAR}" }, "preLaunchTask": "build", },
                 { "type": "debugpy", "request": "attach", "name": "Attach", "connect": { "port": 5678 } },
               ],
             }"#,
@@ -618,7 +618,7 @@ mod tests {
         )
         .unwrap();
         // SAFETY: only this test reads the variable.
-        unsafe { std::env::set_var("KIN_TEST_DEBUG_VAR", "/home/k") };
+        unsafe { std::env::set_var("KUANA_TEST_DEBUG_VAR", "/home/k") };
         let file = root.join("src/main.go");
         let targets = project_configurations(&root, Some(&file));
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
@@ -666,14 +666,14 @@ mod tests {
     #[test]
     fn picks_the_executable_cargo_made() {
         let artifacts = vec![
-            json!({"target": {"name": "kin", "kind": ["bin"]}, "profile": {"test": false}, "executable": "/t/debug/kin"}),
+            json!({"target": {"name": "kuana", "kind": ["bin"]}, "profile": {"test": false}, "executable": "/t/debug/kuana"}),
             json!({"target": {"name": "helper", "kind": ["bin"]}, "profile": {"test": false}, "executable": "/t/debug/helper"}),
-            json!({"target": {"name": "kin", "kind": ["bin"]}, "profile": {"test": true}, "executable": "/t/debug/deps/kin-1a2b"}),
+            json!({"target": {"name": "kuana", "kind": ["bin"]}, "profile": {"test": true}, "executable": "/t/debug/deps/kuana-1a2b"}),
         ];
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(pick_executable(&artifacts, &args(&["build", "--bin", "kin"])), Some("/t/debug/kin".into()));
+        assert_eq!(pick_executable(&artifacts, &args(&["build", "--bin", "kuana"])), Some("/t/debug/kuana".into()));
         assert_eq!(pick_executable(&artifacts, &args(&["build"])), Some("/t/debug/helper".into()));
-        assert_eq!(pick_executable(&artifacts, &args(&["test", "--no-run", "--bin", "kin"])), Some("/t/debug/deps/kin-1a2b".into()));
+        assert_eq!(pick_executable(&artifacts, &args(&["test", "--no-run", "--bin", "kuana"])), Some("/t/debug/deps/kuana-1a2b".into()));
     }
 
     #[test]

@@ -1,6 +1,6 @@
-# Kin documentation
+# Kuana documentation
 
-- [Features](features.md): everything Kin does, in one list
+- [Features](features.md): everything Kuana does, in one list
 - [Installing and building](install.md): downloads, building from source, updates
 - [Key bindings](keybindings.md): the JetBrains, VS Code, Sublime Text and Zed keymaps, and your own
 - [Languages](languages.md): language servers, formatting, Python environments

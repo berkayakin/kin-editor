@@ -2,12 +2,12 @@
 //! run its code without being asked: a language server builds it, ESLint and
 //! Prettier load its JavaScript config, `node_modules/.bin` and venv tools are
 //! its own programs, a venv's activate script is a shell script, and Git runs
-//! `core.fsmonitor` from its config. Until the folder is trusted, Kin does
+//! `core.fsmonitor` from its config. Until the folder is trusted, Kuana does
 //! none of that; editing, Git and anything run explicitly (Run, Debug) work.
 //!
 //! Trusting a folder trusts everything inside it, so trusting a parent folder
 //! covers every project in it. Trusted folders live in `trust.json`, a file of
-//! their own: Kin versions from before trust existed rewrite `state.json`
+//! their own: Kuana versions from before trust existed rewrite `state.json`
 //! without the keys they don't know, which forgot every trusted folder. The
 //! `trust_all_projects` setting turns the checks off without saving anything.
 
@@ -35,11 +35,11 @@ pub fn set_trust_all(on: bool) {
     TRUST_ALL.store(on, Ordering::Relaxed);
 }
 
-/// Whether Kin may run what `path` (a project folder or a file) configures.
+/// Whether Kuana may run what `path` (a project folder or a file) configures.
 pub fn is_trusted(path: &Path) -> bool {
     TRUST_ALL.load(Ordering::Relaxed)
         || trusted_by(path).is_some()
-        // Kin's own settings, keymap and themes.
+        // Kuana's own settings, keymap and themes.
         || crate::theme::config_dir().is_some_and(|dir| path.starts_with(dir))
 }
 
@@ -71,7 +71,7 @@ fn file_path() -> Option<PathBuf> {
 }
 
 /// The trusted folders on disk: `trust.json`, plus any still in `state.json`
-/// from before it existed (moved over right away, before an older Kin can
+/// from before it existed (moved over right away, before an older Kuana can
 /// rewrite `state.json` without them).
 fn load() -> Vec<PathBuf> {
     let file: TrustFile = file_path()
@@ -180,8 +180,8 @@ mod tests {
 
     #[test]
     fn state_keeps_keys_it_does_not_know() {
-        let state: SessionState = serde_json::from_str(r#"{"last_root": "/p", "from_a_newer_kin": [1, 2]}"#).unwrap();
+        let state: SessionState = serde_json::from_str(r#"{"last_root": "/p", "from_a_newer_kuana": [1, 2]}"#).unwrap();
         let json = serde_json::to_string(&state).unwrap();
-        assert!(json.contains(r#""from_a_newer_kin":[1,2]"#), "{json}");
+        assert!(json.contains(r#""from_a_newer_kuana":[1,2]"#), "{json}");
     }
 }

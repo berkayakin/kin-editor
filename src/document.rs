@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn image_documents_are_never_edited_or_overwritten() {
-        let dir = std::env::temp_dir().join(format!("kin-image-doc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-image-doc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pixel.png");
         let bytes = [0x89u8, b'P', b'N', b'G', 0, 1, 2, 3];
@@ -1455,7 +1455,7 @@ mod tests {
 
     #[test]
     fn notices_changes_made_by_other_programs() {
-        let dir = std::env::temp_dir().join(format!("kin-doc-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-doc-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.txt");
         std::fs::write(&path, "one").unwrap();
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[test]
     fn a_reload_drops_what_the_server_placed_in_the_old_text() {
-        let dir = std::env::temp_dir().join(format!("kin-doc-reload-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-doc-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "let index = 1;\n").unwrap();
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn tells_whether_a_file_reads_as_some_text() {
-        let dir = std::env::temp_dir().join(format!("kin-doc-has-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-doc-has-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.txt");
         std::fs::write(&path, "one\r\ntwo\r\n").unwrap();

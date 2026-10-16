@@ -1,8 +1,8 @@
-//! `kin extension check <folder>`: what Kin can verify about an extension
+//! `kuana extension check <folder>`: what Kuana can verify about an extension
 //! without running it. The manifest and each language's config.toml (keys
-//! Kin doesn't know), each grammar (fetched and built as Kin would), and
+//! Kuana doesn't know), each grammar (fetched and built as Kuana would), and
 //! every query against its grammar: that it compiles, and has the captures
-//! Kin looks for.
+//! Kuana looks for.
 
 use std::path::Path;
 
@@ -12,14 +12,14 @@ use tree_sitter::{Language as TsLanguage, Query};
 use super::{OutlineConfig, build, needs_build, read_extension, read_toml};
 use crate::syntax::Highlight;
 
-/// The extension format version this Kin reads (Zed's `schema_version`).
+/// The extension format version this Kuana reads (Zed's `schema_version`).
 pub const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     Error,
     Warning,
-    /// Fine, but worth knowing (a Zed key Kin doesn't use).
+    /// Fine, but worth knowing (a Zed key Kuana doesn't use).
     Note,
 }
 
@@ -31,7 +31,7 @@ pub struct Finding {
 
 const MANIFEST_KEYS: &[&str] =
     &["id", "name", "version", "schema_version", "description", "authors", "repository", "grammars", "language_servers", "debug_adapters"];
-/// Zed's, for things Kin doesn't run (code, AI features).
+/// Zed's, for things Kuana doesn't run (code, AI features).
 const ZED_MANIFEST_KEYS: &[&str] =
     &["lib", "slash_commands", "context_servers", "indexed_docs_providers", "snippets", "capabilities", "agent_servers", "themes", "icon_themes", "languages"];
 const LANGUAGE_KEYS: &[&str] = &[
@@ -65,7 +65,7 @@ pub fn check(dir: &Path) -> Vec<Finding> {
     keys(&manifest, "extension.toml", MANIFEST_KEYS, ZED_MANIFEST_KEYS, &mut add);
     match manifest.get("schema_version") {
         Some(Value::Integer(n)) if *n > SCHEMA_VERSION => {
-            add(Level::Warning, format!("extension.toml: schema_version {n} is newer than the {SCHEMA_VERSION} Kin reads"))
+            add(Level::Warning, format!("extension.toml: schema_version {n} is newer than the {SCHEMA_VERSION} Kuana reads"))
         }
         Some(Value::Integer(_)) => {}
         Some(_) => add(Level::Error, "extension.toml: schema_version should be a number".into()),
@@ -74,7 +74,7 @@ pub fn check(dir: &Path) -> Vec<Finding> {
 
     let (info, languages, _, grammars) = read_extension(dir);
     for problem in info.problems {
-        // Zed starts some debug adapters in extension code, which Kin doesn't run.
+        // Zed starts some debug adapters in extension code, which Kuana doesn't run.
         let level = if problem.ends_with("it needs a command") { Level::Warning } else { Level::Error };
         add(level, problem);
     }
@@ -144,7 +144,7 @@ fn queries(
     {
         add(Level::Error, format!("{folder}: {err}"));
     }
-    // What each query needs to do anything in Kin.
+    // What each query needs to do anything in Kuana.
     let needs: [(&str, &[&[&str]]); 5] = [
         ("injections.scm", &[&["injection.content", "content"]]),
         ("brackets.scm", &[&["open"], &["close"]]),
@@ -157,7 +157,7 @@ fn queries(
         let Some(query) = compile(file, &text, add) else { continue };
         for alternatives in captures {
             if !alternatives.iter().any(|c| query.capture_index_for_name(c).is_some()) {
-                add(Level::Warning, format!("{folder}/{file}: no @{} capture, so Kin doesn't use it", alternatives[0]));
+                add(Level::Warning, format!("{folder}/{file}: no @{} capture, so Kuana doesn't use it", alternatives[0]));
             }
         }
     }
@@ -179,11 +179,11 @@ fn keys(table: &Table, file: &str, known: &[&str], zed: &[&str], add: &mut impl 
         }
     }
     if !unused.is_empty() {
-        add(Level::Note, format!("{file}: Kin doesn't use {}", unused.join(", ")));
+        add(Level::Note, format!("{file}: Kuana doesn't use {}", unused.join(", ")));
     }
 }
 
-/// `kin extension check [folder]`: prints the findings; the exit code is 1
+/// `kuana extension check [folder]`: prints the findings; the exit code is 1
 /// if there are errors.
 pub fn run(dir: &Path) -> i32 {
     let findings = check(dir);
@@ -219,8 +219,8 @@ mod tests {
         let findings = check(&dir);
         let has = |level: Level, text: &str| findings.iter().any(|f| f.level == level && f.message.contains(text));
         assert!(has(Level::Warning, "unknown key \"versoin\" (did you mean \"version\"?)"), "{findings:?}");
-        assert!(has(Level::Note, "extension.toml: Kin doesn't use slash_commands"), "{findings:?}");
-        assert!(has(Level::Note, "config.toml: Kin doesn't use autoclose_before"), "{findings:?}");
+        assert!(has(Level::Note, "extension.toml: Kuana doesn't use slash_commands"), "{findings:?}");
+        assert!(has(Level::Note, "config.toml: Kuana doesn't use autoclose_before"), "{findings:?}");
         assert!(has(Level::Warning, "unknown key \"tab_sise\" (did you mean \"tab_size\"?)"), "{findings:?}");
         assert!(has(Level::Warning, "no built-in color for @fancy.thing"), "{findings:?}");
         assert!(!has(Level::Warning, "@spell"), "{findings:?}");

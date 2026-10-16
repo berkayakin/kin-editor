@@ -1,6 +1,6 @@
 # Key bindings
 
-Kin starts from the JetBrains IDE keymaps: the macOS keymap on macOS and the
+Kuana starts from the JetBrains IDE keymaps: the macOS keymap on macOS and the
 Windows/Linux keymap elsewhere. On macOS the Ctrl variants of Find/Replace
 (Ctrl+F, Ctrl+R, Ctrl+Shift+F, Ctrl+Shift+R) work too. Every action is also
 reachable through Find Action, which shows its shortcut.

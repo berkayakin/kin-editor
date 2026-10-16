@@ -84,18 +84,18 @@ use crate::{
 fn menus() -> Vec<Menu> {
     vec![
         Menu {
-            name: "Kin".into(),
+            name: "Kuana".into(),
             items: vec![
-                MenuItem::action("About Kin", about::About),
+                MenuItem::action("About Kuana", about::About),
                 MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::action("Extensions…", OpenExtensions),
                 MenuItem::action("Project Trust…", ProjectTrust),
                 MenuItem::action("Welcome Setup…", WelcomeSetup),
-                MenuItem::action("Install 'kin' Shell Command", InstallShellCommand),
+                MenuItem::action("Install 'kuana' Shell Command", InstallShellCommand),
                 MenuItem::separator(),
-                MenuItem::action("Quit Kin", Quit),
+                MenuItem::action("Quit Kuana", Quit),
             ],
         },
         Menu {
@@ -229,9 +229,9 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
-/// Run as a bare binary (`cargo run`), macOS names the app after the executable, `kin`.
-/// This fixes the menu bar; the Dock label still says `kin` until Kin runs as the bundled
-/// `Kin.app`, which gets its name from Info.plist. Must run before the application starts.
+/// Run as a bare binary (`cargo run`), macOS names the app after the executable, `kuana`.
+/// This fixes the menu bar; the Dock label still says `kuana` until Kuana runs as the bundled
+/// `Kuana.app`, which gets its name from Info.plist. Must run before the application starts.
 #[cfg(target_os = "macos")]
 fn set_app_name() {
     use objc2::{rc::Retained, runtime::AnyObject};
@@ -244,11 +244,11 @@ fn set_app_name() {
     let Some(info) = bundle.infoDictionary() else { return };
     // Without a bundle, Foundation builds this dictionary in memory and it is mutable.
     let info: Retained<NSMutableDictionary<NSString, AnyObject>> = unsafe { Retained::cast_unchecked(info) };
-    info.insert(ns_string!("CFBundleName"), &*NSString::from_str("Kin"));
+    info.insert(ns_string!("CFBundleName"), &*NSString::from_str("Kuana"));
 }
 
 /// Sets the Dock icon so it also shows when running the bare binary
-/// (`cargo run`); a bundled `.app` gets it from `Kin.icns` as well.
+/// (`cargo run`); a bundled `.app` gets it from `Kuana.icns` as well.
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
     use objc2::{AllocAnyThread, MainThreadMarker};
@@ -265,6 +265,7 @@ fn set_dock_icon() {
 }
 
 fn main() {
+    theme::move_legacy_config();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "extension") {
         std::process::exit(cli::extension_command(&raw[1..]));
@@ -274,7 +275,7 @@ fn main() {
     #[cfg(target_os = "macos")]
     set_app_name();
 
-    // Finder (Open With, double-click) and the `kin` command send paths as
+    // Finder (Open With, double-click) and the `kuana` command send paths as
     // open-file events; they're handled once the app is running.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let app = Application::new().with_assets(assets::Assets);
@@ -345,7 +346,7 @@ fn main() {
             last = workspace::open_window(near, cx, move |workspace, window, cx| workspace.set_root(dir, window, cx)).or(last);
         }
         cx.activate(true);
-        // The About window alone doesn't keep Kin running.
+        // The About window alone doesn't keep Kuana running.
         cx.on_window_closed(|cx| {
             if cx.windows().iter().all(|w| w.downcast::<workspace::Workspace>().is_none()) {
                 cx.quit();
@@ -355,7 +356,7 @@ fn main() {
     });
 }
 
-/// Opens paths from another app in the frontmost Kin window (a new one
+/// Opens paths from another app in the frontmost Kuana window (a new one
 /// when there's none).
 fn open_external(paths: Vec<std::path::PathBuf>, cx: &mut App) {
     cx.activate(true);

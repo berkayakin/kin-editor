@@ -1,13 +1,13 @@
 //! Installing language servers with one click, like Zed does without asking.
 //! A missing server's status bar item offers **Install**, which puts it in
-//! Kin's own folder (`<config>/servers/`): a prebuilt binary from its GitHub
+//! Kuana's own folder (`<config>/servers/`): a prebuilt binary from its GitHub
 //! release (checked against GitHub's SHA-256), an npm package (with the
-//! user's Node.js, or one Kin downloads once and checks against Node's
+//! user's Node.js, or one Kuana downloads once and checks against Node's
 //! checksums), or `go install`. A server the user installed (in the project,
-//! a venv or on PATH) always wins over Kin's copy.
+//! a venv or on PATH) always wins over Kuana's copy.
 //!
 //! Each install goes in a folder per version, with `current` naming the one
-//! in use, so a newer version can arrive while the old one runs. Kin looks
+//! in use, so a newer version can arrive while the old one runs. Kuana looks
 //! for one at most once a week, after starting a server it installed; the new
 //! version runs from the next start.
 
@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use super::servers::{self, ServerSpec};
 
-/// A server Kin can install: the command it provides (a candidate in a
+/// A server Kuana can install: the command it provides (a candidate in a
 /// `ServerSpec`) and where it comes from.
 pub struct Installer {
     pub command: &'static str,
@@ -91,7 +91,7 @@ pub fn set_extension_installers(installers: Vec<&'static Installer>) {
     *EXTENSION_INSTALLERS.write().unwrap() = installers;
 }
 
-/// Kin's own installers, then extensions'.
+/// Kuana's own installers, then extensions'.
 fn all() -> Vec<&'static Installer> {
     INSTALLERS.iter().chain(EXTENSION_INSTALLERS.read().unwrap().iter().copied()).collect()
 }
@@ -178,18 +178,18 @@ impl Installer {
     }
 }
 
-/// Where Kin keeps the servers it installs.
+/// Where Kuana keeps the servers it installs.
 pub fn servers_dir() -> Option<PathBuf> {
     crate::theme::config_dir().map(|d| d.join("servers"))
 }
 
-/// The installer for a server, by the first candidate Kin can install.
+/// The installer for a server, by the first candidate Kuana can install.
 pub fn for_spec(spec: &ServerSpec) -> Option<&'static Installer> {
     let installers = all();
     spec.candidates.iter().find_map(|(command, _)| installers.iter().find(|i| i.command == *command).copied())
 }
 
-/// Kin's copy of `command`, if it installed one.
+/// Kuana's copy of `command`, if it installed one.
 pub fn installed(command: &str) -> Option<PathBuf> {
     all().into_iter().filter(|i| i.command == command).find_map(|i| servers::executable(&i.binary(&current(&i.home()?)?)))
 }
@@ -255,7 +255,7 @@ pub fn install(installer: &'static Installer) -> Result<(), String> {
 }
 
 fn install_now(installer: &Installer) -> Result<(), String> {
-    let home = installer.home().ok_or("Kin has no config folder")?;
+    let home = installer.home().ok_or("Kuana has no config folder")?;
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     match &installer.source {
         Source::GitHub { repo, asset } => install_github(installer, &home, repo, asset),
@@ -368,13 +368,13 @@ fn install_go(installer: &Installer, home: &Path, module: &str) -> Result<(), St
 
 // ---- Node.js ---------------------------------------------------------------------------
 
-/// The folder with Kin's own `node`, if it downloaded one.
+/// The folder with Kuana's own `node`, if it downloaded one.
 pub fn node_bin() -> Option<PathBuf> {
     let dir = current(&servers_dir()?.join("node"))?;
     Some(if cfg!(windows) { dir } else { dir.join("bin") })
 }
 
-/// The search path with Kin's Node.js first (npm packages start with
+/// The search path with Kuana's Node.js first (npm packages start with
 /// `#!/usr/bin/env node`).
 pub fn path_with(node_bin: Option<&Path>) -> std::ffi::OsString {
     let path = servers::search_path();
@@ -382,7 +382,7 @@ pub fn path_with(node_bin: Option<&Path>) -> std::ffi::OsString {
     std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(path))).unwrap_or_else(|_| path.clone())
 }
 
-/// npm, and the folder Kin's `node` is in when the user has none.
+/// npm, and the folder Kuana's `node` is in when the user has none.
 fn npm() -> Result<(PathBuf, Option<PathBuf>), String> {
     if let (Some(npm), Some(_)) = (servers::which("npm"), servers::which("node")) {
         return Ok((npm, None));
@@ -422,7 +422,7 @@ fn install_node() -> Result<(), String> {
         .find_map(|l| l.strip_suffix(&format!("  {name}")).map(str::to_string))
         .ok_or_else(|| format!("SHASUMS256.txt doesn't list {name}"))?;
 
-    let home = servers_dir().ok_or("Kin has no config folder")?.join("node");
+    let home = servers_dir().ok_or("Kuana has no config folder")?.join("node");
     std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let temp = home.join(format!("{name}.download"));
     crate::updater::download(&format!("{base}/{name}"), &temp, "Node.js", None)?;
@@ -482,7 +482,7 @@ fn make_executable(path: &Path) -> Result<(), String> {
 
 // ---- Updates ----------------------------------------------------------------------------
 
-/// After Kin starts a server it installed: at most once a week, installs a
+/// After Kuana starts a server it installed: at most once a week, installs a
 /// newer version if there is one (it runs from the next start). Blocking;
 /// errors are left for the next week.
 pub fn check_for_update(program: &Path) {
@@ -505,7 +505,7 @@ pub fn check_for_update(program: &Path) {
         return;
     }
     if let Err(err) = install(installer) {
-        eprintln!("kin: couldn't update {}: {err}", installer.command);
+        eprintln!("kuana: couldn't update {}: {err}", installer.command);
     }
 }
 
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     #[ignore = "downloads from GitHub"]
     fn installs_from_github() {
-        let config = std::env::temp_dir().join(format!("kin-install-{}", std::process::id()));
+        let config = std::env::temp_dir().join(format!("kuana-install-{}", std::process::id()));
         // SAFETY: tests that touch XDG_CONFIG_HOME run alone (--ignored, one test).
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &config) };
         let marksman = INSTALLERS.iter().find(|i| i.command == "marksman").unwrap();

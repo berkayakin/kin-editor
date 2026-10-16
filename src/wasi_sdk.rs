@@ -56,7 +56,7 @@ pub fn install() -> Result<(), String> {
     if INSTALLING.swap(true, Ordering::SeqCst) {
         return Err("wasi-sdk is already being downloaded".into());
     }
-    let result = home().ok_or_else(|| "Kin has no config folder".to_string()).and_then(|home| install_into(&home));
+    let result = home().ok_or_else(|| "Kuana has no config folder".to_string()).and_then(|home| install_into(&home));
     INSTALLING.store(false, Ordering::SeqCst);
     result
 }
@@ -158,7 +158,7 @@ mod tests {
     fn compiles_a_grammar_that_loads() {
         let clang = clang().expect("set WASI_SDK_PATH");
         let src = std::env::var("GRAMMAR_SRC").map(PathBuf::from).expect("set GRAMMAR_SRC to a grammar's src folder");
-        let out = std::env::temp_dir().join(format!("kin-wasm-{}.wasm", std::process::id()));
+        let out = std::env::temp_dir().join(format!("kuana-wasm-{}.wasm", std::process::id()));
         compile(&clang, &src, "bash", &out).unwrap();
         let language = crate::extensions::load_wasm(&out, "bash").unwrap();
         let mut parser = tree_sitter::Parser::new();

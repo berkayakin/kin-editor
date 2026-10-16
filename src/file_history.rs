@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn renames_undo_and_redo() {
-        let dir = std::env::temp_dir().join(format!("kin-file-history-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-file-history-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
         std::fs::write(&a, "x").unwrap();
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     #[ignore]
     fn trash_round_trip() {
-        let dir = std::env::temp_dir().join(format!("kin-trash-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-trash-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("gone.txt");
         std::fs::write(&file, "keep me").unwrap();
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn finds_folders_a_path_creates() {
         let dir = std::env::temp_dir();
-        assert_eq!(topmost_new(&dir.join("kin-no-such/x/y.txt")), dir.join("kin-no-such"));
-        assert_eq!(topmost_new(&dir.join("kin-y.txt")), dir.join("kin-y.txt"));
+        assert_eq!(topmost_new(&dir.join("kuana-no-such/x/y.txt")), dir.join("kuana-no-such"));
+        assert_eq!(topmost_new(&dir.join("kuana-y.txt")), dir.join("kuana-y.txt"));
     }
 }

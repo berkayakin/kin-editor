@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn keeps_up_with_changes_without_scanning_again() {
-        let root = std::env::temp_dir().join(format!("kin-project-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kuana-project-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("build")).unwrap();

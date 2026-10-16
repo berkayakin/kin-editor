@@ -419,7 +419,7 @@ impl Workspace {
                 let doc = e.read(cx).doc.read(cx);
                 format!("{}{}", doc.file_name(), if doc.is_dirty() { " •" } else { "" })
             }
-            None => "Kin".into(),
+            None => "Kuana".into(),
         };
         if let Some(root) = self.root.as_deref() {
             title.push_str(&format!(" — {}", folder_name(root)));

@@ -1,8 +1,8 @@
-# Kin vs Zed: architecture review
+# Kuana vs Zed: architecture review
 
-*October 2026. Kin `2c7e082` (~47.5k lines, one crate) compared with Zed `main` @ `5a5fbe7`.*
+*October 2026. Kuana `2c7e082` (~47.5k lines, one crate) compared with Zed `main` @ `5a5fbe7`.*
 
-Method: 14 reviewers each read one Kin subsystem in full next to its Zed counterpart:
+Method: 14 reviewers each read one Kuana subsystem in full next to its Zed counterpart:
 
 - buffer
 - display pipeline
@@ -21,13 +21,13 @@ Method: 14 reviewers each read one Kin subsystem in full next to its Zed counter
 
 They produced 126 findings, all listed in the appendix. Each headline claim below was re-checked against the code. Findings that only appear in the appendix were *not* verified one by one, so read their line numbers as pointers.
 
-> **License note.** Most Zed crates that matter here are **GPL-3**: `text`, `rope`, `language`, `editor`, `project`, `workspace`, `lsp`, `terminal`, `settings`, `theme`, `task`, `dap`, `extension_host` and `grammars`. Kin is MIT/Apache. Copy Zed's *designs*, not its code. The Apache-licensed pieces you *can* reuse directly are `gpui`, `gpui_sum_tree` (published on crates.io as 0.2.2), `gpui_collections`, `gpui_util` and Zed's `extension_api` WIT. Tree-sitter queries should come from the grammar crates' own `queries/` folders, not from Zed's `crates/grammars`.
+> **License note.** Most Zed crates that matter here are **GPL-3**: `text`, `rope`, `language`, `editor`, `project`, `workspace`, `lsp`, `terminal`, `settings`, `theme`, `task`, `dap`, `extension_host` and `grammars`. Kuana is MIT/Apache. Copy Zed's *designs*, not its code. The Apache-licensed pieces you *can* reuse directly are `gpui`, `gpui_sum_tree` (published on crates.io as 0.2.2), `gpui_collections`, `gpui_util` and Zed's `extension_api` WIT. Tree-sitter queries should come from the grammar crates' own `queries/` folders, not from Zed's `crates/grammars`.
 
 ---
 
 ## Verdict
 
-Kin's foundations are sound. These choices are right and Zed would be overkill:
+Kuana's foundations are sound. These choices are right and Zed would be overkill:
 
 - `ropey` with UTF-8 byte offsets
 - no CRDT
@@ -39,8 +39,8 @@ Kin's foundations are sound. These choices are right and Zed would be overkill:
 
 The problems come from **three structural decisions** that every subsystem then works around:
 
-1. **Nothing is a cached view, and the Workspace builds everything.** Every caret blink, terminal wakeup, transition frame or keystroke re-runs layout for every visible editor, terminal and list. GPUI already has the fix (`AnyView::cached`), and Kin never calls it.
-2. **The main thread does whole-file work on every edit.** This covers the tree-sitter reparse (inside `Document::edit`), the soft-wrap rebuild, and run targets, conflicts, outline and folds, all computed *inside prepaint*, some with disk I/O. Add find-as-you-type, session save and focus-reload of every tab. Zed pushes all of this to background tasks over cheap snapshots, and Kin already has those snapshots for free: a ropey `Rope` clone and a tree-sitter `Tree` clone are O(1).
+1. **Nothing is a cached view, and the Workspace builds everything.** Every caret blink, terminal wakeup, transition frame or keystroke re-runs layout for every visible editor, terminal and list. GPUI already has the fix (`AnyView::cached`), and Kuana never calls it.
+2. **The main thread does whole-file work on every edit.** This covers the tree-sitter reparse (inside `Document::edit`), the soft-wrap rebuild, and run targets, conflicts, outline and folds, all computed *inside prepaint*, some with disk I/O. Add find-as-you-type, session save and focus-reload of every tab. Zed pushes all of this to background tasks over cheap snapshots, and Kuana already has those snapshots for free: a ropey `Rope` clone and a tree-sitter `Tree` clone are O(1).
 3. **Closed lists instead of registries.** The `Language` enum, a 16-entry highlight vocabulary, one language server per language, the `DebugSpec` enum, the `Modal` enum, hard-wired bottom panels, and a 9k-line `Workspace` that owns everything. For an open-source editor this is the extensibility ceiling. Built-in languages and extension languages run **two different code paths**, so extensions are second-class and contributors have two systems to learn.
 
 None of this needs a rewrite. Nearly every item below has a small first step that can land on its own.
@@ -57,7 +57,7 @@ Effort sizes: **S** is hours, **M** is days, **L** is a week or more.
 | 2 | **Fix the `Document::edit` result/edit mismatch** | Carets jump to offset 0, and overlapping edits delete text (`()a` + 2 carets + Backspace loses `a`) | S | Normalize and coalesce edits up front; keep no-op edits in the result math |
 | 3 | **Reload only when mtime changed** | Window focus re-reads, decodes, compares and **fully re-parses every open tab** and rebuilds the tree | S | `Document::reload_from_disk`: `if !self.changed_on_disk() { return Ok(false) }` (the helper already exists at `document.rs:346`) |
 | 4 | **Decide "large file" before parsing** | A 20–500 MB file is fully tree-sitter-parsed on the UI thread *before* the guard switches to plain text | S | `Document::open` checks the size before `from_text` builds `Syntax` |
-| 5 | **Lenient settings parsing** | One bad value (`"tab_size": "4"`, an enum from a newer Kin) resets *every* setting at startup | S | `deserialize_with = lenient` on `Option` fields; collect errors as warnings |
+| 5 | **Lenient settings parsing** | One bad value (`"tab_size": "4"`, an enum from a newer Kuana) resets *every* setting at startup | S | `deserialize_with = lenient` on `Option` fields; collect errors as warnings |
 | 6 | **Shell-quote extension task variables** | `run.rs:150` joins expanded args with spaces: paths with spaces break, and file contents (a symbol name) can inject shell | S | `sh_quote` every substituted value; one-pass `$VAR` expansion |
 | 7 | **Move derived per-version data off prepaint** | Run targets (with `fs` I/O), conflicts, outline, fold regions and Markdown blocks are recomputed in prepaint after each edit | M | A `Derived<T>` helper (version, `Arc<T>`, task) like the existing lint/blame pattern |
 | 8 | **Background + incremental parse** | `Syntax::reparse` runs synchronously in `Document::edit`; injection trees reparse from scratch | M | Edit and reuse the old injection trees; then a 1 ms budget plus background parse |
@@ -100,7 +100,7 @@ Phase 2 (§7 weeks 2–3) is done too, except lazy session restore:
 
 Phase 3, in the order agreed (Track B, then A, then C). Track B (servers, debuggers, schemas) is done on branch `track-b` (a worktree at `../code-editor-track-b`, rebased on `review-fixes`):
 
-- [x] Several language servers per file: extension servers run beside Kin's; diagnostics combined, completion and code actions merged, the rest to the first capable server (`a73f2fe`). Tests drive fake servers (a Python script) through the store.
+- [x] Several language servers per file: extension servers run beside Kuana's; diagnostics combined, completion and code actions merged, the rest to the first capable server (`a73f2fe`). Tests drive fake servers (a Python script) through the store.
 - [x] `lsp.<id>` settings as in Zed (`settings`, `initialization_options`, `binary`), Zed ids accepted, dotted keys read as nested sections; inlay hints on by default for typescript-language-server, vtsls and gopls (`2717e50`). Checked with basedpyright in the app.
 - [x] Extensions declare installers (npm, Go, GitHub assets per platform) (`41c7e2c`)
 - [x] Files outside the project reuse the running server (`28f1cf2`); restart no longer marked failed by the old process (`273614a`); `exit` after the `shutdown` answer (`190b849`)
@@ -115,7 +115,7 @@ Track A (languages and extensions) is done on branch `track-a` (same worktree, o
 - [x] Reloads reuse unchanged extensions instead of leaking them again (`4d316d5`); not converted to `Arc` (the `&'static` defs run through LSP, debugger and syntax code). Extensions can replace a built-in language's queries (`d84668c`).
 - [x] Grammars compile to WebAssembly with a downloaded wasi-sdk (asks first; 180 MB download, 170 MB on disk); native builds behind `native_grammars` for trusted folders (`c01b7f0`). Checked in the app: prompt, download, build, live highlighting.
 - [x] Download progress in the status bar with a live tooltip, for every download (`8d6ec70`, asked for during this track).
-- [x] `kin extension check` (`d037bf4`); run against Zed's installed extensions.
+- [x] `kuana extension check` (`d037bf4`); run against Zed's installed extensions.
 - Not done: brackets/indents/text-object queries for built-in languages (they keep the hand-written bracket matcher and indent heuristic); built-in run detection still hand-written.
 
 Track C (structure) is done on branch `track-c` (same worktree, on top of `track-a`; review-fixes and the bracket queries merged in):
@@ -150,7 +150,7 @@ These are small and independent.
 
 ## 2. Performance
 
-Zed's rule is *the main thread only does work proportional to what's on screen; everything proportional to file or project size runs on a background executor over a snapshot, tagged with a version, and stale results are dropped*. Kin already follows this for lint, blame, git diff and status, so the work is to apply the same pattern everywhere else.
+Zed's rule is *the main thread only does work proportional to what's on screen; everything proportional to file or project size runs on a background executor over a snapshot, tagged with a version, and stale results are dropped*. Kuana already follows this for lint, blame, git diff and status, so the work is to apply the same pattern everywhere else.
 
 ### 2.1 Whole-window re-render
 
@@ -210,7 +210,7 @@ Zed renders every pane through a cached view (`workspace/src/pane_group.rs:579-5
 
 ### 2.5 Perf tooling
 
-There are no benchmarks, no tracing spans and no frame-time instrumentation. Zed has `editor_benchmarks`, `project_benchmarks`, `ztracing` and `miniprofiler_ui`. For Kin:
+There are no benchmarks, no tracing spans and no frame-time instrumentation. Zed has `editor_benchmarks`, `project_benchmarks`, `ztracing` and `miniprofiler_ui`. For Kuana:
 
 - Add an env-gated frame-time log (prepaint + paint per view).
 - Add a few `#[ignore]` benches: open a 5 MB file, type in a 50k-line Markdown file with wrap on, Go to File over 100k paths.
@@ -247,19 +247,19 @@ Adding a language then becomes "add a folder". Today it means editing `syntax.rs
 
 `extensions.rs:791` builds extension grammars with the system `cc` and `dlopen`s them (`:863`). The consequences:
 
-- arbitrary native code from a git repository runs inside Kin's process
+- arbitrary native code from a git repository runs inside Kuana's process
 - it needs a C toolchain on the user's machine (a problem on Windows)
 - it is a per-platform ABI risk
 - a leaked library can never be unloaded
 
-Zed compiles every grammar to `.wasm` with a pinned wasi-sdk it downloads itself (`extension/src/extension_builder.rs:270-330`). Kin **already loads WASM grammars**, so:
+Zed compiles every grammar to `.wasm` with a pinned wasi-sdk it downloads itself (`extension/src/extension_builder.rs:270-330`). Kuana **already loads WASM grammars**, so:
 
 - reuse `lsp/install.rs`'s verified downloader for wasi-sdk
 - emit `.wasm`
 - keep native builds behind an explicit opt-in tied to project trust until then
 - then delete `libloading`
 
-Also add Zed's parser pool (`language/src/language.rs:131-155`: `PARSERS: Mutex<Vec<Parser>>`, each with one `WasmStore`). Kin creates a new `WasmStore` per parser, which recompiles tree-sitter's WASM stdlib each time. That includes the syntax-error linter and, per frame, the Markdown preview.
+Also add Zed's parser pool (`language/src/language.rs:131-155`: `PARSERS: Mutex<Vec<Parser>>`, each with one `WasmStore`). Kuana creates a new `WasmStore` per parser, which recompiles tree-sitter's WASM stdlib each time. That includes the syntax-error linter and, per frame, the Markdown preview.
 
 ### 3.4 Language servers
 
@@ -287,7 +287,7 @@ Built-in run detection is hand-written per language in Rust, next to a separate 
 
 ### 3.6 Authoring experience
 
-- **No manifest schema or versioning.** Mistakes in `extension.toml`, `config.toml` or `.scm` fail silently or surface only in Preferences after install. Add a `schema_version` field and a headless `kin extension check <dir>` that does the following:
+- **No manifest schema or versioning.** Mistakes in `extension.toml`, `config.toml` or `.scm` fail silently or surface only in Preferences after install. Add a `schema_version` field and a headless `kuana extension check <dir>` that does the following:
   - parse the manifests
   - build the grammar
   - compile every query against it
@@ -345,7 +345,7 @@ Per-editor subscriptions currently leak, and the editor talks to the workspace t
 
 The tree, Go to File and Find in Files each walk the disk with different exclusion rules, and every structural change triggers a full rescan. Zed has one `Worktree` snapshot (entries with `is_ignored`, `is_symlink`, `is_external` and mtime), built by a background scanner and updated incrementally from FS events (`worktree/src/worktree.rs`).
 
-**For Kin:** a `Project` entity owning `root`, the `Watcher`, and `snapshot: Arc<Snapshot { entries: Arc<[Entry]>, scan_id }>`. Build it with one `ignore::WalkBuilder::build_parallel()` scan, and update it per changed parent. A sorted `Arc<[Entry]>` is enough to start; reach for `gpui_sum_tree` later. Use the same snapshot for:
+**For Kuana:** a `Project` entity owning `root`, the `Watcher`, and `snapshot: Arc<Snapshot { entries: Arc<[Entry]>, scan_id }>`. Build it with one `ignore::WalkBuilder::build_parallel()` scan, and update it per changed parent. A sorted `Arc<[Entry]>` is enough to start; reach for `gpui_sum_tree` later. Use the same snapshot for:
 
 - the tree, flattened in the background
 - the Go to File index
@@ -397,19 +397,19 @@ Vim intercepts keystrokes before the keymap. Its motions duplicate the editor's 
 - **UI is untested.** There are 140 `#[test]`s, almost all pure logic, while `Editor` and `Workspace` have essentially none. gpui 0.2.2 ships `test-support` (`TestAppContext`, `VisualTestContext`). Add it as a dev-dependency feature and write a small `EditorTestContext` with marked-text state (`"fn a() {ˇ}"`), like Zed's `editor/src/test/editor_test_context.rs`. The `Document::edit` bug above is exactly what such tests catch.
 - **No fakes.** The LSP `Client` only spawns real processes, and config paths and registries are process globals, so tests get `#[ignore]`d. A `FakeServer` over in-memory pipes, and a `config_dir` override, unlock testing LSP and extension flows.
 - **Crate split.** One 47.5k-line crate rebuilds with `opt-level=3` for every change, since the workflow is `cargo build --release` and no `[profile]` is set. Do these two things:
-  - Add `[profile.dev] opt-level = 1` and `[profile.dev.package."*"] opt-level = 3`, so dependencies stay fast and Kin's own code builds quickly.
-  - Split a gpui-free core crate (`kin_text`: document, syntax, wrap, fold, search, encoding, lint) to get parallel compiles and a clean model/view seam. One cycle blocks it: `syntax.rs` → `extensions.rs` → gpui/settings/theme/file_icons. Moving the language registry out of `extensions.rs` (§3.1) breaks that cycle.
+  - Add `[profile.dev] opt-level = 1` and `[profile.dev.package."*"] opt-level = 3`, so dependencies stay fast and Kuana's own code builds quickly.
+  - Split a gpui-free core crate (`kuana_text`: document, syntax, wrap, fold, search, encoding, lint) to get parallel compiles and a clean model/view seam. One cycle blocks it: `syntax.rs` → `extensions.rs` → gpui/settings/theme/file_icons. Moving the language registry out of `extensions.rs` (§3.1) breaks that cycle.
 - **Theme colors.** Adding one theme color means editing all 31 built-in theme JSONs, although `extends` resolution already falls back. Require new keys only in the two base themes.
 - **Settings plumbing.** A new setting means about 10 hand-synced edits: field, key list, template, README, `Setting` variant, `is_set`. A small derive macro or a single `SETTINGS: &[SettingDef]` table could generate the key list, template, schema and Preferences rows.
 - **Keymap rewrites** drop the user's comments when Preferences changes a shortcut. Settings already has a comment-preserving editor; reuse it.
 
 ---
 
-## 6. Where Kin is right not to copy Zed
+## 6. Where Kuana is right not to copy Zed
 
 The reviewers explicitly recommend keeping these:
 
-- **ropey + UTF-8 byte offsets, no CRDT, no MultiBuffer.** O(1) rope clones give Kin cheap snapshots already; it only needs to *use* them off-thread.
+- **ropey + UTF-8 byte offsets, no CRDT, no MultiBuffer.** O(1) rope clones give Kuana cheap snapshots already; it only needs to *use* them off-thread.
 - **Querying highlights for the visible range only** and relying on GPUI's `LineLayoutCache`, *once long lines are capped*.
 - **A prefix-sum `row_starts` index** for display row ↔ buffer line, instead of a SumTree, until files get huge.
 - **Git via the CLI**, with free functions instead of a `GitRepository` trait; real-repo tests in temp dirs.
@@ -425,7 +425,7 @@ The reviewers explicitly recommend keeping these:
 
 1. **Week 1: quick wins, all S.** Cached views; the `Document::edit` fix with tests; the mtime check on reload; large-file guard first; lenient settings; task quoting; LSP cancel-on-drop + format timeout; CRLF diff bases; symlink tree fix; Markdown preview highlights cached in `parse`; parser pool; CI; a dev profile.
 2. **Weeks 2–3: off the main thread.** The `Derived<T>` helper (run targets, outline, folds, conflicts, find); `Patch`-based shifting; incremental `WrapMap`; long-line cap; background session save; background Go to File scoring; debounced terminal find; `uniform_list` for Problems/Git.
-3. **Month 2: registries.** One language registry with built-ins as data; `HighlightId`; WASM-only grammars; multi-server LSP + `ServerDef` + `lsp.<id>` settings; `kin extension check`; JSON schemas.
+3. **Month 2: registries.** One language registry with built-ins as data; `HighlightId`; WASM-only grammars; multi-server LSP + `ServerDef` + `lsp.<id>` settings; `kuana extension check`; JSON schemas.
 4. **Month 3: structure.** `Entity<Document>` → `BufferStore`; split the workspace into child entities; `PaneItem`/`Panel`/`ModalLayer`; project snapshot; display map with blocks + decoration stores; `DebugAdapter` trait; Git job queue; core crate split.
 
 ---
@@ -500,13 +500,13 @@ Severity as the reviewer assigned it: **C** critical, **H** high, **M** medium, 
 | H | ✗ | L | Built-in languages are a closed enum with hard-coded match arms; extension languages run a second, different code path |
 | H | ✗ | M | Extension language servers replace built-in ones, guess commands from a core table, and run once per language |
 | H | ✗ | S | A new WasmStore for every WASM-grammar parser recompiles tree-sitter's WASM stdlib each time, per frame in the Markdown preview |
-| H | ✗ | M | Extension grammars are compiled with the system C compiler and dlopen-ed into Kin's process |
+| H | ✗ | M | Extension grammars are compiled with the system C compiler and dlopen-ed into Kuana's process |
 | H | ✗ | S | Extension task variables are pasted unquoted into a shell command line |
 | M | ✗ | M | Reload leaks every language, grammar and query again, and reparses every open extension-language file |
 | M | ✗ | S | Extension data is re-read from disk on the UI thread: per completion (snippets), per frame (Extensions page) and at startup |
-| M | ✗ | M | Closed highlight vocabulary: Zed captures and Zed theme keys outside Kin's 16 classes are dropped |
+| M | ✗ | M | Closed highlight vocabulary: Zed captures and Zed theme keys outside Kuana's 16 classes are dropped |
 | M | ✗ | M | No manifest schema, versioning or author check tool; mistakes in extensions fail silently |
-| M |  | M | Extensions cannot provide their language server, although Kin already has verified installers |
+| M |  | M | Extensions cannot provide their language server, although Kuana already has verified installers |
 
 ### LSP client and language-server management
 
@@ -568,7 +568,7 @@ Severity as the reviewer assigned it: **C** critical, **H** high, **M** medium, 
 
 | Sev | | Effort | Finding |
 |---|---|---|---|
-| H | ✗ | M | Terminal output re-renders all visible editors every frame: no view in Kin is `.cached()` |
+| H | ✗ | M | Terminal output re-renders all visible editors every frame: no view in Kuana is `.cached()` |
 | H | ✗ | S | Find in terminal re-scans the whole scrollback on the main thread every frame while output streams |
 | M | ✗ | S | Each non-ASCII cell is shaped as its own text run because force_width is not used |
 | M | ✗ | S | Zero-width and combining characters are dropped from rendering, output_text and link detection |

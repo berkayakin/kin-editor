@@ -1,4 +1,4 @@
-// Helper for scripts/screenshot.sh: finds Kin's window, sizes it and brings it to the front.
+// Helper for scripts/screenshot.sh: finds Kuana's window, sizes it and brings it to the front.
 // Uses only system frameworks so taking screenshots needs no Homebrew packages.
 //
 //   screenshot-helper window <pid>          print the CGWindowID of the pid's main window
@@ -13,7 +13,7 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
-/// The largest normal-layer, on-screen window of `pid` (Kin may also have the About window open).
+/// The largest normal-layer, on-screen window of `pid` (Kuana may also have the About window open).
 func mainWindow(pid: pid_t) -> CGWindowID? {
     let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
         as? [[String: Any]] ?? []

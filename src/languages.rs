@@ -1,6 +1,6 @@
-//! Kin's built-in languages, as data: `assets/languages/<dir>/` holds each
+//! Kuana's built-in languages, as data: `assets/languages/<dir>/` holds each
 //! one's `config.toml` (the keys extensions use: `name`, `path_suffixes`,
-//! comments, `tab_size`, `hard_tabs`; Kin's `soft_wrap` and `[queries]`) and
+//! comments, `tab_size`, `hard_tabs`; Kuana's `soft_wrap` and `[queries]`) and
 //! its query files. They compile the way extensions' do (`LangConfig::build`,
 //! `OutlineConfig::build`, `LanguageQueries::build`), so built-ins get
 //! injections, brackets, indents, text objects and runnables the same way.
@@ -215,7 +215,7 @@ impl BuiltinDef {
     fn load(&self) -> &Loaded {
         self.loaded.get_or_init(|| {
             let grammar = self.grammar();
-            // Built-in queries are Kin's own, checked by tests: a mistake is a bug.
+            // Built-in queries are Kuana's own, checked by tests: a mistake is a bug.
             let highlights = LangConfig::build(grammar.clone(), &self.source("highlights").unwrap_or_default())
                 .unwrap_or_else(|e| panic!("{}: {e}", self.name));
             let outline = self.source("outline").map(|source| OutlineConfig::build(grammar.clone(), &source).unwrap_or_else(|e| panic!("{}: {e}", self.name)));
@@ -227,7 +227,7 @@ impl BuiltinDef {
     }
 }
 
-/// The grammars compiled into Kin.
+/// The grammars compiled into Kuana.
 pub fn native_grammar(name: &str) -> Option<TsLanguage> {
     Some(match name {
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),

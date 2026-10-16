@@ -102,7 +102,7 @@ pub(super) fn user_snippet_items(language: crate::syntax::Language) -> Vec<Compl
                 "detail": s.description,
                 "insertText": s.body,
                 "insertTextFormat": 2,
-                "kinUserSnippet": true,
+                "kuanaUserSnippet": true,
             }))
         })
         .collect()

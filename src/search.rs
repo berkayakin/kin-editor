@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn project_files_skip_ignored_files_and_folders() {
-        let dir = std::env::temp_dir().join(format!("kin-search-files-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-search-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for sub in [".git", "config", "build", "node_modules/pkg"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();

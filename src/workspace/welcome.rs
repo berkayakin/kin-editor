@@ -27,7 +27,7 @@ impl Workspace {
                             .flex()
                             .items_end()
                             .gap_2()
-                            .child(div().font_family(assets::TITLE_FONT).text_size(px(32.)).line_height(px(36.)).text_color(theme.text).child("Kin"))
+                            .child(div().font_family(assets::TITLE_FONT).text_size(px(32.)).line_height(px(36.)).text_color(theme.text).child("Kuana"))
                             .child(
                                 div()
                                     .mb(px(5.))

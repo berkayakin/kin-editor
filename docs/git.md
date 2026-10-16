@@ -1,6 +1,6 @@
 # Git
 
-Kin uses the `git` command line, so your config, credential helpers, SSH keys and hooks
+Kuana uses the `git` command line, so your config, credential helpers, SSH keys and hooks
 all apply. Prompts are disabled, so a remote that needs a password fails fast with a
 message instead of hanging; use an SSH agent or a credential helper.
 
@@ -32,7 +32,7 @@ message instead of hanging; use an SSH agent or a credential helper.
   Push buttons. Click the branch (or use **Branches…** in the Git
   menu) to switch to a local or remote branch, or type a new name to create one. Hover another branch
   for **Merge** (into the current one) and **Rebase** (the current one onto it), and a local one
-  for **Rename** and **Delete** (Kin says when a branch has commits no other branch has, and
+  for **Rename** and **Delete** (Kuana says when a branch has commits no other branch has, and
   deletes it anyway only if you confirm).
 - **Stash:** **Stash Changes…** (the archive button on the Commit panel's first section, the Git
   menu, Find Action) stashes the changes to tracked files, with an optional message; check
@@ -47,7 +47,7 @@ message instead of hanging; use an SSH agent or a credential helper.
   panel with **Abort**. Conflicted files open in the editor, where each conflict is tinted
   (current side green, incoming blue) with **Accept Current / Accept Incoming / Accept Both**
   on its first line (also in the right-click menu and Find Action). Mark a file resolved with
-  ✓ on hover (Kin asks if markers remain), then **Commit Merge** / **Continue**. The merge
+  ✓ on hover (Kuana asks if markers remain), then **Commit Merge** / **Continue**. The merge
   message is filled in, and committing is blocked while conflicts remain.
 - **Log** (⌘9 / Alt+9, or its button at the top right): commits of all branches (toggle) with a branch
   graph, branch and tag labels, and a filter by message, author, hash or branch. Select a commit

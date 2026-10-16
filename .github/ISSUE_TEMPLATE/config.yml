@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Documentation
-    url: https://github.com/berkayakin/kin-editor/tree/main/docs
+    url: https://github.com/berkayakin/kuana-editor/tree/main/docs
     about: Key bindings, settings, language servers, extensions, themes and more.
   - name: Contributing guide
-    url: https://github.com/berkayakin/kin-editor/blob/main/CONTRIBUTING.md
-    about: How to build Kin and send a change.
+    url: https://github.com/berkayakin/kuana-editor/blob/main/CONTRIBUTING.md
+    about: How to build Kuana and send a change.

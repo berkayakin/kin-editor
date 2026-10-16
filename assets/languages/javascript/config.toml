@@ -4,7 +4,7 @@ path_suffixes = ["js", "mjs", "cjs", "jsx"]
 line_comments = ["// "]
 block_comment = { start = "/*", end = "*/" }
 
-# Kin's key: each query from the grammar's own queries (crate:…) and this folder's files, in order.
+# Kuana's key: each query from the grammar's own queries (crate:…) and this folder's files, in order.
 [queries]
 highlights = ["crate:javascript/highlights", "crate:javascript/jsx", "highlights.scm"]
 outline = ["crate:javascript/tags"]

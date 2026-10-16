@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn finds_and_names_venvs() {
-        let root = std::env::temp_dir().join(format!("kin-venv-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("kuana-venv-{}", std::process::id()));
         let app = root.join("services/app");
         std::fs::create_dir_all(&app).unwrap();
         // A plain folder named env isn't a venv.

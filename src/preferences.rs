@@ -96,8 +96,8 @@ impl Page {
             Page::Keymap => "A base keymap to start from, and shortcuts for every action on top",
             Page::Terminal => "The terminal's shell and your own Run configurations",
             Page::Git => "How Update Project brings in other people's commits",
-            Page::Trust => "Folders whose language servers, formatters and tools Kin may run",
-            Page::Updates => "Getting new versions of Kin",
+            Page::Trust => "Folders whose language servers, formatters and tools Kuana may run",
+            Page::Updates => "Getting new versions of Kuana",
         }
     }
 
@@ -256,7 +256,7 @@ impl Setting {
             Setting::Theme => "Add your own themes as .json files in the themes folder.",
             Setting::IconTheme => "File and folder icons. Extensions can add icon themes (Zed's work too).",
             Setting::VisualEffects => "Reduced uses solid colors instead of gradients; Minimal also drops shadows, glows and animations.",
-            Setting::BaseKeymap => "The shortcuts Kin starts from. Your own changes below stay on top of any of them.",
+            Setting::BaseKeymap => "The shortcuts Kuana starts from. Your own changes below stay on top of any of them.",
             Setting::FontFamily => "Monospaced fonts installed on this computer.",
             Setting::FontSize => "Zoom (Increase / Decrease Font Size) adds to this until you reset it.",
             Setting::LineHeight => "A multiple of the font size.",
@@ -268,7 +268,7 @@ impl Setting {
             Setting::InlayHints => "Types and parameter names from the language server, shown in the code.",
             Setting::CodeLens => "The language server's links above lines: references, implementations, Run and Debug.",
             Setting::VimMode => "Vim's Normal, Insert and Visual modes. The status bar shows the mode.",
-            Setting::AutoSave => "Every mode but Off also saves when Kin quits or a tab closes.",
+            Setting::AutoSave => "Every mode but Off also saves when Kuana quits or a tab closes.",
             Setting::AutoSaveDelay => "How long after you stop typing.",
             Setting::FormatOnSave => "Reformat Code when you Save; auto-save never reformats while you type.",
             Setting::TrimWhitespace => "Remove spaces at the ends of lines, except on lines with a caret.",
@@ -864,7 +864,7 @@ impl Preferences {
             ToolMode::Off => Some(Value::Bool(false)),
             ToolMode::LanguageServer => Some("language_server".into()),
             ToolMode::Custom => {
-                // Start from the command Kin would use, or an empty field to type into.
+                // Start from the command Kuana would use, or an empty field to type into.
                 let typed = split_command(&field.read(cx).text(cx));
                 let command = if typed.is_empty() { default_command(tool, language) } else { typed };
                 if command.is_empty() {
@@ -2354,7 +2354,7 @@ fn tool_value(settings: &Settings, tool: Tool, language: Language) -> Option<Val
     map.get(language.name()).cloned()
 }
 
-/// What Kin runs for `tool` unless told otherwise, as a command line.
+/// What Kuana runs for `tool` unless told otherwise, as a command line.
 fn default_command(tool: Tool, language: Language) -> Vec<String> {
     let first = match tool {
         Tool::Server => servers::spec(language).and_then(|s| s.candidates.first()),

@@ -2,10 +2,10 @@
 
 ## The Settings dialog
 
-The first time Kin starts, **Welcome Setup** asks for the basics: a theme (applied as you click),
+The first time Kuana starts, **Welcome Setup** asks for the basics: a theme (applied as you click),
 the keymap to start from (each shown with a few of its shortcuts) and editor basics such as font
 size, auto-save, reformat on save and soft wrap. Its choices go to `settings.json` like any other.
-Open it again any time from the Kin menu or Find Action (**Welcome Setup**).
+Open it again any time from the Kuana menu or Find Action (**Welcome Setup**).
 
 **Settings…** (⌘, / Ctrl+Alt+S, or the gear at the top right) opens the Settings
 dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
@@ -16,10 +16,10 @@ which puts the default back.
 
 Everything is stored in `settings.json`. **Open settings.json** (at the bottom of the dialog and
 in Find Action) opens it, created with every option commented out. Edits to the file apply when
-you save (or when you come back to Kin after editing it elsewhere). Comments and trailing commas
-are fine, and Kin keeps them when it changes a value itself. With the JSON language server
+you save (or when you come back to Kuana after editing it elsewhere). Comments and trailing commas
+are fine, and Kuana keeps them when it changes a value itself. With the JSON language server
 installed (`vscode-langservers-extracted`), `settings.json`, `keymap.json` and your themes get
-completion, documentation on hover and checks from schemas Kin makes of its own options, actions
+completion, documentation on hover and checks from schemas Kuana makes of its own options, actions
 and theme colors.
 
 | Setting | Default | |
@@ -46,7 +46,7 @@ and theme colors.
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
-| `lsp` | | per server, by id (Kin's, e.g. `typescript`, or Zed's, e.g. `vtsls`, `basedpyright`): `settings` (what it asks for through `workspace/configuration`; a change is sent to it), `initialization_options` (applied when it restarts) and `binary` (`{ "path", "arguments" }`), as in Zed |
+| `lsp` | | per server, by id (Kuana's, e.g. `typescript`, or Zed's, e.g. `vtsls`, `basedpyright`): `settings` (what it asks for through `workspace/configuration`; a change is sent to it), `initialization_options` (applied when it restarts) and `binary` (`{ "path", "arguments" }`), as in Zed |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](run-and-debug.md#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
@@ -75,7 +75,7 @@ wins over both: `indent_style`, `indent_size`, `tab_width`, `trim_trailing_white
 A cloned repository can make an editor run its code without asking: a language server builds it,
 ESLint and Prettier load its JavaScript config, `node_modules/.bin` and venv tools are its own
 programs, and Git runs a `core.fsmonitor` command from its config. So the first time you open a
-folder, Kin asks whether you trust it. Until you do, it stays in **Restricted Mode** (shown in the
+folder, Kuana asks whether you trust it. Until you do, it stays in **Restricted Mode** (shown in the
 title bar): language servers don't start, formatters and ESLint don't run, the folder's own tools
 aren't used, terminals don't activate its venv, and Git ignores its fsmonitor. Editing, Git, Run
 and Debug work as usual.

@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn reads_rust_edition() {
-        let dir = std::env::temp_dir().join(format!("kin-fmt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-fmt-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\nedition = \"2024\"\n").unwrap();
         assert_eq!(rust_edition(&dir.join("src/main.rs")), "2024");

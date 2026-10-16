@@ -1,5 +1,5 @@
 name: Feature request
-description: An idea to make Kin better
+description: An idea to make Kuana better
 labels: ["enhancement"]
 body:
   - type: textarea
@@ -12,7 +12,7 @@ body:
   - type: textarea
     id: idea
     attributes:
-      label: What would you like Kin to do?
+      label: What would you like Kuana to do?
       description: How it would work. If another editor does it well (JetBrains, VS Code, Zed…), say which and how.
     validations:
       required: true

@@ -223,7 +223,7 @@ pub fn list_scrollbar(
 
 // ---- Islands ------------------------------------------------------------------------
 //
-// Kin's look: content sits on rounded "islands" (the editor's background) that
+// Kuana's look: content sits on rounded "islands" (the editor's background) that
 // float on the chrome (the theme's panel color, faintly lit with the accent from
 // above). The main window, Preferences and the pickers all follow it; menus,
 // popovers and tooltips are `popover`s floating above everything.

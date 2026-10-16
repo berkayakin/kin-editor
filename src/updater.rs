@@ -1,6 +1,6 @@
 //! Updates from GitHub Releases. The release workflow attaches `latest.json`
 //! (the version and, per platform, an archive's name and SHA-256) and signs it
-//! with minisign; Kin only trusts a manifest whose signature matches
+//! with minisign; Kuana only trusts a manifest whose signature matches
 //! `PUBLIC_KEY`, so a tampered download or a hijacked release can't install
 //! anything. `releases/latest/download/…` always resolves to the newest
 //! published release (drafts and pre-releases are skipped), so checking needs
@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::settings::Settings;
 
-const REPO: &str = "berkayakin/kin-editor";
+const REPO: &str = "berkayakin/kuana-editor";
 /// Release signing key (`~/.minisign/kin-release.pub` on the maintainer's
 /// machine); the secret half is the repository secret `MINISIGN_SECRET_KEY`.
 const PUBLIC_KEY: &str = "RWR5QO9LE08wWLXENZBBui1DNd0r9UFw0h8OV/EB2bWiFgHtIlRP0K70";
@@ -33,7 +33,7 @@ const FIRST_CHECK: Duration = Duration::from_secs(10);
 const CHECK_EVERY: Duration = Duration::from_secs(4 * 60 * 60);
 /// Where a downloaded archive is unpacked, next to the installed app so the
 /// final swap is a rename on the same disk.
-const STAGING: &str = ".kin-update";
+const STAGING: &str = ".kuana-update";
 
 #[derive(Default)]
 pub struct Updater {
@@ -62,9 +62,9 @@ pub enum Check {
 }
 
 /// Whether this build updates itself: only builds from the release workflow
-/// (which sets `KIN_RELEASE`) on a platform it publishes.
+/// (which sets `KUANA_RELEASE`) on a platform it publishes.
 pub fn supported() -> bool {
-    option_env!("KIN_RELEASE").is_some() && platform().is_some()
+    option_env!("KUANA_RELEASE").is_some() && platform().is_some()
 }
 
 /// The `latest.json` asset key for this build.
@@ -92,7 +92,7 @@ pub fn init(cx: &mut App) {
         if cx.global::<Updater>().relaunch
             && let Err(err) = relaunch()
         {
-            eprintln!("kin: couldn't restart after the update: {err}");
+            eprintln!("kuana: couldn't restart after the update: {err}");
         }
         async {}
     })
@@ -123,10 +123,10 @@ pub fn pending_version(cx: &App) -> Option<&str> {
 /// (dropping it cancels the check).
 pub fn check(cx: &mut App) -> Task<Result<Check, String>> {
     if !supported() {
-        return Task::ready(Err("This build of Kin was built from source, so it doesn't update itself.".into()));
+        return Task::ready(Err("This build of Kuana was built from source, so it doesn't update itself.".into()));
     }
     match &cx.global::<Updater>().state {
-        State::Checking => return Task::ready(Err("Kin is already checking for updates.".into())),
+        State::Checking => return Task::ready(Err("Kuana is already checking for updates.".into())),
         State::Installed { version } => return Task::ready(Ok(Check::Ready(version.clone()))),
         State::Idle | State::Ready { .. } => {}
     }
@@ -148,7 +148,7 @@ pub fn check(cx: &mut App) -> Task<Result<Check, String>> {
 }
 
 /// Installs the downloaded update and quits; the new version starts once
-/// Kin has exited. If quitting is cancelled, it starts next time instead.
+/// Kuana has exited. If quitting is cancelled, it starts next time instead.
 pub fn restart(cx: &mut App) -> Result<(), String> {
     let state = cx.global::<Updater>().state.clone();
     match state {
@@ -194,7 +194,7 @@ fn download_latest() -> Result<Option<(String, PathBuf)>, String> {
     let Some(asset) = platform().and_then(|p| manifest.assets.get(p)) else {
         return Ok(None);
     };
-    let dir = std::env::temp_dir().join("kin-update");
+    let dir = std::env::temp_dir().join("kuana-update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let archive = dir.join(&asset.name);
     // Only one update is kept; an earlier download isn't needed any more.
@@ -206,7 +206,7 @@ fn download_latest() -> Result<Option<(String, PathBuf)>, String> {
     if sha256_hex(&archive).as_deref() != Some(asset.sha256.as_str()) {
         let url = format!("https://github.com/{REPO}/releases/download/v{}/{}", manifest.version, asset.name);
         let partial = dir.join(format!("{}.part", asset.name));
-        download(&url, &partial, &format!("Kin {}", manifest.version), None)?;
+        download(&url, &partial, &format!("Kuana {}", manifest.version), None)?;
         if sha256_hex(&partial).as_deref() != Some(asset.sha256.as_str()) {
             std::fs::remove_file(&partial).ok();
             return Err(format!("{} doesn't match the release's checksum.", asset.name));
@@ -223,7 +223,7 @@ fn verified_manifest(data: &[u8], signature: &[u8], public_key: &str) -> Result<
         .and_then(|s| minisign_verify::Signature::decode(s).ok())
         .ok_or("The update's signature is unreadable.")?;
     key.verify(data, &signature, false)
-        .map_err(|_| "The update isn't signed by Kin's release key.".to_string())?;
+        .map_err(|_| "The update isn't signed by Kuana's release key.".to_string())?;
     let manifest: Manifest = serde_json::from_slice(data).map_err(|e| format!("latest.json: {e}"))?;
     // Names become file paths and URLs.
     if manifest.assets.values().any(|a| a.name.is_empty() || a.name.starts_with('.') || a.name.contains(['/', '\\'])) {
@@ -316,7 +316,7 @@ fn curl_error(stderr: &[u8]) -> String {
     }
 }
 
-/// A command without a console window (Kin is a GUI app on Windows).
+/// A command without a console window (Kuana is a GUI app on Windows).
 fn command(program: &str) -> Command {
     let mut cmd = crate::process::command(program);
     cmd.stdin(Stdio::null());
@@ -334,7 +334,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 // ---- Installing ----------------------------------------------------------------
 
-/// What gets replaced: `Kin.app` on macOS, the executable elsewhere.
+/// What gets replaced: `Kuana.app` on macOS, the executable elsewhere.
 fn installed_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.canonicalize().unwrap_or(exe);
@@ -342,10 +342,10 @@ fn installed_path() -> Result<PathBuf, String> {
         let app = exe
             .ancestors()
             .find(|p| p.extension().is_some_and(|e| e == "app"))
-            .ok_or("Kin isn't running from Kin.app.")?;
+            .ok_or("Kuana isn't running from Kuana.app.")?;
         // A quarantined app opened from Downloads runs from a read-only copy.
         if app.to_string_lossy().contains("/AppTranslocation/") {
-            return Err("Move Kin to the Applications folder first, then restart it.".into());
+            return Err("Move Kuana to the Applications folder first, then restart it.".into());
         }
         Ok(app.to_path_buf())
     } else {
@@ -360,7 +360,7 @@ fn install(archive: &Path) -> Result<(), String> {
 }
 
 fn install_to(archive: &Path, target: &Path) -> Result<(), String> {
-    let dir = target.parent().ok_or("Kin's folder wasn't found.")?;
+    let dir = target.parent().ok_or("Kuana's folder wasn't found.")?;
     let staging = dir.join(STAGING);
     let cant = |e: std::io::Error| format!("Couldn't update {}: {e}", target.display());
     std::fs::remove_dir_all(&staging).ok();
@@ -374,11 +374,11 @@ fn install_to(archive: &Path, target: &Path) -> Result<(), String> {
         }
         // What the release workflow packs (the installed copy may be renamed).
         let name = if cfg!(target_os = "macos") {
-            "Kin.app"
+            "Kuana.app"
         } else if cfg!(windows) {
-            "kin.exe"
+            "kuana.exe"
         } else {
-            "kin"
+            "kuana"
         };
         let new = staging.join(name);
         if !new.exists() {
@@ -443,7 +443,7 @@ fn remove_leftovers() {
     std::fs::remove_file(old_exe(&target)).ok();
 }
 
-/// Starts the installed Kin once this process has exited, so the new one
+/// Starts the installed Kuana once this process has exited, so the new one
 /// restores the session this one saved.
 fn relaunch() -> Result<(), String> {
     let target = installed_path()?;
@@ -486,6 +486,7 @@ mod tests {
     }
 
     // Signed with a throwaway key: `minisign -G -W`, then `minisign -S -m latest.json`.
+    // Signed when Kuana was called Kin, so the signed text keeps that name.
     const TEST_KEY: &str = "RWQSuCW4OWCdK1g9tgG25m9bouG+gU4rO3ykgVBmOafxtkB6VTclBJ5+";
     const TEST_MANIFEST: &str = r#"{"version":"0.2.0","assets":{"macos":{"name":"Kin-0.2.0-macos.zip","sha256":"00"}}}"#;
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key
@@ -508,25 +509,25 @@ AxrB0JdAasRgQFsgqpgRL89NottkeVOjXZ4tCR71ugQX75l253CoRpkYNv4ZOlrhGWODeFXKIfyqi75T
     #[cfg(target_os = "macos")]
     #[test]
     fn swaps_in_the_new_app() {
-        let dir = std::env::temp_dir().join(format!("kin-update-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-update-test-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let bundle = |root: &Path, text: &str| {
-            let exe = root.join("Kin.app/Contents/MacOS");
+            let exe = root.join("Kuana.app/Contents/MacOS");
             std::fs::create_dir_all(&exe).unwrap();
-            std::fs::write(exe.join("kin"), text).unwrap();
+            std::fs::write(exe.join("kuana"), text).unwrap();
         };
         bundle(&dir.join("Applications"), "old");
         bundle(&dir.join("build"), "new");
-        let archive = dir.join("Kin.zip");
-        run(command("ditto").args(["-c", "-k", "--keepParent"]).arg(dir.join("build/Kin.app")).arg(&archive)).unwrap();
+        let archive = dir.join("Kuana.zip");
+        run(command("ditto").args(["-c", "-k", "--keepParent"]).arg(dir.join("build/Kuana.app")).arg(&archive)).unwrap();
 
         // Installed under another name, as users sometimes do.
-        let target = dir.join("Applications/Kin Editor.app");
-        std::fs::rename(dir.join("Applications/Kin.app"), &target).unwrap();
+        let target = dir.join("Applications/Kuana Editor.app");
+        std::fs::rename(dir.join("Applications/Kuana.app"), &target).unwrap();
         install_to(&archive, &target).unwrap();
-        assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/kin")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(target.join("Contents/MacOS/kuana")).unwrap(), "new");
         let left: Vec<_> = std::fs::read_dir(dir.join("Applications")).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(left, vec![std::ffi::OsString::from("Kin Editor.app")]);
+        assert_eq!(left, vec![std::ffi::OsString::from("Kuana Editor.app")]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

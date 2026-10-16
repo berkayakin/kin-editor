@@ -1692,9 +1692,9 @@ mod tests {
 
     #[test]
     fn clone_folder_names() {
-        assert_eq!(repo_name_from_url("https://github.com/o/kin.git").as_deref(), Some("kin"));
-        assert_eq!(repo_name_from_url("git@github.com:o/kin").as_deref(), Some("kin"));
-        assert_eq!(repo_name_from_url("https://github.com/o/kin/").as_deref(), Some("kin"));
+        assert_eq!(repo_name_from_url("https://github.com/o/kuana.git").as_deref(), Some("kuana"));
+        assert_eq!(repo_name_from_url("git@github.com:o/kuana").as_deref(), Some("kuana"));
+        assert_eq!(repo_name_from_url("https://github.com/o/kuana/").as_deref(), Some("kuana"));
         assert_eq!(repo_name_from_url("").as_deref(), None);
     }
 
@@ -1842,7 +1842,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         if !is_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("kin-git-crlf-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-git-crlf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
@@ -1887,7 +1887,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         if !is_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("kin-git-hunks-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-git-hunks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
@@ -1955,7 +1955,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         if !is_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("kin-git-actions-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-git-actions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
@@ -2039,7 +2039,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
 
     /// A repository in a fresh temp folder, with a committer and `main` checked out.
     fn test_repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kin-git-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
@@ -2196,7 +2196,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         if !is_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("kin-git-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-git-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         init(&dir).unwrap();
@@ -2254,7 +2254,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         // Windows runners check out with core.autocrlf.
         assert_eq!(std::fs::read_to_string(cloned.join("a.txt")).unwrap().replace("\r\n", "\n"), "one\ntwo\n");
         // A failing clone reports git's error.
-        let err = start_clone(&parent, "file:///nonexistent/kin.git", "nope", false).unwrap().wait().unwrap_err();
+        let err = start_clone(&parent, "file:///nonexistent/kuana.git", "nope", false).unwrap().wait().unwrap_err();
         assert!(!err.is_empty() && !parent.join("nope").exists(), "{err}");
         let _ = std::fs::remove_dir_all(&parent);
         let _ = std::fs::remove_dir_all(&dir);

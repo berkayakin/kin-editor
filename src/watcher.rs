@@ -1,6 +1,6 @@
 //! Watches a project folder (FSEvents on macOS, inotify on Linux,
 //! ReadDirectoryChanges on Windows, via `notify`) so the file tree, Go to File,
-//! Git status and open files follow changes made outside Kin: a checkout, a
+//! Git status and open files follow changes made outside Kuana: a checkout, a
 //! code generator, `npm install`. Events arrive on a background thread; the
 //! workspace batches them and decides what each one affects.
 
@@ -81,7 +81,7 @@ pub fn git_path(path: &Path) -> GitPath {
 }
 
 /// Folders whose churn (builds, package installs) never matters beyond the
-/// file tree: Kin hides `target`, and `node_modules` is never indexed.
+/// file tree: Kuana hides `target`, and `node_modules` is never indexed.
 pub fn in_heavy_folder(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -105,14 +105,14 @@ mod tests {
         assert_eq!(git_path(Path::new("/p/.git/refs/heads/main.lock")), GitPath::Internal);
         assert_eq!(git_path(Path::new("/p/.git/objects/ab/cdef")), GitPath::Internal);
         assert_eq!(git_path(Path::new("/p/.git/logs/HEAD")), GitPath::Internal);
-        assert!(in_heavy_folder(Path::new("/p"), Path::new("/p/target/debug/kin")));
+        assert!(in_heavy_folder(Path::new("/p"), Path::new("/p/target/debug/kuana")));
         assert!(in_heavy_folder(Path::new("/p"), Path::new("/p/web/node_modules/x/index.js")));
         assert!(!in_heavy_folder(Path::new("/p"), Path::new("/p/src/targets.rs")));
     }
 
     #[test]
     fn reports_created_and_written_files() {
-        let dir = std::env::temp_dir().join(format!("kin-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();

@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Kin
+Name=Kuana
 GenericName=Code Editor
 Comment=A small, fast GPU-rendered code editor
-Exec=kin %F
-Icon=dev.kin.editor
+Exec=kuana %F
+Icon=dev.kuana.editor
 Terminal=false
 Categories=Development;TextEditor;IDE;
 MimeType=text/plain;
-StartupWMClass=dev.kin.editor
+StartupWMClass=dev.kuana.editor

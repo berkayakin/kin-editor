@@ -264,7 +264,7 @@ impl Workspace {
             return;
         }
         let detail = format!(
-            "Extensions' grammars ({}) are compiled to WebAssembly, which runs them sandboxed. The compiler, wasi-sdk, is a {mb} MB download (about 170 MB on disk, in Kin's config folder).",
+            "Extensions' grammars ({}) are compiled to WebAssembly, which runs them sandboxed. The compiler, wasi-sdk, is a {mb} MB download (about 170 MB on disk, in Kuana's config folder).",
             waiting.join(", ")
         );
         let rx = window.prompt(PromptLevel::Info, "Download the WebAssembly toolchain?", Some(&detail), &["Download", "Not Now"], cx);

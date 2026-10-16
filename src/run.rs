@@ -68,7 +68,7 @@ impl DebugSpec {
 
 /// What rust-analyzer's Run / Debug lens describes (its `runnable`: cargo's
 /// arguments, the test binary's, and where to run), as a target to run or
-/// debug the same way Kin's own Rust targets are.
+/// debug the same way Kuana's own Rust targets are.
 pub fn from_rust_analyzer(runnable: &serde_json::Value) -> Option<RunTarget> {
     let args = runnable.get("args")?;
     let strings = |key: &str| -> Vec<String> {
@@ -770,7 +770,7 @@ mod tests {
         // Tests run in parallel, several with the same first file.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("kin-run-{}-{n}-{}", std::process::id(), files[0].0.replace('/', "_")));
+        let dir = std::env::temp_dir().join(format!("kuana-run-{}-{n}-{}", std::process::id(), files[0].0.replace('/', "_")));
         for (rel, content) in files {
             let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

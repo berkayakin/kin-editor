@@ -48,7 +48,7 @@ pub enum Block {
     /// A paragraph that's just an image; `path` is the local file it shows,
     /// `width` an HTML image's width in pixels.
     Image { src: String, alt: String, path: Option<PathBuf>, width: Option<f32> },
-    /// A fenced block, highlighted when its language is one Kin knows.
+    /// A fenced block, highlighted when its language is one Kuana knows.
     Code { lang: String, text: String, highlights: Vec<(Range<usize>, Highlight)> },
     Quote(Vec<Block>),
     /// `start`: the first number of an ordered list.
@@ -815,7 +815,7 @@ fn render_inline(inline: &Inline, id: (&'static str, usize), cx: &App) -> AnyEle
         .into_any_element()
 }
 
-/// The highlights of a fenced block, when its language is one Kin knows.
+/// The highlights of a fenced block, when its language is one Kuana knows.
 fn code_highlights(lang: &str, text: &str) -> Vec<(Range<usize>, Highlight)> {
     let extension = match lang.to_lowercase().as_str() {
         "rust" => "rs".to_string(),
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn parses_common_markdown() {
         let md = "# Title\n\nSome **bold** and `code` with a [link](https://x.y).\n\n- one\n- [x] done\n\n1. first\n2. second\n\n> quoted\n\n```rust\nfn main() {}\n```\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n\n---\n\n![logo](img.png)\n";
-        let dir = std::env::temp_dir().join(format!("kin-md-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-md-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("img.png"), b"").unwrap();
         let blocks = parse(md, Some(&dir));
@@ -881,13 +881,13 @@ mod tests {
 
     #[test]
     fn renders_the_html_readmes_use() {
-        let dir = std::env::temp_dir().join(format!("kin-md-html-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-md-html-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("logo.png"), b"").unwrap();
         let md = concat!(
             "<!-- hidden -->\n",
-            "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Kin\" width=\"120\">\n</p>\n\n",
-            "<h1 align=\"center\">Kin &amp; co</h1>\n\n",
+            "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Kuana\" width=\"120\">\n</p>\n\n",
+            "<h1 align=\"center\">Kuana &amp; co</h1>\n\n",
             "<p align=\"center\">\n  <a href=\"https://ci\"><img src=\"https://badge.svg\" alt=\"CI\"></a>\n  A <b>fast</b>\n  editor\n</p>\n\n",
             "Press <kbd>⌘K</kbd> then<br>commit, a < b.\n\n",
             "<details>\n<summary>More</summary>\n\nHidden **text**.\n\n</details>\n\n",
@@ -895,8 +895,8 @@ mod tests {
         );
         let blocks = parse(md, Some(&dir));
         let png = Some(dir.join("logo.png"));
-        assert_eq!(blocks[0], Block::Center(vec![Block::Image { src: "logo.png".into(), alt: "Kin".into(), path: png, width: Some(120.) }]));
-        assert!(matches!(&blocks[1], Block::Center(b) if matches!(&b[..], [Block::Heading(1, i)] if i.text == "Kin & co")), "{:?}", blocks[1]);
+        assert_eq!(blocks[0], Block::Center(vec![Block::Image { src: "logo.png".into(), alt: "Kuana".into(), path: png, width: Some(120.) }]));
+        assert!(matches!(&blocks[1], Block::Center(b) if matches!(&b[..], [Block::Heading(1, i)] if i.text == "Kuana & co")), "{:?}", blocks[1]);
         let Block::Center(inner) = &blocks[2] else { panic!("{:?}", blocks[2]) };
         let [Block::Paragraph(p)] = &inner[..] else { panic!("{inner:?}") };
         assert_eq!(p.text, "CI A fast editor");

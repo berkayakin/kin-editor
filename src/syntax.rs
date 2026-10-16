@@ -36,7 +36,7 @@ pub enum Language {
     Markdown,
     PlainText,
     /// A language an extension adds: an index into `crate::extensions`'
-    /// registry, stable while Kin runs.
+    /// registry, stable while Kuana runs.
     Extension(u16),
 }
 
@@ -985,7 +985,7 @@ fn injected_ranges(language: Language, tree: &Tree, rope: &Rope) -> Vec<(&'stati
             })
         };
         // Looked up once per name: comments (JSDoc) and regexes match often,
-        // and are usually languages Kin doesn't have.
+        // and are usually languages Kuana doesn't have.
         let Some(config) = named.or_else(set).and_then(|name| *found.entry(name).or_insert_with_key(|name| injected_config(name))) else {
             continue;
         };
@@ -1337,15 +1337,15 @@ mod tests {
         let css = highlights_of("a.css", "@media screen { .a { color: red; } }\n");
         assert!(has(&css, "@media", Highlight::Keyword), "{css:?}");
         assert!(has(&css, "color", Highlight::Property), "{css:?}");
-        let json = highlights_of("a.json", "{\"name\": \"kin\", \"n\": 1, \"ok\": true}\n");
+        let json = highlights_of("a.json", "{\"name\": \"kuana\", \"n\": 1, \"ok\": true}\n");
         assert!(has(&json, "\"name\"", Highlight::Property), "{json:?}");
-        assert!(has(&json, "\"kin\"", Highlight::String), "{json:?}");
+        assert!(has(&json, "\"kuana\"", Highlight::String), "{json:?}");
         assert!(has(&json, "true", Highlight::Constant), "{json:?}");
-        let yaml = highlights_of("a.yaml", "name: kin\non: true\n");
+        let yaml = highlights_of("a.yaml", "name: kuana\non: true\n");
         assert!(has(&yaml, "name", Highlight::Property), "{yaml:?}");
-        assert!(has(&yaml, "kin", Highlight::String), "{yaml:?}");
-        let toml = highlights_of("a.toml", "[package]\nname = \"kin\"\n");
-        assert!(has(&toml, "\"kin\"", Highlight::String), "{toml:?}");
+        assert!(has(&yaml, "kuana", Highlight::String), "{yaml:?}");
+        let toml = highlights_of("a.toml", "[package]\nname = \"kuana\"\n");
+        assert!(has(&toml, "\"kuana\"", Highlight::String), "{toml:?}");
         let sh = highlights_of("a.sh", "# hi\nif [ -n \"$X\" ]; then echo ok; fi\n");
         assert!(has(&sh, "# hi", Highlight::Comment), "{sh:?}");
         assert!(has(&sh, "if", Highlight::Keyword), "{sh:?}");

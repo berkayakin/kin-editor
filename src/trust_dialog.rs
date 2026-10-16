@@ -85,7 +85,7 @@ impl Render for TrustDialog {
         };
         let body = if let Some(by) = self.trusted_by.clone() {
             let detail = if by == self.folder {
-                "Kin runs its language servers, formatters, ESLint and the tools installed in it.".to_string()
+                "Kuana runs its language servers, formatters, ESLint and the tools installed in it.".to_string()
             } else {
                 format!("Every project in {} is trusted, this one too.", display(&by))
             };
@@ -95,7 +95,7 @@ impl Render for TrustDialog {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child("Tools Kin starts on its own may run code from this folder. Until you trust it, Kin stays in Restricted Mode:")
+                .child("Tools Kuana starts on its own may run code from this folder. Until you trust it, Kuana stays in Restricted Mode:")
                 .child(
                     div()
                         .flex()

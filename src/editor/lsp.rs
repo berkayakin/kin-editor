@@ -436,7 +436,7 @@ impl Editor {
         let start = menu.start;
         cx.notify();
         // Auto-imports often arrive only on resolve.
-        let own = item.raw.get("kinUserSnippet").is_some();
+        let own = item.raw.get("kuanaUserSnippet").is_some();
         if item.additional_edits.is_empty() && !own && server.resolves("completionProvider") {
             self.lsp.completion_task = Some(cx.spawn(async move |this, cx| {
                 if let Ok(resolved) = server.request("completionItem/resolve", item.raw.clone()).await {
@@ -780,7 +780,7 @@ impl Editor {
     }
 
     /// Carries out a clicked code lens. References and locations open the
-    /// usages list; rust-analyzer's Run and Debug run Kin's target for the
+    /// usages list; rust-analyzer's Run and Debug run Kuana's target for the
     /// line; anything else goes to the server if it runs that command.
     pub(super) fn run_code_lens(&mut self, lens: CodeLens, cx: &mut Context<Self>) {
         let name = lens.command["command"].as_str().unwrap_or_default().to_string();
@@ -798,7 +798,7 @@ impl Editor {
             "rust-analyzer.gotoLocation" => navigate(protocol::locations(&args[0]), server, cx),
             "rust-analyzer.runSingle" | "rust-analyzer.debugSingle" => {
                 let debug = name.ends_with("debugSingle");
-                // What the lens describes, else Kin's own target on that line.
+                // What the lens describes, else Kuana's own target on that line.
                 let target = crate::run::from_rust_analyzer(&args[0]).filter(|t| !debug || t.debug.is_some()).or_else(|| {
                     let targets = self.run_targets(cx);
                     targets
@@ -815,7 +815,7 @@ impl Editor {
             }
             _ => match server.filter(|s| s.executes(&name)) {
                 Some(server) => cx.emit(EditorLspEvent::Command { server, command: lens.command.clone() }),
-                None => cx.emit(EditorLspEvent::Message(format!("Kin can't run “{}”", lens.title).into())),
+                None => cx.emit(EditorLspEvent::Message(format!("Kuana can't run “{}”", lens.title).into())),
             },
         }
     }
@@ -1295,7 +1295,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-lens-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-lens-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
@@ -1339,7 +1339,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-hints-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-hints-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "let index = 1;\n").unwrap();
@@ -1377,7 +1377,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-decl-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-decl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "fn a() {}\nfn b() { a() }\n").unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-watch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
         std::fs::write(&path, "fn a() {}\n").unwrap();
@@ -1446,7 +1446,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-servers-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-servers-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.ts");
         std::fs::write(&path, "x.y\n").unwrap();
@@ -1515,7 +1515,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-restart-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-restart-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.ts");
         std::fs::write(&path, "x\n").unwrap();
@@ -1545,7 +1545,7 @@ mod tests {
         }
         cx.executor().allow_parking();
         crate::trust::set_trust_all(true);
-        let dir = std::env::temp_dir().join(format!("kin-lsp-settings-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.ts");
         std::fs::write(&path, "x\n").unwrap();

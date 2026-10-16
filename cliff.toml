@@ -10,7 +10,7 @@
 
 [remote.github]
 owner = "berkayakin"
-repo = "kin-editor"
+repo = "kuana-editor"
 
 [changelog]
 header = ""
@@ -40,7 +40,7 @@ body = """
 {% endfor -%}
 {%- endif %}
 {% if previous.version and version -%}
-**Full Changelog**: https://github.com/berkayakin/kin-editor/compare/{{ previous.version }}...{{ version }}
+**Full Changelog**: https://github.com/berkayakin/kuana-editor/compare/{{ previous.version }}...{{ version }}
 {% endif -%}
 """
 trim = true

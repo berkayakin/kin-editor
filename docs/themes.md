@@ -12,8 +12,8 @@ and One Light. Their sources in [`assets/themes/`](../assets/themes) use the sam
 
 ### Making your own
 
-Put a `.json` file in the themes folder — `~/.config/kin/themes/` on macOS and Linux
-(`$XDG_CONFIG_HOME/kin/themes` if set), `%APPDATA%\kin\themes\` on Windows.
+Put a `.json` file in the themes folder — `~/.config/kuana/themes/` on macOS and Linux
+(`$XDG_CONFIG_HOME/kuana/themes` if set), `%APPDATA%\kuana\themes\` on Windows.
 **Open Themes Folder** (in Find Action or the theme picker) creates it with a starter
 theme. Then use **Reload Themes**, or just reopen the picker.
 

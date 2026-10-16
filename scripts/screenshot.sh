@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Takes README screenshots of Kin (macOS): the window at Retina resolution, as a PNG with
+# Takes README screenshots of Kuana (macOS): the window at Retina resolution, as a PNG with
 # its rounded corners and drop shadow on a transparent background.
 #
 #   scripts/screenshot.sh [options] [<folder> [<file>…]]
 #
-# Launches target/release/kin with its own config (target/screenshot-config, so your
-# ~/.config/kin isn't shown or changed, and the theme and panels you set up are kept for the
+# Launches target/release/kuana with its own config (target/screenshot-config, so your
+# ~/.config/kuana isn't shown or changed, and the theme and panels you set up are kept for the
 # next run), sizes the window, then asks for a name per shot. Arrange the window, type a name
-# and press Enter: Kin comes to the front and is captured after the delay. Saves
-# docs/screenshots/<name>.png. An empty name quits (and closes the Kin it launched).
+# and press Enter: Kuana comes to the front and is captured after the delay. Saves
+# docs/screenshots/<name>.png. An empty name quits (and closes the Kuana it launched).
 #
 # Options:
 #   -s WxH    window size in points (default 1400x875)
 #   -d SEC    delay before each capture, e.g. to hover something (default 2)
 #   -o DIR    output folder (default docs/screenshots)
-#   -p PID    use an already running Kin instead of launching one
+#   -p PID    use an already running Kuana instead of launching one
 #   -n        no drop shadow
 #   -f        start from a fresh screenshot config
 #
@@ -58,18 +58,18 @@ fi
 
 launched=""
 if [[ -z $pid ]]; then
-    kin="$root/target/release/kin"
-    [[ -x $kin ]] || { echo "No $kin; run cargo build --release first" >&2; exit 1; }
+    kuana="$root/target/release/kuana"
+    [[ -x $kuana ]] || { echo "No $kuana; run cargo build --release first" >&2; exit 1; }
     config="$root/target/screenshot-config"
     [[ $fresh == 1 ]] && rm -rf "$config"
     mkdir -p "$config"
     (( $# > 0 )) || set -- "$root"
-    XDG_CONFIG_HOME="$config" "$kin" "$@" </dev/null >/dev/null 2>&1 &
+    XDG_CONFIG_HOME="$config" "$kuana" "$@" </dev/null >/dev/null 2>&1 &
     pid=$!
     launched=$pid
 fi
 
-# Only the Kin this script started, by PID: other Kin windows may be open.
+# Only the Kuana this script started, by PID: other Kuana windows may be open.
 trap '[[ -n $launched ]] && kill "$launched" 2>/dev/null || true' EXIT
 
 window=""
@@ -78,20 +78,20 @@ for _ in $(seq 100); do
     window=""
     sleep 0.2
 done
-[[ -n $window ]] || { echo "Kin's window didn't appear (pid $pid)" >&2; exit 1; }
+[[ -n $window ]] || { echo "Kuana's window didn't appear (pid $pid)" >&2; exit 1; }
 
 "$helper" resize "$pid" "$width" "$height" || echo "Keeping the current window size."
 "$helper" activate "$pid"
 mkdir -p "$out"
 
-echo "Arrange the Kin window, then type a name for the shot here and press Enter (empty to quit)."
+echo "Arrange the Kuana window, then type a name for the shot here and press Enter (empty to quit)."
 while true; do
     read -r -p "Shot name: " name || break
     [[ -n $name ]] || break
     name=${name%.png}
     file="$out/$name.png"
     # Find the window again: it changes if the project is reopened.
-    window=$("$helper" window "$pid") || { echo "Kin's window is gone" >&2; exit 1; }
+    window=$("$helper" window "$pid") || { echo "Kuana's window is gone" >&2; exit 1; }
     "$helper" activate "$pid"
     sleep "$delay"
     if ! screencapture -x ${shadow[@]+"${shadow[@]}"} -l "$window" -t png "$file"; then

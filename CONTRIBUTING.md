@@ -1,21 +1,21 @@
-# Contributing to Kin
+# Contributing to Kuana
 
-Thanks for helping! Kin is young, so every bug report, theme, doc fix and feature makes a real
+Thanks for helping! Kuana is young, so every bug report, theme, doc fix and feature makes a real
 difference. This page covers how to get started, the checks a change has to pass, and the
 conventions the code follows.
 
 ## Ways to help
 
-- **Report bugs.** Open an [issue](https://github.com/berkayakin/kin-editor/issues/new/choose) with
-  the version from **About Kin → Copy Version**. Reports from Windows and Linux are especially
+- **Report bugs.** Open an [issue](https://github.com/berkayakin/kuana-editor/issues/new/choose) with
+  the version from **About Kuana → Copy Version**. Reports from Windows and Linux are especially
   valuable: those builds have had the least testing.
 - **Make a theme.** A theme is a JSON file with only the colors it changes; see
   [Themes](docs/themes.md). Built-in themes live in [`assets/themes/`](assets/themes).
-- **Make or test an extension.** Kin reads Zed's extension format; see
-  [Extensions](docs/extensions.md). `kin extension check <folder>` validates one.
+- **Make or test an extension.** Kuana reads Zed's extension format; see
+  [Extensions](docs/extensions.md). `kuana extension check <folder>` validates one.
 - **Improve the docs** in [`docs/`](docs): if something confused you, it'll confuse the next person.
 - **Write code.** Look for issues labeled
-  [`good first issue`](https://github.com/berkayakin/kin-editor/labels/good%20first%20issue), or
+  [`good first issue`](https://github.com/berkayakin/kuana-editor/labels/good%20first%20issue), or
   pick something from the roadmap below. For anything larger than a bug fix, please open an issue
   first so we can agree on the approach before you put in the time.
 
@@ -25,7 +25,7 @@ You need Rust 1.94 or newer and `cmake` (for wasmtime): `brew install cmake` on 
 install GPUI's dependencies (the list is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ```bash
-cargo build                 # debug build: dependencies optimized, Kin itself rebuilds quickly
+cargo build                 # debug build: dependencies optimized, Kuana itself rebuilds quickly
 cargo run --release -- <folder> [<file>…]
 cargo test
 cargo clippy --all-targets
@@ -34,10 +34,10 @@ cargo clippy --all-targets
 The first build compiles GPUI, tree-sitter grammars and rumdl, which takes several minutes;
 after that, incremental builds take seconds.
 
-To try a change without touching your own settings, point Kin at a scratch config folder:
+To try a change without touching your own settings, point Kuana at a scratch config folder:
 
 ```bash
-XDG_CONFIG_HOME=/tmp/kin-test ./target/release/kin <folder>
+XDG_CONFIG_HOME=/tmp/kuana-test ./target/release/kuana <folder>
 ```
 
 ## Before you open a pull request
@@ -54,13 +54,13 @@ XDG_CONFIG_HOME=/tmp/kin-test ./target/release/kin <folder>
 
 ## How the code is organized
 
-Start with [Architecture](docs/architecture.md): Kin is one Rust crate on
+Start with [Architecture](docs/architecture.md): Kuana is one Rust crate on
 [GPUI](https://www.gpui.rs). `Workspace` is the window's root view, and each open file is an
 `Editor` showing a `Document` (a `ropey` rope, undo history, syntax tree and diagnostics).
 
 ## Conventions
 
-These keep Kin consistent; reviews will point back to them.
+These keep Kuana consistent; reviews will point back to them.
 
 - **Offsets are UTF-8 byte offsets** everywhere (rope, tree-sitter, diagnostics). Convert to
   UTF-16 only at the IME and language-server boundaries, and to chars only for display.
@@ -102,4 +102,4 @@ Things we'd love help with:
 ## License
 
 By contributing, you agree that your contributions are dual licensed under the
-[MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE) licenses, like the rest of Kin.
+[MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE) licenses, like the rest of Kuana.

@@ -96,11 +96,11 @@ impl Workspace {
             let result = check.await;
             this.update(cx, |ws, cx| match result {
                 Ok(updater::Check::UpToDate) => {
-                    ws.toast(ToastKind::Success, format!("Kin {} is up to date", env!("CARGO_PKG_VERSION")), None, cx)
+                    ws.toast(ToastKind::Success, format!("Kuana {} is up to date", env!("CARGO_PKG_VERSION")), None, cx)
                 }
                 Ok(updater::Check::Ready(version)) => ws.toast(
                     ToastKind::Success,
-                    format!("Kin {version} is ready"),
+                    format!("Kuana {version} is ready"),
                     Some("Restart to Update in the status bar installs it.".into()),
                     cx,
                 ),

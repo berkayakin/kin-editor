@@ -1,29 +1,29 @@
 <p align="center">
-  <img src="assets/app-icon/macos/icon_1024.png" alt="Kin logo" width="256">
+  <img src="assets/app-icon/macos/icon_1024.png" alt="Kuana logo" width="256">
 </p>
 
-# Kin
+# Kuana
 
 **A fast, beautiful code editor, written in Rust and drawn by your GPU.**
 JetBrains-style comfort, native speed, works with Zed extensions. Free and open source.
 
-[Download](https://github.com/berkayakin/kin-editor/releases/latest) ·
+[Download](https://github.com/berkayakin/kuana-editor/releases/latest) ·
 [Features](docs/features.md) ·
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md)
 
-![Kin with the file tree and a Rust file open, in the Monokai Pro theme](docs/screenshots/default.png)
+![Kuana with the file tree and a Rust file open, in the Monokai Pro theme](docs/screenshots/default.png)
 
-## Why Kin
+## Why Kuana
 
-**⚡ Fast by design.** Kin is native Rust with no Electron and no web view. The whole interface is
+**⚡ Fast by design.** Kuana is native Rust with no Electron and no web view. The whole interface is
 drawn on the GPU with [GPUI](https://www.gpui.rs), the framework behind Zed: Metal on macOS,
 DirectX on Windows. Text uses the system's own font rendering. The editor shapes and paints only
 the lines on screen. Parsing, linting, Git, search and language servers all run off the main
 thread, so typing never waits for them.
 
 **🪶 Light on memory.** With this repository open (540 files) and a 4,900-line Rust file
-showing, Kin uses about **130 MB**. Language servers run as their own processes, and restored
+showing, Kuana uses about **130 MB**. Language servers run as their own processes, and restored
 tabs aren't read from disk until you look at them.
 
 **🎨 Beautiful out of the box.** A calm "islands" layout: the sidebar, editors and panels float
@@ -32,12 +32,12 @@ There are **31 built-in themes**, from Monokai Pro and Catppuccin to Tokyo Night
 each previewed live as you pick it. Prefer something plainer? One setting tones down gradients,
 shadows and animations.
 
-**🧩 Zed extensions.** Kin reads [Zed's extension format](docs/extensions.md), so Zed's language,
+**🧩 Zed extensions.** Kuana reads [Zed's extension format](docs/extensions.md), so Zed's language,
 theme and icon-theme extensions work as they are. Gleam, Elixir, Zig, Lua, Nix, Kotlin, Haskell
 and Catppuccin are all tested. Grammars run sandboxed as WebAssembly.
 
 **⌨️ Feels like home.** Search Everywhere on double Shift, Find Action, ⌥↩ for context
-actions: Kin behaves like a JetBrains IDE. One click switches to the **VS Code**, **Sublime
+actions: Kuana behaves like a JetBrains IDE. One click switches to the **VS Code**, **Sublime
 Text** or **Zed** keymap instead, and Vim mode is built in.
 
 **🔋 Batteries included.** Language servers, a debugger, Git, a terminal, test running and
@@ -65,25 +65,25 @@ There's much more: see the [full feature list](docs/features.md).
 ## Get started
 
 **Download** the latest release for macOS, Windows or Linux from
-[GitHub Releases](https://github.com/berkayakin/kin-editor/releases/latest). It updates itself
+[GitHub Releases](https://github.com/berkayakin/kuana-editor/releases/latest). It updates itself
 from then on.
 
 **Or build it** (Rust 1.94+ and `cmake`):
 
 ```bash
-git clone https://github.com/berkayakin/kin-editor.git
-cd kin-editor
+git clone https://github.com/berkayakin/kuana-editor.git
+cd kuana-editor
 cargo run --release -- path/to/project
 ```
 
-macOS is Kin's everyday platform; Windows and Linux builds are newer and less tested. See
+macOS is Kuana's everyday platform; Windows and Linux builds are newer and less tested. See
 [Installing and building](docs/install.md) for details.
 
 ## Documentation
 
 | | |
 | --- | --- |
-| [Features](docs/features.md) | Everything Kin does, in one list |
+| [Features](docs/features.md) | Everything Kuana does, in one list |
 | [Key bindings](docs/keybindings.md) | The keymaps and how to change shortcuts |
 | [Languages](docs/languages.md) | Language servers, formatting, Python environments |
 | [Editing, panes and windows](docs/editing.md) | Splits, tabs, Vim mode, snippets, projects |
@@ -95,13 +95,13 @@ macOS is Kin's everyday platform; Windows and Linux builds are newer and less te
 
 ## Contributing
 
-Kin is young, and contributions of every size are welcome: bug reports, themes, docs, language
+Kuana is young, and contributions of every size are welcome: bug reports, themes, docs, language
 support, features. Good places to start:
 
 - **Try it and report what breaks**, especially on Windows and Linux.
 - **Make a theme or an extension.** Neither needs any Rust: see [Themes](docs/themes.md) and
   [Extensions](docs/extensions.md).
-- **Pick an open [issue](https://github.com/berkayakin/kin-editor/issues)**, or take something
+- **Pick an open [issue](https://github.com/berkayakin/kuana-editor/issues)**, or take something
   from the roadmap: a three-way merge editor, Vim registers and macros, semantic tokens, an
   extension registry.
 
@@ -127,5 +127,5 @@ Bundled third-party assets keep their own licenses: file-type icons from
 License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)).
 
 Zed, JetBrains, Visual Studio Code and Sublime Text are trademarks of their respective owners.
-Kin is an independent project, not affiliated with or endorsed by any of them; it mentions them
+Kuana is an independent project, not affiliated with or endorsed by any of them; it mentions them
 only to describe compatibility.

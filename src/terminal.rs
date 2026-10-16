@@ -167,7 +167,7 @@ impl TerminalView {
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "Kin".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "Kuana".to_string());
         let shell = shell.and_then(|command| {
             let (program, args) = command.split_first()?;
             Some(tty::Shell::new(program.clone(), args.to_vec()))
@@ -1047,7 +1047,7 @@ pub struct TerminalFrame {
 fn run_script(command: &str) -> String {
     let shown = command.replace('\'', r"'\''");
     format!(
-        "trap : INT\nprintf '\\033[2m$ %s\\033[0m\\n' '{shown}'\n(\n{command}\n)\nkin_code=$?\nprintf '\\n\\033[2mProcess finished with exit code %s\\033[0m\\n' \"$kin_code\"\nexit $kin_code\n"
+        "trap : INT\nprintf '\\033[2m$ %s\\033[0m\\n' '{shown}'\n(\n{command}\n)\nkin_code=$?\nprintf '\\n\\033[2mProcess finished with exit code %s\\033[0m\\n' \"$kuana_code\"\nexit $kuana_code\n"
     )
 }
 
@@ -1388,7 +1388,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn finds_a_process_working_directory() {
-        let dir = std::env::temp_dir().join(format!("kin-cwd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-cwd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut child = std::process::Command::new("sleep").arg("5").current_dir(&dir).spawn().unwrap();
         let found = process_cwd(child.id()).and_then(|p| p.canonicalize().ok());
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn finds_links_in_output() {
-        let dir = std::env::temp_dir().join(format!("kin-term-links-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-term-links-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "").unwrap();
         let row: Vec<char> = "  --> src/main.rs:12:5 (see https://example.com/a?b=1).".chars().collect();

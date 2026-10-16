@@ -3,7 +3,7 @@
 //!
 //! An `LspStore` per window starts one server per kind and project root the
 //! first time a matching file opens, keeps open documents in sync and routes
-//! what servers send back. A document can have several servers (Kin's own,
+//! what servers send back. A document can have several servers (Kuana's own,
 //! then extensions': ESLint beside TypeScript); they all get its text, and
 //! their diagnostics are combined. Editors talk to the servers directly for
 //! requests: the first that can answer, or all for completion and code
@@ -167,9 +167,9 @@ pub enum LspStatus {
     /// Work in progress, e.g. "Indexing 40%".
     Busy(String),
     Ready(String),
-    /// Not installed: how to install it by hand, and Kin's installer if it has one.
+    /// Not installed: how to install it by hand, and Kuana's installer if it has one.
     Missing { command: &'static str, installer: Option<&'static install::Installer> },
-    /// Kin is installing it (this command).
+    /// Kuana is installing it (this command).
     Installing(&'static str),
     Failed(String),
 }
@@ -190,7 +190,7 @@ pub enum LspEvent {
     ApplyEdit { key: ServerKey, request_id: Value, encoding: Encoding, edits: Vec<(PathBuf, Vec<TextEdit>)> },
     /// An error message from a server.
     Message(String),
-    /// Kin installed this server.
+    /// Kuana installed this server.
     Installed(&'static str),
 }
 
@@ -358,10 +358,10 @@ impl LspStore {
                     let venv = (language == Language::Python).then(|| crate::python::venv(file.parent()?)).flatten();
                     let command = match &custom {
                         Some(command) => servers::custom(command),
-                        // `lsp.<id>.binary`, else where Kin finds it.
+                        // `lsp.<id>.binary`, else where Kuana finds it.
                         None => servers::user_binary(spec, &user_for_find).or_else(|| servers::find(spec, &file, venv.as_deref())),
                     };
-                    // Kin's own Node.js runs the npm servers it installed.
+                    // Kuana's own Node.js runs the npm servers it installed.
                     let path = crate::python::path_with(venv.as_deref(), &install::path_with(install::node_bin().as_deref()));
                     let spawned = command.map(|c| (Client::spawn(&c.program, &c.args, &root, &path), c));
                     if let Some((Ok(_), c)) = &spawned {
@@ -551,7 +551,7 @@ impl LspStore {
             Incoming::Request { id, method, params } => {
                 let Some(client) = self.client(key) else { return };
                 match method.as_str() {
-                    // From `lsp.<id>.settings` (and Kin's defaults); null means "use yours".
+                    // From `lsp.<id>.settings` (and Kuana's defaults); null means "use yours".
                     "workspace/configuration" => {
                         let settings = self.configs.get(key).map_or(Value::Null, |(_, _, c)| c.settings.clone());
                         let items = params.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -935,11 +935,11 @@ fn workspace_folders(root: &Path) -> Value {
     json!([{ "uri": path_to_uri(root), "name": name }])
 }
 
-/// What Kin tells servers it can do.
+/// What Kuana tells servers it can do.
 fn initialize_params(root: &Path, initialization_options: Value) -> Value {
     let mut params = json!({
         "processId": std::process::id(),
-        "clientInfo": { "name": "Kin", "version": env!("CARGO_PKG_VERSION") },
+        "clientInfo": { "name": "Kuana", "version": env!("CARGO_PKG_VERSION") },
         "rootUri": path_to_uri(root),
         "rootPath": root.to_string_lossy(),
         "workspaceFolders": workspace_folders(root),
@@ -986,7 +986,7 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
                 "inlayHint": {},
                 "codeLens": {},
             },
-            // Commands Kin runs itself, so servers send code lenses that use
+            // Commands Kuana runs itself, so servers send code lenses that use
             // them (rust-analyzer's Run, Debug and references lenses).
             "experimental": { "commands": { "commands": CLIENT_COMMANDS } },
         },

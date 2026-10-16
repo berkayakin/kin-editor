@@ -1,5 +1,5 @@
 //! User preferences in `settings.json`. The file may contain comments and
-//! trailing commas; when Kin changes a key (Preferences, the theme picker) it
+//! trailing commas; when Kuana changes a key (Preferences, the theme picker) it
 //! rewrites only that key's entry, so comments and formatting survive.
 //!
 //! Editor options resolve per file: built-in language defaults, then the
@@ -28,7 +28,7 @@ use crate::{
 #[serde(default)]
 pub struct Settings {
     pub theme: Option<String>,
-    /// The shortcuts Kin starts from; `keymap.json` goes on top.
+    /// The shortcuts Kuana starts from; `keymap.json` goes on top.
     pub base_keymap: Option<BaseKeymap>,
     /// When edited files are written to disk without an explicit save.
     pub auto_save: Option<AutoSave>,
@@ -46,7 +46,7 @@ pub struct Settings {
     /// Per language: `false` to turn its language server off, or a command
     /// (`["pylsp"]`) to use instead of the built-in choice.
     pub language_servers: HashMap<String, serde_json::Value>,
-    /// Per language server, by id (Kin's, `typescript`, or Zed's, `vtsls`):
+    /// Per language server, by id (Kuana's, `typescript`, or Zed's, `vtsls`):
     /// its settings, initialization options and program. Zed's names, so
     /// Zed users' settings work as they are.
     pub lsp: HashMap<String, LspSettings>,
@@ -289,10 +289,10 @@ impl EditorSettings {
         }
     }
 
-    /// What Kin does for a language unless told otherwise.
+    /// What Kuana does for a language unless told otherwise.
     fn language_default(language: Language) -> EditorSettings {
         let mut s = EditorSettings::default();
-        // What the language's config.toml says (Kin's own in
+        // What the language's config.toml says (Kuana's own in
         // assets/languages, or the extension's).
         if let Some(def) = crate::languages::def(language) {
             s.tab_size = def.tab_size;
@@ -381,7 +381,7 @@ impl Settings {
     }
 
     /// Reads `settings.json`. Only text that isn't JSON fails: a value of the
-    /// wrong type (`"tab_size": "4"`, an option from a newer Kin) is left out
+    /// wrong type (`"tab_size": "4"`, an option from a newer Kuana) is left out
     /// and reported as "key: why", so the other settings still apply.
     pub fn parse_reporting(text: &str) -> Result<(Self, Vec<String>), String> {
         if text.trim().is_empty() {
@@ -680,7 +680,7 @@ fn unknown_key_problems() -> Vec<String> {
 }
 
 /// Re-applies `settings.json` and `keymap.json` if they changed on disk since
-/// they were last applied (after saving them in Kin, or editing elsewhere).
+/// they were last applied (after saving them in Kuana, or editing elsewhere).
 /// A broken file keeps the previous state. Returns problems to report.
 pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
     let (settings_time, keymap_time) = (modified(Settings::path()), modified(keymap::keymap_path()));
@@ -726,7 +726,7 @@ pub fn reload_if_changed(cx: &mut App) -> Vec<String> {
     problems
 }
 
-/// Applies `settings.json` now, after Kin changed it itself (a quick second
+/// Applies `settings.json` now, after Kuana changed it itself (a quick second
 /// write can share the first one's modified time).
 pub fn reload_now(cx: &mut App) -> Vec<String> {
     let keymap = cx.try_global::<ConfigStamps>().and_then(|s| s.keymap);
@@ -734,7 +734,7 @@ pub fn reload_now(cx: &mut App) -> Vec<String> {
     reload_if_changed(cx)
 }
 
-/// Applies `keymap.json` now, after Kin changed it itself.
+/// Applies `keymap.json` now, after Kuana changed it itself.
 pub fn reload_keymap_now(cx: &mut App) -> Vec<String> {
     let settings = cx.try_global::<ConfigStamps>().and_then(|s| s.settings);
     cx.set_global(ConfigStamps { settings, keymap: None });
@@ -749,7 +749,7 @@ impl Global for StartupProblems {}
 
 /// Written by Open Settings when there's no file yet: every option, commented
 /// out at its default.
-pub const SETTINGS_TEMPLATE: &str = r#"// Kin settings. Changes apply when you save this file.
+pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you save this file.
 // Comments and trailing commas are allowed.
 {
   // "theme": "Monokai Pro",
@@ -1145,7 +1145,7 @@ mod tests {
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].starts_with("tab_size: invalid type"), "{problems:?}");
 
-        // An option value from a newer Kin, and bad keys inside a language's overrides.
+        // An option value from a newer Kuana, and bad keys inside a language's overrides.
         let text = r#"{"auto_save": "sometimes", "vim_mode": true,
             "languages": {"Go": {"tab_size": 8, "soft_wrap": "yes"}, "Rust": 3}}"#;
         let (s, problems) = Settings::parse_reporting(text).unwrap();

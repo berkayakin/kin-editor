@@ -1,5 +1,5 @@
 //! Which language server each language uses, and finding it on disk: the
-//! project's (`node_modules/.bin`, a venv), then one on PATH, then a copy Kin
+//! project's (`node_modules/.bin`, a venv), then one on PATH, then a copy Kuana
 //! installed itself (see `install.rs`, the status bar's Install).
 
 use std::{
@@ -39,12 +39,12 @@ pub fn spec(language: Language) -> Option<&'static ServerSpec> {
     specs(language).into_iter().next()
 }
 
-/// Every server a `language` document gets, the main one first: Kin's own
+/// Every server a `language` document gets, the main one first: Kuana's own
 /// choice, then the ones extensions bring, which run beside it (ESLint or
 /// Tailwind beside TypeScript). Requests go to the first server that can
 /// answer; diagnostics, completion and code actions come from all. An
 /// extension's server that's the same program as an earlier one (a choice
-/// Kin already makes) isn't started twice.
+/// Kuana already makes) isn't started twice.
 pub fn specs(language: Language) -> Vec<&'static ServerSpec> {
     combine(builtin(language), crate::extensions::servers_for(language.name()))
 }
@@ -60,7 +60,7 @@ fn combine(builtin: Option<&'static ServerSpec>, extensions: Vec<&'static Server
     out
 }
 
-/// Kin's own server for a built-in language.
+/// Kuana's own server for a built-in language.
 fn builtin(language: Language) -> Option<&'static ServerSpec> {
     static RUST: ServerSpec = ServerSpec {
         id: "rust-analyzer",
@@ -216,7 +216,7 @@ fn zed_id(program: &str) -> &str {
     }
 }
 
-/// The user's `lsp.<id>` entry for a server: by Kin's id, else by the
+/// The user's `lsp.<id>` entry for a server: by Kuana's id, else by the
 /// program's Zed id or name (`program`, else any of its candidates').
 fn user_entry<'a>(spec: &ServerSpec, program: Option<&str>, user: &'a HashMap<String, LspSettings>) -> Option<&'a LspSettings> {
     let mut keys = vec![spec.id];
@@ -243,7 +243,7 @@ pub struct ServerConfig {
     pub settings: Value,
 }
 
-/// A server's configuration: Kin's defaults for its program, then its
+/// A server's configuration: Kuana's defaults for its program, then its
 /// extension's, then the user's `lsp.<id>`, each merged over the one before.
 pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSettings>) -> ServerConfig {
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -273,7 +273,7 @@ fn expand_dotted(value: &Value) -> Value {
     out
 }
 
-/// What Kin passes a server program unless told otherwise:
+/// What Kuana passes a server program unless told otherwise:
 /// (initialization options, settings). Inlay hints are off in TypeScript's
 /// and Go's servers until asked for.
 fn defaults(program: &str) -> (Value, Value) {
@@ -314,7 +314,7 @@ fn defaults(program: &str) -> (Value, Value) {
             });
             (Value::Null, json!({ "gopls": { "hints": hints } }))
         }
-        // Schemas for Kin's own settings, keymap and theme files.
+        // Schemas for Kuana's own settings, keymap and theme files.
         "vscode-json-language-server" => match crate::schemas::json_schemas() {
             Value::Null => (Value::Null, Value::Null),
             schemas => (Value::Null, json!({ "json": { "schemas": schemas } })),
@@ -365,7 +365,7 @@ pub fn find(spec: &ServerSpec, file: &Path, venv: Option<&Path>) -> Option<Comma
             return Some(command(program, args));
         }
     }
-    // Only then Kin's own copies: the user's servers, any of them, come first.
+    // Only then Kuana's own copies: the user's servers, any of them, come first.
     spec.candidates.iter().find_map(|(name, args)| Some(command(super::install::installed(name)?, args)))
 }
 
@@ -450,11 +450,11 @@ pub fn search_path() -> &'static OsString {
 }
 
 /// `$PATH` as the user's login shell sets it, with a timeout so a slow or
-/// interactive shell config can't hang Kin.
+/// interactive shell config can't hang Kuana.
 #[cfg(unix)]
 fn login_shell_path() -> Option<OsString> {
     use std::{io::Read, os::unix::process::CommandExt, process::Stdio, time::Duration};
-    const MARK: &str = "__KIN_PATH__";
+    const MARK: &str = "__KUANA_PATH__";
     let shell = std::env::var("SHELL").ok()?;
     let mut command = crate::process::command(shell);
     command
@@ -463,7 +463,7 @@ fn login_shell_path() -> Option<OsString> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // An interactive shell opens /dev/tty and makes itself the terminal's foreground job,
-    // which stops (or breaks) the shell Kin was started from. Its own session has no terminal.
+    // which stops (or breaks) the shell Kuana was started from. Its own session has no terminal.
     // SAFETY: setsid is async-signal-safe, as pre_exec requires.
     unsafe {
         command.pre_exec(|| {
@@ -510,10 +510,10 @@ mod tests {
         static ESLINT: ServerSpec = ServerSpec { id: "eslint", candidates: &[("vscode-eslint-language-server", &["--stdio"])], ..SPEC };
         static VTSLS: ServerSpec = ServerSpec { id: "ext:vtsls", candidates: &[("vtsls", &["--stdio"])], ..SPEC };
         let ids = |specs: Vec<&ServerSpec>| specs.iter().map(|s| s.id).collect::<Vec<_>>();
-        // ESLint joins TypeScript; an extension's vtsls is one of Kin's own
+        // ESLint joins TypeScript; an extension's vtsls is one of Kuana's own
         // choices for TypeScript already, so it isn't started a second time.
         assert_eq!(ids(combine(builtin(Language::TypeScript), vec![&ESLINT, &VTSLS])), ["typescript", "eslint"]);
-        // A language Kin has no server for gets the extensions' alone.
+        // A language Kuana has no server for gets the extensions' alone.
         assert_eq!(ids(combine(None, vec![&VTSLS, &ESLINT])), ["ext:vtsls", "eslint"]);
     }
 
@@ -521,14 +521,14 @@ mod tests {
     fn configuration_merges_defaults_extension_and_user_settings() {
         use crate::settings::{LspBinary, LspSettings};
         let typescript = builtin(Language::TypeScript).unwrap();
-        // Kin's defaults turn on inlay hints, by program.
+        // Kuana's defaults turn on inlay hints, by program.
         let none = HashMap::new();
         let ts = config(typescript, Path::new("/bin/typescript-language-server"), &none);
         assert_eq!(ts.initialization_options["preferences"]["includeInlayParameterNameHints"], "all");
         let vtsls = config(typescript, Path::new("/bin/vtsls"), &none);
         assert_eq!(vtsls.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "all");
 
-        // The user's entry by Kin's id or Zed's, merged over the defaults.
+        // The user's entry by Kuana's id or Zed's, merged over the defaults.
         let user: HashMap<String, LspSettings> = [(
             "vtsls".to_string(),
             LspSettings { settings: Some(json!({ "typescript": { "inlayHints": { "parameterNames": { "enabled": "none" } } } })), ..Default::default() },
@@ -585,7 +585,7 @@ mod tests {
     fn roots() {
         let rust = spec(Language::Rust).unwrap();
         assert_eq!(root_for(rust, Path::new("/w/src/a.rs"), Some(Path::new("/w"))), PathBuf::from("/w"));
-        let dir = std::env::temp_dir().join(format!("kin-root-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-root-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("crate/src")).unwrap();
         std::fs::write(dir.join("crate/Cargo.toml"), "").unwrap();
         assert_eq!(root_for(rust, &dir.join("crate/src/main.rs"), None), dir.join("crate"));

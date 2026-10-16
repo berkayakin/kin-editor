@@ -1,6 +1,6 @@
 # Architecture
 
-Kin is one Rust binary crate built on [GPUI](https://www.gpui.rs). The window's root view is
+Kuana is one Rust binary crate built on [GPUI](https://www.gpui.rs). The window's root view is
 `Workspace`; every open file is an `Editor` showing a `Document` (a `ropey` rope with undo
 history, a tree-sitter syntax tree and diagnostics). The editor is a custom GPUI element that
 shapes and paints only the lines on screen; parsing, linting, Git, search and language servers
@@ -36,7 +36,7 @@ bindings, colors, icons) are in the [contributing guide](../CONTRIBUTING.md).
 - `src/state.rs` — remembered UI state and per-project sessions
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
 - `src/updater.rs`, `.github/workflows/release.yml` — auto-update and the release build
-- `src/about.rs` — the About Kin window
+- `src/about.rs` — the About Kuana window
 - `src/ui.rs`, `src/context_menu.rs`, `src/input_dialog.rs` — shared widgets, menus and prompts
 - `src/assets.rs`, `assets/icons/` — UI icons ([Material Symbols](https://fonts.google.com/icons), Rounded, filled; Apache 2.0) and the title font embedded into the binary
 - `assets/file-icons/`, `src/file_icons.rs` — file-type icons ([Charmed Icons](https://github.com/jmesrje/zed-charmed-icons)) and their file-name associations

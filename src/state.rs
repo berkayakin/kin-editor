@@ -49,7 +49,7 @@ pub struct SessionState {
     /// Where the last moved or resized window was, for the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
-    /// Keys this version doesn't know (a newer Kin wrote them), kept so that
+    /// Keys this version doesn't know (a newer Kuana wrote them), kept so that
     /// saving here doesn't drop them.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -274,19 +274,19 @@ mod tests {
 
     #[test]
     fn session_file_names_are_stable_and_distinct() {
-        let a = ProjectSession::file_name(Path::new("/work/kin"));
-        assert_eq!(a, ProjectSession::file_name(Path::new("/work/kin")));
-        assert!(a.starts_with("kin-") && a.ends_with(".json"), "{a}");
-        assert_ne!(a, ProjectSession::file_name(Path::new("/other/kin")));
+        let a = ProjectSession::file_name(Path::new("/work/kuana"));
+        assert_eq!(a, ProjectSession::file_name(Path::new("/work/kuana")));
+        assert!(a.starts_with("kuana-") && a.ends_with(".json"), "{a}");
+        assert_ne!(a, ProjectSession::file_name(Path::new("/other/kuana")));
         assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
     }
 
     #[test]
     fn sessions_round_trip() {
         let session = ProjectSession {
-            root: "/work/kin".into(),
+            root: "/work/kuana".into(),
             tabs: vec![
-                TabSession { path: Some("/work/kin/a.rs".into()), cursor: 12, top_line: Some(40), unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
+                TabSession { path: Some("/work/kuana/a.rs".into()), cursor: 12, top_line: Some(40), unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
                 TabSession { path: None, cursor: 0, top_line: None, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new(), encoding: None },
             ],
             active: 1,
@@ -296,7 +296,7 @@ mod tests {
             terminals: Some(TerminalLayout {
                 open: true,
                 groups: vec![
-                    TerminalGroupSession { tabs: vec![TerminalTabSession { name: Some("server".into()), cwd: Some("/work/kin/web".into()) }], active: 0 },
+                    TerminalGroupSession { tabs: vec![TerminalTabSession { name: Some("server".into()), cwd: Some("/work/kuana/web".into()) }], active: 0 },
                     TerminalGroupSession { tabs: vec![TerminalTabSession::default(), TerminalTabSession::default()], active: 1 },
                 ],
                 active: 1,
@@ -307,8 +307,8 @@ mod tests {
             }],
             last_run: Some(RunTarget {
                 name: "Tests in 'tests'".into(),
-                command: "cargo test --bin kin -- tests".into(),
-                cwd: "/work/kin".into(),
+                command: "cargo test --bin kuana -- tests".into(),
+                cwd: "/work/kuana".into(),
                 row: None,
                 rows: 0..0,
                 debug: Some(DebugSpec::Cargo { build: vec!["test".into(), "--no-run".into()], args: vec!["tests".into()] }),
@@ -321,10 +321,10 @@ mod tests {
         let go = RunTarget {
             name: "Test 'TestA'".into(),
             command: "go test -run '^TestA$' ./pkg".into(),
-            cwd: "/work/kin".into(),
+            cwd: "/work/kuana".into(),
             row: None,
             rows: 0..0,
-            debug: Some(DebugSpec::Go { mode: "test".into(), program: "/work/kin/pkg".into(), args: vec!["-test.run".into()] }),
+            debug: Some(DebugSpec::Go { mode: "test".into(), program: "/work/kuana/pkg".into(), args: vec!["-test.run".into()] }),
         };
         let json = serde_json::to_string(&go).unwrap();
         assert_eq!(serde_json::from_str::<RunTarget>(&json).unwrap(), go);

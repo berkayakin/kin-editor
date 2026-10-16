@@ -1,6 +1,6 @@
-//! The slice of the Language Server Protocol Kin uses, parsed from
+//! The slice of the Language Server Protocol Kuana uses, parsed from
 //! `serde_json::Value` by hand (the full `lsp-types` crate is large), plus
-//! conversions between LSP positions and Kin's byte offsets.
+//! conversions between LSP positions and Kuana's byte offsets.
 
 use std::{
     ops::Range,
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::lint::{Diagnostic, Severity};
 
 /// How a server counts columns. LSP's default is UTF-16 code units; servers
-/// that offer UTF-8 save Kin the conversion.
+/// that offer UTF-8 save Kuana the conversion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Encoding {
     Utf8,
@@ -424,7 +424,7 @@ fn expand_into(chars: &[char], i: &mut usize, out: &mut String, stops: &mut Vec<
                         }
                         stops.push((n, start..out.len()));
                     } else {
-                        // A variable: `${NAME}` or `${NAME:default}`; Kin has none, so use the default.
+                        // A variable: `${NAME}` or `${NAME:default}`; Kuana has none, so use the default.
                         while *i < chars.len() && (chars[*i].is_alphanumeric() || chars[*i] == '_') {
                             *i += 1;
                         }

@@ -2,20 +2,20 @@
 
 ## Language servers
 
-Kin starts a language server the first time you open a file it handles, one per server and
+Kuana starts a language server the first time you open a file it handles, one per server and
 project, and shows it in the status bar (with indexing progress). It uses the server in the
 project's `node_modules/.bin` or venv, else one on your PATH (also the login shell's PATH,
-`~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kin is opened from the Dock).
+`~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kuana is opened from the Dock).
 
-If none is installed, the status bar offers **Install <server>**: one click puts it in Kin's own
-folder (`~/.config/kin/servers/`) and starts it. While Kin downloads anything (a server, Node.js,
+If none is installed, the status bar offers **Install <server>**: one click puts it in Kuana's own
+folder (`~/.config/kuana/servers/`) and starts it. While Kuana downloads anything (a server, Node.js,
 wasi-sdk, an update), the status bar shows its progress; the tooltip lists each download's size,
 progress and speed. rust-analyzer, taplo and marksman come from their
 GitHub releases (checked against GitHub's SHA-256); vtsls, basedpyright, intelephense, the
 vscode-langservers (HTML, CSS, JSON), yaml-language-server and bash-language-server are npm
-packages, installed with your Node.js or, without one, a Node.js LTS Kin downloads once (checked
+packages, installed with your Node.js or, without one, a Node.js LTS Kuana downloads once (checked
 against its SHASUMS256.txt); gopls comes from `go install`. A server you install yourself is
-always used instead, and Kin looks for a newer version of its own copies once a week (it runs from
+always used instead, and Kuana looks for a newer version of its own copies once a week (it runs from
 the next start). Servers without an installer show **No language server**; click it to copy the
 install command.
 
@@ -32,7 +32,7 @@ install command.
 | Shell | bash-language-server | `npm install -g bash-language-server` |
 | Markdown | marksman | `brew install marksman` |
 
-With a server running, its diagnostics replace Kin's built-in syntax check (the other built-in
+With a server running, its diagnostics replace Kuana's built-in syntax check (the other built-in
 rules and ESLint still run). Hover a symbol for its documentation and any problem there (the
 popover scrolls, and a copy button that appears on hover copies its text); completion opens as you type (Enter inserts, Tab replaces the rest of the word). **Restart
 Language Server** (Find Action) restarts it after installing or when it's stuck. To use another
@@ -41,7 +41,7 @@ server or turn one off, see `language_servers` in [Settings](settings.md); to co
 A problem shows at the end of its line, cut short when it's long. With the caret on that line, a
 problem that doesn't fit there (or several, or a multi-line message) shows in full in rows under it.
 
-A file can have several servers: Kin's own and any an extension adds for its language (ESLint or
+A file can have several servers: Kuana's own and any an extension adds for its language (ESLint or
 Tailwind beside TypeScript). All of them get the file; their problems show together, completion
 and code actions list all of theirs, and the rest (hover, Go to Declaration, rename, formatting)
 goes to the first that offers it. The status bar names the ones running.
@@ -51,14 +51,14 @@ Run tab or the debugger, like the gutter ▶), implementations and references (w
 usages list), and other servers' commands. Turn them off with `code_lens`.
 
 **Inlay hints** show what the server infers inside the code, on a soft chip: variable types,
-parameter names at call sites and the like. Kin turns them on in typescript-language-server, vtsls
+parameter names at call sites and the like. Kuana turns them on in typescript-language-server, vtsls
 and gopls, which leave them off unless asked (change that through `lsp`). Turn them off with
 `inlay_hints` or, for one editor, **Toggle Inlay Hints**.
 
 ## Formatting
 
 **Reformat Code** formats the file, or the selection when the language server supports range
-formatting. Kin picks, in order: a formatter installed in the project (`node_modules/.bin`, e.g.
+formatting. Kuana picks, in order: a formatter installed in the project (`node_modules/.bin`, e.g.
 Prettier), the language server, then a formatter on PATH: Prettier (JS, TS, CSS, HTML, JSON,
 YAML, Markdown), rustfmt (with the edition from Cargo.toml), gofmt, ruff or black, taplo, shfmt.
 Only the changed lines are replaced, so the caret stays put and one undo reverts it. Formatters
@@ -67,7 +67,7 @@ read their own config (`.prettierrc`, `rustfmt.toml`, `pyproject.toml`…). Set 
 
 ## Python environments
 
-Kin finds the project's virtual environment: a `.venv`, `venv`, `env` or `.env` folder holding
+Kuana finds the project's virtual environment: a `.venv`, `venv`, `env` or `.env` folder holding
 `pyvenv.cfg`, next to the file or in a folder above it. New terminals activate it (its activate
 script, typed in like you would), Run tabs and the debugger use its Python, and language servers
 and formatters start with it first on PATH, so they see its packages and are found when installed

@@ -1,10 +1,10 @@
-//! Kin windows: opening, placement, quitting.
+//! Kuana windows: opening, placement, quitting.
 
 use super::*;
 
 // ---- Windows ------------------------------------------------------------------------
 
-/// Opens a Kin window and runs `setup` on its workspace. With `near` (the
+/// Opens a Kuana window and runs `setup` on its workspace. With `near` (the
 /// bounds of the window it was opened from) it's cascaded a little down and
 /// to the right so it doesn't cover that window exactly.
 /// Where modals start: a little below the title bar, lower in tall windows.
@@ -33,12 +33,12 @@ pub fn open_window(
         window_bounds: Some(bounds),
         display_id,
         titlebar: Some(TitlebarOptions {
-            title: Some("Kin".into()),
+            title: Some("Kuana".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(16.), px(13.))),
         }),
         window_min_size: Some(size(px(480.), px(320.))),
-        app_id: Some("dev.kin.editor".into()),
+        app_id: Some("dev.kuana.editor".into()),
         ..Default::default()
     };
     let window = match cx.open_window(options, |window, cx| cx.new(|cx| Workspace::new(window, cx))) {

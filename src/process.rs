@@ -2,7 +2,7 @@
 
 use std::{ffi::OsStr, process::Command};
 
-/// A command that opens no console window. Kin is a GUI app on Windows, so
+/// A command that opens no console window. Kuana is a GUI app on Windows, so
 /// each console program it starts (git, shells, servers, compilers) would
 /// otherwise flash a window of its own.
 pub fn command(program: impl AsRef<OsStr>) -> Command {

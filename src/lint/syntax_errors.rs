@@ -114,7 +114,7 @@ mod tests {
         assert!(errors(Language::Shell, "#!/bin/sh\nif [ -n \"$1\" ]; then\n  echo \"$1\"\nfi\n").is_empty());
         assert!(errors(Language::Json, "{\n  // comment\n  \"a\": [1, true, null]\n}\n").is_empty());
         assert!(errors(Language::Yaml, "name: ci\non:\n  push:\n    branches: [main]\nsteps:\n  - run: echo hi\n").is_empty());
-        assert!(errors(Language::Toml, "[package]\nname = \"kin\"\n\n[dependencies]\nserde = { version = \"1\" }\n").is_empty());
+        assert!(errors(Language::Toml, "[package]\nname = \"kuana\"\n\n[dependencies]\nserde = { version = \"1\" }\n").is_empty());
     }
 
     #[test]
@@ -129,7 +129,7 @@ mod tests {
             (Language::Shell, "if true; then\n  echo hi\n"),
             (Language::Json, "{\"a\": 1,, \"b\": 2}\n"),
             (Language::Yaml, "a: [1, 2\nb: 3\n"),
-            (Language::Toml, "[package\nname = \"kin\"\n"),
+            (Language::Toml, "[package\nname = \"kuana\"\n"),
         ] {
             let found = errors(language, src);
             eprintln!("{language:?}: {found:?}");

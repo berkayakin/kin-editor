@@ -78,7 +78,7 @@ pub fn current(cx: &App) -> BaseKeymap {
     cx.try_global::<crate::settings::Settings>().and_then(|s| s.base_keymap).unwrap_or_default()
 }
 
-/// Shortcuts every editor (and the platform) agrees on, and Kin's own
+/// Shortcuts every editor (and the platform) agrees on, and Kuana's own
 /// dialogs. `secondary` is ⌘ on macOS and Ctrl elsewhere.
 fn common(mac: bool) -> Vec<KeyBinding> {
     let e = Some("Editor");
@@ -371,7 +371,7 @@ fn vscode(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-+", IncreaseFontSize, None),
         KeyBinding::new("secondary--", DecreaseFontSize, None),
         KeyBinding::new("secondary-0", ResetFontSize, None),
-        // F5 runs (VS Code debugs; Kin runs without the debugger), ⇧F5 stops.
+        // F5 runs (VS Code debugs; Kuana runs without the debugger), ⇧F5 stops.
         // F5 debugs (or continues); Ctrl+F5 runs without the debugger.
         KeyBinding::new("f5", Resume, None),
         KeyBinding::new("ctrl-f5", Rerun, None),
@@ -674,7 +674,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Step Into", StepInto),
         a("Step Out", StepOut),
         a("Debug Panel", ToggleDebugPanel),
-        a("Install 'kin' Shell Command", InstallShellCommand),
+        a("Install 'kuana' Shell Command", InstallShellCommand),
         a("Find Usages", FindUsages),
         a("Rename…", RenameSymbol),
         a("Show Context Actions", ShowContextActions),
@@ -708,7 +708,7 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Close Window", CloseWindow),
         a("Minimize Window", MinimizeWindow),
         a("Zoom Window", ZoomWindow),
-        a("About Kin", About),
+        a("About Kuana", About),
         a("Save", Save),
         a("Save As…", SaveAs),
         a("Toggle Auto Save", ToggleAutoSave),
@@ -920,7 +920,7 @@ fn user_bindings(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
 }
 
 /// The comment at the top of `keymap.json`.
-const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in keymap
+const KEYMAP_HEADER: &str = r#"// Kuana key bindings, added on top of the built-in keymap
 // ("base_keymap" in settings.json: JetBrains, VSCode, SublimeText or Zed).
 // Changes apply when you save this file.
 //
@@ -933,7 +933,7 @@ const KEYMAP_HEADER: &str = r#"// Kin key bindings, added on top of the built-in
 "#;
 
 /// Written by Open Keymap when there's no file yet.
-pub const KEYMAP_TEMPLATE: &str = r#"// Kin key bindings, added on top of the built-in keymap
+pub const KEYMAP_TEMPLATE: &str = r#"// Kuana key bindings, added on top of the built-in keymap
 // ("base_keymap" in settings.json: JetBrains, VSCode, SublimeText or Zed).
 // Changes apply when you save this file.
 //

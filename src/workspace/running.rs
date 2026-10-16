@@ -115,7 +115,7 @@ impl Workspace {
                 if let Some(editor) = self.tab_for(path, cx) {
                     editor.update(cx, |e, cx| e.set_debug_line(Some(line.saturating_sub(1) as usize), cx));
                 }
-                // A breakpoint hit brings Kin forward, like JetBrains.
+                // A breakpoint hit brings Kuana forward, like JetBrains.
                 window.activate_window();
             }
             DebugEvent::Resumed | DebugEvent::Ended => self.clear_debug_location(cx),

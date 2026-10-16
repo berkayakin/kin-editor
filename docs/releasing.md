@@ -11,9 +11,9 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The release gets a universal macOS `Kin.app` (`.dmg` and `.zip`), a Windows installer
+The release gets a universal macOS `Kuana.app` (`.dmg` and `.zip`), a Windows installer
 (`-setup.exe`, per user, no admin rights; made with Inno Setup from
-[`scripts/kin.iss`](../scripts/kin.iss)) and `.zip`, and a Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
+[`scripts/kuana.iss`](../scripts/kuana.iss)) and `.zip`, and a Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
 [minisign](https://jedisct1.github.io/minisign/) using the `MINISIGN_SECRET_KEY` repository
 secret. Tags with a hyphen (`v0.3.0-beta.1`) become pre-releases, which the updater skips.
 The release notes come from [git-cliff](https://git-cliff.org) ([`cliff.toml`](../cliff.toml)):
@@ -22,7 +22,7 @@ line, however it was merged), with authors @mentioned and first-time contributor
 
 ### Signing the macOS app
 
-The workflow signs `Kin.app` and the `.dmg` with a Developer ID and has Apple notarize them as
+The workflow signs `Kuana.app` and the `.dmg` with a Developer ID and has Apple notarize them as
 soon as these repository secrets exist (Settings → Secrets and variables → Actions). It needs
 an [Apple Developer Program](https://developer.apple.com/programs/) membership.
 

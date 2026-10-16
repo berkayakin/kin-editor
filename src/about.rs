@@ -1,4 +1,4 @@
-//! About Kin: a small window of its own (like Zed's), so it also opens when no
+//! About Kuana: a small window of its own (like Zed's), so it also opens when no
 //! project window is. Shows the logo, the name in the title font, the version
 //! and build, with a button that copies them for bug reports.
 
@@ -18,12 +18,12 @@ use crate::{
 };
 
 // Named like Zed's `zed::About`.
-actions!(kin, [About]);
+actions!(kuana, [About]);
 
 /// "0.1.0 (987a960)": the commit comes from `build.rs` and is left out when
-/// Kin wasn't built from a git checkout.
+/// Kuana wasn't built from a git checkout.
 fn version() -> String {
-    match option_env!("KIN_COMMIT") {
+    match option_env!("KUANA_COMMIT") {
         Some(commit) => format!("{} ({commit})", env!("CARGO_PKG_VERSION")),
         None => env!("CARGO_PKG_VERSION").to_string(),
     }
@@ -38,13 +38,13 @@ pub fn open(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(300.), px(330.)), cx))),
         titlebar: Some(TitlebarOptions {
-            title: Some("About Kin".into()),
+            title: Some("About Kuana".into()),
             appears_transparent: true,
             traffic_light_position: Some(point(px(12.), px(12.))),
         }),
         is_resizable: false,
         is_minimizable: false,
-        app_id: Some("dev.kin.editor".into()),
+        app_id: Some("dev.kuana.editor".into()),
         ..Default::default()
     };
     if let Err(err) = cx.open_window(options, |window, cx| cx.new(|cx| AboutWindow::new(window, cx))) {
@@ -66,7 +66,7 @@ impl AboutWindow {
     }
 
     fn copy_version(&mut self, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(format!("Kin {}", version())));
+        cx.write_to_clipboard(ClipboardItem::new_string(format!("Kuana {}", version())));
         self.copied = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(1500)).await;
             this.update(cx, |this, cx| {
@@ -113,7 +113,7 @@ impl Render for AboutWindow {
                     .font_family(assets::TITLE_FONT)
                     .text_size(px(36.))
                     .line_height(px(42.))
-                    .child("Kin"),
+                    .child("Kuana"),
             )
             .child(div().text_color(theme.text_muted).child(format!("Version {}", version())))
             .child(div().mt_1().text_color(theme.text_dim).child("A fast, GPU-rendered code editor"))
@@ -128,7 +128,7 @@ impl Render for AboutWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(theme.text_dim)
-                    .child(format!("© 2026 Kin contributors · {} license", env!("CARGO_PKG_LICENSE").replace(" OR ", " or "))),
+                    .child(format!("© 2026 Kuana contributors · {} license", env!("CARGO_PKG_LICENSE").replace(" OR ", " or "))),
             )
     }
 }

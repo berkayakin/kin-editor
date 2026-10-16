@@ -1,6 +1,6 @@
 //! Themes are JSON files. Built-in themes live in `assets/themes/` and are
 //! compiled in; user themes are loaded from the config directory
-//! (`~/.config/kin/themes`, or `%APPDATA%\kin\themes` on Windows).
+//! (`~/.config/kuana/themes`, or `%APPDATA%\kuana\themes` on Windows).
 //!
 //! A theme only has to specify what it changes: anything missing is taken
 //! from the theme named in `"extends"`, or from the default theme of the
@@ -302,7 +302,7 @@ impl Theme {
 
     /// The color for a capture: the theme's color for the longest prefix of
     /// its name ("keyword.control.return" → "keyword.control"), stopping at
-    /// the level Kin's base kinds cover, whose color is then used.
+    /// the level Kuana's base kinds cover, whose color is then used.
     pub fn highlight_color(&self, h: Highlight) -> Hsla {
         if !self.syntax_names.is_empty() {
             let mut name = h.name();
@@ -470,7 +470,7 @@ impl ThemeRegistry {
                         continue;
                     }
                 };
-                // A Zed theme family (several themes), else Kin's format.
+                // A Zed theme family (several themes), else Kuana's format.
                 let parsed = match zed_theme_family(&text) {
                     Some(family) => Ok(family),
                     None => serde_json::from_str::<ThemeFile>(&text).map(|file| vec![file]).map_err(|e| e.to_string()),
@@ -519,9 +519,9 @@ fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
         let style = theme.get("style")?;
         let color = |key: &str| style.get(key).and_then(|v| v.as_str()).filter(|c| parse_color(c).is_some()).map(str::to_string);
         let mut colors = HashMap::new();
-        let mut put = |kin: &str, zed: &[&str]| {
+        let mut put = |kuana: &str, zed: &[&str]| {
             if let Some(value) = zed.iter().find_map(|k| color(k)) {
-                colors.insert(kin.to_string(), value);
+                colors.insert(kuana.to_string(), value);
             }
         };
         put("background", &["editor.background", "background"]);
@@ -566,7 +566,7 @@ fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
             syntax_style.and_then(|s| s.get(key)).and_then(|s| s.get("color")).and_then(|v| v.as_str()).map(str::to_string)
         };
         let mut syntax = HashMap::new();
-        for (kin, zed) in [
+        for (kuana, zed) in [
             ("plain", &["variable", "primary"][..]),
             ("keyword", &["keyword"]),
             ("string", &["string"]),
@@ -585,7 +585,7 @@ fn zed_theme_family(text: &str) -> Option<Vec<ThemeFile>> {
             ("escape", &["string.escape", "string.special"]),
         ] {
             if let Some(value) = zed.iter().find_map(|k| syntax_color(k)) {
-                syntax.insert(kin.to_string(), value);
+                syntax.insert(kuana.to_string(), value);
             }
         }
         // And every name the theme colors, for captures more specific than
@@ -726,16 +726,30 @@ pub fn display_path(path: &Path) -> String {
 
 // ---- Settings ------------------------------------------------------------------
 
-/// Where user configuration lives: `~/.config/kin` (or `$XDG_CONFIG_HOME/kin`)
-/// on macOS and Linux, `%APPDATA%\kin` on Windows.
+/// Where user configuration lives: `~/.config/kuana` (or `$XDG_CONFIG_HOME/kuana`)
+/// on macOS and Linux, `%APPDATA%\kuana` on Windows.
 pub fn config_dir() -> Option<PathBuf> {
     if cfg!(windows) {
-        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("kin"));
+        return std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("kuana"));
     }
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .map(|d| d.join("kin"))
+        .map(|d| d.join("kuana"))
+}
+
+/// Kuana was called Kin up to 0.1.6. Its config folder (settings, sessions,
+/// installed servers and extensions) moves to the new name the first time
+/// Kuana starts, unless a `kuana` folder is already there.
+pub fn move_legacy_config() {
+    let Some(dir) = config_dir() else { return };
+    let legacy = dir.with_file_name("kin");
+    if !dir.exists()
+        && legacy.is_dir()
+        && let Err(err) = std::fs::rename(&legacy, &dir)
+    {
+        eprintln!("kuana: couldn't move {} to {}: {err}", legacy.display(), dir.display());
+    }
 }
 
 pub fn themes_dir() -> Option<PathBuf> {
@@ -860,7 +874,7 @@ pub fn init(cx: &mut App) {
 
 /// Default editor size; zoom and `editor_font_size` move away from it.
 pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 14.0;
-/// 22px lines at 14px, the spacing Kin has always used.
+/// 22px lines at 14px, the spacing Kuana has always used.
 const DEFAULT_LINE_HEIGHT: f32 = 22.0 / 14.0;
 
 /// Sets the fonts from the settings and the remembered zoom.
@@ -952,7 +966,7 @@ mod tests {
         assert_eq!(dark.syntax["keyword"], "#ff79c6");
         let theme = resolve(dark, &builtins(), &mut Vec::new(), &mut Vec::new()).unwrap();
         assert_eq!(theme.background, parse_color("#101820ff").unwrap());
-        // Colors for names Kin has no base kind for are kept.
+        // Colors for names Kuana has no base kind for are kept.
         assert_eq!(theme.highlight_color(Highlight::from_capture("string.regex")), Hsla::from(parse_color("#ff9900").unwrap()));
         assert!(zed_theme_family("{\"name\": \"not a family\"}").is_none());
     }

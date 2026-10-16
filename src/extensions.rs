@@ -1,5 +1,5 @@
 //! Extensions: folders in `<config>/extensions/` that add languages, themes
-//! and snippets without rebuilding Kin. The layout is Zed's, so Zed's
+//! and snippets without rebuilding Kuana. The layout is Zed's, so Zed's
 //! language extensions work as they are:
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //!   languages/<lang>/config.toml name, grammar, path_suffixes, line_comments,
 //!                                block_comment, tab_size, hard_tabs, formatter
 //!   languages/<lang>/highlights.scm, outline.scm (else the grammar's queries/)
-//!   themes/*.json                Kin themes
+//!   themes/*.json                Kuana themes
 //!   snippets/*.json              VS Code style snippets, `<language id>.json`
 //! ```
 //!
@@ -692,7 +692,7 @@ fn read_extension(dir: &Path) -> Read {
         let candidate: Candidate = (leak(command), Box::leak(args.into_iter().map(leak).collect::<Vec<_>>().into_boxed_slice()));
         let install = server.get("install").and_then(Value::as_str).map(leak);
         let markers: Vec<&'static str> = strings(server.get("root_markers")).into_iter().map(leak).collect();
-        // Kin's own keys: what Zed extensions' code would pass the server.
+        // Kuana's own keys: what Zed extensions' code would pass the server.
         let json = |key: &str| -> Json {
             let value = serde_json::to_value(server.get(key)?).ok()?;
             Some(Box::leak(Box::new(value)))
@@ -804,7 +804,7 @@ fn strings(value: Option<&Value>) -> Vec<String> {
     }
 }
 
-/// Registry entries live as long as Kin (and are few).
+/// Registry entries live as long as Kuana (and are few).
 fn leak(s: impl Into<String>) -> &'static str {
     Box::leak(s.into().into_boxed_str())
 }
@@ -827,7 +827,7 @@ fn zed_installed_dir() -> Option<PathBuf> {
     Some(dir.join("extensions").join("installed"))
 }
 
-/// Zed's installed extensions that Kin doesn't have yet: (name, folder).
+/// Zed's installed extensions that Kuana doesn't have yet: (name, folder).
 pub fn zed_extensions() -> Vec<(String, PathBuf)> {
     let have: Vec<String> = installed().into_iter().map(|e| e.id).collect();
     let mut found: Vec<(String, PathBuf)> = zed_installed_dir()
@@ -993,7 +993,7 @@ fn compile(grammar: &Grammar) -> Result<(), String> {
     if src.join("scanner.cc").is_file() {
         return Err("its scanner is C++, which only builds as native code (the native_grammars setting)".into());
     }
-    let clang = wasi_sdk::clang().ok_or("the WebAssembly toolchain (wasi-sdk) isn't installed: Kin offers to download it, or set WASI_SDK_PATH")?;
+    let clang = wasi_sdk::clang().ok_or("the WebAssembly toolchain (wasi-sdk) isn't installed: Kuana offers to download it, or set WASI_SDK_PATH")?;
     let temp = grammar.wasm.with_extension("building");
     if let Err(err) = wasi_sdk::compile(&clang, src, &grammar.name, &temp) {
         std::fs::remove_file(&temp).ok();
@@ -1066,7 +1066,7 @@ fn check_abi(language: &TsLanguage) -> Result<(), String> {
     let abi = language.abi_version();
     if !(tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION..=tree_sitter::LANGUAGE_VERSION).contains(&abi) {
         return Err(format!(
-            "generated for tree-sitter ABI {abi}; Kin reads {}–{}",
+            "generated for tree-sitter ABI {abi}; Kuana reads {}–{}",
             tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION,
             tree_sitter::LANGUAGE_VERSION
         ));
@@ -1097,7 +1097,7 @@ mod tests {
     use super::*;
 
     pub(super) fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kin-ext-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-ext-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

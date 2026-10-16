@@ -70,7 +70,7 @@ struct Var {
 enum Line {
     Output,
     Error,
-    /// Kin's own notes (build progress, "Process exited").
+    /// Kuana's own notes (build progress, "Process exited").
     Info,
     /// An evaluated expression, as typed.
     Input,
@@ -377,8 +377,8 @@ impl DebugSession {
                     client.respond(seq, &command, true, json!({}));
                     self.start_child(arguments, cx);
                 } else {
-                    // Kin runs programs itself (no runInTerminal and the like).
-                    client.respond(seq, &command, false, json!({ "error": { "format": "Not supported by Kin" } }));
+                    // Kuana runs programs itself (no runInTerminal and the like).
+                    client.respond(seq, &command, false, json!({ "error": { "format": "Not supported by Kuana" } }));
                 }
             }
             Incoming::Output(line) => {
@@ -782,7 +782,7 @@ fn pause_reason(body: &Value) -> String {
 }
 
 /// An adapter's console output without its own bookkeeping: lldb echoes
-/// the init commands and reports the exit that Kin already notes; Delve and
+/// the init commands and reports the exit that Kuana already notes; Delve and
 /// js-debug say where they listen.
 fn without_chatter(text: &str) -> String {
     let chatter = |line: &str| {
@@ -1186,10 +1186,10 @@ mod tests {
     #[test]
     #[ignore = "needs cargo and lldb-dap; run with --ignored"]
     fn debugs_a_rust_program_with_lldb_dap() {
-        let dir = std::env::temp_dir().join(format!("kin-dap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-dap-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"dapdemo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
-        let main = "fn main() {\n    let name = String::from(\"Kin\");\n    let n = name.len();\n    println!(\"{name} {n}\");\n}\n";
+        let main = "fn main() {\n    let name = String::from(\"Kuana\");\n    let n = name.len();\n    println!(\"{name} {n}\");\n}\n";
         std::fs::write(dir.join("src/main.rs"), main).unwrap();
         let dir = dir.canonicalize().unwrap();
 
@@ -1226,7 +1226,7 @@ mod tests {
                 let vars = client.request("variables", json!({ "variablesReference": locals })).await.unwrap().unwrap();
                 let name = vars["variables"].as_array().unwrap().iter().find(|v| v["name"] == "name").cloned().unwrap();
                 // Rust's formatters show the string itself.
-                assert!(name["value"].as_str().unwrap().contains("Kin"), "{name}");
+                assert!(name["value"].as_str().unwrap().contains("Kuana"), "{name}");
 
                 client.request("continue", json!({ "threadId": thread })).await.unwrap().unwrap();
                 event("terminated").await;

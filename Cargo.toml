@@ -1,18 +1,18 @@
 [package]
-name = "kin"
+name = "kuana"
 version = "0.1.6"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [package.metadata.bundle]
-name = "Kin"
-identifier = "dev.kin.editor"
-icon = ["assets/app-icon/macos/Kin.icns", "assets/app-icon/linux/hicolor/*/apps/dev.kin.editor.png"]
+name = "Kuana"
+identifier = "dev.kuana.editor"
+icon = ["assets/app-icon/macos/Kuana.icns", "assets/app-icon/linux/hicolor/*/apps/dev.kuana.editor.png"]
 category = "public.app-category.developer-tools"
 short_description = "A small, fast GPU-rendered code editor"
 
 [package.metadata.bundle.osx]
-# Lets Finder offer Kin in Open With for folders and files (Alternate: never the default app).
+# Lets Finder offer Kuana in Open With for folders and files (Alternate: never the default app).
 info_plist_exts = ["assets/macos/document-types.plist"]
 
 [dependencies]
@@ -72,7 +72,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 gpui = { version = "0.2.2", features = ["test-support"] }
 
 [target.'cfg(unix)'.dependencies]
-# setsid for the login shell that reports PATH, so it can't take over Kin's terminal.
+# setsid for the login shell that reports PATH, so it can't take over Kuana's terminal.
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -83,7 +83,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
 
-# Debug builds: Kin's own code compiles quickly, dependencies (tree-sitter, oxc, gpui) stay fast.
+# Debug builds: Kuana's own code compiles quickly, dependencies (tree-sitter, oxc, gpui) stay fast.
 [profile.dev]
 opt-level = 1
 

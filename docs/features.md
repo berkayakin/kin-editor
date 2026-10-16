@@ -1,6 +1,6 @@
 # Features
 
-Everything Kin does, in one list. Each area has its own page with the details.
+Everything Kuana does, in one list. Each area has its own page with the details.
 
 - Rope-backed buffer (`ropey`) with undo/redo; only visible lines are shaped and painted
 - Tree-sitter syntax highlighting for JavaScript/JSX, TypeScript/TSX, HTML (including `<script>` blocks),
@@ -89,7 +89,7 @@ Everything Kin does, in one list. Each area has its own page with the details.
   encoding can't hold is never saved in it. Files over 20 MB open as plain text without language
   features; over 500 MB they don't open
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
-  follow changes made outside Kin (a checkout, a generator, another editor) as they happen
+  follow changes made outside Kuana (a checkout, a generator, another editor) as they happen
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
   Reveal in Finder; drag entries onto a folder to move them (open tabs follow); **Select Opened File**
   (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z)

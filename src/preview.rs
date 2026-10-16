@@ -1,4 +1,4 @@
-//! Image files: which ones Kin shows as pictures instead of text, their
+//! Image files: which ones Kuana shows as pictures instead of text, their
 //! size and dimensions, and temporary copies of image versions from Git
 //! (GPUI decodes images from paths, with every format the `image` crate has).
 
@@ -57,7 +57,7 @@ pub fn temp_copy(bytes: &[u8], extension: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
-    let dir = std::env::temp_dir().join("kin-images");
+    let dir = std::env::temp_dir().join("kuana-images");
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{:016x}.{extension}", hasher.finish()));
     if !path.exists() {

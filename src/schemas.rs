@@ -1,4 +1,4 @@
-//! JSON schemas for Kin's own files: `settings.json` (from the `Settings`
+//! JSON schemas for Kuana's own files: `settings.json` (from the `Settings`
 //! structs, so it can't fall behind them), `keymap.json` (action names) and
 //! themes (color keys). The JSON language server gets them (`json.schemas`,
 //! see `lsp::servers`), so editing these files has completion, hover docs
@@ -24,7 +24,7 @@ pub fn json_schemas() -> Value {
 
 fn build(cx: &App) -> Value {
     let Some(dir) = crate::theme::config_dir() else { return Value::Null };
-    // Matched like Zed's, by the end of the path: "kin/settings.json".
+    // Matched like Zed's, by the end of the path: "kuana/settings.json".
     let folder = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut actions: Vec<String> = crate::keymap::action_entries().into_iter().map(|e| e.name.to_string()).collect();
     actions.extend(cx.all_action_names().iter().map(|name| name.to_string()));
@@ -37,7 +37,7 @@ fn build(cx: &App) -> Value {
     ])
 }
 
-/// Kin's files are JSON with comments and trailing commas (`allowComments`
+/// Kuana's files are JSON with comments and trailing commas (`allowComments`
 /// and `allowTrailingCommas` are the JSON server's own keywords).
 fn jsonc(mut schema: Value) -> Value {
     schema["allowComments"] = json!(true);

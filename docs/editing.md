@@ -57,10 +57,10 @@ Each window holds one project folder, so several projects can be open side by si
 - Opening a folder that's already open in another window brings that window forward.
 - Files and folders dragged from Finder go where you drop them: onto the editor area they open
   (a "Drop to open" frame shows while dragging); onto the file tree they're copied into the
-  highlighted folder, and in a Git project Kin offers to add them to Git. Kin is listed in Finder's
-  **Open With** for files and folders (the release app). **Install 'kin' Shell Command** (Kin menu
-  or Find Action) adds `/usr/local/bin/kin`, asking for an administrator password if needed:
-  `kin .` or `kin src/main.rs` opens them in the running Kin.
+  highlighted folder, and in a Git project Kuana offers to add them to Git. Kuana is listed in Finder's
+  **Open With** for files and folders (the release app). **Install 'kuana' Shell Command** (Kuana menu
+  or Find Action) adds `/usr/local/bin/kuana`, asking for an administrator password if needed:
+  `kuana .` or `kuana src/main.rs` opens them in the running Kuana.
 - Quitting or closing a project window doesn't ask about unsaved edits: they're kept and come back
   with the project's tabs. Windows without a project folder still ask.
 
@@ -68,7 +68,7 @@ These are all in the File menu and Find Action.
 
 ## Remembered state
 
-Kin reopens the last project folder when started without arguments, lists the last ten
+Kuana reopens the last project folder when started without arguments, lists the last ten
 folders under Recent Projects (shared by all windows; hover a welcome-screen row to remove it), and remembers
 panel sizes, whether the sidebar, Problems panel, terminal and Git log are open (all but the sidebar start
 closed the first time; without a project the sidebar is always closed), which sidebar view (Files or Commit) shows, the font zoom, the diff layout and the window's size and

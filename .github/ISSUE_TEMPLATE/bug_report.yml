@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in Kin doesn't work as it should
+description: Something in Kuana doesn't work as it should
 labels: ["bug"]
 body:
   - type: markdown
@@ -25,9 +25,9 @@ body:
   - type: input
     id: version
     attributes:
-      label: Kin version
-      description: "About Kin → Copy Version (the version and the commit it was built from)."
-      placeholder: "Kin 0.2.0 (abc1234)"
+      label: Kuana version
+      description: "About Kuana → Copy Version (the version and the commit it was built from)."
+      placeholder: "Kuana 0.2.0 (abc1234)"
     validations:
       required: true
   - type: dropdown

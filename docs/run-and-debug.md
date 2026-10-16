@@ -7,7 +7,7 @@ the bottom panel, which it shares with Problems. Press it again to jump between 
 the editor. Each **+** tab is its own shell; a tab closes when its shell exits.
 
 While the terminal has focus, keys go to the shell: Ctrl shortcuts (Ctrl+R history search, Ctrl+F,
-Ctrl+E…) aren't taken by Kin, except a few for getting around (⌥F12, tab switching, Find Action).
+Ctrl+E…) aren't taken by Kuana, except a few for getting around (⌥F12, tab switching, Find Action).
 On macOS, Option types characters as usual (`@` on many layouts). Full-screen programs (vim,
 htop, less) get mouse and wheel events; hold Shift to select text in them instead. Colors come
 from the theme's `terminal_*` keys.
@@ -89,7 +89,7 @@ and Zed use):
   `node --test`), every Node process it starts included; TypeScript breakpoints work through source maps.
 - **The project's own configurations**: Debug… also lists what the project wrote for VS Code
   (`.vscode/launch.json`) or Zed (`.zed/debug.json`), with their variables filled in
-  (`${workspaceFolder}`, `${file}`, `${env:NAME}`, Zed's `$ZED_WORKTREE_ROOT`…). Kin starts the
+  (`${workspaceFolder}`, `${file}`, `${env:NAME}`, Zed's `$ZED_WORKTREE_ROOT`…). Kuana starts the
   adapter they name (`node`/`pwa-node`, `debugpy`/`python`, `go`/`Delve`, `lldb`/`CodeLLDB`, or an
   extension's) with the configuration as written; `preLaunchTask` isn't run.
 - **Attach to Process…** (⌥⇧F5 / Ctrl+Alt+F5, or the Run menu) lists your running processes (search
@@ -109,7 +109,7 @@ Nothing is downloaded; the adapters come from your system:
 | Rust | `lldb-dap` (with Rust's own formatters, so `String`, `Vec` and `Option` read naturally) | Xcode's command line tools (`xcode-select --install`) or LLVM |
 | Go | Delve (`dlv dap`) | `go install github.com/go-delve/delve/cmd/dlv@latest` |
 | Python | debugpy, in the project's venv or `python3` | `python3 -m pip install debugpy` |
-| JavaScript, TypeScript | Microsoft's js-debug (the one in VS Code), run with `node` | Unpack `js-debug-dap-v*.tar.gz` from [its releases](https://github.com/microsoft/vscode-js-debug/releases) into `~/.config/kin/debug-adapters` (so `debug-adapters/js-debug/src/dapDebugServer.js` exists), or put `js-debug-adapter` on PATH |
+| JavaScript, TypeScript | Microsoft's js-debug (the one in VS Code), run with `node` | Unpack `js-debug-dap-v*.tar.gz` from [its releases](https://github.com/microsoft/vscode-js-debug/releases) into `~/.config/kuana/debug-adapters` (so `debug-adapters/js-debug/src/dapDebugServer.js` exists), or put `js-debug-adapter` on PATH |
 
 One session runs at a time. Attaching to Python injects debugpy into the process, which macOS can
 block; attaching to Node turns on its inspector (port 9229 unless it was started with `--inspect`).

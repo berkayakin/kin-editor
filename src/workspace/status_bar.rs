@@ -22,7 +22,7 @@ impl Workspace {
             LspStatus::Missing { installer: Some(installer), .. } => (
                 format!("Install {}", installer.command),
                 theme.warning.into(),
-                Some(format!("No language server yet. {}, into Kin's own folder; one you install yourself is used instead.", installer.describe())),
+                Some(format!("No language server yet. {}, into Kuana's own folder; one you install yourself is used instead.", installer.describe())),
             ),
             LspStatus::Missing { command, installer: None } => {
                 ("No language server".into(), theme.warning.into(), Some(format!("Install one with `{command}`. Click to copy.")))
@@ -265,7 +265,7 @@ impl Workspace {
             })
             .child(div().flex_1())
             .when_some(self.render_downloads(&theme), |el, downloads| el.child(downloads))
-            .when_some(updater::pending_version(cx).map(|v| format!("Kin {v} is downloaded")), |el, tip| {
+            .when_some(updater::pending_version(cx).map(|v| format!("Kuana {v} is downloaded")), |el, tip| {
                 el.child(
                     div()
                         .id("restart-to-update")

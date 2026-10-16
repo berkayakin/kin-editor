@@ -309,7 +309,7 @@ impl Onboarding {
             ("Font size", "For code and the terminal. Zoom in and out any time.", font_size.into_any_element()),
             (
                 "Save automatically",
-                "A second after you stop typing, and when Kin quits.",
+                "A second after you stop typing, and when Kuana quits.",
                 toggle("welcome-auto-save", auto_save, cx, |this, on, cx| {
                     let mode = if on { AutoSave::AfterDelay } else { AutoSave::Off };
                     this.set_or_default("auto_save", mode.key().into(), AutoSave::default().key().into(), cx);
@@ -379,7 +379,7 @@ impl Render for Onboarding {
                             .text_size(px(38.))
                             .line_height(px(44.))
                             .text_color(theme.text)
-                            .child("Welcome to Kin"),
+                            .child("Welcome to Kuana"),
                     )
                     .child(
                         div()

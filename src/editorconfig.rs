@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn reads_nested_files() {
-        let dir = std::env::temp_dir().join(format!("kin-editorconfig-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-editorconfig-{}", std::process::id()));
         let sub = dir.join("web");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(

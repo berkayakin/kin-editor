@@ -5,7 +5,7 @@ use super::*;
 impl Workspace {
     // ---- Watching the disk --------------------------------------------------------
 
-    /// Watches the project folder so changes made outside Kin show up right away.
+    /// Watches the project folder so changes made outside Kuana show up right away.
     pub(super) fn start_watching(&mut self, cx: &mut Context<Self>) {
         self.watcher = None;
         self.watch_task = None;

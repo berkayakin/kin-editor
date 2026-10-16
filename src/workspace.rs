@@ -1306,7 +1306,7 @@ mod tests {
 
         use crate::project_tree::children as tree_children;
 
-        let dir = std::env::temp_dir().join(format!("kin-tree-links-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kuana-tree-links-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("real/inner")).unwrap();
         std::fs::write(dir.join("file.txt"), "").unwrap();
