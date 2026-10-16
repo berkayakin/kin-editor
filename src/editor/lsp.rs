@@ -102,9 +102,14 @@ pub(super) struct EditorLsp {
     /// The word a declaration request is out for, and the request.
     link_pending: Option<std::ops::Range<usize>>,
     link_task: Option<Task<()>>,
-    /// The words asked about for a document version and whether each has a
-    /// declaration, so going back over one doesn't ask again.
-    link_checked: (u64, Vec<(std::ops::Range<usize>, bool)>),
+    /// Words with a declaration, for a document version: going back over one
+    /// doesn't ask again.
+    link_found: (u64, Vec<std::ops::Range<usize>>),
+    /// The word under the pointer the server had no declaration for. Only
+    /// until the pointer leaves it or ⌘/Ctrl comes up: a server still loading
+    /// the project answers nothing (rust-analyzer: `[]`, `null`, "content
+    /// modified"), and the next hover should ask again.
+    link_none: Option<std::ops::Range<usize>>,
     pub(super) signature: Option<SignatureHelp>,
     signature_task: Option<Task<()>>,
     /// Each server's diagnostics as received (by `Server::id`), for code
@@ -680,28 +685,27 @@ impl Editor {
         }
     }
 
-    /// Shows `word` as a link if the server has a declaration for it (asked
-    /// once per word and document version); `None` hides the link.
+    /// Shows `word` as a link if the server has a declaration for it (a found
+    /// one is remembered for the document version); `None` hides the link.
     pub(super) fn link_word(&mut self, word: Option<std::ops::Range<usize>>, cx: &mut Context<Self>) {
-        if word.is_some() && (self.lsp.link == word || self.lsp.link_pending == word) {
+        if word.is_some() && [&self.lsp.link, &self.lsp.link_pending, &self.lsp.link_none].contains(&&word) {
             return;
         }
         // Another word: what was asked about the last one no longer matters.
         self.lsp.link_task = None;
         self.lsp.link_pending = None;
+        self.lsp.link_none = None;
         if self.lsp.link.take().is_some() {
             cx.notify();
         }
         let Some(word) = word else { return };
         let version = self.doc.read(cx).version();
-        if self.lsp.link_checked.0 != version {
-            self.lsp.link_checked = (version, Vec::new());
+        if self.lsp.link_found.0 != version {
+            self.lsp.link_found = (version, Vec::new());
         }
-        if let Some((_, found)) = self.lsp.link_checked.1.iter().find(|(w, _)| *w == word) {
-            if *found {
-                self.lsp.link = Some(word);
-                cx.notify();
-            }
+        if self.lsp.link_found.1.contains(&word) {
+            self.lsp.link = Some(word);
+            cx.notify();
             return;
         }
         let Some(server) = self.lsp_server_with("definitionProvider", cx) else { return };
@@ -711,11 +715,10 @@ impl Editor {
             let found = server.request("textDocument/definition", params).await.is_ok_and(|v| !protocol::locations(&v).is_empty());
             this.update(cx, |e, cx| {
                 e.lsp.link_pending = None;
-                if e.lsp.link_checked.0 != version {
-                    return;
-                }
-                e.lsp.link_checked.1.push((word.clone(), found));
-                if found {
+                if !found {
+                    e.lsp.link_none = Some(word);
+                } else if e.lsp.link_found.0 == version {
+                    e.lsp.link_found.1.push(word.clone());
                     e.lsp.link = Some(word);
                     cx.notify();
                 }
@@ -1536,13 +1539,20 @@ mod tests {
         editor.update(cx, |e, cx| e.link_word(Some(19..20), cx));
         assert_eq!(link(cx), None);
         wait_for(cx, "the link", |cx| link(cx) == Some(19..20));
-        // `x` has no declaration: no link.
+        // `x` has no declaration: no link, and moving over it doesn't ask again.
         editor.update(cx, |e, cx| e.link_word(Some(29..30), cx));
         wait_for(cx, "the answer", answered);
         assert_eq!(link(cx), None);
+        editor.update(cx, |e, cx| e.link_word(Some(29..30), cx));
+        assert!(answered(cx));
         // Back on `a`: known already, a link right away.
         editor.update(cx, |e, cx| e.link_word(Some(19..20), cx));
         assert_eq!(link(cx), Some(19..20));
+        // Back on `x`: asked again (a server still loading answers nothing).
+        editor.update(cx, |e, cx| e.link_word(Some(29..30), cx));
+        assert!(!answered(cx));
+        wait_for(cx, "the answer", answered);
+        assert_eq!(link(cx), None);
         // ⌘/Ctrl up, or an edit: gone.
         editor.update(cx, |e, cx| e.link_word(None, cx));
         assert_eq!(link(cx), None);
