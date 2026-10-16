@@ -652,6 +652,8 @@ pub struct Workspace {
     git_status: Arc<RepoStatus>,
     /// Change per file (and "contains changes" per folder) for the file tree.
     git_paths: Arc<HashMap<PathBuf, Change>>,
+    /// What Git ignores (files, and folders as a whole), dimmed in the tree.
+    git_ignored: Arc<HashSet<PathBuf>>,
     git_user: Option<String>,
     /// URL of the repository's `origin` (or first) remote.
     git_remote: Option<String>,
@@ -945,6 +947,7 @@ impl Workspace {
             repo: None,
             git_status: Arc::new(RepoStatus::default()),
             git_paths: Arc::new(HashMap::new()),
+            git_ignored: Arc::default(),
             git_user: None,
             git_remote: None,
             last_commit: None,

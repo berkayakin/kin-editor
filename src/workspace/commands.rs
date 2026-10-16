@@ -150,6 +150,7 @@ impl Workspace {
         self.last_commit = None;
         self.git_status = Arc::new(RepoStatus::default());
         self.git_paths = Arc::new(HashMap::new());
+        self.git_ignored = Arc::default();
         window.focus(&self.focus_handle);
         cx.notify();
     }

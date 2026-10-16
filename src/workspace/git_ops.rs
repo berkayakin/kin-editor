@@ -28,6 +28,7 @@ impl Workspace {
                 ws.last_commit = None;
                 ws.git_status = Arc::new(RepoStatus::default());
                 ws.git_paths = Arc::new(HashMap::new());
+                ws.git_ignored = Arc::default();
                 // A repository above the project folder: watch its .git too.
                 if let (Some(repo), Some(root), Some(watcher)) = (&repo, &ws.root, ws.watcher.as_mut())
                     && !repo.starts_with(root)
@@ -85,6 +86,10 @@ impl Workspace {
                     ws.git_log.update(cx, |l, cx| l.reload(cx));
                 }
                 ws.git_paths = Arc::new(status.path_map(&repo));
+                if ws.git_ignored.len() != status.ignored.len() || !status.ignored.iter().all(|p| ws.git_ignored.contains(p)) {
+                    ws.git_ignored = Arc::new(status.ignored.iter().cloned().collect());
+                }
+                ws.decorate_tree(cx);
                 ws.git_status = Arc::new(status);
                 let status = ws.git_status.clone();
                 ws.git_panel.update(cx, |p, cx| p.set_status(status, cx));

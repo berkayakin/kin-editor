@@ -68,6 +68,8 @@ pub struct ProjectTree {
     drop_target: Option<PathBuf>,
     /// Change per file (and "contains changes" per folder).
     git: Arc<HashMap<PathBuf, Change>>,
+    /// What Git ignores: files, and folders with everything in them. Dimmed.
+    ignored: Arc<HashSet<PathBuf>>,
     /// The open file, marked.
     active: Option<PathBuf>,
     /// The row a context menu is open for, outlined.
@@ -84,6 +86,7 @@ impl ProjectTree {
             focus: cx.focus_handle(),
             drop_target: None,
             git: Arc::default(),
+            ignored: Arc::default(),
             active: None,
             menu_target: None,
         }
@@ -177,13 +180,26 @@ impl ProjectTree {
         }
     }
 
-    /// How rows look: Git changes, the open file, a context menu's row.
-    pub fn decorate(&mut self, git: Arc<HashMap<PathBuf, Change>>, active: Option<PathBuf>, menu_target: Option<PathBuf>, cx: &mut Context<Self>) {
-        if Arc::ptr_eq(&self.git, &git) && self.active == active && self.menu_target == menu_target {
+    /// How rows look: Git changes, what Git ignores, the open file, a context
+    /// menu's row.
+    pub fn decorate(
+        &mut self,
+        git: Arc<HashMap<PathBuf, Change>>,
+        ignored: Arc<HashSet<PathBuf>>,
+        active: Option<PathBuf>,
+        menu_target: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if Arc::ptr_eq(&self.git, &git) && Arc::ptr_eq(&self.ignored, &ignored) && self.active == active && self.menu_target == menu_target {
             return;
         }
-        (self.git, self.active, self.menu_target) = (git, active, menu_target);
+        (self.git, self.ignored, self.active, self.menu_target) = (git, ignored, active, menu_target);
         cx.notify();
+    }
+
+    /// Whether Git ignores `path`: itself, or a folder it's in.
+    fn is_ignored(&self, path: &Path) -> bool {
+        !self.ignored.is_empty() && path.ancestors().any(|p| self.ignored.contains(p))
     }
 
     fn click(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -221,8 +237,10 @@ impl Render for ProjectTree {
                         let e = &tree.entries[ix];
                         let selected = tree.active.as_deref() == Some(e.path.as_path());
                         let change = tree.git.get(&e.path).copied();
+                        // Ignored by Git: dimmed, like VS Code and Zed.
                         let name_color: Hsla = match change {
                             Some(c) => change_color(theme, c),
+                            None if tree.is_ignored(&e.path) => theme.text_dim.into(),
                             None if selected => theme.text.into(),
                             None => theme.text_muted.into(),
                         };
@@ -389,4 +407,26 @@ pub fn children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
         .collect();
     children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
     children
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{AppContext, TestAppContext};
+
+    use super::*;
+
+    #[gpui::test]
+    fn what_git_ignores_is_dimmed_with_everything_in_it(cx: &mut TestAppContext) {
+        let tree = cx.new(ProjectTree::new);
+        let ignored: Arc<HashSet<PathBuf>> = Arc::new(["/p/target", "/p/run.log"].map(PathBuf::from).into_iter().collect());
+        tree.update(cx, |t, cx| t.decorate(Arc::default(), ignored, None, None, cx));
+        tree.read_with(cx, |t, _| {
+            assert!(t.is_ignored(Path::new("/p/target")));
+            assert!(t.is_ignored(Path::new("/p/target/debug/a.o")));
+            assert!(t.is_ignored(Path::new("/p/run.log")));
+            assert!(!t.is_ignored(Path::new("/p/src/main.rs")));
+            // A name that only starts like an ignored folder's.
+            assert!(!t.is_ignored(Path::new("/p/target-notes.md")));
+        });
+    }
 }

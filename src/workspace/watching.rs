@@ -72,7 +72,10 @@ impl Workspace {
                         (true, false) => FileChange::Changed,
                     };
                     file_changes.push((change.path.clone(), kind));
-                    git |= !ignored(&change.path);
+                    // Churn in what Git ignores doesn't change its status; a
+                    // new ignored file or folder does (the tree dims it).
+                    let ignored_known = || change.path.ancestors().any(|p| self.git_ignored.contains(p));
+                    git |= !ignored(&change.path) || (kind == FileChange::Created && !ignored_known());
                     paths.insert(change.path);
                 }
             }

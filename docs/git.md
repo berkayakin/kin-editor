@@ -13,7 +13,8 @@ message instead of hanging; use an SSH agent or a credential helper.
 - **Inline blame:** the caret line shows its author, age and commit message
   (Find Action → Toggle Inline Git Blame).
 - **File tree:** changed files are colored with a status letter; folders containing
-  changes are tinted.
+  changes are tinted. What Git ignores (`.gitignore` files, `.git/info/exclude` and your
+  global excludes) is dimmed, an ignored folder with everything in it.
 - **Commit panel** (⌘K / ⌘0, or the Commit tab above the sidebar, whose tooltip shows the
   number of changes): the branch with fetch, pull and push at the top, then staged changes,
   unstaged changes and **Unversioned Files** (new files Git doesn't track), with stage, unstage,

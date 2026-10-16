@@ -142,6 +142,17 @@ impl Workspace {
             .child(label)
     }
 
+    /// Tells the tree how its rows look: Git changes, what Git ignores, the
+    /// open file, a menu's row. Also called where the Git data changes, not
+    /// only from `render`: the tree is a cached view, and one told during
+    /// another view's render isn't drawn again (a new file kept no color).
+    pub(super) fn decorate_tree(&mut self, cx: &mut Context<Self>) {
+        let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
+        let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
+        let (git_paths, git_ignored) = (self.git_paths.clone(), self.git_ignored.clone());
+        self.tree.update(cx, |t, cx| t.decorate(git_paths, git_ignored, active_path, menu_target, cx));
+    }
+
     /// While a resize is on, follows the pointer anywhere in the window and
     /// keeps the resize cursor. The root's own mouse-move listener only hears
     /// moves while it's hovered, which the Git diff (it occludes) prevents,
@@ -247,11 +258,7 @@ impl Render for Workspace {
         if !cx.has_active_drag() && self.tree.read(cx).has_drop_target() {
             self.tree.update(cx, |t, cx| t.set_drop_target(None, cx));
         }
-        // How the tree's rows look: Git changes, the open file, a menu's row.
-        let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
-        let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
-        let git_paths = self.git_paths.clone();
-        self.tree.update(cx, |t, cx| t.decorate(git_paths, active_path, menu_target, cx));
+        self.decorate_tree(cx);
         let git_target = self.context_menu.as_ref().and_then(|m| m.git_target.clone());
         self.git_panel.update(cx, |p, cx| p.set_menu_target(git_target, cx));
         let theme = Theme::get(cx).clone();

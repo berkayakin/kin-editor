@@ -82,6 +82,9 @@ pub struct RepoStatus {
     pub ahead: u32,
     pub behind: u32,
     pub files: Vec<FileStatus>,
+    /// What Git ignores (the global excludes and nested .gitignore files
+    /// included): files, and folders as a whole, nothing listed inside them.
+    pub ignored: Vec<PathBuf>,
     /// A merge or rebase that stopped and waits to be continued or aborted.
     pub state: Option<RepoState>,
 }
@@ -270,6 +273,8 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
             "--branch",
             "-z",
             "--untracked-files=all",
+            // An ignored folder once, not every file in it (as `traditional` would).
+            "--ignored=matching",
         ],
     )?;
     let mut status = parse_status(root, &out);
@@ -341,6 +346,8 @@ fn parse_status(root: &Path, out: &str) -> RepoStatus {
             '?' => {
                 status.files.push(file(&entry[2..], None, Some(Change::Untracked)));
             }
+            // A folder ends with a slash.
+            '!' => status.ignored.push(root.join(entry[2..].trim_end_matches('/'))),
             _ => {}
         }
     }
@@ -1706,8 +1713,11 @@ mod tests {
 1 A. N... 000000 100644 100644 000 ccc new.js\0\
 2 R. N... 100644 100644 100644 ddd eee R100 renamed.js\0old.js\0\
 u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
-? notes.txt\0";
+? notes.txt\0\
+! target/\0\
+! logs/a.log\0";
         let s = parse_status(root, out);
+        assert_eq!(s.ignored, [Path::new("/repo/target"), Path::new("/repo/logs/a.log")]);
         assert_eq!(s.branch.as_deref(), Some("main"));
         assert_eq!((s.ahead, s.behind), (2, 1));
         assert_eq!(s.files.len(), 5);
@@ -1880,6 +1890,34 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         unstage_lines(&root, "w.txt", Some(&edited), 4..5).unwrap();
         assert_eq!(index_blob(&root, "w.txt").unwrap(), lines);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_lists_what_git_ignores() {
+        if !is_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kuana-git-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        init(&dir).unwrap();
+        // Not the machine's own global excludes.
+        let excludes = std::env::temp_dir().join(format!("kuana-git-excludes-{}", std::process::id()));
+        std::fs::write(&excludes, "").unwrap();
+        run(&dir, &["config", "core.excludesFile", &excludes.to_string_lossy()]).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n").unwrap();
+        std::fs::write(dir.join("sub/.gitignore"), "secret.txt\n").unwrap();
+        for file in ["target/debug/a.o", "target/b.o", "run.log", "sub/secret.txt", "sub/keep.rs"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let root = discover(&dir).unwrap();
+        let mut ignored = status(&root).unwrap().ignored;
+        ignored.sort();
+        // The folder once, not what's in it; nested .gitignore files count.
+        assert_eq!(ignored, ["run.log", "sub/secret.txt", "target"].map(|rel| root.join(rel)));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&excludes).ok();
     }
 
     #[test]
