@@ -177,6 +177,9 @@ pub struct Document {
     /// The language server's inlay hints (sorted); they follow edits until
     /// the next answer replaces them.
     inlay_hints: Vec<InlayHint>,
+    /// Counts `set_inlay_hints` calls (not hints following edits), so soft
+    /// wrap knows when to look for lines whose hints changed.
+    inlay_generation: u64,
     /// Language servers' code lenses, by line (shown above it).
     code_lenses: Vec<CodeLens>,
     /// Modification time of the file when it was last read or written, to
@@ -294,6 +297,7 @@ impl Document {
             parse_budget: PARSE_BUDGET,
             tree_version: 0,
             inlay_hints: Vec::new(),
+            inlay_generation: 1,
             code_lenses: Vec::new(),
             disk_mtime: None,
             image: None,
@@ -886,6 +890,12 @@ impl Document {
     pub fn set_inlay_hints(&mut self, mut hints: Vec<InlayHint>) {
         hints.sort_by_key(|h| h.offset);
         self.inlay_hints = hints;
+        self.inlay_generation += 1;
+    }
+
+    /// Changes when the hints are replaced (from 1; see `inlay_generation`).
+    pub fn inlay_generation(&self) -> u64 {
+        self.inlay_generation
     }
 
     /// Hints after an edit move with the text; ones inside replaced text go.

@@ -4,16 +4,23 @@
 //! lines), which carets skip.
 //!
 //! Positions are byte offsets into a line's [`DisplayLine`] text (tabs
-//! expanded). A break's offset starts a new row, so a cursor exactly on a
+//! expanded, inlay hints in place: they take room on their rows, as in Zed,
+//! where the inlay map sits below the wrap map). A break's offset starts a new row, so a cursor exactly on a
 //! break shows at the start of the next row. Continuation rows keep the
 //! line's indentation, like Zed and VS Code.
 
-use std::ops::Range;
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    ops::Range,
+};
 
 use gpui::{Font, LineFragment, LineWrapperHandle, Pixels, SharedString, TextSystem};
 use ropey::Rope;
 
-use crate::{document::LineEdit, editor::DisplayLine};
+use crate::{
+    document::{InlayHint, LineEdit},
+    editor::DisplayLine,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Break {
@@ -26,7 +33,7 @@ pub struct Break {
 }
 
 /// What line breaks depend on; a change means measuring every line again.
-/// (Edits and folds update the map in place.)
+/// (Edits, folds and inlay hints update the map in place.)
 #[derive(Clone, PartialEq)]
 pub struct WrapKey {
     /// The width to wrap at; zero without soft wrap (long lines break at a
@@ -51,6 +58,11 @@ pub struct WrapMap {
     blocks: Vec<(usize, usize)>,
     /// Breaks per buffer line; empty for lines that fit.
     breaks: Vec<Vec<Break>>,
+    /// The hints each line was measured with (see `fingerprint`), to tell
+    /// which lines new hints change.
+    inlays: Vec<u64>,
+    /// The `Inlays::generation` the breaks are for.
+    inlay_generation: u64,
     /// First display row of each line (its block rows, then its text),
     /// plus the total at the end.
     row_starts: Vec<usize>,
@@ -63,85 +75,175 @@ pub const LONG_LINE: usize = 1024;
 /// The most display columns on a row of a long line without soft wrap.
 const LONG_LINE_ROW: usize = 512;
 
+/// The inlay hints shown in the text, which lines are measured with.
+#[derive(Clone, Copy)]
+pub struct Inlays<'a> {
+    /// Sorted by offset; empty when hints are off.
+    pub hints: &'a [InlayHint],
+    /// `Document::inlay_generation`, 0 when hints are off: a change means
+    /// looking for the lines whose hints changed. (Hints following edits
+    /// stay on the edited lines, which are measured again anyway.)
+    pub generation: u64,
+}
+
+impl<'a> Inlays<'a> {
+    pub const NONE: Inlays<'static> = Inlays { hints: &[], generation: 0 };
+
+    /// Line `row`'s start and its hints: from its start to its end, the
+    /// newline excluded (as `Editor::display_line` shows them).
+    pub fn of_line(&self, rope: &Rope, row: usize) -> (usize, &'a [InlayHint]) {
+        let row = row.min(rope.len_lines());
+        let start = rope.line_to_byte(row);
+        let end = if row + 1 >= rope.len_lines() { rope.len_bytes() } else { rope.line_to_byte(row + 1) - 1 };
+        let first = self.hints.partition_point(|h| h.offset < start);
+        let count = self.hints[first..].partition_point(|h| h.offset <= end);
+        (start, &self.hints[first..first + count])
+    }
+
+    /// Every line's `fingerprint`, walking the hints rather than the lines.
+    fn fingerprints(&self, rope: &Rope) -> Vec<u64> {
+        let mut out = vec![0; rope.len_lines()];
+        let shown = &self.hints[..self.hints.partition_point(|h| h.offset <= rope.len_bytes())];
+        for line in shown.chunk_by(|a, b| rope.byte_to_line(a.offset) == rope.byte_to_line(b.offset)) {
+            let row = rope.byte_to_line(line[0].offset);
+            out[row] = fingerprint(rope.line_to_byte(row), line);
+        }
+        out
+    }
+}
+
+/// A line's hints (starting at `start`) as a number, 0 without any: what its
+/// breaks depend on besides its text.
+fn fingerprint(start: usize, hints: &[InlayHint]) -> u64 {
+    if hints.is_empty() {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    for h in hints {
+        (h.offset - start, &h.label, h.pad_left, h.pad_right).hash(&mut hasher);
+    }
+    hasher.finish().max(1)
+}
+
 /// Finds a line's breaks; only lines that may be wider than the view are
 /// shaped.
-struct Measure {
+struct Measure<'a> {
     wrapper: LineWrapperHandle,
     width: Pixels,
+    char_width: Pixels,
     max_cols: usize,
     tab_size: usize,
     wrap: bool,
+    inlays: Inlays<'a>,
 }
 
-impl Measure {
-    fn new(key: &WrapKey, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
+impl<'a> Measure<'a> {
+    fn new(key: &WrapKey, inlays: Inlays<'a>, text_system: &std::sync::Arc<TextSystem>, font: Font, char_width: Pixels) -> Self {
         Measure {
             wrapper: text_system.line_wrapper(font, key.font_size),
             width: key.width,
+            char_width,
             // Lines narrower than this many columns can't wrap, which skips
             // shaping-free measurement for most lines.
             max_cols: (key.width / char_width).floor().max(1.) as usize,
             tab_size: key.tab_size,
             wrap: key.wrap,
+            inlays,
         }
     }
 
-    fn line(&mut self, rope: &Rope, row: usize) -> Vec<Break> {
+    /// Line `row`'s breaks and the `fingerprint` of the hints they're for.
+    fn line(&mut self, rope: &Rope, row: usize) -> (Vec<Break>, u64) {
+        let (start, hints) = self.inlays.of_line(rope, row);
+        (self.breaks(rope, row, start, hints), fingerprint(start, hints))
+    }
+
+    fn breaks(&mut self, rope: &Rope, row: usize, start: usize, hints: &[InlayHint]) -> Vec<Break> {
         let line = rope.line(row);
         let long = line.len_bytes() > LONG_LINE;
         if !self.wrap && !long {
             return Vec::new();
         }
-        if self.wrap && (line.len_chars() <= self.max_cols / self.tab_size || display_columns(line, self.tab_size) <= self.max_cols) {
+        let hint_cols: usize = hints.iter().map(|h| display_columns(h.label.chars(), 1) + h.pad_left as usize + h.pad_right as usize).sum();
+        if self.wrap
+            && ((hint_cols == 0 && line.len_chars() <= self.max_cols / self.tab_size) || display_columns(line.chars(), self.tab_size) + hint_cols <= self.max_cols)
+        {
             return Vec::new();
         }
         // Same text as `Document::line_text`: without the newline.
         let text = line.to_string();
         let text = text.strip_suffix('\n').unwrap_or(&text);
-        let dl = DisplayLine::new(text, self.tab_size);
+        let inlays: Vec<(usize, &str, bool, bool)> = hints.iter().map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right)).collect();
+        let dl = DisplayLine::with_inlays(text, self.tab_size, &inlays);
         let at = |ix: usize, indent: u32| Break { ix: ix as u32, byte: dl.to_buffer(ix) as u32, indent };
         if !self.wrap {
             return dl.text.char_indices().map(|(ix, _)| ix).step_by(LONG_LINE_ROW).skip(1).map(|ix| at(ix, 0)).collect();
         }
-        let fragments = [LineFragment::text(&dl.text)];
+        // A hint is one piece: rows break before or after it, not inside.
+        let mut fragments = Vec::with_capacity(2 * dl.inlays.len() + 1);
+        let mut from = 0;
+        for span in dl.inlays.iter().filter(|s| !s.whole.is_empty()) {
+            if span.whole.start > from {
+                fragments.push(LineFragment::text(&dl.text[from..span.whole.start]));
+            }
+            let width = self.char_width * display_columns(dl.text[span.whole.clone()].chars(), 1) as f32;
+            fragments.push(LineFragment::element(width, span.whole.len()));
+            from = span.whole.end;
+        }
+        if from < dl.text.len() {
+            fragments.push(LineFragment::text(&dl.text[from..]));
+        }
         self.wrapper.wrap_line(&fragments, self.width).map(|b| at(b.ix, b.next_indent)).collect()
     }
 }
 
 impl WrapMap {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: WrapKey,
         version: u64,
         folds: &[Range<usize>],
+        inlays: Inlays,
         rope: &Rope,
         text_system: &std::sync::Arc<TextSystem>,
         font: Font,
         char_width: Pixels,
     ) -> Self {
-        let mut measure = Measure::new(&key, text_system, font, char_width);
-        let breaks = (0..rope.len_lines()).map(|row| measure.line(rope, row)).collect();
-        let mut map = WrapMap { key, version, folds: folds.to_vec(), blocks: Vec::new(), breaks, row_starts: Vec::new() };
+        let mut measure = Measure::new(&key, inlays, text_system, font, char_width);
+        let (breaks, fingerprints) = (0..rope.len_lines()).map(|row| measure.line(rope, row)).unzip();
+        let mut map = WrapMap {
+            key,
+            version,
+            folds: folds.to_vec(),
+            blocks: Vec::new(),
+            breaks,
+            inlays: fingerprints,
+            inlay_generation: inlays.generation,
+            row_starts: Vec::new(),
+        };
         map.count_rows(rope, 0);
         map
     }
 
     /// Catches up with `edits` (from `self.version` to `version`, see
-    /// `Document::line_edits_since`) and `folds`: only the lines the edits
-    /// touched are measured again, and rows are counted from the first of
-    /// them. False when the edits don't fit this map; then build a new one.
+    /// `Document::line_edits_since`), `folds` and `inlays`: only the lines
+    /// the edits touched or whose hints changed are measured again, and rows
+    /// are counted from the first of them. False when the edits don't fit
+    /// this map; then build a new one.
     #[allow(clippy::too_many_arguments)]
     pub fn update<'e>(
         &mut self,
         edits: impl Iterator<Item = &'e LineEdit>,
         version: u64,
         folds: &[Range<usize>],
+        inlays: Inlays,
         rope: &Rope,
         text_system: &std::sync::Arc<TextSystem>,
         font: Font,
         char_width: Pixels,
     ) -> bool {
         // Asked every frame; usually nothing changed.
-        if version == self.version && self.folds == folds {
+        if version == self.version && self.folds == folds && inlays.generation == self.inlay_generation {
             return true;
         }
         let mut dirty = vec![false; self.breaks.len()];
@@ -152,16 +254,28 @@ impl WrapMap {
                 return false;
             }
             self.breaks.splice(old.clone(), std::iter::repeat_with(Vec::new).take(edit.new_rows));
+            self.inlays.splice(old.clone(), std::iter::repeat_n(0, edit.new_rows));
             dirty.splice(old, std::iter::repeat_n(true, edit.new_rows));
             first = first.min(edit.row);
         }
         if self.breaks.len() != rope.len_lines() {
             return false;
         }
+        // New hints: the lines whose hints aren't the ones they were measured
+        // with (edited lines are already due).
+        if inlays.generation != self.inlay_generation {
+            for (row, now) in inlays.fingerprints(rope).into_iter().enumerate() {
+                if self.inlays[row] != now && !dirty[row] {
+                    dirty[row] = true;
+                    first = first.min(row);
+                }
+            }
+            self.inlay_generation = inlays.generation;
+        }
         if first < dirty.len() {
-            let mut measure = Measure::new(&self.key, text_system, font, char_width);
+            let mut measure = Measure::new(&self.key, inlays, text_system, font, char_width);
             for row in (first..dirty.len()).filter(|&row| dirty[row]) {
-                self.breaks[row] = measure.line(rope, row);
+                (self.breaks[row], self.inlays[row]) = measure.line(rope, row);
             }
         }
         self.version = version;
@@ -316,11 +430,11 @@ impl WrapMap {
     }
 }
 
-/// Display columns of a rope line (tabs expanded, wide characters as two),
-/// an upper bound for whether it can need wrapping.
-fn display_columns(line: ropey::RopeSlice, tab_size: usize) -> usize {
+/// Display columns of a line's characters (tabs expanded, wide characters
+/// as two), an upper bound for whether it can need wrapping.
+fn display_columns(chars: impl Iterator<Item = char>, tab_size: usize) -> usize {
     let mut col = 0;
-    for c in line.chars() {
+    for c in chars {
         col += match c {
             '\t' => tab_size - col % tab_size,
             '\n' => 0,
@@ -351,27 +465,52 @@ mod tests {
     #[gpui::test]
     fn edits_update_the_map_like_a_new_one(cx: &mut gpui::TestAppContext) {
         use crate::document::{Document, EditKind};
+        fn inlays(doc: &Document) -> Inlays<'_> {
+            Inlays { hints: doc.inlay_hints(), generation: doc.inlay_generation() }
+        }
         let text_system = cx.update(|cx| cx.text_system().clone());
         let font = gpui::font("Test");
         let key = |wrap| WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 4, wrap };
         let long = "word ".repeat(40);
         let text: String = (0..30).map(|i| if i % 3 == 0 { format!("{i} {long}\n") } else { format!("line {i}\n") }).collect();
+        let line = |doc: &Document, row: usize| doc.line_start(row);
+        // Hints at (line, column): a type in a long line, one too wide for
+        // its short line, parameter names.
+        let hints = |d: &Document, at: &[(usize, usize, &str)]| -> Vec<InlayHint> {
+            at.iter().map(|&(row, col, label)| InlayHint { offset: line(d, row) + col, label: label.into(), pad_left: true, pad_right: false }).collect()
+        };
         for wrap in [true, false] {
             let mut doc = Document::from_text(text.clone(), None);
+            doc.set_inlay_hints(hints(&doc, &[(0, 1, ": Vec<String>"), (4, 6, &long), (8, 2, "name: ")]));
             let mut folds = crate::fold::Folds::default();
             folds.fold_rows(&doc, 10, 12);
-            let mut map = WrapMap::new(key(wrap), doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+            let mut map = WrapMap::new(key(wrap), doc.version(), folds.ranges(), inlays(&doc), doc.rope(), &text_system, font.clone(), gpui::px(7.));
             assert_eq!(wrap, map.breaks.iter().any(|b| !b.is_empty()), "long lines wrap");
-            let line = |doc: &Document, row: usize| doc.line_start(row);
+            assert_eq!(wrap, !map.breaks(4).is_empty(), "a short line wraps with a wide hint");
             let steps: Vec<Box<dyn Fn(&mut Document)>> = vec![
                 // Typing in a long line, then several carets adding lines.
                 Box::new(|d| drop(d.edit(vec![(line(d, 3) + 5..line(d, 3) + 5, "more ".repeat(20))], &[], EditKind::Other))),
+                // New hints: the wide one moves to another line, one more.
+                Box::new(|d| d.set_inlay_hints(hints(d, &[(0, 1, ": Vec<String>"), (7, 6, &long), (8, 2, "name: "), (9, 0, "p: ")]))),
                 Box::new(|d| drop(d.edit(vec![(line(d, 1)..line(d, 1), "a\nb\n".into()), (line(d, 20)..line(d, 20), long.clone())], &[], EditKind::Other))),
+                // Typing where a hint is (it stays after the text), deleting
+                // text around one (it goes).
+                Box::new(|d| {
+                    let at = d.inlay_hints()[2].offset;
+                    drop(d.edit(vec![(at..at, "abc".into())], &[], EditKind::Other));
+                }),
+                Box::new(|d| drop(d.edit(vec![(line(d, 0)..line(d, 0) + 3, String::new())], &[], EditKind::Other))),
                 // Joining lines, an edit that opens the fold, undo and redo.
                 Box::new(|d| drop(d.edit(vec![(line(d, 5) - 1..line(d, 7), String::new())], &[], EditKind::Other))),
                 Box::new(|d| drop(d.edit(vec![(line(d, 11) + 1..line(d, 11) + 1, "x".into())], &[], EditKind::Other))),
                 Box::new(|d| drop(d.undo())),
                 Box::new(|d| drop(d.redo())),
+                // An edit and new hints between two frames, then no hints.
+                Box::new(|d| {
+                    drop(d.edit(vec![(line(d, 2)..line(d, 2), long.clone())], &[], EditKind::Other));
+                    d.set_inlay_hints(hints(d, &[(2, 3, &long), (15, 0, "x: ")]));
+                }),
+                Box::new(|d| d.set_inlay_hints(Vec::new())),
             ];
             for step in steps {
                 // Two versions at a time, as when frames are skipped.
@@ -380,11 +519,53 @@ mod tests {
                 step(&mut doc);
                 folds.follow(&doc, before);
                 let edits = doc.line_edits_since(map.version).expect("kept");
-                assert!(map.update(edits, doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.)));
-                let fresh = WrapMap::new(key(wrap), doc.version(), folds.ranges(), doc.rope(), &text_system, font.clone(), gpui::px(7.));
-                assert_eq!((&map.breaks, &map.row_starts), (&fresh.breaks, &fresh.row_starts));
+                assert!(map.update(edits, doc.version(), folds.ranges(), inlays(&doc), doc.rope(), &text_system, font.clone(), gpui::px(7.)));
+                let fresh = WrapMap::new(key(wrap), doc.version(), folds.ranges(), inlays(&doc), doc.rope(), &text_system, font.clone(), gpui::px(7.));
+                assert_eq!((&map.breaks, &map.inlays, &map.row_starts), (&fresh.breaks, &fresh.inlays, &fresh.row_starts));
+            }
+            // Hints switched off and on again.
+            doc.set_inlay_hints(hints(&doc, &[(4, 2, &long)]));
+            for shown in [Inlays::NONE, inlays(&doc)] {
+                let edits = doc.line_edits_since(map.version).expect("kept");
+                assert!(map.update(edits, doc.version(), folds.ranges(), shown, doc.rope(), &text_system, font.clone(), gpui::px(7.)));
+                let fresh = WrapMap::new(key(wrap), doc.version(), folds.ranges(), shown, doc.rope(), &text_system, font.clone(), gpui::px(7.));
+                assert_eq!((&map.breaks, &map.inlays, &map.row_starts), (&fresh.breaks, &fresh.inlays, &fresh.row_starts));
             }
         }
+    }
+
+    /// A hint takes room on its row and wraps as one piece; buffer columns
+    /// map to the rows the display shows them on, before a hint.
+    #[gpui::test]
+    fn hints_take_room_on_wrapped_rows(cx: &mut gpui::TestAppContext) {
+        let text_system = cx.update(|cx| cx.text_system().clone());
+        let key = WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true };
+        let text = "let value = compute(first, second);";
+        let rope = Rope::from_str(text);
+        let label = ": Result<Vec<String>, Error>";
+        let hints = [InlayHint { offset: 9, label: label.into(), pad_left: false, pad_right: false }];
+        let new = |inlays| WrapMap::new(key.clone(), 0, &[], inlays, &rope, &text_system, gpui::font("Test"), gpui::px(7.));
+        assert!(new(Inlays::NONE).breaks(0).is_empty(), "fits without its hint");
+        let map = new(Inlays { hints: &hints, generation: 1 });
+        let breaks = map.breaks(0);
+        assert!(!breaks.is_empty(), "wraps with it");
+        let dl = DisplayLine::with_inlays(text, 4, &[(9, label, false, false)]);
+        let hint = dl.inlays[0].whole.clone();
+        for b in breaks {
+            assert!(b.ix as usize <= hint.start || b.ix as usize >= hint.end, "not inside the hint: {b:?}");
+            assert_eq!(dl.to_buffer(b.ix as usize), b.byte as usize);
+        }
+        // Every buffer column shows on the row that holds its display column,
+        // and a click there comes back to it.
+        for col in (0..=text.len()).filter(|&c| text.is_char_boundary(c)) {
+            let shown = dl.to_display(col);
+            let (range, _) = segment(breaks, segment_of(breaks, shown), dl.text.len());
+            assert!(range.contains(&shown) || shown == range.end, "column {col}");
+            assert_eq!(dl.to_buffer(shown), col);
+        }
+        // The hint's column is before the hint; a click inside it goes there.
+        assert_eq!(dl.to_display(9), hint.start);
+        assert_eq!(dl.to_buffer(hint.start + 3), 9);
     }
 
     #[gpui::test]
@@ -396,7 +577,7 @@ mod tests {
         let json = format!("[{}é]", "1,".repeat(649));
         let mut doc = Document::from_text(format!("short\n{json}\n"), None);
         assert!(doc.has_long_lines());
-        let map = WrapMap::new(key.clone(), doc.version(), &[], doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
+        let map = WrapMap::new(key.clone(), doc.version(), &[], Inlays::NONE, doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
         assert!(map.breaks(0).is_empty());
         assert_eq!(map.breaks(1), [Break { ix: 512, byte: 512, indent: 0 }, Break { ix: 1024, byte: 1024, indent: 0 }]);
         assert_eq!(map.row_count(), 1 + 3 + 1);
@@ -422,9 +603,9 @@ mod tests {
     #[test]
     fn counts_display_columns() {
         let rope = Rope::from_str("\tab\n世界\n");
-        assert_eq!(display_columns(rope.line(0), 4), 6);
-        assert_eq!(display_columns(rope.line(0), 2), 4);
-        assert_eq!(display_columns(rope.line(1), 4), 4);
+        assert_eq!(display_columns(rope.line(0).chars(), 4), 6);
+        assert_eq!(display_columns(rope.line(0).chars(), 2), 4);
+        assert_eq!(display_columns(rope.line(1).chars(), 4), 4);
     }
 
     #[test]
@@ -435,6 +616,8 @@ mod tests {
             version: 0,
             folds: Vec::new(),
             breaks: vec![vec![], vec![Break { ix: 5, byte: 5, indent: 0 }, Break { ix: 9, byte: 9, indent: 0 }], vec![]],
+            inlays: vec![0; 3],
+            inlay_generation: 0,
             row_starts: vec![0, 1, 4, 5],
         };
         assert_eq!(map.row_count(), 5);
@@ -450,7 +633,7 @@ mod tests {
     fn block_rows_sit_between_lines(cx: &mut gpui::TestAppContext) {
         let rope = Rope::from_str("a\nb\nc\n");
         let key = WrapKey { width: gpui::px(400.), font_family: "Menlo".into(), font_size: gpui::px(13.), tab_size: 4, wrap: false };
-        let mut map = cx.update(|cx| WrapMap::new(key, 0, &[], &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
+        let mut map = cx.update(|cx| WrapMap::new(key, 0, &[], Inlays::NONE, &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
         // Two rows above line 1 ("b"), one after the last line.
         map.set_blocks(&[(1, 2), (4, 1)], &rope);
         assert_eq!(map.row_count(), 4 + 3);
@@ -473,7 +656,7 @@ mod tests {
         let key = WrapKey { width: gpui::px(0.), font_family: "Menlo".into(), font_size: gpui::px(13.), tab_size: 4, wrap: false };
         // Lines 5 and 6 folded away (the fold covers them whole).
         let fold = rope.line_to_byte(5)..rope.line_to_byte(7) - 1;
-        let mut map = cx.update(|cx| WrapMap::new(key, 0, std::slice::from_ref(&fold), &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
+        let mut map = cx.update(|cx| WrapMap::new(key, 0, std::slice::from_ref(&fold), Inlays::NONE, &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
         let blocks = [(0, 1), (2, 2), (2, 1), (5, 3), (9, 1), (13, 2)];
         map.set_blocks(&blocks, &rope);
         // Every display row by hand: (line, Some(block row)) or (line, None)
@@ -506,6 +689,8 @@ mod tests {
             version: 0,
             folds: Vec::new(),
             breaks: vec![vec![], vec![], vec![], vec![]],
+            inlays: vec![0; 4],
+            inlay_generation: 0,
             row_starts: vec![0, 1, 1, 1, 2],
         };
         assert_eq!(map.row_count(), 2);

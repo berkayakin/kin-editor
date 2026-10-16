@@ -1257,22 +1257,25 @@ impl Editor {
         }
     }
 
-    /// `row` as displayed: tabs expanded, inlay hints in place. Wrapped lines
-    /// get no hints (the wrap map is measured without them).
+    /// The inlay hints shown (none when they're off); the wrap map measures
+    /// lines with them.
+    fn inlays<'a>(&self, cx: &'a App) -> wrap::Inlays<'a> {
+        let doc = self.doc.read(cx);
+        if !self.file_settings.inlay_hints || doc.inlay_hints().is_empty() {
+            return wrap::Inlays::NONE;
+        }
+        wrap::Inlays { hints: doc.inlay_hints(), generation: doc.inlay_generation() }
+    }
+
+    /// `row` as displayed: tabs expanded, inlay hints in place (soft wrap
+    /// measures lines the same way).
     fn display_line(&self, row: usize, cx: &App) -> DisplayLine {
         let text = self.doc.read(cx).line_text(row);
-        let hints = self.doc.read(cx).inlay_hints();
-        if !self.file_settings.inlay_hints || hints.is_empty() || !self.line_breaks(row).is_empty() {
+        let (start, hints) = self.inlays(cx).of_line(self.doc.read(cx).rope(), row);
+        if hints.is_empty() {
             return DisplayLine::new(&text, self.tab_size);
         }
-        let start = self.doc.read(cx).line_start(row);
-        let end = start + text.len();
-        let first = hints.partition_point(|h| h.offset < start);
-        let inlays: Vec<(usize, &str, bool, bool)> = hints[first..]
-            .iter()
-            .take_while(|h| h.offset <= end)
-            .map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right))
-            .collect();
+        let inlays: Vec<(usize, &str, bool, bool)> = hints.iter().map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right)).collect();
         DisplayLine::with_inlays(&text, self.tab_size, &inlays)
     }
 
@@ -1520,12 +1523,13 @@ impl Editor {
             wrap,
         };
         let (char_width, version, folds, rope) = (layout.char_width, self.doc.read(cx).version(), self.folds.ranges(), self.doc.read(cx).rope());
-        // Edits re-measure only their lines; a new width, font or tab size
-        // measures them all.
+        let inlays = self.inlays(cx);
+        // Edits and new hints re-measure only their lines; a new width, font
+        // or tab size measures them all.
         if let Some(map) = self.wrap.as_mut().filter(|map| map.key == key) {
             let edits = self.doc.read(cx).line_edits_since(map.version);
             let caught_up = match edits {
-                Some(edits) => map.update(edits, version, folds, rope, window.text_system(), font.clone(), char_width),
+                Some(edits) => map.update(edits, version, folds, inlays, rope, window.text_system(), font.clone(), char_width),
                 None => false,
             };
             if caught_up {
@@ -1533,7 +1537,7 @@ impl Editor {
                 return;
             }
         }
-        let mut map = WrapMap::new(key, version, folds, rope, window.text_system(), font, char_width);
+        let mut map = WrapMap::new(key, version, folds, inlays, rope, window.text_system(), font, char_width);
         map.set_blocks(&blocks, rope);
         self.wrap = Some(map);
     }
@@ -1715,7 +1719,7 @@ impl Editor {
         if breaks.is_empty() {
             return self.first_display_row(row);
         }
-        let col = DisplayLine::new(&self.doc.read(cx).line_text(row), self.tab_size).to_display(offset - self.doc.read(cx).line_start(row));
+        let col = self.display_line(row, cx).to_display(offset - self.doc.read(cx).line_start(row));
         self.first_display_row(row) + wrap::segment_of(breaks, col)
     }
 
