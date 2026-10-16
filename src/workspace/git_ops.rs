@@ -42,7 +42,7 @@ impl Workspace {
                     p.set_status(Arc::new(RepoStatus::default()), cx);
                 });
                 ws.refresh_git(cx);
-                for editor in ws.tabs.clone() {
+                for editor in ws.editors.clone() {
                     ws.load_diff_base(&editor, cx);
                 }
                 cx.notify();
@@ -94,7 +94,7 @@ impl Workspace {
                 let status = ws.git_status.clone();
                 ws.git_panel.update(cx, |p, cx| p.set_status(status, cx));
                 // HEAD or the index may have moved (commits, staging, checkouts).
-                for editor in ws.tabs.clone() {
+                for editor in ws.editors.clone() {
                     ws.load_diff_base(&editor, cx);
                 }
                 cx.notify();
@@ -108,10 +108,6 @@ impl Workspace {
         let Some(repo) = self.repo.clone() else { return };
         // A tab not read yet gets it when it is (`file_opened`).
         let Some(path) = editor.read(cx).doc.read(cx).path.clone().filter(|_| editor.read(cx).is_loaded()) else { return };
-        // Images have no lines to mark.
-        if editor.read(cx).doc.read(cx).image.is_some() {
-            return;
-        }
         let Ok(rel) = path.strip_prefix(&repo) else {
             editor.update(cx, |e, cx| e.set_diff_base(None, None, None, cx));
             return;
@@ -136,8 +132,11 @@ impl Workspace {
 
     /// Picks up on-disk changes (checkout, pull, rollback) in unmodified tabs.
     pub(super) fn reload_changed_files(&mut self, cx: &mut Context<Self>) {
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             editor.update(cx, |e, cx| e.reload_if_changed(cx));
+        }
+        for image in self.images() {
+            image.update(cx, |i, cx| i.reload_if_changed(cx));
         }
         self.tree.update(cx, |t, cx| t.rebuild(cx));
     }
@@ -420,7 +419,7 @@ impl Workspace {
                 }
                 // Staging part of a file may leave its status as it was.
                 if matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
-                    for editor in ws.tabs.clone() {
+                    for editor in ws.editors.clone() {
                         ws.load_diff_base(&editor, cx);
                     }
                 }
@@ -638,7 +637,7 @@ impl Workspace {
 
     pub(super) fn open_diff(&mut self, file: FileStatus, staged: bool, window: &mut Window, cx: &mut Context<Self>) {
         let buffer = self
-            .tabs
+            .editors
             .iter()
             .find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(file.path.as_path()))
             .map(|t| t.read(cx).text(cx));

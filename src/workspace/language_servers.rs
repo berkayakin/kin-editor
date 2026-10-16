@@ -37,7 +37,7 @@ impl Workspace {
     /// `/tmp/…` for `/private/tmp/…`).
     pub(super) fn tab_for(&self, path: &Path, cx: &App) -> Option<Entity<Editor>> {
         let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.tabs
+        self.editors
             .iter()
             .find(|t| {
                 t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p == path || p.canonicalize().is_ok_and(|p| p == wanted))

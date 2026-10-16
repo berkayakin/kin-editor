@@ -9,7 +9,7 @@ impl Workspace {
     /// The editor keeps focus, like JetBrains' Run window.
     pub(super) fn run_target(&mut self, target: RunTarget, window: &mut Window, cx: &mut Context<Self>) {
         // Unsaved edits would make the run disagree with what's on screen.
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
@@ -82,7 +82,7 @@ impl Workspace {
             return;
         }
         // What's debugged is what's on screen.
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                 editor.update(cx, |e, cx| e.save(cx)).ok();
             }
@@ -138,7 +138,7 @@ impl Workspace {
     /// Every breakpoint: open files' (which move with edits) and the rest.
     pub(super) fn all_breakpoints(&self, cx: &App) -> HashMap<PathBuf, Vec<Breakpoint>> {
         let mut all = self.breakpoints.clone();
-        for editor in &self.tabs {
+        for editor in &self.editors {
             let e = editor.read(cx);
             // A tab not read yet has its file's breakpoints in `self.breakpoints`.
             if let Some(path) = e.doc.read(cx).path.clone().filter(|_| e.is_loaded()) {

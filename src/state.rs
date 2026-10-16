@@ -189,6 +189,10 @@ pub struct PaneLayout {
 #[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct TabSession {
+    /// What the tab shows; absent for a text editor (and in sessions from
+    /// before other kinds, where an image's tab comes back as an image).
+    #[serde(skip_serializing_if = "TabKind::is_editor")]
+    pub kind: TabKind,
     /// None for an untitled buffer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -211,6 +215,23 @@ pub struct TabSession {
     /// A file's encoding when it isn't UTF-8 (a chosen one isn't guessed again).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
+}
+
+/// The kinds of pane items a session brings back (see `pane_item`).
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TabKind {
+    #[default]
+    Editor,
+    Image,
+    /// The Markdown preview of the file at `path`, which a text tab has open.
+    MarkdownPreview,
+}
+
+impl TabKind {
+    fn is_editor(&self) -> bool {
+        *self == TabKind::Editor
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -286,8 +307,10 @@ mod tests {
         let session = ProjectSession {
             root: "/work/kuana".into(),
             tabs: vec![
-                TabSession { path: Some("/work/kuana/a.rs".into()), cursor: 12, top_line: Some(40), unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
-                TabSession { path: None, cursor: 0, top_line: None, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new(), encoding: None },
+                TabSession { kind: TabKind::Editor, path: Some("/work/kuana/a.rs".into()), cursor: 12, top_line: Some(40), unsaved: None, pane: 0, pinned: true, folds: vec![[3, 9]], encoding: Some("windows-1254".into()) },
+                TabSession { kind: TabKind::Editor, path: None, cursor: 0, top_line: None, unsaved: Some("draft".into()), pane: 1, pinned: false, folds: Vec::new(), encoding: None },
+                TabSession { kind: TabKind::MarkdownPreview, path: Some("/work/kuana/README.md".into()), pane: 1, ..TabSession::default() },
+                TabSession { kind: TabKind::Image, path: Some("/work/kuana/logo.png".into()), ..TabSession::default() },
             ],
             active: 1,
             layout: Some(PaneLayout { column: false, sizes: vec![0.4, 0.6], active: vec![0, 0] }),
@@ -316,6 +339,8 @@ mod tests {
         };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(serde_json::from_str::<ProjectSession>(&json).unwrap(), session);
+        // Text tabs don't name their kind, as before there were others.
+        assert!(json.contains(r#""kind":"markdown_preview""#) && !json.contains(r#""kind":"editor""#));
 
         // Every way to debug comes back.
         let go = RunTarget {

@@ -81,7 +81,7 @@ impl Workspace {
         let files = if self.root.is_some() {
             self.project.openable()
         } else {
-            Arc::new(self.tabs.iter().filter_map(|t| t.read(cx).doc.read(cx).path.clone()).collect())
+            Arc::new(self.items().filter(|t| t.preview().is_none()).filter_map(|t| t.path(cx)).collect())
         };
         let recent = if mode == PickerMode::Projects { self.recent_projects.clone() } else { self.recent.clone() };
         let (root, actions) = (self.root.clone(), self.actions.clone());
@@ -285,7 +285,7 @@ impl Workspace {
 
     /// Current text of every open document, so searches see unsaved edits.
     pub(super) fn open_buffers(&self, cx: &App) -> HashMap<PathBuf, Arc<str>> {
-        self.tabs
+        self.editors
             .iter()
             .filter_map(|t| {
                 let e = t.read(cx);
@@ -380,7 +380,7 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| {
                 let mut failures = Vec::new();
                 for path in &files {
-                    if let Some(editor) = ws.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())) {
+                    if let Some(editor) = ws.editors.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())) {
                         editor.update(cx, |e, cx| {
                             // A restored tab not shown yet is read first, like any open file.
                             if e.load(cx).is_err() {
@@ -421,7 +421,7 @@ impl Workspace {
     /// editors about ⌘/Ctrl (links under the pointer): only the focused one
     /// hears it, and the pointer may rest on another.
     pub(super) fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|p| p.tabs.get(p.active).cloned()).collect();
+        let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|p| p.tabs.get(p.active)?.editor().cloned()).collect();
         for editor in shown {
             editor.update(cx, |e, cx| e.secondary_modifier_changed(event.modifiers.secondary(), window, cx));
         }

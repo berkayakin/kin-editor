@@ -21,34 +21,10 @@ impl Workspace {
         for (pane_ix, pane) in self.panes.iter().enumerate() {
             let mut active_in_pane = 0;
             let mut count = 0;
-            for (ix, tab) in pane.tabs.iter().enumerate() {
-                let e = tab.read(cx);
-                let doc = e.doc.read(cx);
-                let mut session =
-                    TabSession { path: doc.path.clone(), pane: pane_ix, pinned: self.pinned.contains(&tab.entity_id()), ..TabSession::default() };
-                let text = if let Some(u) = e.unloaded() {
-                    // A tab not read yet goes back as it was restored.
-                    session.cursor = u.cursor;
-                    session.top_line = u.top_line;
-                    session.folds = u.folds.clone();
-                    session.encoding = u.encoding.filter(|&enc| enc != TextEncoding::UTF8).map(TextEncoding::key);
-                    u.unsaved.clone()
-                } else if !e.is_loaded() {
-                    // A split of one: its own caret and view (the text, folds
-                    // and encoding go with that tab).
-                    (session.cursor, session.top_line) = e.waiting_view().unwrap_or_default();
-                    None
-                } else {
-                    // An untitled buffer without edits has nothing to bring back.
-                    if doc.path.is_none() && !doc.is_dirty() {
-                        continue;
-                    }
-                    session.cursor = e.primary_selection().head;
-                    session.top_line = e.top_line(cx);
-                    session.folds = e.folded_rows(cx);
-                    session.encoding = (doc.encoding != TextEncoding::UTF8).then(|| doc.encoding.key());
-                    doc.is_dirty().then(|| doc.rope().clone())
-                };
+            for (ix, item) in pane.tabs.iter().enumerate() {
+                let Some((mut session, text)) = item.read(cx).session(cx) else { continue };
+                session.pane = pane_ix;
+                session.pinned = self.pinned.contains(&item.entity_id());
                 if ix == pane.active {
                     active_in_pane = count;
                     if pane_ix == self.active_pane {
@@ -110,35 +86,25 @@ impl Workspace {
         // Tabs read their files when first shown (see `Editor::load`): the
         // current tab of each pane right away, the others when activated.
         let mut restored: Vec<(PathBuf, Entity<Editor>)> = Vec::new();
-        for tab in session.tabs {
-            // The file is gone and there's nothing unsaved to keep.
-            if tab.unsaved.is_none() && tab.path.as_deref().is_none_or(|p| !p.is_file()) {
-                continue;
+        let mut items = Vec::new();
+        for tab in &session.tabs {
+            items.push(match tab.kind {
+                // Sessions from before images had their own tabs list them as text.
+                TabKind::Image => self.restore_image(tab, cx),
+                TabKind::Editor if tab.path.as_deref().is_some_and(crate::preview::is_image) => self.restore_image(tab, cx),
+                TabKind::Editor => self.restore_editor(tab, &mut restored, cx),
+                TabKind::MarkdownPreview => None,
+            });
+        }
+        // Previews once their documents are there (a preview may be in a pane
+        // before its file's).
+        for (tab, item) in session.tabs.iter().zip(&mut items) {
+            if tab.kind == TabKind::MarkdownPreview {
+                *item = self.restore_preview(tab, &restored, cx);
             }
-            let encoding = tab.encoding.as_deref().and_then(TextEncoding::from_key);
-            // Text the file has by now isn't unsaved (auto-save wrote it after
-            // the session was written).
-            let unsaved = tab.unsaved.filter(|text| tab.path.as_deref().is_none_or(|p| !Document::file_has(p, text, encoding)));
-            let unloaded = Unloaded {
-                cursor: tab.cursor,
-                top_line: tab.top_line,
-                unsaved: unsaved.as_deref().map(ropey::Rope::from_str),
-                folds: tab.folds,
-                encoding,
-            };
-            // A file shown in two panes is one document, in two editors.
-            let shown = tab.path.as_ref().and_then(|p| restored.iter().find(|(q, _)| q == p)).map(|(_, e)| e.clone());
-            let editor = match shown {
-                Some(first) => cx.new(|cx| {
-                    let mut split = Editor::view_of(&first, cx);
-                    split.set_waiting_view(tab.cursor, tab.top_line);
-                    split
-                }),
-                None => cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx)),
-            };
-            if let Some(path) = &tab.path {
-                restored.push((path.clone(), editor.clone()));
-            }
+        }
+        for (tab, item) in session.tabs.into_iter().zip(items) {
+            let Some(item) = item else { continue };
             // Into the pane it was in, creating panes as needed.
             while self.panes.len() <= tab.pane.min(7) {
                 self.panes.push(Pane::new());
@@ -146,11 +112,11 @@ impl Workspace {
             }
             self.active_pane = tab.pane.min(7);
             if tab.pinned {
-                self.pinned.insert(editor.entity_id());
+                self.pinned.insert(item.entity_id());
             }
-            let at = self.insert_tab(editor, window, cx);
+            let at = self.insert_tab(item, window, cx);
             self.panes[self.active_pane].active = at;
-            if let Some(path) = tab.path {
+            if let Some(path) = tab.path.filter(|_| tab.kind != TabKind::MarkdownPreview) {
                 self.recent.retain(|p| p != &path);
                 self.recent.insert(0, path);
             }
@@ -167,15 +133,59 @@ impl Workspace {
         } else {
             self.pane_sizes = vec![1. / self.panes.len() as f32; self.panes.len()];
         }
-        if let Some(editor) = self.tabs_in_order().get(session.active).cloned() {
-            self.activate_editor(&editor, window, cx);
+        let active = self.items().nth(session.active).cloned();
+        if let Some(item) = active {
+            self.activate_item(&item, window, cx);
         }
+        self.sync_previewed(cx);
         self.load_shown_tabs(cx);
     }
 
-    /// Tabs in pane order, as the session lists them.
-    pub(super) fn tabs_in_order(&self) -> Vec<Entity<Editor>> {
-        self.panes.iter().flat_map(|p| p.tabs.iter().cloned()).collect()
+    /// A text tab from the session, not read yet; `restored` lists the files
+    /// restored so far, so a file shown twice is one document.
+    fn restore_editor(&mut self, tab: &TabSession, restored: &mut Vec<(PathBuf, Entity<Editor>)>, cx: &mut Context<Self>) -> Option<PaneItem> {
+        // The file is gone and there's nothing unsaved to keep.
+        if tab.unsaved.is_none() && tab.path.as_deref().is_none_or(|p| !p.is_file()) {
+            return None;
+        }
+        let encoding = tab.encoding.as_deref().and_then(TextEncoding::from_key);
+        // Text the file has by now isn't unsaved (auto-save wrote it after
+        // the session was written).
+        let unsaved = tab.unsaved.as_ref().filter(|text| tab.path.as_deref().is_none_or(|p| !Document::file_has(p, text, encoding)));
+        let unloaded = Unloaded {
+            cursor: tab.cursor,
+            top_line: tab.top_line,
+            unsaved: unsaved.map(|text| ropey::Rope::from_str(text)),
+            folds: tab.folds.clone(),
+            encoding,
+        };
+        // A file shown in two panes is one document, in two editors.
+        let shown = tab.path.as_ref().and_then(|p| restored.iter().find(|(q, _)| q == p)).map(|(_, e)| e.clone());
+        let editor = match shown {
+            Some(first) => cx.new(|cx| {
+                let mut split = Editor::view_of(&first, cx);
+                split.set_waiting_view(tab.cursor, tab.top_line);
+                split
+            }),
+            None => cx.new(|cx| Editor::new_unloaded(tab.path.clone(), unloaded, cx)),
+        };
+        if let Some(path) = &tab.path {
+            restored.push((path.clone(), editor.clone()));
+        }
+        Some(editor.into())
+    }
+
+    fn restore_image(&mut self, tab: &TabSession, cx: &mut Context<Self>) -> Option<PaneItem> {
+        let path = tab.path.clone().filter(|p| p.is_file())?;
+        Some(cx.new(|cx| ImageView::new(path, cx)).into())
+    }
+
+    /// A preview follows a document a text tab has open (one restored before
+    /// it); without one, it isn't brought back.
+    fn restore_preview(&mut self, tab: &TabSession, restored: &[(PathBuf, Entity<Editor>)], cx: &mut Context<Self>) -> Option<PaneItem> {
+        let path = tab.path.as_ref()?;
+        let doc = restored.iter().find(|(p, _)| p == path)?.1.read(cx).doc.clone();
+        Some(cx.new(|cx| MarkdownPreview::new(doc, cx)).into())
     }
 
     /// Removes empty panes (keeping at least one) and rebalances sizes.

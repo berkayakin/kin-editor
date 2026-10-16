@@ -36,8 +36,11 @@ use crate::{
     extensions,
     editor::{
         self, Cancel, Editor, EditorBreakpointMenu, EditorBreakpointsChanged, EditorContextMenu, EditorEvent, EditorGitEvent, EditorLoaded,
-        EditorLspEvent, EditorRunEvent, GitFile, Unloaded,
+        EditorLspEvent, EditorPreviewToggle, EditorRunEvent, GitFile, ToggleMarkdownPreview, Unloaded,
     },
+    image_view::ImageView,
+    markdown_preview::MarkdownPreview,
+    pane_item::{PaneItem, Saving, TabIcon},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent},
     problems_panel::{ProblemsEvent, ProblemsPanel},
@@ -54,7 +57,7 @@ use crate::{
     project_search::{ProjectSearch, ProjectSearchEvent},
     search::{SearchQuery},
     state::{
-        FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabSession, TerminalGroupSession, TerminalLayout, TerminalTabSession,
+        FileBreakpoints, PaneLayout, ProjectSession, SessionState, TabKind, TabSession, TerminalGroupSession, TerminalLayout, TerminalTabSession,
         WindowPlacement,
     },
     syntax::Language,
@@ -356,7 +359,7 @@ enum BottomPanel {
 
 /// A group of tabs with its own tab bar; panes sit side by side or stacked.
 struct Pane {
-    tabs: Vec<Entity<Editor>>,
+    tabs: Vec<PaneItem>,
     active: usize,
 }
 
@@ -399,7 +402,7 @@ enum PaneAxis {
 /// A tab being dragged to a new place or pane.
 #[derive(Clone)]
 struct DraggedTab {
-    editor: Entity<Editor>,
+    item: PaneItem,
     name: SharedString,
 }
 
@@ -426,7 +429,7 @@ enum MenuAction {
     Run(Box<dyn gpui::Action>),
     /// A language server's fix or refactoring.
     CodeAction(Arc<Server>, CodeAction),
-    Tab(TabAction, Entity<Editor>),
+    Tab(TabAction, PaneItem),
     /// Status bar: save with these line endings (true: CRLF).
     LineEndings(bool, Entity<Editor>),
     Encoding(TextEncoding, Entity<Editor>),
@@ -535,6 +538,8 @@ impl ModalLayer {
     }
 }
 
+/// The most panes the editor area splits into.
+const MAX_PANES: usize = 6;
 /// How long two Shift taps may be apart to count as a double Shift.
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 /// How long Save waits for format on save before saving unformatted.
@@ -586,8 +591,9 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     file_history: crate::file_history::FileHistory,
     root: Option<PathBuf>,
-    /// Every open editor, in any pane (for saving, searching, sessions).
-    tabs: Vec<Entity<Editor>>,
+    /// Every open text editor, in any pane (for saving, searching, language
+    /// servers); `panes` hold them and the other kinds of tabs.
+    editors: Vec<Entity<Editor>>,
     panes: Vec<Pane>,
     active_pane: usize,
     pane_axis: PaneAxis,
@@ -841,7 +847,7 @@ impl Workspace {
             let settings = Settings::get(cx).clone();
             ws.auto_save = settings.auto_save.unwrap_or_default();
             ws.auto_save_delay = Duration::from_millis(settings.auto_save_delay.unwrap_or(1000).max(50));
-            for tab in ws.tabs.clone() {
+            for tab in ws.editors.clone() {
                 tab.update(cx, |e, cx| e.apply_settings(cx));
             }
             ws.lsp.update(cx, |s, cx| s.settings_changed(cx));
@@ -893,7 +899,7 @@ impl Workspace {
             focus_handle,
             file_history: Default::default(),
             root: None,
-            tabs: Vec::new(),
+            editors: Vec::new(),
             panes: vec![Pane::new()],
             active_pane: 0,
             pane_axis: PaneAxis::Row,
@@ -1006,8 +1012,8 @@ impl Workspace {
             window.focus(&onboarding.focus_handle(cx));
             return;
         }
-        match self.active_editor() {
-            Some(editor) => window.focus(&editor.focus_handle(cx)),
+        match self.active_item() {
+            Some(item) => window.focus(&item.focus_handle(cx)),
             None => window.focus(&self.focus_handle),
         }
     }
@@ -1018,18 +1024,28 @@ impl Workspace {
             self.set_root(path, window, cx);
             return;
         }
-        if let Some(editor) = self.tabs.iter().find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(path.as_path())).cloned() {
-            self.activate_editor(&editor, window, cx);
+        // Open already (a preview of it doesn't count).
+        let open = self.items().find(|t| t.preview().is_none() && t.path(cx).as_deref() == Some(path.as_path())).cloned();
+        if let Some(item) = open {
+            self.activate_item(&item, window, cx);
             return;
         }
-        match Document::open(&path) {
-            Ok(doc) => {
-                if doc.large {
+        let mut large = false;
+        let opened = if crate::preview::is_image(&path) {
+            std::fs::metadata(&path).map(|_| PaneItem::from(cx.new(|cx| ImageView::new(path.clone(), cx))))
+        } else {
+            Document::open(&path).map(|doc| {
+                large = doc.large;
+                PaneItem::from(cx.new(|cx| Editor::new(doc, cx)))
+            })
+        };
+        match opened {
+            Ok(item) => {
+                if large {
                     let detail = "Highlighting, linting and language servers are off for files this big.";
                     self.toast(ToastKind::Info, "Opened as plain text", Some(detail.into()), cx);
                 }
-                let editor = cx.new(|cx| Editor::new(doc, cx));
-                self.add_tab(editor, window, cx);
+                self.add_tab(item, window, cx);
             }
             Err(err) => {
                 let message = format!("Couldn't open {}", path.display());
@@ -1057,49 +1073,65 @@ impl Workspace {
         }
     }
 
-    fn add_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        let at = self.insert_tab(editor, window, cx);
+    fn add_tab(&mut self, item: PaneItem, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.insert_tab(item, window, cx);
         self.activate_in(self.active_pane, at, window, cx);
     }
 
     /// Adds a tab to the active pane without showing it; returns its index.
-    fn insert_tab(&mut self, editor: Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        self._subscriptions.push(cx.observe(&editor, |_, _, cx| cx.notify()));
-        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorEvent, cx| {
-            ws.schedule_auto_save(&editor, cx);
-            ws.schedule_session_save(cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
-            ws.open_editor_menu(editor.clone(), event.0, window, cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
-            ws.on_editor_lsp_event(event, window, cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
-            ws.on_run_event(event, window, cx);
-        }));
-        self._subscriptions.push(cx.subscribe(&editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
-            ws.breakpoints_changed(&editor, cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
-            ws.open_breakpoint_menu(editor.clone(), event.row, event.position, window, cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
-            ws.run_git(event.0.clone(), window, cx);
-        }));
-        self._subscriptions.push(cx.subscribe_in(&editor, window, |ws, editor, event: &EditorLoaded, window, cx| {
-            ws.tab_loaded(editor, event, window, cx);
-        }));
-        if editor.read(cx).is_loaded() {
-            self.file_opened(&editor, cx);
+    fn insert_tab(&mut self, item: PaneItem, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // Tabs show titles, dirty dots and errors from what they hold.
+        match &item {
+            PaneItem::Editor(editor) => self.add_editor(editor, window, cx),
+            PaneItem::Image(image) => self._subscriptions.push(cx.observe(image, |_, _, cx| cx.notify())),
+            PaneItem::Preview(preview) => self._subscriptions.push(cx.observe(preview, |_, _, cx| cx.notify())),
         }
-        self.tabs.push(editor.clone());
         let pane = &mut self.panes[self.active_pane];
         // After the current tab, but never among pinned ones.
         let pinned = pane.tabs.iter().filter(|t| self.pinned.contains(&t.entity_id())).count();
         let at = if pane.tabs.is_empty() { 0 } else { (pane.active + 1).max(pinned).min(pane.tabs.len()) };
-        pane.tabs.insert(at, editor);
+        pane.tabs.insert(at, item);
         at
+    }
+
+    /// A new text tab: the workspace hears what it asks for and starts what
+    /// its file needs.
+    fn add_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
+        self._subscriptions.push(cx.observe(editor, |_, _, cx| cx.notify()));
+        self._subscriptions.push(cx.subscribe(editor, |ws, editor, _: &EditorEvent, cx| {
+            ws.schedule_auto_save(&editor, cx);
+            ws.schedule_session_save(cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, editor, event: &EditorContextMenu, window, cx| {
+            ws.open_editor_menu(editor.clone(), event.0, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, _, event: &EditorLspEvent, window, cx| {
+            ws.on_editor_lsp_event(event, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, _, event: &EditorRunEvent, window, cx| {
+            ws.on_run_event(event, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe(editor, |ws, editor, _: &EditorBreakpointsChanged, cx| {
+            ws.breakpoints_changed(&editor, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, editor, event: &EditorBreakpointMenu, window, cx| {
+            ws.open_breakpoint_menu(editor.clone(), event.row, event.position, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, _, event: &EditorGitEvent, window, cx| {
+            ws.run_git(event.0.clone(), window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, editor, event: &EditorLoaded, window, cx| {
+            ws.tab_loaded(editor, event, window, cx);
+        }));
+        self._subscriptions.push(cx.subscribe_in(editor, window, |ws, editor, _: &EditorPreviewToggle, window, cx| {
+            ws.toggle_preview_of(editor, window, cx);
+        }));
+        if editor.read(cx).is_loaded() {
+            self.file_opened(editor, cx);
+        }
+        self.editors.push(editor.clone());
+        // A preview of its document may be open (a split of the file).
+        self.sync_previewed(cx);
     }
 
     /// What starts once a tab's text is there (when it opens, or when a
@@ -1151,9 +1183,24 @@ impl Workspace {
     /// Activation reads its tab already; this covers a pane whose current tab
     /// changed otherwise (a tab closed or moved out of it).
     fn load_shown_tabs(&mut self, cx: &mut Context<Self>) {
-        let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|pane| pane.tabs.get(pane.active).cloned()).collect();
-        for editor in shown {
-            self.load_tab(&editor, cx);
+        let shown: Vec<PaneItem> = self.panes.iter().filter_map(|pane| pane.tabs.get(pane.active).cloned()).collect();
+        for item in shown {
+            self.load_item(&item, cx);
+        }
+    }
+
+    /// Reads the file behind a tab if it's a restored one not read yet: an
+    /// editor's, or the document a Markdown preview shows.
+    fn load_item(&mut self, item: &PaneItem, cx: &mut Context<Self>) {
+        match item {
+            PaneItem::Editor(editor) => self.load_tab(editor, cx),
+            PaneItem::Preview(preview) => {
+                let doc = preview.read(cx).document().clone();
+                if let Some(editor) = self.editors.iter().find(|e| e.read(cx).doc == doc).cloned() {
+                    self.load_tab(&editor, cx);
+                }
+            }
+            PaneItem::Image(_) => {}
         }
     }
 
@@ -1176,25 +1223,32 @@ impl Workspace {
     /// The other tabs showing `editor`'s document.
     fn siblings(&self, editor: &Entity<Editor>, cx: &App) -> Vec<Entity<Editor>> {
         let e = editor.read(cx);
-        self.tabs.iter().filter(|t| *t != editor && t.read(cx).shares_document(e)).cloned().collect()
+        self.editors.iter().filter(|t| *t != editor && t.read(cx).shares_document(e)).cloned().collect()
     }
 
     /// Shows an open editor in its pane and focuses it.
     fn activate_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((pane, ix)) = self.locate(editor) {
+        if let Some((pane, ix)) = self.locate(editor.entity_id()) {
             self.activate_in(pane, ix, window, cx);
         }
     }
 
-    /// The pane holding `editor` and its index there.
-    fn locate(&self, editor: &Entity<Editor>) -> Option<(usize, usize)> {
-        self.panes.iter().enumerate().find_map(|(p, pane)| pane.tabs.iter().position(|t| t == editor).map(|ix| (p, ix)))
+    /// Shows a tab in its pane and focuses it.
+    fn activate_item(&mut self, item: &PaneItem, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((pane, ix)) = self.locate(item.entity_id()) {
+            self.activate_in(pane, ix, window, cx);
+        }
+    }
+
+    /// The pane holding a tab (by its view's id) and its index there.
+    fn locate(&self, id: EntityId) -> Option<(usize, usize)> {
+        self.panes.iter().enumerate().find_map(|(p, pane)| pane.tabs.iter().position(|t| t.entity_id() == id).map(|ix| (p, ix)))
     }
 
     fn activate_in(&mut self, pane: usize, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self.panes.get(pane).and_then(|p| p.tabs.get(ix)).cloned() {
+        if let Some(item) = self.panes.get(pane).and_then(|p| p.tabs.get(ix)).cloned() {
             if let Some(previous) = self.active_editor().cloned()
-                && previous != editor
+                && Some(&previous) != item.editor()
                 && matches!(self.auto_save, AutoSave::AfterDelay | AutoSave::OnFocusChange)
             {
                 self.auto_save(&previous, cx);
@@ -1207,24 +1261,41 @@ impl Workspace {
             self.active_pane = pane;
             self.panes[pane].active = ix;
             // A restored tab reads its file when first shown.
-            self.load_tab(&editor, cx);
-            window.focus(&editor.focus_handle(cx));
-            if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
+            self.load_item(&item, cx);
+            window.focus(&item.focus_handle(cx));
+            // A preview is of a file opened already.
+            if let Some(path) = item.path(cx).filter(|_| item.preview().is_none()) {
                 self.recent.retain(|p| p != &path);
                 self.recent.insert(0, path);
                 self.recent.truncate(50);
             }
             if self.show_find {
-                self.find_bar.update(cx, |f, cx| f.set_target(Some(editor), cx));
+                self.find_bar.update(cx, |f, cx| f.set_target(item.editor().cloned(), cx));
             }
             self.schedule_session_save(cx);
         }
         cx.notify();
     }
 
-    fn active_editor(&self) -> Option<&Entity<Editor>> {
+    /// The current tab of the current pane.
+    fn active_item(&self) -> Option<&PaneItem> {
         let pane = self.panes.get(self.active_pane)?;
         pane.tabs.get(pane.active)
+    }
+
+    /// The current tab, if it's a text editor.
+    fn active_editor(&self) -> Option<&Entity<Editor>> {
+        self.active_item()?.editor()
+    }
+
+    /// Every tab, in pane order.
+    fn items(&self) -> impl Iterator<Item = &PaneItem> {
+        self.panes.iter().flat_map(|pane| &pane.tabs)
+    }
+
+    /// The image tabs.
+    fn images(&self) -> Vec<Entity<ImageView>> {
+        self.items().filter_map(|t| t.image().cloned()).collect()
     }
 }
 
@@ -1234,7 +1305,12 @@ impl Workspace {
 /// window again. It fills its parent. State it draws must reach it through
 /// its own `cx.notify()`; focus changes and theme switches refresh the window.
 fn cached<V: Render>(view: &Entity<V>) -> AnyView {
-    AnyView::from(view.clone()).cached(StyleRefinement::default().size_full())
+    cached_view(AnyView::from(view.clone()))
+}
+
+/// [`cached`] for a view of any kind (a pane's tab).
+fn cached_view(view: AnyView) -> AnyView {
+    view.cached(StyleRefinement::default().size_full())
 }
 
 fn plural(n: usize) -> &'static str {

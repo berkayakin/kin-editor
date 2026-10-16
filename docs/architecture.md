@@ -30,7 +30,9 @@ bindings, colors, icons) are in the [contributing guide](../CONTRIBUTING.md).
 - `src/git.rs`, `src/git_panel.rs`, `src/diff_view.rs`, `src/git_log.rs`, `src/push_dialog.rs`,
   `src/branch_picker.rs`, `src/clone_dialog.rs` — Git backend and UI
 - `src/conflict.rs`, `src/editor/conflict.rs` — merge conflict markers and their resolution
-- `src/preview.rs` — image files
+- `src/pane_item.rs` — what a pane's tab can show: an editor, an image or a Markdown preview
+- `src/preview.rs`, `src/image_view.rs` — image files and their tab
+- `src/markdown_preview.rs`, `src/markdown_preview/view.rs` — the Markdown preview and its tab
 - `src/settings.rs`, `src/editorconfig.rs`, `src/preferences.rs`, `src/preferences/` —
   `settings.json`, `.editorconfig` and the Settings dialog
 - `src/state.rs` — remembered UI state and per-project sessions

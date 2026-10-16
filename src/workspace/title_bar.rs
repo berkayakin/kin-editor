@@ -414,11 +414,8 @@ impl Workspace {
     }
 
     pub(super) fn update_window_title(&mut self, window: &mut Window, cx: &App) {
-        let mut title = match self.active_editor() {
-            Some(e) => {
-                let doc = e.read(cx).doc.read(cx);
-                format!("{}{}", doc.file_name(), if doc.is_dirty() { " •" } else { "" })
-            }
+        let mut title = match self.active_item() {
+            Some(item) => format!("{}{}", item.tab_title(cx), if item.is_dirty(cx) { " •" } else { "" }),
             None => "Kuana".into(),
         };
         if let Some(root) = self.root.as_deref() {

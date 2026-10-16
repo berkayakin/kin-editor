@@ -390,7 +390,7 @@ impl Workspace {
                 self.close_tab(&CloseTab, window, cx);
             }
             "wa" | "wall" => {
-                for editor in self.tabs.clone() {
+                for editor in self.editors.clone() {
                     if editor.read(cx).doc.read(cx).is_dirty() && editor.read(cx).doc.read(cx).path.is_some() {
                         editor.update(cx, |e, cx| e.save(cx)).ok();
                     }
@@ -521,7 +521,7 @@ impl Workspace {
                 }
             });
         }
-        let dirty = self.tabs.iter().any(|t| {
+        let dirty = self.editors.iter().any(|t| {
             let doc = t.read(cx).doc.read(cx);
             doc.is_dirty() && doc.path.as_deref().is_some_and(|p| trashes.iter().any(|t| p.starts_with(t)))
         });
@@ -552,11 +552,7 @@ impl Workspace {
                 }
                 Change::Trashed(trashed) => {
                     let path = &trashed.original;
-                    for editor in self.tabs.clone() {
-                        if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(path)) {
-                            self.remove_tab(&editor, window, cx);
-                        }
-                    }
+                    self.close_tabs_under(path, window, cx);
                     self.tree.update(cx, |t, _| t.forget(path));
                     self.recent.retain(|p| !p.starts_with(path));
                 }
@@ -576,12 +572,17 @@ impl Workspace {
     /// Keeps open tabs, expanded folders and recents pointing at moved files.
     pub(super) fn moved(&mut self, old: &Path, new: &Path, cx: &mut Context<Self>) {
         let remap = |p: &Path| p.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) });
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             let path = editor.read(cx).doc.read(cx).path.clone();
             if let Some((path, moved)) = path.as_deref().and_then(|p| Some((p, remap(p)?))) {
                 editor.update(cx, |e, cx| e.set_path(moved, cx));
                 self.lsp.update(cx, |s, cx| s.moved(path, &editor, cx));
                 self.load_diff_base(&editor, cx);
+            }
+        }
+        for image in self.images() {
+            if let Some(moved) = remap(image.read(cx).path()) {
+                image.update(cx, |i, cx| i.set_path(moved, cx));
             }
         }
         self.tree.update(cx, |t, _| t.remap(remap));
@@ -724,7 +725,7 @@ impl Workspace {
 
     /// Shows the active file in the tree: opens its folders and scrolls to it.
     pub(super) fn select_opened_file(&mut self, _: &SelectOpenedFile, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone()) else { return };
+        let Some(path) = self.active_item().and_then(|t| t.path(cx)) else { return };
         if !self.root.as_deref().is_some_and(|r| path.starts_with(r)) {
             return;
         }
@@ -770,7 +771,7 @@ impl Workspace {
 
     pub(super) fn confirm_trash(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let dirty = self.tabs.iter().any(|t| {
+        let dirty = self.editors.iter().any(|t| {
             let doc = t.read(cx).doc.read(cx);
             doc.is_dirty() && doc.path.as_deref().is_some_and(|p| p.starts_with(&path))
         });
@@ -801,6 +802,21 @@ impl Workspace {
         .detach();
     }
 
+    /// Closes the tabs of a file, or of the files in a folder, that went to
+    /// the Trash, unsaved edits and all (the user was asked).
+    fn close_tabs_under(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        for editor in self.editors.clone() {
+            if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(path)) {
+                self.remove_tab(&editor, window, cx);
+            }
+        }
+        for image in self.images() {
+            if image.read(cx).path().starts_with(path) {
+                self.remove_item(&image.into(), window, cx);
+            }
+        }
+    }
+
     /// Moves a file or folder to the Trash (undoable), closing its tabs.
     fn move_to_trash(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         let trashed = match crate::file_history::move_to_trash(path) {
@@ -812,11 +828,7 @@ impl Workspace {
         };
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let id = self.file_history.record(format!("Delete “{name}”"), crate::file_history::Change::Trashed(trashed));
-        for editor in self.tabs.clone() {
-            if editor.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p.starts_with(path)) {
-                self.remove_tab(&editor, window, cx);
-            }
-        }
+        self.close_tabs_under(path, window, cx);
         self.tree.update(cx, |t, _| t.forget(path));
         self.recent.retain(|p| !p.starts_with(path));
         self.after_fs_change(cx);

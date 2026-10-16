@@ -385,6 +385,8 @@ fn vscode(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-f12", GoToImplementation, e),
         KeyBinding::new("secondary-t", GoToSymbol, None),
         KeyBinding::new("secondary-k v", ToggleMarkdownPreview, e),
+        // The preview has it too: it closes there.
+        KeyBinding::new("secondary-k v", ToggleMarkdownPreview, Some("MarkdownPreview")),
         KeyBinding::new("shift-f12", FindUsages, e),
         KeyBinding::new("alt-shift-f12", FindUsages, e),
         KeyBinding::new("f2", RenameSymbol, e),
@@ -559,6 +561,8 @@ fn zed(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-f12", GoToTypeDefinition, e),
         KeyBinding::new("secondary-t", GoToSymbol, None),
         KeyBinding::new("secondary-k v", ToggleMarkdownPreview, e),
+        // The preview has it too: it closes there.
+        KeyBinding::new("secondary-k v", ToggleMarkdownPreview, Some("MarkdownPreview")),
         KeyBinding::new("f5", Resume, None),
         KeyBinding::new("shift-f5", StopRun, None),
         KeyBinding::new("f9", ToggleBreakpoint, e),
