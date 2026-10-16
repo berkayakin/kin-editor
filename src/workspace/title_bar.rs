@@ -412,9 +412,18 @@ impl Workspace {
             Some(keys) => format!("{tip}. {label} ({keys})"),
             None => format!("{tip}. {label}"),
         };
+        let dim: Hsla = theme.text_dim.into();
+        let bright: Hsla = theme.text.into();
+        let count = move |icon: Icon, n: u32| {
+            div().flex().items_center().gap(px(2.)).child(
+                svg().path(icon.path()).size(px(14.)).flex_shrink_0().text_color(dim).group_hover("sync-counts", move |s| s.text_color(bright)),
+            )
+            .child(n.to_string())
+        };
         Some(
             div()
                 .id("sync-counts")
+                .group("sync-counts")
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -436,8 +445,8 @@ impl Workspace {
                     }
                 }))
                 .tooltip(move |_, cx| tooltip_view(tip.clone(), cx))
-                .when(ahead > 0, |el| el.child(format!("↑{ahead}")))
-                .when(behind > 0, |el| el.child(format!("↓{behind}"))),
+                .when(ahead > 0, |el| el.child(count(Icon::ArrowUp, ahead)))
+                .when(behind > 0, |el| el.child(count(Icon::ArrowDown, behind))),
         )
     }
 
