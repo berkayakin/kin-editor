@@ -302,10 +302,9 @@ fn set_dock_icon() {
 
 /// AppKit zooms a window on a double click in its title bar strip before the
 /// view under the pointer sees the click: on the title bar's buttons too, and
-/// on its empty parts along with Kuana's own handler (`render_titlebar`), so
-/// the two could cancel out. Double clicks in that strip go to GPUI's view
-/// directly; Kuana zooms only over the bar's empty parts. Single clicks still
-/// go through AppKit, which drags the window by the bar.
+/// along with Kuana's own drag areas, so the two could cancel out. Double
+/// clicks in that strip go to GPUI's view directly (`window_drag_area` zooms);
+/// single ones still go through AppKit (the traffic lights are its buttons).
 #[cfg(target_os = "macos")]
 fn limit_window_zoom() {
     use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};

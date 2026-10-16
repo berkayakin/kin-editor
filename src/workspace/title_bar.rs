@@ -1,23 +1,52 @@
 //! The title bar: project and branch chips, the run widget, panel toggles, search and settings, window controls.
 
 use super::*;
-use gpui::{DispatchPhase, canvas, svg};
-use std::sync::atomic::{AtomicBool, Ordering};
+use gpui::svg;
 
-/// macOS: whether the pointer is over one of the title bar's empty parts, where
-/// a double click zooms the window (Kuana's, since `limit_window_zoom` in
-/// `main.rs` keeps AppKit's from happening anywhere on the bar, its buttons
-/// and chips included).
-static OVER_DRAG_AREA: AtomicBool = AtomicBool::new(false);
-
-/// One of the title bar's empty parts: what the system drags (Windows), or
-/// where a double click zooms the window (macOS, see `OVER_DRAG_AREA`).
-fn drag_area() -> Div {
+/// Free space on the window's chrome (the title bar's empty parts, the room
+/// after the top tab strips' tabs, the status bar's): drags the window, and a
+/// double click zooms it. Only where nothing else is: a press reaches every
+/// element under the pointer, so behind a tab it would move the window too.
+/// Windows: the system does both over a drag area that no GPUI listener
+/// handles, so it's occluded (the workspace root's focus-on-click would
+/// count), which hides it from whatever is behind: drops that should land
+/// there go on it too. macOS: a press hands the window to the window server.
+pub(super) fn window_drag_area(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
     div()
+        .id(id)
         .h_full()
-        .flex_shrink_0()
         .window_control_area(WindowControlArea::Drag)
-        .when(cfg!(target_os = "macos"), |el| el.on_mouse_move(|_, _, _| OVER_DRAG_AREA.store(true, Ordering::Relaxed)))
+        .when(cfg!(windows), |el| el.occlude())
+        .when(cfg!(target_os = "macos"), |el| {
+            el.on_mouse_down(MouseButton::Left, |event, window, cx| {
+                cx.stop_propagation();
+                if event.click_count >= 2 {
+                    window.titlebar_double_click();
+                } else {
+                    #[cfg(target_os = "macos")]
+                    drag_window();
+                }
+            })
+        })
+}
+
+/// Moves the key window with the pointer, from the mouse down being handled.
+#[cfg(target_os = "macos")]
+fn drag_window() {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    let Some(app) = AnyClass::get(c"NSApplication") else { return };
+    unsafe {
+        let app: *mut AnyObject = msg_send![app, sharedApplication];
+        let Some(app) = app.as_ref() else { return };
+        let event: *mut AnyObject = msg_send![app, currentEvent];
+        let Some(event) = event.as_ref() else { return };
+        let window: *mut AnyObject = msg_send![event, window];
+        if let Some(window) = window.as_ref() {
+            let _: () = msg_send![window, performWindowDragWithEvent: event];
+        }
+    }
 }
 
 impl Workspace {
@@ -40,36 +69,15 @@ impl Workspace {
             // don't happen. Blocking the mouse keeps the workspace root from
             // taking focus on it.
             .when(cfg!(windows), |el| el.occlude())
-            .when(mac, |el| {
-                el.on_click(|event: &ClickEvent, window, _| {
-                    if event.click_count() == 2 && OVER_DRAG_AREA.load(Ordering::Relaxed) {
-                        window.titlebar_double_click();
-                    }
-                })
-                // Every move starts off the drag areas; one under the pointer
-                // says otherwise (bubble phase, after this).
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        |_, _, window, _| {
-                            window.on_mouse_event(|_: &MouseMoveEvent, phase, _, _| {
-                                if phase == DispatchPhase::Capture {
-                                    OVER_DRAG_AREA.store(false, Ordering::Relaxed);
-                                }
-                            })
-                        },
-                    )
-                    .absolute()
-                    .size_0(),
-                )
-            })
             // Drag areas (Windows) are the bar's empty parts, not the bar itself:
             // GPUI picks the first control area under the pointer, and a parent's
             // comes before its children's (the window buttons).
             //
             // Room for the traffic lights, which macOS moves out of the window in full screen.
-            .child(drag_area().w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. })))
-            .when(app_menu::APP_MENU_IN_TITLE_BAR, |el| el.child(self.render_app_menu(cx)).child(drag_area().w(px(GAP))))
+            .child(window_drag_area("titlebar-start").flex_shrink_0().w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. })))
+            .when(app_menu::APP_MENU_IN_TITLE_BAR, |el| {
+                el.child(self.render_app_menu(cx)).child(window_drag_area("titlebar-menu-gap").flex_shrink_0().w(px(GAP)))
+            })
             // The chips give way (their names cut) before the tools would. An
             // open app menu's names take their place.
             .when(!self.app_menu_open(), |el| el.child(
@@ -78,18 +86,19 @@ impl Workspace {
                     .min_w_0()
                     .overflow_hidden()
                     .items_center()
-                    .gap_1()
+                    .gap_1p5()
                     .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
                     .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
+                    .when_some(self.render_sync_counts(window, cx), |el, counts| el.child(counts))
                     .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
             ))
-            .child(drag_area().flex_1().flex_shrink().min_w(px(GAP)))
+            .child(window_drag_area("titlebar-middle").flex_1().min_w(px(GAP)))
             .child(
                 div()
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap_2()
+                    .gap_2p5()
                     .child(self.render_run_widget(width >= 820., window, cx))
                     .child(separator(&theme))
                     .child(self.render_panel_dock(window, cx))
@@ -99,7 +108,7 @@ impl Workspace {
                     .child(self.render_settings_button(window, cx)),
             )
             .map(|el| match mac {
-                true => el.child(drag_area().w(px(GAP + 2.))),
+                true => el.child(window_drag_area("titlebar-end").flex_shrink_0().w(px(GAP + 2.))),
                 false => el.child(div().w(px(GAP)).h_full().flex_shrink_0()).child(self.render_window_controls(cx)),
             })
     }
@@ -150,11 +159,11 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_1p5()
-                        .h(px(24.))
+                        .h(px(28.))
                         .pl_1()
                         .pr_1p5()
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_size(px(12.5))
                         .text_color(theme.text_muted)
                         .hover(|s| s.text_color(theme.text))
                         .tooltip(|window, cx| status_tooltip("Run Configuration…", &RunConfiguration, window, cx))
@@ -164,7 +173,7 @@ impl Workspace {
                         .child(
                             svg()
                                 .path(Icon::ChevronDown.path())
-                                .size(px(12.))
+                                .size(px(14.))
                                 .flex_shrink_0()
                                 .text_color(theme.text_dim)
                                 .group_hover("run-configuration", |s| s.text_color(theme.text)),
@@ -274,7 +283,7 @@ impl Workspace {
             .tooltip(|window, cx| status_tooltip("Settings", &OpenSettings, window, cx))
     }
 
-    /// A title bar icon button: just the icon, `color` at rest and `hover`
+    /// A title bar icon button: just the icon (18 px in a 30 px target), `color` at rest and `hover`
     /// under the mouse (`None` = the same color, a little brighter for being
     /// full strength: at rest it's slightly faded).
     pub(super) fn bar_button(
@@ -293,7 +302,7 @@ impl Workspace {
         div()
             .id(id)
             .group(id)
-            .size(px(26.))
+            .size(px(30.))
             .flex()
             .flex_shrink_0()
             .items_center()
@@ -301,11 +310,11 @@ impl Workspace {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(on_click))
-            .child(svg().path(icon.path()).size(px(15.)).flex_shrink_0().text_color(rest).group_hover(id, move |s| s.text_color(hover)))
+            .child(svg().path(icon.path()).size(px(18.)).flex_shrink_0().text_color(rest).group_hover(id, move |s| s.text_color(hover)))
     }
 
-    /// The open project: a tinted monogram and its folder name. Clicking
-    /// lists recent projects.
+    /// The open project: a pill like the branch chip beside it, with a round
+    /// tinted monogram and the folder name. Clicking lists recent projects.
     pub(super) fn render_project_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let name = self.root.as_deref().map(folder_name).unwrap_or_default();
@@ -316,27 +325,27 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_2()
-            .h(px(28.))
-            .pl_1()
-            .pr_2()
-            .rounded(px(8.))
+            .h(px(CHIP_HEIGHT))
+            .pl(px(4.))
+            .pr(px(12.))
+            .rounded_full()
             .cursor_pointer()
-            .text_size(px(12.5))
+            .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(theme.text)
-            .hover_bg(theme.hover)
+            .hover_fill(theme.hover, theme.active)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.recent_projects(&RecentProjects, window, cx)))
             .tooltip(|window, cx| status_tooltip("Recent Projects…", &RecentProjects, window, cx))
             .max_w(px(if narrow { 180. } else { 300. }))
             .child(
                 div()
-                    .size(px(20.))
+                    .size(px(CHIP_HEIGHT - 8.))
                     .flex()
                     .flex_shrink_0()
                     .items_center()
                     .justify_center()
-                    .rounded(px(6.))
+                    .rounded_full()
                     .map(|el| {
                         if !theme.gradients {
                             el.bg(tint)
@@ -359,29 +368,77 @@ impl Workspace {
     /// The current branch beside the project name. Clicking opens Branches….
     pub(super) fn render_branch_chip(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let s = &self.git_status;
+        // Uncommitted changes aren't marked here: the Commit tab counts them.
         div()
             .id("branch-chip")
             .flex()
             .items_center()
             .gap_1p5()
-            .h(px(24.))
+            .h(px(CHIP_HEIGHT))
             .max_w(px(if narrow { 150. } else { 280. }))
-            .px_2()
-            .rounded(px(12.))
+            .pl(px(10.))
+            .pr(px(12.))
+            .rounded_full()
             .cursor_pointer()
-            .text_size(px(12.))
+            // The same size as the project's name beside it.
+            .text_size(px(13.))
             .text_color(theme.text_muted)
             .hover_fill(theme.hover, theme.active)
             .hover(|st| st.text_color(theme.text))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.git_branches(&GitBranches, window, cx)))
             .tooltip(|window, cx| status_tooltip("Branches…", &GitBranches, window, cx))
-            .child(icon_el(Icon::GitBranch, px(12.), theme.text_dim.into()))
+            .child(icon_el(Icon::GitBranch, px(14.), theme.text_dim.into()))
             .child(div().min_w_0().truncate().child(ellipsize(&self.branch_label(), if narrow { 12 } else { 28 })))
-            // Uncommitted changes aren't marked here: the Commit tab counts them.
-            .when(s.ahead > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↑{}", s.ahead))))
-            .when(s.behind > 0, |el| el.child(div().flex_shrink_0().text_color(theme.text_dim).child(format!("↓{}", s.behind))))
+    }
+
+    /// Commits to push and to pull, beside the branch pill: Push… when there
+    /// are some to push, else Update Project.
+    pub(super) fn render_sync_counts(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let s = &self.git_status;
+        let (ahead, behind) = (s.ahead, s.behind);
+        if self.repo.is_none() || (ahead == 0 && behind == 0) {
+            return None;
+        }
+        let theme = Theme::get(cx).clone();
+        let commits = |n: u32| if n == 1 { "1 commit".to_string() } else { format!("{n} commits") };
+        let tip = match (ahead, behind) {
+            (0, b) => format!("{} to pull", commits(b)),
+            (a, 0) => format!("{} to push", commits(a)),
+            (a, b) => format!("{} to push, {b} to pull", commits(a)),
+        };
+        let (label, action): (&str, &dyn gpui::Action) = if ahead > 0 { ("Push…", &GitPush) } else { ("Update Project", &GitPull) };
+        let tip = match binding_label(action, window) {
+            Some(keys) => format!("{tip}. {label} ({keys})"),
+            None => format!("{tip}. {label}"),
+        };
+        Some(
+            div()
+                .id("sync-counts")
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1p5()
+                .h(px(CHIP_HEIGHT))
+                .px(px(8.))
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .text_color(theme.text_dim)
+                .hover_bg(theme.hover)
+                .hover(|st| st.text_color(theme.text))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |ws, _, window, cx| {
+                    if ahead > 0 {
+                        ws.git_push(&GitPush, window, cx)
+                    } else {
+                        ws.git_pull(&GitPull, window, cx)
+                    }
+                }))
+                .tooltip(move |_, cx| tooltip_view(tip.clone(), cx))
+                .when(ahead > 0, |el| el.child(format!("↑{ahead}")))
+                .when(behind > 0, |el| el.child(format!("↓{behind}"))),
+        )
     }
 
     /// Shown while the project isn't trusted; opens the trust dialog.
@@ -394,17 +451,18 @@ impl Workspace {
             .items_center()
             .gap_1p5()
             // A pill like the branch chip beside it: it's a button too.
-            .h(px(24.))
-            .px_2()
-            .rounded(px(12.))
+            .h(px(CHIP_HEIGHT))
+            .pl(px(10.))
+            .pr(px(12.))
+            .rounded_full()
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(px(12.5))
             .text_color(theme.warning)
             .hover_fill(Hsla::from(theme.warning).alpha(0.12), Hsla::from(theme.warning).alpha(0.2))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|ws, _, window, cx| ws.open_trust_dialog(window, cx)))
             .tooltip(|_, cx| tooltip_view("Language servers, formatters and project tools are off until you trust this folder", cx))
-            .child(icon_el(Icon::ShieldAlert, px(12.), theme.warning.into()))
+            .child(icon_el(Icon::ShieldAlert, px(14.), theme.warning.into()))
             .child("Restricted Mode")
     }
 
@@ -457,12 +515,15 @@ impl Workspace {
     }
 }
 
-/// A stable tint per project name for its monogram.
+/// The project, branch and Restricted Mode pills' height.
+const CHIP_HEIGHT: f32 = 28.;
+
 /// A short hairline between groups of title bar buttons.
 fn separator(theme: &Theme) -> Div {
-    div().w(px(1.)).h(px(14.)).flex_shrink_0().bg(theme.border)
+    div().w(px(1.)).h(px(18.)).flex_shrink_0().bg(theme.border)
 }
 
+/// A stable tint per project name for its monogram.
 pub(super) fn monogram_color(name: &str, theme: &Theme) -> Hsla {
     let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));

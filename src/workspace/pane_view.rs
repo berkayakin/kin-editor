@@ -199,6 +199,14 @@ impl Workspace {
                         .child(count.to_string()),
                 )
             })
+            // Along the window's top, the free space after the tabs moves the window.
+            .when(self.pane_axis == PaneAxis::Row || pane_ix == 0, |el| {
+                el.child(super::title_bar::window_drag_area(("tabs-free", pane_ix)).flex_1().min_w_0().when(cfg!(windows), |el| {
+                    el.on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
+                        ws.move_tab(&dragged.item, pane_ix, None, window, cx);
+                    }))
+                }))
+            })
     }
 
     /// The room for a pane's tabs, from the panes' bounds in the last frame
@@ -313,7 +321,8 @@ impl Workspace {
                         .pt(px(TAB_STRIP_TOP))
                         .pl(px(TAB_STRIP_INSET))
                         .occlude()
-                        .child(tab),
+                        .child(tab)
+                        .child(super::title_bar::window_drag_area("diff-tabs-free").flex_1().min_w_0()),
                 ),
         )
         .with_priority(1)
@@ -387,8 +396,16 @@ impl Workspace {
                 PaneAxis::Column => el.w_full().h(share),
             })
             // The tab strip's room on the chrome (kept without tabs too, so the
-            // island lines up with the sidebar's).
-            .child(div().flex_shrink_0().h(px(TAB_STRIP_HEIGHT - 1.)))
+            // island lines up with the sidebar's). Empty along the window's top,
+            // it moves the window; with tabs, their strip's free space does.
+            .map(|el| {
+                let room = px(TAB_STRIP_HEIGHT - 1.);
+                if pane.tabs.is_empty() && (self.pane_axis == PaneAxis::Row || pane_ix == 0) {
+                    el.child(super::title_bar::window_drag_area(("tabs-room", pane_ix)).flex_shrink_0().h(room))
+                } else {
+                    el.child(div().flex_shrink_0().h(room))
+                }
+            })
             .child(island)
             // After the island, so the current tab paints over its top border.
                         // A Git diff over the panes shows its own tab instead.

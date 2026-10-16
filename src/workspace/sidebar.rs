@@ -192,5 +192,6 @@ impl Workspace {
                     })
                     .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
             )
+            .child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0())
     }
 }
