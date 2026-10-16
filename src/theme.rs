@@ -663,7 +663,7 @@ fn resolve(
         // names ("syntax.keywrd") are reported.
         if let Some(name) = key.strip_prefix("syntax.").filter(|_| color_mut(&mut theme, &key).is_none()) {
             match parse_color(value) {
-                Some(_) if !name.contains('.') && Highlight::base_at(name).is_none() && suggest_key(&key).is_some() => {
+                Some(_) if !name.contains('.') && Highlight::base_at(name).is_none() && !ZED_SYNTAX_NAMES.contains(&name) && suggest_key(&key).is_some() => {
                     let hint = suggest_key(&key).map(|k| format!(" (did you mean \"{k}\"?)")).unwrap_or_default();
                     errors.push(format!("{}: unknown color \"{key}\"{hint}", file.name));
                 }
@@ -730,6 +730,11 @@ pub fn lightness(c: gpui::Rgba) -> f32 {
 }
 
 /// The known key closest to a misspelled one, if any is close enough.
+/// Syntax names Zed's themes color that aren't Kuana's base kinds. They're
+/// close to some ("title" to "type"), but meant: never report them as typos.
+const ZED_SYNTAX_NAMES: &[&str] =
+    &["emphasis", "enum", "hint", "link_text", "link_uri", "namespace", "predictive", "preproc", "primary", "selector", "title", "variant"];
+
 fn suggest_key(key: &str) -> Option<&'static str> {
     closest(key, COLOR_KEYS.iter().copied())
 }
@@ -982,6 +987,15 @@ mod tests {
         assert_eq!(color("function.method.call"), Hsla::from(theme.syntax.method));
         // A misspelled base name is still reported.
         assert!(errors.iter().any(|e| e.contains("keywrd") && e.contains("keyword")), "{errors:?}");
+    }
+
+    #[test]
+    fn zed_syntax_names_are_not_typos() {
+        let syntax: Vec<String> = ZED_SYNTAX_NAMES.iter().map(|n| format!("\"{n}\": \"#123456\"")).collect();
+        let file: ThemeFile = serde_json::from_str(&format!(r#"{{ "name": "T", "syntax": {{ {} }} }}"#, syntax.join(", "))).unwrap();
+        let mut errors = Vec::new();
+        resolve(&file, &builtins(), &mut Vec::new(), &mut errors).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
