@@ -26,6 +26,7 @@ const FILES: &[(&str, &str)] = &[
     ("css/outline.scm", include_str!("../assets/languages/css/outline.scm")),
     ("go/brackets.scm", include_str!("../assets/languages/go/brackets.scm")),
     ("go/config.toml", include_str!("../assets/languages/go/config.toml")),
+    ("go/highlights.scm", include_str!("../assets/languages/go/highlights.scm")),
     ("go/indents.scm", include_str!("../assets/languages/go/indents.scm")),
     ("go/textobjects.scm", include_str!("../assets/languages/go/textobjects.scm")),
     ("html/brackets.scm", include_str!("../assets/languages/html/brackets.scm")),

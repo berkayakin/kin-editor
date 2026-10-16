@@ -1430,6 +1430,28 @@ mod tests {
     }
 
     #[test]
+    fn go_names_keep_their_colors() {
+        let src = "package main\n\nimport \"fmt\"\n\nconst Max = 10\n\ntype Point struct {\n\tX int\n}\n\n\
+                   func (p Point) Len(scale int) int {\n\treturn p.X * scale\n}\n\n\
+                   func main() {\n\tp := Point{X: 1}\n\tfmt.Println(p.Len(2), len(\"x\"))\n}\n";
+        let go = highlights_of("a.go", src);
+        let expected = [
+            ("main", Highlight::Function),
+            ("Len", Highlight::Method),
+            ("Println", Highlight::Method),
+            ("len", Highlight::Function),
+            ("Max", Highlight::Constant),
+            ("Point", Highlight::Type),
+            ("X", Highlight::Property),
+            ("(", Highlight::Punctuation),
+            ("{", Highlight::Punctuation),
+        ];
+        for (text, h) in expected {
+            assert!(has(&go, text, h), "{text} as {}: {go:?}", h.name());
+        }
+    }
+
+    #[test]
     fn grammars_injections_highlight_embedded_code() {
         let html = highlights_of("a.html", "<style>body { color: red }</style>\n");
         assert!(has(&html, "color", Highlight::Property), "{html:?}");

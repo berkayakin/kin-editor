@@ -6,5 +6,5 @@ block_comment = { start = "/*", end = "*/" }
 hard_tabs = true
 
 [queries]
-highlights = ["crate:go/highlights"]
+highlights = ["highlights.scm"]
 outline = ["crate:go/tags"]
