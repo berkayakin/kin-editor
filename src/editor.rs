@@ -1316,6 +1316,15 @@ impl Editor {
         self.offset_for_display_row_x(drow, x.max(px(0.)), window, cx)
     }
 
+    /// Whether `position` is on a block row (code lenses, a hunk's deleted
+    /// lines): `offset_for_position` maps those to the line above, which
+    /// isn't what the pointer is over.
+    fn on_block_row(&self, position: Point<Pixels>) -> bool {
+        let (Some(layout), Some(wrap)) = (self.layout.as_ref(), self.wrap.as_ref()) else { return false };
+        let y = position.y - layout.bounds.top() + self.scroll.y;
+        y >= px(0.) && wrap.block_at((y / layout.line_height).floor() as usize).is_some()
+    }
+
     fn vertical_target(&self, sel: &Selection, rows: isize, goal: Pixels, window: &mut Window, cx: &App) -> usize {
         let mut drow = self.display_row_of(sel.head, cx) as isize + rows;
         // Carets don't stop on block rows.
@@ -2655,8 +2664,9 @@ impl Editor {
                 self.gutter_hovered = over_gutter;
                 cx.notify();
             }
-            // The pinned lines aren't the code under them.
-            if self.sticky_at(event.position).is_some() {
+            // The pinned lines aren't the code under them, and block rows
+            // (code lenses) aren't the line above.
+            if self.sticky_at(event.position).is_some() || self.on_block_row(event.position) {
                 self.pointer_left(window, cx);
             } else {
                 self.hover_at(event.position, window, cx);
