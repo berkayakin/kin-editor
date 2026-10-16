@@ -27,7 +27,7 @@ my-extension/
   languages/mylang/textobjects.scm    functions and classes for Vim's af / if / ac / ic
   languages/mylang/runnables.scm      gutter ▶ for tests and mains, with tasks.json
   languages/mylang/tasks.json         commands for runnables' tags ($ZED_FILE, $ZED_ROW…)
-  grammars/mylang.wasm                a prebuilt grammar (as in Zed's packaged extensions)
+  grammars/mylang.wasm                a prebuilt grammar (Zed's packaged extensions have one)
   themes/*.json                       Kuana themes, or Zed theme families
   icon_themes/*.json                  file icon themes (Zed's format)
   snippets/<language id>.json         VS Code / Zed snippets
@@ -41,7 +41,7 @@ version = "0.1.0"
 description = "MyLang support"
 authors = ["You <you@example.com>"]
 
-# The grammar: fetched from a repository at a commit (as in Zed), or
+# The grammar: fetched from a repository at a commit, or
 # without `repository`, the sources in grammars/mylang/ (src/parser.c…).
 [grammars.mylang]
 repository = "https://github.com/someone/tree-sitter-mylang"
@@ -117,7 +117,7 @@ exits with 1 when there are errors. `schema_version = 1` in `extension.toml` (Ze
 this Kuana reads.
 
 Grammars run as WebAssembly, sandboxed in Kuana's runtime. One that comes prebuilt
-(`grammars/<name>.wasm`, as in the extensions Zed installs) runs as is. Otherwise it's compiled
+(`grammars/<name>.wasm`, which the extensions Zed installs include) runs as is. Otherwise it's compiled
 the first time, in the background, with [wasi-sdk](https://github.com/WebAssembly/wasi-sdk): Kuana
 asks before downloading it once (about 180 MB, 170 MB on disk in `~/.config/kuana/toolchains/`;
 `WASI_SDK_PATH` uses one you have). Files of that language are highlighted when it's done.

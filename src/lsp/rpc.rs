@@ -65,7 +65,7 @@ pub const STOPPED: &str = "The language server stopped";
 /// The error for a request still unanswered after `REQUEST_TIMEOUT`.
 pub const TIMED_OUT: &str = "The language server didn't answer in time";
 
-/// How long a request waits for its answer (Zed's default too); then it
+/// How long a request waits for its answer; then it
 /// fails, and the server is told to stop working on it.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 

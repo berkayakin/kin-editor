@@ -184,7 +184,7 @@ fn parse(json: &str) -> HashMap<String, String> {
         Some(path.rsplit('/').next()?.strip_suffix(".svg")?.to_string())
     };
     let mut map = HashMap::new();
-    // Names win over suffixes for the same key, as in Zed.
+    // Names win over suffixes for the same key.
     for table in ["file_suffixes", "file_stems"] {
         for (key, kind) in theme[table].as_object().into_iter().flatten() {
             if let Some(svg) = kind.as_str().and_then(svg_of) {

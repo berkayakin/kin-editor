@@ -1,5 +1,5 @@
-//! The window's documents by path, with or without a tab, as Zed's
-//! `BufferStore`. Tabs' documents are added as they open; workspace edits
+//! The window's documents by path, with or without a tab.
+//! Tabs' documents are added as they open; workspace edits
 //! and Replace in Files open the others here (one load per path, however
 //! many ask) and edit them without a tab. A document edited that way is
 //! kept alive until it's saved or a tab takes it (`keep`), and listed for

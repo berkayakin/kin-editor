@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     /// A language server answers for the version it was sent; what it found
-    /// is read in that text and moved to today's (Zed does the same).
+    /// is read in that text and moved to today's.
     #[test]
     fn results_for_an_older_version_move_to_todays_text() {
         let problem = |range: Range<usize>| Diagnostic { range, severity: crate::lint::Severity::Error, message: "m".into(), rule: "r".into() };

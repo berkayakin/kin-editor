@@ -112,7 +112,8 @@ pub struct RunConfiguration {
 
 impl Global for Settings {}
 
-/// Built-in keymaps, named as in Zed's `base_keymap` setting.
+/// Built-in keymaps for `base_keymap`, with the values Zed's setting takes,
+/// so a Zed user's choice works as it is.
 #[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BaseKeymap {
     #[default]
@@ -806,7 +807,7 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you
   //   "Markdown": false
   // },
 
-  // Per server (by id, as in Zed): settings it asks for, initialization
+  // Per server (by id; Zed's ids work too): settings it asks for, initialization
   // options (applied when it restarts) and another program to run.
   // "lsp": {
   //   "basedpyright": { "settings": { "basedpyright.analysis": { "typeCheckingMode": "strict" } } },

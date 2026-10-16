@@ -7,7 +7,7 @@ reachable through Find Action, which shows its shortcut.
 
 To use other shortcuts, pick a **Base keymap** in Settings → Keymap (or set `"base_keymap"` in
 `settings.json`): **JetBrains** (the default), **VS Code**, **Sublime Text** or **Zed**, each in its
-macOS or Windows/Linux variant, like Zed's setting of the same name. Shortcuts you change yourself
+macOS or Windows/Linux variant. Shortcuts you change yourself
 (`keymap.json`) stay on top of whichever you pick, and menus and Find Action show the current keys.
 The table below is the JetBrains keymap.
 

@@ -519,7 +519,7 @@ fn injected(name: &str) -> Option<(&'static LangConfig, Option<&'static Language
     Some((config(builtin)?, queries(builtin)))
 }
 
-/// An embedded language's tree, as in Zed: one per region (a code fence, a
+/// An embedded language's tree: one per region (a code fence, a
 /// `<script>`), or one for all of a language's regions in its host when the
 /// query says `injection.combined` (the HTML around PHP). Injections nest:
 /// an injected tree has injections of its own (HTML in Markdown, then the
@@ -606,7 +606,7 @@ pub struct Syntax {
     /// Embedded languages (see the languages' injection queries), by depth.
     injections: Vec<Injection>,
     /// What edits touched since the last full parse: injections are looked
-    /// for again there, not in the whole file (as Zed does).
+    /// for again there, not in the whole file.
     pending: Vec<Range<usize>>,
 }
 
@@ -1319,7 +1319,7 @@ mod tests {
 
     /// Each fenced block is its own tree (an unclosed brace in one doesn't
     /// spill into the next), injections nest (CSS in HTML in Markdown), and
-    /// PHP's HTML pieces are one tree (`injection.combined`), as in Zed.
+    /// PHP's HTML pieces are one tree (`injection.combined`).
     #[test]
     fn injections_are_per_region_nested_or_combined() {
         let md = highlights_of("a.md", "```js\nfunction f() {\n```\n\n```js\nconst x = 1;\n```\n");

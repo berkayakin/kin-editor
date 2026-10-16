@@ -256,9 +256,8 @@ impl Editor {
 
     /// One server's diagnostics for the document, as it published them.
     /// They're read in the text of the version they were computed for (the
-    /// server may be some edits behind) and moved to today's text, as Zed
-    /// does; one for a version no longer known is dropped (a newer one
-    /// follows). The other servers' diagnostics stay as they are.
+    /// server may be some edits behind) and moved to today's text; one for
+    /// a version no longer known is dropped (a newer one follows). The other servers' diagnostics stay as they are.
     pub fn set_server_diagnostics(&mut self, source: crate::lsp::LspDiagnostics, cx: &mut Context<Self>) {
         let name = diagnostic_source(&source.server);
         let doc = self.doc.read(cx);
@@ -677,8 +676,8 @@ impl Editor {
     // ---- ⌘/Ctrl-hover links --------------------------------------------------------------
 
     /// The pointer moved, or ⌘/Ctrl went down or up (`held`): the word under
-    /// the pointer is a link while ⌘/Ctrl-click would go somewhere (like Zed
-    /// and VS Code, only once the server knows its declaration).
+    /// the pointer is a link while ⌘/Ctrl-click would go somewhere (like VS
+    /// Code, only once the server knows its declaration).
     pub(super) fn update_link(&mut self, position: Point<Pixels>, held: bool, window: &mut Window, cx: &mut Context<Self>) {
         let word = if held && self.drag.is_none() { self.word_under(position, window, cx) } else { None };
         self.link_word(word, cx);

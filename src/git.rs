@@ -158,7 +158,7 @@ const REPOSITORY_VARS: &[&str] = &[
 ];
 
 /// What a repository's own config may name to run, turned off where the
-/// folder isn't trusted (Restricted Mode), as Zed does: hooks, an SSH command,
+/// folder isn't trusted (Restricted Mode): hooks, an SSH command,
 /// credential helpers, the `ext::` transport and external diff programs.
 const UNTRUSTED_CONFIG: &[&str] =
     &["core.hooksPath=/dev/null", "core.sshCommand=ssh", "credential.helper=", "protocol.ext.allow=never", "diff.external="];
@@ -402,8 +402,8 @@ pub fn index_blob(root: &Path, rel: &str) -> Option<Vec<u8>> {
     run_bytes(root, &["show", &format!(":{rel}")]).ok()
 }
 
-/// Several objects' bytes from one `git cat-file --batch` (as Zed loads
-/// open files' diff bases), e.g. `HEAD:src/a.rs` and `:src/a.rs` (the
+/// Several objects' bytes from one `git cat-file --batch` (open files'
+/// diff bases load this way), e.g. `HEAD:src/a.rs` and `:src/a.rs` (the
 /// index): one process however many files. None for what doesn't exist.
 pub fn read_blobs(root: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>, String> {
     if specs.is_empty() {
@@ -1917,7 +1917,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
     }
 
     /// In a folder that isn't trusted, what the repository's config names
-    /// to run is turned off (as in Zed), and diffs use no external program.
+    /// to run is turned off, and diffs use no external program.
     #[test]
     fn reads_cat_file_batches() {
         let out = b"abc blob 5\nhello\nHEAD:gone.rs missing\ndef blob 0\n\n";

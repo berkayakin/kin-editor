@@ -62,7 +62,7 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   the editor, branches, pull and fetch
 - Welcome screen with quick-start tiles, Recent Projects, a Git card for the open repository and quick actions
 - 31 built-in themes (24 dark, 7 light) and JSON user themes with live preview
-- Multiple windows, one project each (like Zed), with a Recent Projects picker; on macOS the
+- Multiple windows, one project each, with a Recent Projects picker; on macOS the
   Window menu and the Dock icon's menu list them. Recent projects are also in the Dock icon's
   menu (macOS) and the taskbar's jump list (Windows)
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
@@ -76,7 +76,7 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Debugger for Rust, Go, Python and JavaScript/TypeScript (lldb-dap, Delve, debugpy, js-debug):
   breakpoints with conditions and logpoints, attaching to running processes, stepping, frames,
   variables, watches and an evaluating console; see [Debugging](run-and-debug.md#debugging)
-- Restricted Mode for folders you haven't trusted (like VS Code and Zed): no language servers,
+- Restricted Mode for folders you haven't trusted (like VS Code's): no language servers,
   formatters or project tools until you do; see [Project trust](settings.md#project-trust)
 - Python virtual environments detected per project and used by terminals, Run, the debugger,
   language servers and formatters; see [Python environments](languages.md#python-environments)

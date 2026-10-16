@@ -128,7 +128,7 @@ impl ProjectSearch {
             use futures::StreamExt as _;
             // Debounce typing.
             cx.background_executor().timer(Duration::from_millis(120)).await;
-            // Matches stream in as they're found (as in Zed), in batches.
+            // Matches stream in as they're found, in batches.
             let (found_tx, mut found) = futures::channel::mpsc::unbounded();
             let search = cx.background_executor().spawn(async move {
                 // The project's files under the folder searched, else a walk of it.

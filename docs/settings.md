@@ -46,7 +46,7 @@ and theme colors.
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |
 | `language_servers` | | per language: `false` turns its server off, `["cmd", "args"]` replaces it |
-| `lsp` | | per server, by id (Kuana's, e.g. `typescript`, or Zed's, e.g. `vtsls`, `basedpyright`): `settings` (what it asks for through `workspace/configuration`; a change is sent to it), `initialization_options` (applied when it restarts) and `binary` (`{ "path", "arguments" }`), as in Zed |
+| `lsp` | | per server, by id (Kuana's, e.g. `typescript`, or Zed's, e.g. `vtsls`, `basedpyright`): `settings` (what it asks for through `workspace/configuration`; a change is sent to it), `initialization_options` (applied when it restarts) and `binary` (`{ "path", "arguments" }`) |
 | `terminal_shell` | login shell | the terminal's shell and arguments, e.g. `["/opt/homebrew/bin/fish", "--login"]` |
 | `run_configurations` | | `[{ "name", "command", "cwd" }]` added to Run…; see [Run and test](run-and-debug.md#run-and-test) |
 | `formatters` | | per language: `"language_server"`, a command reading stdin and writing stdout (`{file}` is the path), or `false` |
@@ -77,7 +77,7 @@ ESLint and Prettier load its JavaScript config, `node_modules/.bin` and venv too
 programs, and Git runs commands its config names (an fsmonitor, hooks, an SSH command, diff programs). So the first time you open a
 folder, Kuana asks whether you trust it. Until you do, it stays in **Restricted Mode** (shown in the
 title bar): language servers don't start, formatters and ESLint don't run, the folder's own tools
-aren't used, terminals don't activate its venv, and Git leaves out what the folder's own config would run (its fsmonitor, hooks, SSH command, credential helper and external diff, as in Zed). Editing, Git, Run
+aren't used, terminals don't activate its venv, and Git leaves out what the folder's own config would run (its fsmonitor, hooks, SSH command, credential helper and external diff). Editing, Git, Run
 and Debug work as usual.
 
 **Trust Folder** remembers the folder; tick **Trust every project in …** to trust its parent

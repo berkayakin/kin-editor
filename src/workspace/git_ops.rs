@@ -90,7 +90,7 @@ impl Workspace {
                 ws.decorate_tree(cx);
                 // Diff bases are read again only where HEAD or a file's index
                 // blob moved (commits, staging, checkouts), not for every
-                // change in the working tree, as Zed does.
+                // change in the working tree.
                 let old = std::mem::replace(&mut ws.git_status, Arc::new(status));
                 let new = ws.git_status.clone();
                 let blobs = |status: &git::RepoStatus, path: &Path| status.files.iter().find(|f| f.path == path).and_then(|f| f.blobs.clone());

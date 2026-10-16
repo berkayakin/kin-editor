@@ -1,5 +1,5 @@
 //! Key bindings. A base keymap chosen in settings (`base_keymap`: JetBrains by
-//! default, VS Code, Sublime Text or Zed, like Zed's own setting) goes on top
+//! default, VS Code, Sublime Text or Zed) goes on top
 //! of the shortcuts they all share, each in its macOS or Windows/Linux variant.
 //! Double Shift (Search Everywhere) isn't a regular binding; the workspace
 //! detects it.
@@ -38,7 +38,7 @@ pub struct Installed(pub crate::settings::BaseKeymap);
 impl gpui::Global for Installed {}
 
 /// The built-in bindings for a base keymap: what every keymap shares, then
-/// its own layer (later bindings win), like Zed's base keymaps. On macOS the
+/// its own layer (later bindings win). On macOS the
 /// macOS variant of each keymap, the Windows/Linux one elsewhere.
 pub fn bindings(base: BaseKeymap) -> Vec<KeyBinding> {
     let mac = cfg!(target_os = "macos");

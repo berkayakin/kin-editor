@@ -462,7 +462,7 @@ impl ThemeRegistry {
                 .collect();
             paths.sort();
             for path in paths {
-                // Comments and trailing commas are fine, as in Zed's theme files.
+                // Comments and trailing commas are fine (Zed's theme files have them).
                 let text = match std::fs::read_to_string(&path) {
                     Ok(text) => crate::settings::strip_jsonc(&text),
                     Err(e) => {

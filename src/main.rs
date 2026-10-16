@@ -341,7 +341,7 @@ fn main() {
         // Kuanas from before they did too.
         workspace::update_recent_projects(|_| {}, cx);
 
-        // Each folder on the command line gets its own window, like Zed;
+        // Each folder on the command line gets its own window;
         // files open in the first one. Without paths, reopen the last project.
         let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = args
             .into_iter()

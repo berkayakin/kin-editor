@@ -219,7 +219,7 @@ enum OpenIn {
     /// Replace this window's project (asking about unsaved edits first).
     ThisWindow,
     NewWindow,
-    /// This window if it has no project yet, otherwise a new one (like Zed).
+    /// This window if it has no project yet, otherwise a new one.
     Auto,
 }
 
@@ -688,7 +688,7 @@ pub struct Workspace {
     /// The running Git operation (one at a time), shown in the status bar.
     git_busy: Busy,
     /// Operations started while another ran: they run next, in order (Git
-    /// takes one at a time; Zed queues them too).
+    /// takes one at a time).
     git_queue: std::collections::VecDeque<GitOp>,
     status_task: Option<Task<()>>,
     git_op_task: Option<Task<()>>,
@@ -822,7 +822,7 @@ impl Workspace {
             }
         });
         // Keep Git state fresh: when the window regains focus, and every few seconds.
-        // Leaving the window saves edits, like VS Code and Zed.
+        // Leaving the window saves edits, like VS Code.
         let activation = cx.observe_window_activation(window, |ws, window, cx| {
             if window.is_window_active() {
                 ws.check_config(cx);

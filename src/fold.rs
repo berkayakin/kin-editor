@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use crate::document::{Document, Patch};
 
-/// One editor's folded text (two editors of a file fold apart, as in Zed):
+/// One editor's folded text (two editors of a file fold apart):
 /// from the start of the first hidden line to the end of the last, sorted.
 /// Edits move folds; an edit touching one opens it.
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -4,10 +4,10 @@
 //! lines), which carets skip.
 //!
 //! Positions are byte offsets into a line's [`DisplayLine`] text (tabs
-//! expanded, inlay hints in place: they take room on their rows, as in Zed,
-//! where the inlay map sits below the wrap map). A break's offset starts a new row, so a cursor exactly on a
-//! break shows at the start of the next row. Continuation rows keep the
-//! line's indentation, like Zed and VS Code.
+//! expanded, inlay hints in place: they take room on their rows like text).
+//! A break's offset starts a new row, so a cursor exactly on a break shows at
+//! the start of the next row. Continuation rows keep the
+//! line's indentation, like VS Code.
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},

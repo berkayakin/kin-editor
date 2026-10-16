@@ -1,8 +1,7 @@
 //! Undo and redo for file operations: new files and folders, renames, moves,
 //! duplicates, deletes and copies dropped on the file tree.
 //!
-//! Like Zed's project panel, each entry keeps what an operation did (a
-//! `Change`). Undoing an entry does its inverse and stores what that did in
+//! Each entry keeps what an operation did (a `Change`). Undoing an entry does its inverse and stores what that did in
 //! its place, so redoing inverts that again: undoing `Created(a)` moves `a` to
 //! the Trash and stores `Trashed(a)`, and redoing that restores it. Deleting
 //! always goes through the Trash, so it can be undone too.

@@ -1,6 +1,6 @@
 //! A document's Git changes: the gutter hunks against HEAD and whether each
 //! is staged. One per document (`DocumentStore::diff_for`), so split views of
-//! a file share one diff instead of computing it each, as Zed's `BufferDiff`.
+//! a file share one diff instead of computing it each.
 
 use std::{sync::Arc, time::Duration};
 

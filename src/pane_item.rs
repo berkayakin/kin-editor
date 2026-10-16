@@ -1,5 +1,5 @@
-//! What a pane's tab shows: a text editor, an image, or a Markdown preview
-//! (Zed's `Item`, much smaller). Each kind is its own view implementing
+//! What a pane's tab shows: a text editor, an image, or a Markdown preview.
+//! Each kind is its own view implementing
 //! [`Item`], the surface the workspace needs to draw its tab, save, close
 //! and keep it in the session; [`PaneItem`] is the handle panes hold.
 //!

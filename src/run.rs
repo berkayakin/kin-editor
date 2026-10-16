@@ -198,7 +198,7 @@ fn extension_targets(language: Language, path: &Path, text: &str, tree: &Tree, o
         for task in def.tasks.iter().filter(|t| t.tags.iter().any(|tag| tags.contains(&tag.as_str()))) {
             // The command is shell text, so values put into it are quoted (a
             // path with spaces, or a symbol that looks like `$(…)`); each
-            // argument is one word, as Zed passes them.
+            // argument stays one word.
             let command = std::iter::once(expand_vars(&task.command, &vars, sh_quote))
                 .chain(task.args.iter().map(|a| sh_quote(&plain(a))))
                 .collect::<Vec<_>>()

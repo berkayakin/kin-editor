@@ -106,7 +106,7 @@ pub struct SearchEnd {
     pub truncated: bool,
 }
 
-/// The most files and matches a search lists (Zed's limits too).
+/// The most files and matches a search lists.
 pub const MAX_FILES: usize = 5_000;
 pub const MAX_MATCHES: usize = 10_000;
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;

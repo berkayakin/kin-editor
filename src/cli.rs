@@ -93,7 +93,7 @@ pub fn extension_command(args: &[String]) -> i32 {
 }
 
 /// Writes the script to [`COMMAND_PATH`], asking for an administrator
-/// password when that folder isn't writable (as Zed and VS Code do).
+/// password when that folder isn't writable (as VS Code does).
 pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let text = script(&exe);

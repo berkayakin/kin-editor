@@ -31,7 +31,7 @@ impl Watcher {
         let mut inner = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let event = match event {
                 Ok(event) if !event.need_rescan() => event,
-                // Events were lost: like Zed, look at everything again
+                // Events were lost: look at everything again
                 // (rather than polling Git all the time to catch this).
                 _ => {
                     let _ = tx.unbounded_send(vec![FsChange { path: everything.clone(), structural: true }]);

@@ -1,4 +1,4 @@
-//! Installing language servers with one click, like Zed does without asking.
+//! Installing language servers with one click.
 //! A missing server's status bar item offers **Install**, which puts it in
 //! Kuana's own folder (`<config>/servers/`): a prebuilt binary from its GitHub
 //! release (checked against GitHub's SHA-256), an npm package (with the

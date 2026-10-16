@@ -237,7 +237,7 @@ impl Render for ProjectTree {
                         let e = &tree.entries[ix];
                         let selected = tree.active.as_deref() == Some(e.path.as_path());
                         let change = tree.git.get(&e.path).copied();
-                        // Ignored by Git: dimmed, like VS Code and Zed.
+                        // Ignored by Git: dimmed, like VS Code.
                         let name_color: Hsla = match change {
                             Some(c) => change_color(theme, c),
                             None if tree.is_ignored(&e.path) => theme.text_dim.into(),

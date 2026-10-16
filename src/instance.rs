@@ -1,4 +1,4 @@
-//! One Kuana per config folder, as Zed does on every platform: a second
+//! One Kuana per config folder, on every platform: a second
 //! launch hands its paths to the running Kuana and exits, so two processes
 //! never rewrite the same sessions and state (the Windows jump list and the
 //! `kuana` command outside an app bundle start a new process each time; a
@@ -6,7 +6,7 @@
 //! listens on a loopback port that it writes, with a random token, to
 //! `<config>/instance.json`.
 //!
-//! Only release builds do this (like Zed's stable channel): development
+//! Only release builds do this: development
 //! builds and their tests often run several instances on purpose.
 
 use std::{

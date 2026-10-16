@@ -24,7 +24,7 @@ pub fn json_schemas() -> Value {
 
 fn build(cx: &App) -> Value {
     let Some(dir) = crate::theme::config_dir() else { return Value::Null };
-    // Matched like Zed's, by the end of the path: "kuana/settings.json".
+    // Matched by the end of the path: "kuana/settings.json".
     let folder = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut actions: Vec<String> = crate::keymap::action_entries().into_iter().map(|e| e.name.to_string()).collect();
     actions.extend(cx.all_action_names().iter().map(|name| name.to_string()));

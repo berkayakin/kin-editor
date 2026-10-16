@@ -1,5 +1,5 @@
-//! About Kuana: a small window of its own (like Zed's), so it also opens when no
-//! project window is. Shows the logo, the name in the title font, the version
+//! About Kuana: a small window of its own, so it also opens when no project
+//! window is. Shows the logo, the name in the title font, the version
 //! and build, with a button that copies them for bug reports.
 
 use std::time::Duration;
@@ -17,7 +17,6 @@ use crate::{
     workspace::{CloseTab, CloseWindow},
 };
 
-// Named like Zed's `zed::About`.
 actions!(kuana, [About]);
 
 /// "0.1.0 (987a960)": the commit comes from `build.rs` and is left out when

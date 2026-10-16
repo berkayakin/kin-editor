@@ -173,7 +173,7 @@ struct Loaded {
     queries: &'static LanguageQueries,
 }
 
-/// A task from a language's `tasks.json`, as in Zed.
+/// A task from a language's `tasks.json` (Zed's format).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct Task {
     pub label: String,
@@ -811,7 +811,7 @@ fn leak(s: impl Into<String>) -> &'static str {
 
 // ---- Installing --------------------------------------------------------------------
 
-/// Links a folder in (like Zed's dev extensions): it's used in place, so its
+/// Links a folder in: it's used in place, so its
 /// author's edits apply on Reload. Returns the extension's name.
 /// Where Zed keeps the extensions it installed: packaged, so their grammars
 /// are prebuilt WASM and need no compiler here.
@@ -957,7 +957,7 @@ fn build(grammar: &Grammar) -> Result<(), String> {
     result
 }
 
-/// Like Zed: a shallow fetch of exactly `rev`, or the default branch.
+/// A shallow fetch of exactly `rev`, or the default branch.
 fn fetch(grammar: &Grammar) -> Result<(), String> {
     let Some(repository) = grammar.repository.as_deref() else { return Ok(()) };
     let dir = &grammar.checkout;

@@ -20,7 +20,7 @@ pub struct ProjectSnapshot {
     files: BTreeMap<PathBuf, bool>,
     /// Each folder's own .gitignore (None: it has none), read as changes
     /// need them: a path is ignored by the rules of every folder above it,
-    /// as in the scan (and in Zed), not only the project's.
+    /// as in the scan, not only the project's.
     ignores: HashMap<PathBuf, Option<Arc<Gitignore>>>,
     /// `.git/info/exclude` and the user's global excludes, below them all.
     excludes: Vec<Arc<Gitignore>>,
