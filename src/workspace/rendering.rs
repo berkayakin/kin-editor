@@ -142,7 +142,34 @@ impl Workspace {
             .child(label)
     }
 
-    pub(super) fn on_root_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// While a resize is on, follows the pointer anywhere in the window and
+    /// keeps the resize cursor. The root's own mouse-move listener only hears
+    /// moves while it's hovered, which the Git diff (it occludes) prevents,
+    /// and an element's cursor loses to the editor's or the diff's under it.
+    fn resize_tracker(&self, resize: Resize, cx: &Context<Self>) -> impl IntoElement {
+        let cursor = match resize.edge {
+            Edge::Problems => CursorStyle::ResizeUpDown,
+            Edge::Sidebar => CursorStyle::ResizeLeftRight,
+            Edge::Pane(_) if self.pane_axis == PaneAxis::Row => CursorStyle::ResizeLeftRight,
+            Edge::Pane(_) => CursorStyle::ResizeUpDown,
+        };
+        let this = cx.entity().downgrade();
+        gpui::canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                window.set_window_cursor_style(cursor);
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase == gpui::DispatchPhase::Capture {
+                        this.update(cx, |ws, cx| ws.on_resize_move(event, window, cx)).ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    fn on_resize_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(resize) = self.resizing else { return };
         if event.pressed_button != Some(MouseButton::Left) {
             self.resizing = None;
@@ -323,18 +350,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .capture_key_down(cx.listener(Self::on_any_key_down))
-            .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .on_drop(cx.listener(|ws, paths: &gpui::ExternalPaths, window, cx| ws.open_dropped(paths.paths(), window, cx)))
-            .when_some(self.resizing, |el, r| {
-                el.cursor(match r.edge {
-                    Edge::Problems => CursorStyle::ResizeUpDown,
-                    Edge::Sidebar => CursorStyle::ResizeLeftRight,
-                    Edge::Pane(_) if self.pane_axis == PaneAxis::Row => CursorStyle::ResizeLeftRight,
-                    Edge::Pane(_) => CursorStyle::ResizeUpDown,
-                })
-            })
+            .when_some(self.resizing, |el, resize| el.child(self.resize_tracker(resize, cx)))
             .relative()
             .size_full()
             .flex()
