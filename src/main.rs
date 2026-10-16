@@ -87,8 +87,42 @@ use crate::{
 };
 
 fn menus() -> Vec<Menu> {
-    vec![
-        Menu {
+    menus_for(cfg!(target_os = "macos"))
+}
+
+/// The app's menus: macOS's menu bar, or the title bar's ☰ elsewhere
+/// (`Workspace::open_app_menu`), where there's no app menu: its items go
+/// under File and Help, as Windows and Linux apps have them.
+fn menus_for(mac: bool) -> Vec<Menu> {
+    let mut file = vec![
+        MenuItem::action("New File", NewFile),
+        MenuItem::action("New Window", NewWindow),
+        MenuItem::separator(),
+        MenuItem::action("Open File…", OpenFile),
+        MenuItem::action("Open Folder…", OpenFolder),
+        MenuItem::action("Open Folder in This Window…", OpenFolderInThisWindow),
+        MenuItem::action("Recent Projects…", RecentProjects),
+        MenuItem::action("Clone Repository…", GitClone),
+        MenuItem::separator(),
+        MenuItem::action("Save", Save),
+        MenuItem::action("Save As…", SaveAs),
+        MenuItem::separator(),
+    ];
+    if !mac {
+        file.extend([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Extensions…", OpenExtensions),
+            MenuItem::action("Project Trust…", ProjectTrust),
+            MenuItem::separator(),
+        ]);
+    }
+    file.extend([MenuItem::action("Close Tab", CloseTab), MenuItem::action("Close Window", CloseWindow)]);
+    if !mac {
+        file.extend([MenuItem::separator(), MenuItem::action("Exit", Quit)]);
+    }
+    let mut menus = Vec::new();
+    if mac {
+        menus.push(Menu {
             name: "Kuana".into(),
             items: vec![
                 MenuItem::action("About Kuana", about::About),
@@ -102,26 +136,10 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Quit Kuana", Quit),
             ],
-        },
-        Menu {
-            name: "File".into(),
-            items: vec![
-                MenuItem::action("New File", NewFile),
-                MenuItem::action("New Window", NewWindow),
-                MenuItem::separator(),
-                MenuItem::action("Open File…", OpenFile),
-                MenuItem::action("Open Folder…", OpenFolder),
-                MenuItem::action("Open Folder in This Window…", OpenFolderInThisWindow),
-                MenuItem::action("Recent Projects…", RecentProjects),
-                MenuItem::action("Clone Repository…", GitClone),
-                MenuItem::separator(),
-                MenuItem::action("Save", Save),
-                MenuItem::action("Save As…", SaveAs),
-                MenuItem::separator(),
-                MenuItem::action("Close Tab", CloseTab),
-                MenuItem::action("Close Window", CloseWindow),
-            ],
-        },
+        });
+    }
+    menus.extend([
+        Menu { name: "File".into(), items: file },
         Menu {
             name: "Edit".into(),
             items: vec![
@@ -222,6 +240,8 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Initialize Repository", GitInit),
             ],
         },
+    ]);
+    menus.push(if mac {
         // GPUI makes the menu named "Window" the app's windows menu: macOS then
         // lists the open windows in it and in the Dock icon's menu.
         Menu {
@@ -230,8 +250,19 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Minimize", MinimizeWindow),
                 MenuItem::action("Zoom", ZoomWindow),
             ],
-        },
-    ]
+        }
+    } else {
+        Menu {
+            name: "Help".into(),
+            items: vec![
+                MenuItem::action("Welcome Setup…", WelcomeSetup),
+                MenuItem::separator(),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::action("About Kuana", about::About),
+            ],
+        }
+    });
+    menus
 }
 
 /// Run as a bare binary (`cargo run`), macOS names the app after the executable, `kuana`.
@@ -269,6 +300,87 @@ fn set_dock_icon() {
     }
 }
 
+/// AppKit zooms a window on a double click in its title bar strip before the
+/// view under the pointer sees the click: on the title bar's buttons too, and
+/// on its empty parts along with Kuana's own handler (`render_titlebar`), so
+/// the two could cancel out. Double clicks in that strip go to GPUI's view
+/// directly; Kuana zooms only over the bar's empty parts. Single clicks still
+/// go through AppKit, which drags the window by the bar.
+#[cfg(target_os = "macos")]
+fn limit_window_zoom() {
+    use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+    use objc2::{Encode, Encoding, msg_send, sel};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+    unsafe impl Encode for Point {
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        origin: Point,
+        size: Point,
+    }
+    unsafe impl Encode for Rect {
+        const ENCODING: Encoding =
+            Encoding::Struct("CGRect", &[Point::ENCODING, Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING])]);
+    }
+    const LEFT_MOUSE_DOWN: usize = 1;
+
+    /// GPUI's view, among the content view's subviews (a blur view may be one too).
+    unsafe fn gpui_view(window: &AnyObject) -> Option<&AnyObject> {
+        let class = AnyClass::get(c"GPUIView")?;
+        unsafe {
+            let content: &AnyObject = msg_send![window, contentView];
+            let subviews: &AnyObject = msg_send![content, subviews];
+            let count: usize = msg_send![subviews, count];
+            (0..count).map(|i| -> &AnyObject { msg_send![subviews, objectAtIndex: i] }).find(|view| {
+                let is: Bool = msg_send![*view, isKindOfClass: class];
+                is.as_bool()
+            })
+        }
+    }
+
+    extern "C-unwind" fn send_event(this: &AnyObject, _: Sel, event: &AnyObject) {
+        unsafe {
+            let kind: usize = msg_send![event, type];
+            // `clickCount` only exists on mouse events.
+            if kind == LEFT_MOUSE_DOWN && { let clicks: isize = msg_send![event, clickCount]; clicks } >= 2_isize {
+                let at: Point = msg_send![event, locationInWindow];
+                let content: &AnyObject = msg_send![this, contentView];
+                let frame: Rect = msg_send![content, frame];
+                // Window coordinates start at the bottom.
+                if frame.size.y - at.y < workspace::TITLEBAR_HEIGHT as f64
+                    && let Some(view) = gpui_view(this)
+                {
+                    let _: () = msg_send![view, mouseDown: event];
+                    return;
+                }
+            }
+            // The class GPUI's is made from (not `this`'s superclass: observing
+            // a window swaps its class for a subclass).
+            let panel = AnyClass::get(c"GPUIPanel").is_some_and(|panel| {
+                let is: Bool = msg_send![this, isKindOfClass: panel];
+                is.as_bool()
+            });
+            let Some(base) = AnyClass::get(if panel { c"NSPanel" } else { c"NSWindow" }) else { return };
+            let _: () = msg_send![super(this, base), sendEvent: event];
+        }
+    }
+    // GPUI registers its window classes before `main` runs.
+    let imp = unsafe { std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel, &AnyObject), Imp>(send_event) };
+    for name in [c"GPUIWindow", c"GPUIPanel"] {
+        if let Some(class) = AnyClass::get(name) {
+            unsafe { objc2::ffi::class_addMethod(std::ptr::from_ref(class).cast_mut(), sel!(sendEvent:), imp, c"v@:@".as_ptr()) };
+        }
+    }
+}
+
 fn main() {
     theme::move_legacy_config();
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -281,6 +393,8 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     set_app_name();
+    #[cfg(target_os = "macos")]
+    limit_window_zoom();
 
     // Finder (Open With, double-click) and the `kuana` command send paths as
     // open-file events; they're handled once the app is running.
@@ -394,6 +508,34 @@ fn open_external(paths: Vec<std::path::PathBuf>, cx: &mut App) {
         }
         None => {
             workspace::open_window(None, cx, move |ws, window, cx| ws.open_external(paths, window, cx));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::Action;
+
+    fn action_names(menus: &[Menu]) -> Vec<&'static str> {
+        menus
+            .iter()
+            .flat_map(|m| &m.items)
+            .filter_map(|item| match item {
+                MenuItem::Action { action, .. } => Some(action.name()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Without the app menu, its items still have a place (Window's and the
+    /// shell command are macOS's own).
+    #[test]
+    fn menus_elsewhere_keep_the_app_menus_items() {
+        let elsewhere = action_names(&menus_for(false));
+        let mac_only = [MinimizeWindow.name(), ZoomWindow.name(), InstallShellCommand.name()];
+        for name in action_names(&menus_for(true)) {
+            assert!(elsewhere.contains(&name) || mac_only.contains(&name), "{name} is only in the macOS menus");
         }
     }
 }

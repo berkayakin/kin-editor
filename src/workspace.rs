@@ -77,6 +77,7 @@ use crate::ui::{
     GAP, chrome_bg, soft_shadow, file_icon, island,
 };
 
+mod app_menu;
 mod background;
 mod commands;
 mod file_tree;
@@ -517,6 +518,8 @@ struct OpenContextMenu {
     target: Option<PathBuf>,
     /// The Git panel row that was right-clicked: relative path, staged.
     git_target: Option<(String, bool)>,
+    /// Which of the title bar's menus (☰, see `app_menu.rs`) this is.
+    app_menu: Option<usize>,
     _subscription: Subscription,
 }
 
@@ -564,7 +567,7 @@ const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
 /// How long Save waits for format on save before saving unformatted.
 const FORMAT_ON_SAVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-const TITLEBAR_HEIGHT: f32 = 40.0;
+pub const TITLEBAR_HEIGHT: f32 = 40.0;
 const STATUSBAR_HEIGHT: f32 = 30.0;
 const TAB_HEIGHT: f32 = 38.0;
 /// The editor tabs' strip on the chrome above each pane; the pane's island
@@ -695,6 +698,8 @@ pub struct Workspace {
     toasts: Vec<Toast>,
     next_toast: usize,
     context_menu: Option<OpenContextMenu>,
+    /// Where the title bar's menu names are while one is open, by menu.
+    app_menu_names: std::rc::Rc<std::cell::RefCell<Vec<Bounds<Pixels>>>>,
     pending_input: Option<PendingInput>,
     auto_save: AutoSave,
     auto_save_delay: Duration,
@@ -1005,6 +1010,7 @@ impl Workspace {
             toasts: Vec::new(),
             next_toast: 0,
             context_menu: None,
+            app_menu_names: Default::default(),
             pending_input: None,
             auto_save: settings.auto_save.unwrap_or_default(),
             auto_save_delay: Duration::from_millis(settings.auto_save_delay.unwrap_or(1000).max(50)),

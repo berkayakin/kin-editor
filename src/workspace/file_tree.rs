@@ -218,8 +218,9 @@ impl Workspace {
                 }
             }
             ContextMenuEvent::Dismissed => ws.close_context_menu(window, cx),
+            ContextMenuEvent::Neighbor(forward) => ws.step_app_menu(*forward, window, cx),
         });
-        self.context_menu = Some(OpenContextMenu { menu, position, actions, target, git_target: None, _subscription: subscription });
+        self.context_menu = Some(OpenContextMenu { menu, position, actions, target, git_target: None, app_menu: None, _subscription: subscription });
         cx.notify();
     }
 }

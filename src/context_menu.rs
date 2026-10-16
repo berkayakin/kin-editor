@@ -8,7 +8,7 @@ use gpui::{
 
 use crate::{
     assets::Icon,
-    editor::{Cancel, MoveDown, MoveUp, Newline},
+    editor::{Cancel, MoveDown, MoveLeft, MoveRight, MoveUp, Newline},
     theme::Theme,
     ui::{HoverFill, icon_el},
 };
@@ -57,6 +57,8 @@ pub enum ContextMenuEvent {
     /// Index into the entries passed to [`ContextMenu::new`].
     Chose(usize),
     Dismissed,
+    /// ← (false) or → (true): a menu bar's menu opens its neighbor.
+    Neighbor(bool),
 }
 
 pub struct ContextMenu {
@@ -104,6 +106,14 @@ impl ContextMenu {
         }
     }
 
+    fn on_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(ContextMenuEvent::Neighbor(false));
+    }
+
+    fn on_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(ContextMenuEvent::Neighbor(true));
+    }
+
     fn on_escape(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(ContextMenuEvent::Dismissed);
     }
@@ -124,6 +134,8 @@ impl Render for ContextMenu {
             .on_action(cx.listener(Self::on_down))
             .on_action(cx.listener(Self::on_up))
             .on_action(cx.listener(Self::on_enter))
+            .on_action(cx.listener(Self::on_left))
+            .on_action(cx.listener(Self::on_right))
             .on_action(cx.listener(Self::on_escape))
             .min_w(px(196.))
             .p_1()

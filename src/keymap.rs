@@ -117,6 +117,8 @@ fn common(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("up", MoveUp, Some("ContextMenu")),
         KeyBinding::new("down", MoveDown, Some("ContextMenu")),
         KeyBinding::new("enter", Newline, Some("ContextMenu")),
+        KeyBinding::new("left", MoveLeft, Some("ContextMenu")),
+        KeyBinding::new("right", MoveRight, Some("ContextMenu")),
         // Editor basics
         KeyBinding::new("left", MoveLeft, e),
         KeyBinding::new("right", MoveRight, e),

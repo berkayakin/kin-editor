@@ -1,7 +1,24 @@
 //! The title bar: project and branch chips, the run widget, panel toggles, search and settings, window controls.
 
 use super::*;
-use gpui::svg;
+use gpui::{DispatchPhase, canvas, svg};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// macOS: whether the pointer is over one of the title bar's empty parts, where
+/// a double click zooms the window (Kuana's, since `limit_window_zoom` in
+/// `main.rs` keeps AppKit's from happening anywhere on the bar, its buttons
+/// and chips included).
+static OVER_DRAG_AREA: AtomicBool = AtomicBool::new(false);
+
+/// One of the title bar's empty parts: what the system drags (Windows), or
+/// where a double click zooms the window (macOS, see `OVER_DRAG_AREA`).
+fn drag_area() -> Div {
+    div()
+        .h_full()
+        .flex_shrink_0()
+        .window_control_area(WindowControlArea::Drag)
+        .when(cfg!(target_os = "macos"), |el| el.on_mouse_move(|_, _, _| OVER_DRAG_AREA.store(true, Ordering::Relaxed)))
+}
 
 impl Workspace {
     pub(super) fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -25,25 +42,37 @@ impl Workspace {
             .when(cfg!(windows), |el| el.occlude())
             .when(mac, |el| {
                 el.on_click(|event: &ClickEvent, window, _| {
-                    if event.click_count() == 2 {
+                    if event.click_count() == 2 && OVER_DRAG_AREA.load(Ordering::Relaxed) {
                         window.titlebar_double_click();
                     }
                 })
+                // Every move starts off the drag areas; one under the pointer
+                // says otherwise (bubble phase, after this).
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        |_, _, window, _| {
+                            window.on_mouse_event(|_: &MouseMoveEvent, phase, _, _| {
+                                if phase == DispatchPhase::Capture {
+                                    OVER_DRAG_AREA.store(false, Ordering::Relaxed);
+                                }
+                            })
+                        },
+                    )
+                    .absolute()
+                    .size_0(),
+                )
             })
             // Drag areas (Windows) are the bar's empty parts, not the bar itself:
             // GPUI picks the first control area under the pointer, and a parent's
             // comes before its children's (the window buttons).
             //
             // Room for the traffic lights, which macOS moves out of the window in full screen.
-            .child(
-                div()
-                    .h_full()
-                    .w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. }))
-                    .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag),
-            )
-            // The chips give way (their names cut) before the tools would.
-            .child(
+            .child(drag_area().w(px(if mac && !window.is_fullscreen() { 86. } else { GAP + 4. })))
+            .when(app_menu::APP_MENU_IN_TITLE_BAR, |el| el.child(self.render_app_menu(cx)).child(drag_area().w(px(GAP))))
+            // The chips give way (their names cut) before the tools would. An
+            // open app menu's names take their place.
+            .when(!self.app_menu_open(), |el| el.child(
                 div()
                     .flex()
                     .min_w_0()
@@ -53,8 +82,8 @@ impl Workspace {
                     .when(self.root.is_some(), |el| el.child(self.render_project_chip(narrow, cx)))
                     .when(self.repo.is_some(), |el| el.child(self.render_branch_chip(narrow, cx)))
                     .when(self.restricted(cx), |el| el.child(self.render_restricted_chip(cx))),
-            )
-            .child(div().flex_1().min_w(px(GAP)).h_full().window_control_area(WindowControlArea::Drag))
+            ))
+            .child(drag_area().flex_1().flex_shrink().min_w(px(GAP)))
             .child(
                 div()
                     .flex()
@@ -70,7 +99,7 @@ impl Workspace {
                     .child(self.render_settings_button(window, cx)),
             )
             .map(|el| match mac {
-                true => el.child(div().w(px(GAP + 2.)).h_full().flex_shrink_0().window_control_area(WindowControlArea::Drag)),
+                true => el.child(drag_area().w(px(GAP + 2.))),
                 false => el.child(div().w(px(GAP)).h_full().flex_shrink_0()).child(self.render_window_controls(cx)),
             })
     }
@@ -248,7 +277,7 @@ impl Workspace {
     /// A title bar icon button: just the icon, `color` at rest and `hover`
     /// under the mouse (`None` = the same color, a little brighter for being
     /// full strength: at rest it's slightly faded).
-    fn bar_button(
+    pub(super) fn bar_button(
         &self,
         id: &'static str,
         icon: Icon,
