@@ -73,6 +73,9 @@ impl Workspace {
         for editor in self.tabs.clone() {
             self.auto_save(&editor, cx);
         }
+        if !self.documents.read(cx).kept(cx).is_empty() {
+            self.save_background(true, cx);
+        }
     }
 
     pub(super) fn toggle_auto_save(&mut self, _: &ToggleAutoSave, window: &mut Window, cx: &mut Context<Self>) {
@@ -175,10 +178,12 @@ impl Workspace {
         if self.close_confirmed && !matches!(intent, CloseIntent::ReplaceProject(_)) {
             return true;
         }
+        let background = self.documents.read(cx).kept(cx);
         let unsaved: Vec<String> = self
             .tabs
             .iter()
             .map(|t| t.read(cx).doc.read(cx))
+            .chain(background.iter().map(|d| d.read(cx)))
             .filter(|d| d.is_dirty())
             .map(|d| d.file_name())
             .collect();
@@ -200,6 +205,7 @@ impl Workspace {
             let Ok(answer) = rx.await else { return };
             this.update_in(cx, |ws, window, cx| match answer {
                 0 => {
+                    ws.save_background(false, cx);
                     for editor in ws.tabs.clone() {
                         if editor.read(cx).doc.read(cx).is_dirty()
                             && editor.read(cx).doc.read(cx).path.is_some()
@@ -215,7 +221,7 @@ impl Workspace {
                         if dirty.read(cx).doc.read(cx).path.is_none() {
                             ws.save_as(&SaveAs, window, cx);
                         }
-                    } else {
+                    } else if ws.documents.read(cx).kept(cx).is_empty() {
                         ws.finish_close(intent, window, cx);
                     }
                 }
@@ -270,6 +276,8 @@ impl Workspace {
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
+                    let doc = editor.read(cx).doc.clone();
+                    ws.documents.update(cx, |s, cx| s.add(&doc, cx));
                     match &current {
                         Some(old) => ws.lsp.update(cx, |s, cx| s.moved(old, &editor, cx)),
                         None => ws.lsp.update(cx, |s, cx| s.register(&editor, cx)),
@@ -341,6 +349,9 @@ impl Workspace {
                 sibling.update(cx, |e, _| e.put_unloaded(unloaded));
             }
         } else if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
+            // Closed without saving: its edits go with it, so the store doesn't keep it.
+            let doc = editor.read(cx).doc.clone();
+            self.documents.update(cx, |s, cx| s.release(&doc, cx));
             self.lsp.update(cx, |s, _| s.did_close(&path));
             let breakpoints = editor.read(cx).breakpoints(cx);
             if !breakpoints.is_empty() {

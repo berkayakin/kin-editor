@@ -284,12 +284,6 @@ impl Editor {
         cx.notify();
     }
 
-    /// A server stopped or restarts: what it found goes.
-    pub fn clear_server_diagnostics(&mut self, server: &str, cx: &mut Context<Self>) {
-        self.doc.as_mut(cx).clear_server_diagnostics(server);
-        cx.notify();
-    }
-
     fn text_document(&self, cx: &App) -> Option<Value> {
         Some(json!({ "uri": path_to_uri(self.doc.read(cx).path.as_deref()?) }))
     }

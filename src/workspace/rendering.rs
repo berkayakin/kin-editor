@@ -53,17 +53,17 @@ impl Workspace {
                                     el.child(div().text_size(px(12.)).text_color(theme.text_muted).line_clamp(4).child(d))
                                 }),
                         )
-                        // Only while it would still undo what the toast reports.
-                        .when_some(t.undo.filter(|undo| self.undo_applies(*undo)), |el, undo| {
+                        // Only while what it does still applies.
+                        .when_some(t.button.filter(|button| self.toast_button_applies(*button, cx)), |el, button| {
                             el.child(
-                                crate::ui::text_button(("toast-undo", id), "Undo", false, cx)
+                                crate::ui::text_button(("toast-button", id), button.label(), false, cx)
                                     .h(px(24.))
                                     .px_2p5()
                                     .text_size(px(12.))
                                     .on_click(cx.listener(move |ws, _, window, cx| {
                                         cx.stop_propagation();
                                         ws.dismiss_toast(id, cx);
-                                        ws.run_toast_undo(undo, window, cx);
+                                        ws.run_toast_button(button, window, cx);
                                     })),
                             )
                         })

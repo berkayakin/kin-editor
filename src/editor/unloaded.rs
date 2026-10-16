@@ -122,10 +122,13 @@ impl Editor {
         };
         // A fresh editor for the text, in the same view (tabs and focus refer
         // to it) and the same document entity (other editors may show it).
-        let focus_handle = self.focus_handle.clone();
+        let (focus_handle, git_diff) = (self.focus_handle.clone(), self.git_diff.take());
         self.doc.write(cx, doc);
         *self = Self::with_document(self.doc.clone(), cx);
         self.focus_handle = focus_handle;
+        if let Some((diff, _)) = git_diff {
+            self.set_git_diff(diff, cx);
+        }
         // Unless the file has it already (saved after the session was written).
         if let Some(text) = unloaded.unsaved
             && text != *self.doc.read(cx).rope()

@@ -14,6 +14,8 @@ mod dap;
 mod debugger;
 mod diff_view;
 mod document;
+mod document_diff;
+mod document_store;
 mod downloads;
 mod editor;
 mod extensions;

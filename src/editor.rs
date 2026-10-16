@@ -33,6 +33,7 @@ use crate::{
     assets::Icon,
     conflict::Resolution,
     document::{Document, EditKind, Selection},
+    document_diff::DocumentDiff,
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
     settings::{FileSettings, Settings, ShowWhitespace},
@@ -274,15 +275,15 @@ pub struct Editor {
     external: Option<ExternalLinter>,
     external_error: Option<String>,
     external_task: Option<Task<()>>,
+    /// The document's Git changes, shared with its other editors (see
+    /// `DocumentDiff`); the fields below mirror it as of its last notify.
+    git_diff: Option<(Entity<DocumentDiff>, gpui::Subscription)>,
     git_file: Option<GitFile>,
-    /// The file's text at HEAD; changes are shown against it.
-    diff_base: Option<Arc<str>>,
-    /// The file's staged text, to tell staged changes from unstaged ones.
-    index_base: Option<Arc<str>>,
+    /// There's a HEAD text the changes are shown against.
+    has_diff_base: bool,
     hunks: Arc<Vec<Hunk>>,
     /// Per hunk: whether it's fully staged.
     hunk_staged: Arc<Vec<bool>>,
-    diff_task: Option<Task<()>>,
     /// Index into `hunks` of the change popover that is open.
     open_hunk: Option<usize>,
     blame: Option<(usize, u64, BlameLine)>,
@@ -414,12 +415,11 @@ impl Editor {
             external: None,
             external_error: None,
             external_task: None,
+            git_diff: None,
             git_file: None,
-            diff_base: None,
-            index_base: None,
+            has_diff_base: false,
             hunks: Arc::new(Vec::new()),
             hunk_staged: Arc::new(Vec::new()),
-            diff_task: None,
             open_hunk: None,
             blame: None,
             blame_request: None,
@@ -520,8 +520,12 @@ impl Editor {
             cx.defer(move |cx| {
                 this.update(cx, |editor, cx| {
                     let (focus_handle, waited, view) = (editor.focus_handle.clone(), editor.waiting, editor.waiting_view.take());
+                    let git_diff = editor.git_diff.take();
                     *editor = Self::with_document(editor.doc.clone(), cx);
                     editor.focus_handle = focus_handle;
+                    if let Some((diff, _)) = git_diff {
+                        editor.set_git_diff(diff, cx);
+                    }
                     // A split of a restored tab: its text is here now too.
                     if waited {
                         if let Some((cursor, top_line)) = view {
@@ -539,7 +543,6 @@ impl Editor {
         self.selections = self.clamp_selections(selections, cx);
         self.follow_edits(self.seen.1, cx);
         self.seen = (id, version);
-        self.schedule_diff(Duration::from_millis(120), cx);
         cx.notify();
     }
 
@@ -748,61 +751,39 @@ impl Editor {
         window.focus(&self.focus_handle);
     }
 
-    /// Sets the text that changes are measured against (HEAD) and the staged
-    /// text, or clears them for files outside a repository or not yet committed.
-    pub fn set_diff_base(&mut self, git_file: Option<GitFile>, base: Option<String>, index: Option<String>, cx: &mut Context<Self>) {
+    /// Shows the document's Git changes from `diff` (the same one for every
+    /// editor of the document, so it's computed once).
+    pub fn set_git_diff(&mut self, diff: Entity<DocumentDiff>, cx: &mut Context<Self>) {
+        if self.git_diff.as_ref().is_some_and(|(d, _)| *d == diff) {
+            return;
+        }
+        let observer = cx.observe(&diff, |editor, _, cx| editor.git_diff_changed(cx));
+        self.git_diff = Some((diff, observer));
+        self.git_diff_changed(cx);
+    }
+
+    fn git_diff_changed(&mut self, cx: &mut Context<Self>) {
+        let Some((diff, _)) = &self.git_diff else { return };
+        let diff = diff.read(cx);
+        let git_file = diff.git_file().cloned();
         if self.git_file != git_file {
             self.blame = None;
             self.blame_request = None;
         }
         self.git_file = git_file;
-        self.diff_base = base.map(Arc::from);
-        self.index_base = index.map(Arc::from);
-        self.schedule_diff(Duration::ZERO, cx);
+        self.has_diff_base = diff.has_base();
+        self.hunks = diff.hunks().clone();
+        self.hunk_staged = diff.staged().clone();
+        if self.open_hunk.is_some_and(|i| i >= self.hunks.len()) {
+            self.open_hunk = None;
+        }
+        cx.notify();
     }
 
-    fn schedule_diff(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        let Some(base) = self.diff_base.clone() else {
-            if !self.hunks.is_empty() {
-                self.hunks = Arc::new(Vec::new());
-                self.open_hunk = None;
-                cx.notify();
-            }
-            return;
-        };
-        let rope = self.doc.read(cx).rope().clone();
-        let version = self.doc.read(cx).version();
-        let index = self.index_base.clone();
-        self.diff_task = Some(cx.spawn(async move |this, cx| {
-            if !delay.is_zero() {
-                cx.background_executor().timer(delay).await;
-            }
-            let (hunks, staged) = cx
-                .background_executor()
-                .spawn(async move {
-                    let text = rope.to_string();
-                    let hunks = git::diff_hunks(&base, &text);
-                    // A change is staged when nothing differs from the index there.
-                    let unstaged = index.map(|index| git::diff_hunks(&index, &text));
-                    let staged: Vec<bool> = hunks
-                        .iter()
-                        .map(|h| unstaged.as_ref().is_some_and(|u| !u.iter().any(|u| git::rows_touch(&u.new_rows, &h.new_rows))))
-                        .collect();
-                    (hunks, staged)
-                })
-                .await;
-            this.update(cx, |editor, cx| {
-                if editor.doc.read(cx).version() == version {
-                    editor.hunks = Arc::new(hunks);
-                    editor.hunk_staged = Arc::new(staged);
-                    if editor.open_hunk.is_some_and(|i| i >= editor.hunks.len()) {
-                        editor.open_hunk = None;
-                    }
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
+    /// The rows of each change, for tests.
+    #[cfg(test)]
+    pub(crate) fn hunk_rows(&self) -> Vec<Range<usize>> {
+        self.hunks.iter().map(|h| h.new_rows.clone()).collect()
     }
 
     /// Re-reads the file if it changed on disk and has no unsaved edits
@@ -844,7 +825,6 @@ impl Editor {
         self.autoscroll = false;
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
-        self.schedule_diff(Duration::ZERO, cx);
         self.edited(cx);
         // The text is the file's again, as after a save: servers that check
         // on save (rust-analyzer's cargo check) check it again; until then
@@ -1116,7 +1096,6 @@ impl Editor {
         self.schedule_inlay_hints(cx);
         self.schedule_code_lenses(cx);
         self.schedule_lint(Duration::from_millis(150), cx);
-        self.schedule_diff(Duration::from_millis(120), cx);
         self.edited(cx);
         cx.notify();
     }
@@ -2431,7 +2410,6 @@ impl Editor {
             let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
-            self.schedule_diff(Duration::from_millis(120), cx);
             self.edited(cx);
         }
     }
@@ -2446,7 +2424,6 @@ impl Editor {
             let selections = self.clamp_selections(selections, cx);
             self.set_selections(selections, 0, cx);
             self.schedule_lint(Duration::from_millis(150), cx);
-            self.schedule_diff(Duration::from_millis(120), cx);
             self.edited(cx);
         }
     }
@@ -4147,7 +4124,7 @@ impl Editor {
         let Some(git_file) = self.git_file.clone().filter(|_| enabled) else {
             return;
         };
-        if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || self.diff_base.is_none() {
+        if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || !self.has_diff_base {
             return;
         }
         let row = self.doc.read(cx).row_of(self.primary_selection().head);

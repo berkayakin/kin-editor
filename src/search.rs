@@ -78,16 +78,6 @@ impl SearchQuery {
             _ => replacement.to_string(),
         }
     }
-
-    pub fn replace_all(&self, text: &str, replacement: &str) -> (String, usize) {
-        let count = self.find_all(text).len();
-        let result = if self.is_regex {
-            self.regex.replace_all(text, replacement).into_owned()
-        } else {
-            self.regex.replace_all(text, regex::NoExpand(replacement)).into_owned()
-        };
-        (result, count)
-    }
 }
 
 #[derive(Clone)]
@@ -323,6 +313,7 @@ mod tests {
         let q = SearchQuery::new(r"(\w+)@(\w+)", re).unwrap().unwrap();
         let text = "a@b c@d";
         assert_eq!(q.replacement_for(text, 4..7, "$2@$1"), "d@c");
-        assert_eq!(q.replace_all(text, "$2@$1"), ("b@a d@c".to_string(), 2));
+        let found: Vec<String> = q.find_all(text).into_iter().map(|r| q.replacement_for(text, r, "$2@$1")).collect();
+        assert_eq!(found, ["b@a", "d@c"]);
     }
 }
