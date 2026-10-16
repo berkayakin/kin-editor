@@ -213,6 +213,7 @@ impl Workspace {
             self.toast(ToastKind::Info, "Open a folder to trust it", None, cx);
             return;
         };
+        self.trust_waits = false;
         self.close_modal(window, cx);
         let dialog = cx.new(|cx| crate::trust_dialog::TrustDialog::new(folder, window, cx));
         let subscription = cx.subscribe_in(&dialog, window, |ws, _, event: &crate::trust_dialog::TrustDialogEvent, window, cx| {
@@ -231,6 +232,23 @@ impl Workspace {
         });
         self.modals.open(Modal::Trust(dialog), subscription);
         cx.notify();
+    }
+
+    /// Asks the trust question Welcome Setup held back, once nothing covers
+    /// the project. Deferred: what closed Welcome Setup or a dialog may be
+    /// opening another (its settings link opens Preferences, asked after).
+    pub(super) fn ask_waiting_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.trust_waits {
+            return;
+        }
+        cx.defer_in(window, |ws, window, cx| {
+            if ws.trust_waits && ws.onboarding.is_none() && ws.modals.current.is_none() {
+                ws.trust_waits = false;
+                if ws.restricted(cx) {
+                    ws.open_trust_dialog(window, cx);
+                }
+            }
+        });
     }
 
     /// Starts what trust allows, or stops it.

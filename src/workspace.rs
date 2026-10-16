@@ -724,6 +724,10 @@ pub struct Workspace {
     symbol_task: Option<Task<()>>,
     /// Welcome Setup, shown in place of everything below the title bar.
     onboarding: Option<(Entity<Onboarding>, Subscription)>,
+    /// The project's trust question, held back while Welcome Setup shows
+    /// (showing it closes dialogs): asked once nothing covers the project,
+    /// `ask_waiting_trust`.
+    trust_waits: bool,
     /// Language servers for this window's files.
     lsp: Entity<LspStore>,
     /// This window's documents by path, with a tab or without (edited by a
@@ -1020,6 +1024,7 @@ impl Workspace {
             session_task: None,
             placement_task: None,
             onboarding: None,
+            trust_waits: false,
             watcher: None,
             watch_task: None,
             ignore: None,

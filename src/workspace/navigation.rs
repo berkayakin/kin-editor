@@ -66,6 +66,7 @@ impl Workspace {
         }
         if self.modals.take().is_some() {
             self.focus_active(window, cx);
+            self.ask_waiting_trust(window, cx);
             cx.notify();
         }
     }

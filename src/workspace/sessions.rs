@@ -293,6 +293,10 @@ impl Workspace {
 
     /// Shows Welcome Setup (theme, keymap, editor basics) over the window.
     pub fn show_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // At startup the restored project has just asked.
+        if matches!(self.modals.current, Some(Modal::Trust(_))) {
+            self.trust_waits = true;
+        }
         self.close_modal(window, cx);
         let onboarding = cx.new(Onboarding::new);
         let subscription = cx.subscribe_in(&onboarding, window, |ws, _, event: &OnboardingEvent, window, cx| match event {
@@ -318,6 +322,7 @@ impl Workspace {
         self.onboarding = None;
         SessionState::set_onboarded();
         self.focus_active(window, cx);
+        self.ask_waiting_trust(window, cx);
         cx.notify();
     }
 }
