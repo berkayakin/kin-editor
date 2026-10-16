@@ -1357,15 +1357,20 @@ mod tests {
             hints(cx) == [14]
         });
 
-        // A merge rewrites the file: the old hint would land mid-line.
+        // A merge adds a line above: the hint moves with its line until the
+        // server answers for the new text.
         std::fs::write(&path, "// merged\nlet index = 1;\n").unwrap();
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
         editor.update(cx, |e, cx| e.reload_if_changed(cx));
-        assert!(hints(cx).is_empty());
+        assert_eq!(hints(cx), [24]);
         wait_for(cx, "the new hint", |cx| {
             cx.executor().advance_clock(Duration::from_millis(500));
             hints(cx) == [9]
+        });
+        // The file is saved as it is now: a server that checks on save checks again.
+        wait_for(cx, "the server's check", |cx| {
+            editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().any(|d| &*d.message == "hints checked // merged"))
         });
         std::fs::remove_dir_all(&dir).ok();
     }

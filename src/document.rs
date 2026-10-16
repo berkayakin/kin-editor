@@ -399,29 +399,33 @@ impl Document {
 
     /// Replaces all text, as when the file changed on disk. Returns whether
     /// anything changed; undo history goes since it no longer applies.
+    /// What follows the text (diagnostics, folds, breakpoints, the debug
+    /// line, inlay hints, code lenses, other editors' carets) moves as
+    /// through an edit made of the lines that changed (`changed_ranges`):
+    /// on lines that stayed it follows them, in changed text it goes.
     fn replace_all(&mut self, text: String) -> bool {
         if self.rope == text.as_str() {
             return false;
         }
-        // Breakpoints and the debug line keep their line numbers across a reload.
-        let (breakpoints, debug_row) = (self.breakpoints(), self.debug_row());
-        self.rope = Rope::from_str(&text);
+        let old = std::mem::replace(&mut self.rope, Rope::from_str(&text));
+        let changes = changed_ranges(&String::from(&old), &text);
+        // Logged as `edit` logs them: the last first, each in the text before it.
+        if self.line_edits.len() + changes.len() >= LINE_EDIT_LOG {
+            self.line_edits.clear();
+            self.line_edits_base = self.version + 1;
+        } else {
+            for (range, new) in changes.iter().rev() {
+                self.line_edits.push((self.version + 1, LineEdit::of(&old, range.clone(), &text[new.clone()])));
+            }
+        }
         self.long_lines = long_lines(&self.rope, 0..usize::MAX);
-        self.line_edits.clear();
-        self.line_edits_base = self.version + 1;
-        self.set_breakpoints(&breakpoints);
-        self.set_debug_row(debug_row);
         let (syntax, parsed) = Syntax::new_within(self.language, &self.rope, OPEN_PARSE_BUDGET);
         self.set_syntax(syntax, parsed);
         self.lsp_changes.mark_full();
-        self.folds.clear();
-        self.snippet = None;
-        // The server's hints and lenses point into the old text; editors ask again.
-        self.inlay_hints.clear();
-        self.code_lenses.clear();
+        let patch = Patch::new(changes.into_iter().map(|(range, new)| (range, new.len())).collect());
+        self.shift_tracked(&patch, &old);
         self.version += 1;
-        self.patches.clear();
-        self.patches_base = self.version;
+        self.log_patch(patch);
         self.saved_version = self.version;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -580,6 +584,7 @@ impl Document {
         }
 
         // Apply from last to first so earlier ranges remain valid.
+        let before = self.rope.clone();
         let mut records = Vec::with_capacity(groups.len());
         for g in groups.iter().rev() {
             if g.range.is_empty() && g.text.is_empty() {
@@ -593,7 +598,7 @@ impl Document {
         let patch = Patch::new(
             groups.iter().filter(|g| !(g.range.is_empty() && g.text.is_empty())).map(|g| (g.range.clone(), g.text.len())).collect(),
         );
-        self.shift_tracked(&patch);
+        self.shift_tracked(&patch, &before);
         let mut patch = Some(patch);
 
         // Compute post-edit ranges by accumulating deltas front to back.
@@ -676,9 +681,10 @@ impl Document {
         let mut steps = Vec::new();
         for rec in t.edits.iter().rev() {
             let range = rec.start..rec.start + rec.new.len();
+            let before = self.rope.clone();
             self.raw_replace(range.clone(), &rec.old);
             let patch = Patch::new(vec![(range, rec.old.len())]);
-            self.shift_tracked(&patch);
+            self.shift_tracked(&patch, &before);
             steps.push(patch);
         }
         self.version += 1;
@@ -694,9 +700,10 @@ impl Document {
         let mut steps = Vec::new();
         for rec in &t.edits {
             let range = rec.start..rec.start + rec.old.len();
+            let before = self.rope.clone();
             self.raw_replace(range.clone(), &rec.new);
             let patch = Patch::new(vec![(range, rec.new.len())]);
-            self.shift_tracked(&patch);
+            self.shift_tracked(&patch, &before);
             steps.push(patch);
         }
         self.version += 1;
@@ -715,12 +722,8 @@ impl Document {
             self.line_edits.clear();
             self.line_edits_base = self.version + 1;
         }
-        let row = self.rope.byte_to_line(range.start);
-        let lines = LineEdit {
-            row,
-            old_rows: self.rope.byte_to_line(range.end) - row + 1,
-            new_rows: 1 + text.bytes().filter(|&b| b == b'\n').count(),
-        };
+        let lines = LineEdit::of(&self.rope, range.clone(), text);
+        let row = lines.row;
         self.line_edits.push((self.version + 1, lines));
         self.long_lines -= long_lines(&self.rope, row..row + lines.old_rows);
         let edit = input_edit(&self.rope, range.clone(), text);
@@ -837,14 +840,15 @@ impl Document {
 
     /// Moves what follows the text (folds, breakpoints, the debug line, a
     /// snippet's stops, inlay hints, diagnostics) across a transaction's
-    /// edits, once for all of them. Runs after the rope changed.
-    fn shift_tracked(&mut self, patch: &Patch) {
+    /// edits, once for all of them. Runs after the rope changed; `old` is
+    /// the text before.
+    fn shift_tracked(&mut self, patch: &Patch, old: &Rope) {
         if patch.edits.is_empty() {
             return;
         }
         self.shift_folds(patch);
-        self.shift_breakpoints(patch);
-        self.debug_line = self.debug_line.and_then(|offset| self.shift_line(offset, patch));
+        self.shift_breakpoints(patch, old);
+        self.debug_line = self.debug_line.and_then(|offset| self.shift_line(offset, patch, old));
         if let Some(snippet) = &mut self.snippet
             && !snippet.shift(patch)
         {
@@ -853,7 +857,7 @@ impl Document {
         self.shift_inlay_hints(patch);
         self.code_lenses = std::mem::take(&mut self.code_lenses)
             .into_iter()
-            .filter_map(|lens| Some(CodeLens { line_start: self.shift_line(lens.line_start, patch)?, ..lens }))
+            .filter_map(|lens| Some(CodeLens { line_start: self.shift_line(lens.line_start, patch, old)?, ..lens }))
             .collect();
         // The merged list too: shifting keeps its order, so it needn't be
         // built and sorted again.
@@ -983,15 +987,15 @@ impl Document {
     }
 
     /// Breakpoints follow their line's text: an edit before a line moves
-    /// it, one that removes the line's start removes it. (Runs after the
-    /// rope changed, so lines can be looked up again.)
-    fn shift_breakpoints(&mut self, patch: &Patch) {
+    /// it, one that removes the line (see `shift_line`) removes it. (Runs
+    /// after the rope changed, so lines can be looked up again.)
+    fn shift_breakpoints(&mut self, patch: &Patch, old: &Rope) {
         if self.breakpoints.is_empty() {
             return;
         }
         let mut moved = Vec::with_capacity(self.breakpoints.len());
         for (offset, breakpoint) in std::mem::take(&mut self.breakpoints) {
-            if let Some(start) = self.shift_line(offset, patch) {
+            if let Some(start) = self.shift_line(offset, patch, old) {
                 moved.push((start, Breakpoint { row: self.row_of(start), ..breakpoint }));
             }
         }
@@ -999,13 +1003,28 @@ impl Document {
         self.breakpoints = moved;
     }
 
-    /// Where the line starting at `offset` starts after `patch`; None when
-    /// the edits removed its start (joined it with the line above).
-    fn shift_line(&self, offset: usize, patch: &Patch) -> Option<usize> {
+    /// Where the line starting at `offset` starts after `patch` (`old` is
+    /// the text before it); None when the edits removed the line: replaced
+    /// text around its start, joined it with the line above, or deleted it
+    /// whole, line break included.
+    fn shift_line(&self, offset: usize, patch: &Patch, old: &Rope) -> Option<usize> {
         let (mut delta, near) = patch.around(offset..offset);
         for (range, new_len) in near {
-            if range.start < offset && offset <= range.end {
+            if range.start < offset && offset < range.end {
                 return None;
+            }
+            if range.start == offset && offset < range.end && *new_len == 0 && old.byte_to_line(range.end) > old.byte_to_line(offset) {
+                // Deleted from its start through its line break: the line
+                // after takes its place, with its own things.
+                return None;
+            }
+            if range.start < offset && offset == range.end {
+                // Text before it went (lines above deleted, or its line
+                // break): it's still a line if a line ends where that text did.
+                let end = moved(range.start, delta) + new_len;
+                if self.line_start(self.row_of(end)) != end {
+                    return None;
+                }
             }
             if offset >= range.end {
                 delta += Patch::change(range, *new_len);
@@ -1068,6 +1087,14 @@ pub struct LineEdit {
     pub row: usize,
     pub old_rows: usize,
     pub new_rows: usize,
+}
+
+impl LineEdit {
+    /// What replacing `range` of `rope` with `text` does to its lines.
+    fn of(rope: &Rope, range: Range<usize>, text: &str) -> Self {
+        let row = rope.byte_to_line(range.start);
+        LineEdit { row, old_rows: rope.byte_to_line(range.end) - row + 1, new_rows: 1 + text.bytes().filter(|&b| b == b'\n').count() }
+    }
 }
 
 /// A type or parameter name from the language server, shown in the text
@@ -1143,6 +1170,92 @@ impl LspChanges {
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// How long a reload may diff the old text with the new (on the UI
+/// thread); past it the diff is coarser, and fewer things keep their place.
+const RELOAD_DIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// What turns `old` into `new`, as the byte ranges of `old` that change
+/// with the ranges of `new` that replace them (sorted, apart). Found by
+/// lines; within a run of changed lines, lines pair up in order, the
+/// shorter side placed along the longer where its lines are most alike
+/// (lines added above a changed one, below it, or around a block that got
+/// indented), and each pair only changes the bytes between their common
+/// start and end. So what's on the unchanged parts of a line stays: its
+/// breakpoint, a diagnostic on a name whose value changed, the code after
+/// a new indentation.
+fn changed_ranges(old: &str, new: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    // Line pairs compared at most for placing one run (else only its ends).
+    const PLACING: usize = 20_000;
+    let (old_lines, new_lines): (Vec<&str>, Vec<&str>) = (old.split_inclusive('\n').collect(), new.split_inclusive('\n').collect());
+    // Where each line starts, and the end.
+    let starts = |lines: &[&str]| -> Vec<usize> {
+        let mut at = vec![0];
+        at.extend(lines.iter().scan(0, |end, line| {
+            *end += line.len();
+            Some(*end)
+        }));
+        at
+    };
+    let (old_at, new_at) = (starts(&old_lines), starts(&new_lines));
+    let mut changes = Vec::new();
+    let mut change = |old_rows: Range<usize>, new_rows: Range<usize>| {
+        let (o, n) = (old_at[old_rows.start]..old_at[old_rows.end], new_at[new_rows.start]..new_at[new_rows.end]);
+        let (prefix, suffix) = common_ends(&old[o.clone()], &new[n.clone()]);
+        if o.len() != prefix + suffix || n.len() != prefix + suffix {
+            changes.push((o.start + prefix..o.end - suffix, n.start + prefix..n.end - suffix));
+        }
+    };
+    let diff = similar::TextDiff::configure().timeout(RELOAD_DIFF_TIMEOUT).diff_slices(&old_lines, &new_lines);
+    for op in diff.ops() {
+        let (tag, o, n) = op.as_tag_tuple();
+        if tag == similar::DiffTag::Equal {
+            continue;
+        }
+        let pairs = o.len().min(n.len());
+        let rest = o.len().max(n.len()) - pairs;
+        // Where the pairs start when they skip `skip` lines of the longer side.
+        let from = |skip: usize| if o.len() > n.len() { (o.start + skip, n.start) } else { (o.start, n.start + skip) };
+        let alike = |skip: usize| -> usize {
+            let (o_from, n_from) = from(skip);
+            (0..pairs)
+                .map(|i| {
+                    let (prefix, suffix) = common_ends(old_lines[o_from + i], new_lines[n_from + i]);
+                    prefix + suffix
+                })
+                .sum()
+        };
+        let skip = match (pairs, rest) {
+            (0, _) | (_, 0) => 0,
+            _ if pairs * (rest + 1) <= PLACING => (0..=rest).max_by_key(|&skip| (alike(skip), std::cmp::Reverse(skip))).unwrap_or(0),
+            _ => [0, rest].into_iter().max_by_key(|&skip| (alike(skip), std::cmp::Reverse(skip))).unwrap_or(0),
+        };
+        // The longer side's lines before and after the pairs were added or removed.
+        let (o_from, n_from) = from(skip);
+        change(o.start..o_from, n.start..n_from);
+        for i in 0..pairs {
+            change(o_from + i..o_from + i + 1, n_from + i..n_from + i + 1);
+        }
+        change(o_from + pairs..o.end, n_from + pairs..n.end);
+    }
+    changes
+}
+
+/// How many bytes `a` and `b` share at their start, and then at their end
+/// (whole characters).
+fn common_ends(a: &str, b: &str) -> (usize, usize) {
+    let mut prefix = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    while !a.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let (a, b) = (&a[prefix..], &b[prefix..]);
+    let mut suffix = a.bytes().rev().zip(b.bytes().rev()).take_while(|(x, y)| x == y).count();
+    // The bytes from there on are the same in both, so a boundary in one is in the other.
+    while !a.is_char_boundary(a.len() - suffix) {
+        suffix -= 1;
+    }
+    (prefix, suffix)
 }
 
 /// One transaction's edits, for moving tracked positions: the replaced
@@ -1487,23 +1600,153 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `old` with `changes` made, checking they're sorted and apart.
+    fn apply_changes(old: &str, new: &str, changes: &[(Range<usize>, Range<usize>)]) -> String {
+        let (mut text, mut at) = (String::new(), 0);
+        for (range, by) in changes {
+            assert!(range.start >= at && range.start <= range.end, "sorted and apart: {changes:?}");
+            text.push_str(&old[at..range.start]);
+            text.push_str(&new[by.clone()]);
+            at = range.end;
+        }
+        text + &old[at..]
+    }
+
     #[test]
-    fn a_reload_drops_what_the_server_placed_in_the_old_text() {
-        let dir = std::env::temp_dir().join(format!("kuana-doc-reload-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("a.rs");
-        std::fs::write(&path, "let index = 1;\n").unwrap();
-        let mut doc = Document::open(&path).unwrap();
-        doc.set_inlay_hints(vec![InlayHint { offset: 9, label: ": usize".into(), pad_left: false, pad_right: false }]);
-        doc.set_code_lenses(vec![CodeLens { line_start: 0, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() }]);
-        // A merge rewrote the file: offset 9 is somewhere else entirely now.
-        std::fs::write(&path, "fn main() {\n    let index = 1;\n}\n").unwrap();
-        let later = std::time::SystemTime::now() + Duration::from_secs(5);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
-        assert!(doc.reload_from_disk().unwrap());
-        assert!(doc.inlay_hints().is_empty());
-        assert!(doc.code_lenses().is_empty());
-        std::fs::remove_dir_all(&dir).ok();
+    fn changed_ranges_turn_the_old_text_into_the_new() {
+        let cases: [(&str, &str, &[(Range<usize>, Range<usize>)]); 11] = [
+            // A line added, one removed: whole lines.
+            ("a\nc\n", "a\nb\nc\n", &[(2..2, 2..4)]),
+            ("a\nb\nc\n", "a\nc\n", &[(2..4, 2..2)]),
+            // A changed line, only between what it keeps at its ends.
+            ("let x = 1;\n", "let x = 22;\n", &[(8..9, 8..10)]),
+            // Every line indented: each keeps its code.
+            ("a();\nb();\n", "  a();\n  b();\n", &[(0..0, 0..2), (5..5, 7..9)]),
+            // A line added above a changed one: the changed one pairs with its new self.
+            ("    foo();\n", "    // c\n    foo(1);\n", &[(0..0, 0..9), (8..8, 17..18)]),
+            // Lines wrapped in a block.
+            ("foo();\nbar();\n", "if x {\n    foo();\n    bar();\n}\n", &[(0..0, 0..7), (0..0, 7..11), (7..7, 18..22), (14..14, 29..31)]),
+            // Whole characters only.
+            ("aé\n", "a©\n", &[(1..3, 1..3)]),
+            // The last line without a line break, and with one.
+            ("a\nb", "a\nb\n", &[(3..3, 3..4)]),
+            ("a\nb\n", "", &[(0..4, 0..0)]),
+            ("", "a\n", &[(0..0, 0..2)]),
+            ("same\n", "same\n", &[]),
+        ];
+        for (old, new, expected) in cases {
+            let changes = changed_ranges(old, new);
+            assert_eq!(changes, expected, "{old:?} → {new:?}");
+            assert_eq!(apply_changes(old, new, &changes), new);
+        }
+
+        // Random edits of random lines.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let words = ["fn", "x", "    ", "é", "{", "}", "\n", "\n", "\n", "let", "🦀", ""];
+        for _ in 0..500 {
+            let old: String = (0..next(40)).map(|_| words[next(words.len())]).collect();
+            let mut new = old.clone();
+            for _ in 0..next(5) {
+                let at = new.char_indices().map(|(i, _)| i).nth(next(new.chars().count() + 1)).unwrap_or(new.len());
+                let end = new[at..].char_indices().map(|(i, _)| at + i).nth(next(4)).unwrap_or(new.len());
+                new.replace_range(at..end, words[next(words.len())]);
+            }
+            let changes = changed_ranges(&old, &new);
+            assert_eq!(apply_changes(&old, &new, &changes), new, "{old:?} → {new:?}: {changes:?}");
+        }
+    }
+
+    #[test]
+    fn a_reload_moves_what_follows_the_text() {
+        let old = "fn a() {\n    one();\n    gone();\n}\nfn b() {\n    two();\n}\n";
+        // Lines added at the top, `one();` changed, `gone();` removed.
+        let new = "use std::fmt;\n\nfn a() {\n    one(1);\n}\nfn b() {\n    two();\n}\n";
+        let mut doc = Document::from_text(old.into(), Some("a.rs".into()));
+        let diagnostic = |range: Range<usize>| Diagnostic {
+            range,
+            severity: crate::lint::Severity::Warning,
+            message: "m".into(),
+            rule: "r".into(),
+        };
+        // On `one`, on `one`'s `()`, on `gone`, on `two`.
+        doc.set_lsp_diagnostics(vec![diagnostic(13..16), diagnostic(16..18), diagnostic(24..28), diagnostic(47..50)]);
+        let hint = |offset| InlayHint { offset, label: ": T".into(), pad_left: false, pad_right: false };
+        doc.set_inlay_hints(vec![hint(16), hint(28), hint(50)]);
+        let lens = |line_start| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
+        doc.set_code_lenses(vec![lens(0), lens(34)]);
+        let condition = Some("x > 1".to_string());
+        doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(2), Breakpoint::at(3), Breakpoint { condition: condition.clone(), ..Breakpoint::at(5) }]);
+        doc.set_debug_row(Some(5));
+        doc.fold_rows(1, 3);
+        doc.fold_rows(5, 6);
+        doc.take_lsp_changes();
+        let version = doc.version();
+
+        assert!(doc.replace_all(new.into()));
+        assert_eq!(doc.rope().to_string(), new);
+        // Things on lines that stayed follow them; ones in changed text go.
+        let ranges = doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>();
+        assert_eq!(ranges, [28..31, 51..54]);
+        assert_eq!(doc.inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>(), [31, 54]);
+        assert_eq!(doc.code_lenses().iter().map(|l| doc.row_of(l.line_start)).collect::<Vec<_>>(), [2, 5]);
+        // `gone();`'s breakpoint went with it; the changed line kept its own.
+        let rows = doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>();
+        assert_eq!(rows, [3, 4, 6]);
+        assert_eq!(doc.breakpoint(6).and_then(|b| b.condition.clone()), condition);
+        assert_eq!(doc.debug_row(), Some(6));
+        // The fold over changed lines opened; the other moved.
+        assert_eq!(doc.folds(), [doc.line_start(6)..doc.line_end(7)]);
+
+        // Other editors' carets follow too: `two` and a caret in `gone();`.
+        let patches = doc.patches_since(version).expect("kept").collect::<Vec<_>>();
+        let map = |offset: usize| patches.iter().fold(offset, |offset, patch| patch.map(offset));
+        assert_eq!((map(47), map(25)), (51, doc.line_start(4)));
+        // Soft wrap re-measures only the changed lines: untouched ones keep their rows.
+        let mut lines: Vec<Option<usize>> = (0..Rope::from_str(old).len_lines()).map(Some).collect();
+        for edit in doc.line_edits_since(version).expect("kept") {
+            lines.splice(edit.row..edit.row + edit.old_rows, std::iter::repeat_n(None, edit.new_rows));
+        }
+        assert_eq!(lines.len(), doc.line_count());
+        assert_eq!(lines[5..], [Some(4), Some(5), Some(6), Some(7)]);
+        // Saved, with nothing to undo; the server gets all of it.
+        assert!(!doc.is_dirty() && doc.undo().is_none());
+        assert!(doc.take_lsp_changes().full);
+    }
+
+    #[test]
+    fn a_reload_that_reindents_every_line_keeps_things_on_their_lines() {
+        let mut doc = Document::from_text("a();\nb();\nc();\n".into(), None);
+        doc.set_breakpoints(&[Breakpoint::at(0), Breakpoint::at(1), Breakpoint::at(2)]);
+        doc.set_lsp_diagnostics(vec![Diagnostic { range: 5..6, severity: crate::lint::Severity::Error, message: "m".into(), rule: "r".into() }]);
+        let version = doc.version();
+        assert!(doc.replace_all("    a();\n    b();\n    c();\n".into()));
+        assert_eq!(doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [13..14]);
+        let patch = doc.patches_since(version).unwrap().next().unwrap();
+        assert_eq!(patch.map(6), 14);
+    }
+
+    #[test]
+    fn deleting_whole_lines_keeps_the_breakpoints_below() {
+        let mut doc = Document::from_text("a\nb\nc\n\nd\n".into(), None);
+        let rows = |doc: &Document| doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>();
+        doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint { condition: Some("x".into()), ..Breakpoint::at(2) }, Breakpoint::at(4)]);
+        // Delete Line on `b`: its breakpoint goes, the next line's moves up with it.
+        doc.edit(vec![(2..4, String::new())], &[], EditKind::Other);
+        assert_eq!(rows(&doc), [1, 3]);
+        assert_eq!(doc.breakpoint(1).and_then(|b| b.condition.as_deref()), Some("x"));
+        // Backspace at the start of `d` removes the empty line above it, not `d`.
+        let d = doc.line_start(3);
+        doc.edit(vec![(d - 1..d, String::new())], &[], EditKind::Deleting);
+        assert_eq!(rows(&doc), [1, 2]);
+        doc.undo();
+        assert_eq!(rows(&doc), [1, 3]);
     }
 
     #[test]

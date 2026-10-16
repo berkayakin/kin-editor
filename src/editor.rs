@@ -244,6 +244,9 @@ pub struct Editor {
     center_on_next_frame: bool,
     /// A buffer line to put at the top on the next frame (a restored tab's view).
     scroll_to_line: Option<usize>,
+    /// After a reload: the line that was at the top of the view (its number
+    /// then) and where its text is now, for `sync_wrap` to keep it there.
+    reloaded_top: Option<(usize, usize)>,
     /// Like autoscroll, but centers the cursor when it is off screen.
     reveal_primary: bool,
     /// Vim mode's state while the `vim_mode` setting is on.
@@ -386,6 +389,7 @@ impl Editor {
             autoscroll: false,
             center_on_next_frame: false,
             scroll_to_line: None,
+            reloaded_top: None,
             reveal_primary: false,
             vim: None,
             layout: None,
@@ -506,16 +510,20 @@ impl Editor {
             });
             return;
         }
-        let moved: Option<Vec<Selection>> = self.doc.read(cx).patches_since(self.seen.1).map(|patches| {
-            let patches: Vec<&crate::document::Patch> = patches.collect();
-            let map = |offset: usize| patches.iter().fold(offset, |offset, patch| patch.map(offset));
-            self.selections.iter().map(|s| Selection { anchor: map(s.anchor), head: map(s.head) }).collect()
-        });
-        let selections = moved.unwrap_or_else(|| self.selections.clone());
+        let selections = self.moved_since(self.seen.1, &self.selections, cx);
         self.selections = self.clamp_selections(selections, cx);
         self.seen = (id, version);
         self.schedule_diff(Duration::from_millis(120), cx);
         cx.notify();
+    }
+
+    /// `selections` moved through the document's edits since `version`
+    /// (left as they are when those aren't kept any more).
+    fn moved_since(&self, version: u64, selections: &[Selection], cx: &App) -> Vec<Selection> {
+        let Some(patches) = self.doc.read(cx).patches_since(version) else { return selections.to_vec() };
+        let patches: Vec<&crate::document::Patch> = patches.collect();
+        let map = |offset: usize| patches.iter().fold(offset, |offset, patch| patch.map(offset));
+        selections.iter().map(|s| Selection { anchor: map(s.anchor), head: map(s.head) }).collect()
     }
 
     /// Finishes in the background a parse that ran out of time on the UI
@@ -778,31 +786,49 @@ impl Editor {
         if self.doc.read(cx).is_dirty() || !self.is_loaded() {
             return;
         }
-        let reloaded = self.change_doc(cx, |doc| doc.reload_from_disk());
-        if let Ok(true) = reloaded {
-            self.after_reload(cx);
-        }
+        let _ = self.reload(cx, Document::reload_from_disk);
     }
 
     /// Reads the file again as `encoding`; unsaved edits are dropped.
     pub fn reload_with_encoding(&mut self, encoding: crate::encoding::TextEncoding, cx: &mut Context<Self>) -> std::io::Result<()> {
-        self.change_doc(cx, |doc| doc.reload_with_encoding(encoding))?;
-        self.after_reload(cx);
-        Ok(())
+        self.reload(cx, |doc| doc.reload_with_encoding(encoding).map(|()| true)).map(|_| ())
     }
 
-    fn after_reload(&mut self, cx: &mut Context<Self>) {
-        let selections = self.clamp_selections(self.selections.clone(), cx);
-        self.set_selections(selections, 0, cx);
+    /// Replaces the text with what `read` reads (true: it read something).
+    /// Carets and the line at the top of the view follow the text through
+    /// what changed (see `Document::replace_all`); what's derived from the
+    /// text is asked for again.
+    fn reload(&mut self, cx: &mut Context<Self>, read: impl FnOnce(&mut Document) -> std::io::Result<bool>) -> std::io::Result<bool> {
+        let version = self.doc.read(cx).version();
+        // Not drawn since the last reload: its top line is still to place.
+        let top = self.reloaded_top.or_else(|| self.top_line(cx).map(|line| (line, self.doc.read(cx).line_start(line))));
+        if !self.change_doc(cx, read)? {
+            return Ok(false);
+        }
+        let selections = self.moved_since(version, &self.selections, cx);
+        let selections = self.clamp_selections(selections, cx);
+        self.set_selections(selections, self.primary, cx);
+        if let Some((line, at)) = top {
+            let at = self.moved_since(version, &[Selection::cursor(at)], cx)[0].head;
+            match self.scroll_to_line.as_mut() {
+                Some(pending) => *pending = self.doc.read(cx).row_of(at),
+                None => self.reloaded_top = Some((line, at)),
+            }
+        }
         self.autoscroll = false;
         self.linted_version = None;
         self.schedule_lint(Duration::ZERO, cx);
         self.schedule_diff(Duration::ZERO, cx);
         self.edited(cx);
-        // The reload dropped them (they were for the old text).
+        // The text is the file's again, as after a save: servers that check
+        // on save (rust-analyzer's cargo check) check it again; until then
+        // they send what they found in the old text where it was.
+        self.lsp_did_save(cx);
+        // Those in changed text went; the server's answer brings them back.
         self.schedule_inlay_hints(cx);
         self.schedule_code_lenses(cx);
         cx.notify();
+        Ok(true)
     }
 
     /// Re-reads the settings and `.editorconfig` for this file: tab size,
@@ -1425,14 +1451,20 @@ impl Editor {
     /// before anything maps between offsets and display rows. The line at
     /// the top of the view stays there as rows above it come and go (code
     /// lenses or problems arriving after a restored tab took its place,
-    /// folds, a new width).
+    /// folds, a new width, lines a reload added or removed above it).
     fn sync_wrap(&mut self, window: &mut Window, cx: &App) {
+        let reloaded = self.reloaded_top.take();
         let top = self.layout.as_ref().map(|layout| {
             let line = self.line_at_row((self.scroll.y / layout.line_height).floor() as usize, cx);
             (line, self.first_display_row(line))
         });
         self.update_wrap(window, cx);
         if let (Some((line, before)), Some(layout)) = (top, self.layout.as_ref()) {
+            // After a reload that line's text can be on another line now.
+            let line = match reloaded {
+                Some((old, at)) if old == line => self.doc.read(cx).row_of(at),
+                _ => line,
+            };
             let after = self.first_display_row(line);
             if after != before {
                 self.scroll.y = (self.scroll.y + layout.line_height * (after as f32 - before as f32)).max(px(0.));

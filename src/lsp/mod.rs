@@ -1065,7 +1065,8 @@ impl FileWatcher {
 /// by its initialization option `greeting` and the `mode` in its `fake`
 /// settings section when it has them), completes with "<name>-item", offers "<name> fix
 /// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
-/// Named "hints", it also gives an inlay hint at the end of the first line.
+/// Named "hints", it also gives an inlay hint at the end of the first line, and on a
+/// save checks the file as rust-analyzer does: "hints checked <first line>".
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
@@ -1108,9 +1109,13 @@ while True:
         caps = {"textDocumentSync": 1, "completionProvider": {"triggerCharacters": triggers}, "codeActionProvider": True, "codeLensProvider": {"resolveProvider": True}, "definitionProvider": True, "referencesProvider": True}
         if name == "hints":
             caps["inlayHintProvider"] = True
+            caps["textDocumentSync"] = {"openClose": True, "change": 1, "save": True}
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didChange":
         text = m["params"]["contentChanges"][-1]["text"]
+    elif method == "textDocument/didSave" and last_uri:
+        problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "message": name + " checked " + text.split("\n", 1)[0]}
+        send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
     elif method == "textDocument/inlayHint":
         first = text.split("\n", 1)[0]
         send({"jsonrpc": "2.0", "id": id, "result": [{"position": {"line": 0, "character": len(first)}, "label": ": hint"}]})

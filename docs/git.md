@@ -89,4 +89,4 @@ message instead of hanging; use an SSH agent or a credential helper.
 
 Status refreshes after saves and Git actions, when the window regains focus, and every few
 seconds. Open files without unsaved edits reload when a checkout, pull or rollback changes
-them on disk.
+them on disk; carets, breakpoints, folds and problems stay with the lines they were on.
