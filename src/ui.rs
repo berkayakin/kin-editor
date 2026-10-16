@@ -372,7 +372,7 @@ pub fn input_box(editor: &Entity<Editor>, icon: Option<Icon>, window: &Window, c
     focus_ring(field, ("input-focus", editor.entity_id().as_u64()), focused, theme)
 }
 
-/// A text field's border, accent with `focus_glow` while `focused`, fading in
+/// A text field's border, accent with a soft glow while `focused`, fading in
 /// and out. Every field draws its focus this way; `id` must be stable across frames.
 pub fn focus_ring<E: Styled + IntoElement + 'static>(
     field: E,
@@ -381,7 +381,8 @@ pub fn focus_ring<E: Styled + IntoElement + 'static>(
     theme: &Theme,
 ) -> Transition<E> {
     let (border, accent) = (Hsla::from(theme.border).alpha(0.75), Hsla::from(theme.accent).alpha(0.7));
-    let glow = focus_glow(theme);
+    // A little softer than `focus_glow`: a field's border already marks it.
+    let glow = glow(theme, Hsla::from(theme.accent).alpha(0.16), 5., 1.);
     field.border_1().with_transition(id, focused, transition::FOCUS, move |el, t| {
         el.border_color(mix(border, accent, t)).when(t > 0., |el| el.shadow(faded(glow, t)))
     })
