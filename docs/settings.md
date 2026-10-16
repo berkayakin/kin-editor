@@ -29,7 +29,7 @@ and theme colors.
 | `auto_save` | `"after_delay"` | `"off"`, `"after_delay"`, `"on_focus_change"`, `"on_window_change"` |
 | `auto_save_delay` | `1000` | milliseconds |
 | `editor_font_family` | built-in choice | any installed font |
-| `editor_font_size` | `14` | the zoom actions adjust it on top (remembered between launches) |
+| `editor_font_size` | `13` | the zoom actions adjust it on top (remembered between launches) |
 | `editor_line_height` | `1.57` | multiple of the font size |
 | `tab_size` | `4` (2 for HTML, JSON, YAML) | columns per indent and per tab |
 | `hard_tabs` | `false` (`true` for Go) | indent with tabs |

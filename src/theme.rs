@@ -246,8 +246,8 @@ impl Theme {
             ui_font: ".SystemUIFont".into(),
             mono_font: "Menlo".into(),
             ui_font_size: 13.0,
-            editor_font_size: 14.0,
-            editor_line_height: 22.0,
+            editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
+            editor_line_height: 20.0,
             background: bg,
             panel: bg,
             elevated: bg,
@@ -873,8 +873,9 @@ pub fn init(cx: &mut App) {
 }
 
 /// Default editor size; zoom and `editor_font_size` move away from it.
-pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 14.0;
-/// 22px lines at 14px, the spacing Kuana has always used.
+pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 13.0;
+/// The spacing Kuana has always used: 22px lines at 14px (20px at the
+/// default 13px).
 const DEFAULT_LINE_HEIGHT: f32 = 22.0 / 14.0;
 
 /// Sets the fonts from the settings and the remembered zoom.

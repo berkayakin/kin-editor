@@ -763,7 +763,7 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you
   // "auto_save_delay": 1000,
 
   // "editor_font_family": "JetBrains Mono",
-  // "editor_font_size": 14,
+  // "editor_font_size": 13,
   // Line height as a multiple of the font size.
   // "editor_line_height": 1.6,
 
