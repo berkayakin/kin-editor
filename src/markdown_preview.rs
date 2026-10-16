@@ -1,7 +1,10 @@
 //! Markdown preview: the document parsed with pulldown-cmark into a few
 //! block kinds, drawn with GPUI next to the text (see the editor's split
 //! view). Code blocks are highlighted with the editor's own grammars;
-//! local images show; links open in the browser.
+//! local images show; links open in the browser. HTML isn't rendered as such:
+//! the tags READMEs use (emphasis, links, images, line breaks, centered
+//! blocks, headings, tables, details) map onto the same blocks and styles,
+//! comments are hidden, and other tags are dropped with their text kept.
 
 use std::{
     ops::Range,
@@ -42,8 +45,9 @@ pub enum Style {
 pub enum Block {
     Heading(u8, Inline),
     Paragraph(Inline),
-    /// A paragraph that's just an image; `path` is the local file it shows.
-    Image { src: String, alt: String, path: Option<PathBuf> },
+    /// A paragraph that's just an image; `path` is the local file it shows,
+    /// `width` an HTML image's width in pixels.
+    Image { src: String, alt: String, path: Option<PathBuf>, width: Option<f32> },
     /// A fenced block, highlighted when its language is one Kin knows.
     Code { lang: String, text: String, highlights: Vec<(Range<usize>, Highlight)> },
     Quote(Vec<Block>),
@@ -51,6 +55,8 @@ pub enum Block {
     List { start: Option<u64>, items: Vec<Item> },
     Table { aligns: Vec<Alignment>, rows: Vec<Vec<Inline>> },
     Rule,
+    /// HTML's `align="center"` (and `<center>`).
+    Center(Vec<Block>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -85,6 +91,8 @@ struct Builder {
     table: Option<(Vec<Alignment>, Vec<Vec<Inline>>)>,
     heading: Option<u8>,
     base: Option<PathBuf>,
+    /// An HTML block's text, handled whole when it ends (a tag can span lines).
+    html: Option<String>,
 }
 
 enum Container {
@@ -92,6 +100,8 @@ enum Container {
     Quote,
     List(Option<u64>, Vec<Item>),
     Item(Option<bool>),
+    /// An HTML block element (`<p>`, `<div>`, `<h2>`…); `center`: its contents are centered.
+    Html { center: bool },
 }
 
 impl Builder {
@@ -114,13 +124,27 @@ impl Builder {
 
     /// Ends the current paragraph-like text (also for "tight" list items, whose text has no paragraph).
     fn flush_inline(&mut self) {
-        if let Some(inline) = self.inline.take().filter(|i| !i.text.trim().is_empty()) {
+        // Styles don't cross paragraphs; one still open is unbalanced HTML.
+        self.open.clear();
+        if let Some(mut inline) = self.inline.take().filter(|i| !i.text.trim().is_empty()) {
+            // HTML's line breaks before a closing tag leave a space.
+            let len = inline.text.trim_end().len();
+            inline.text.truncate(len);
+            for range in inline.styles.iter_mut().map(|(r, _)| r).chain(inline.links.iter_mut().map(|(r, _)| r)) {
+                range.end = range.end.min(len);
+            }
             self.blocks().push(Block::Paragraph(inline));
         }
     }
 
     fn event(&mut self, event: Event) {
         match event {
+            Event::Start(Tag::HtmlBlock) => self.html = Some(String::new()),
+            Event::End(TagEnd::HtmlBlock) => {
+                if let Some(html) = self.html.take() {
+                    self.html(&html);
+                }
+            }
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => self.text(&t),
@@ -141,12 +165,10 @@ impl Builder {
                     *task = Some(done);
                 }
             }
-            Event::Html(t) | Event::InlineHtml(t) => {
-                // Shown as written; Kin doesn't render HTML.
-                if self.code.is_none() {
-                    self.text(t.trim_end_matches('\n'));
-                }
-            }
+            Event::Html(t) | Event::InlineHtml(t) => match &mut self.html {
+                Some(block) => block.push_str(&t),
+                None => self.html(&t),
+            },
             _ => {}
         }
     }
@@ -199,12 +221,23 @@ impl Builder {
     }
 
     fn end(&mut self, tag: TagEnd) {
+        // An HTML element left open inside a quote or list ends with it.
+        if matches!(tag, TagEnd::Item | TagEnd::List(_) | TagEnd::BlockQuote(_)) {
+            while matches!(self.stack.last(), Some((Container::Html { .. }, _))) {
+                self.close_html_block();
+            }
+        }
         match tag {
             TagEnd::Paragraph => self.flush_inline(),
             TagEnd::Heading(_) => {
                 let inline = self.inline.take().unwrap_or_default();
                 let level = self.heading.take().unwrap_or(1);
                 self.blocks().push(Block::Heading(level, inline));
+            }
+            TagEnd::Table => {
+                if let Some((aligns, rows)) = self.table.take() {
+                    self.blocks().push(Block::Table { aligns, rows });
+                }
             }
             TagEnd::CodeBlock => {
                 if let Some((lang, text)) = self.code.take() {
@@ -240,35 +273,173 @@ impl Builder {
                     row.push(cell);
                 }
             }
-            TagEnd::Table => {
-                if let Some((aligns, rows)) = self.table.take() {
-                    self.blocks().push(Block::Table { aligns, rows });
-                }
-            }
             TagEnd::Image => {
                 if let Some((src, alt)) = self.image.take() {
                     // On its own it's a picture; inside text, its description.
                     let alone = self.inline.as_ref().is_none_or(|i| i.text.trim().is_empty());
                     if alone && self.table.is_none() {
                         self.inline = None;
-                        let path = self.base.as_ref().map(|b| b.join(&src)).filter(|p| !src.contains("://") && p.is_file());
-                        self.blocks().push(Block::Image { src, alt, path });
+                        let path = self.local_image(&src);
+                        self.blocks().push(Block::Image { src, alt, path, width: None });
                     } else {
                         self.text(&alt);
                     }
                 }
             }
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
-                if let Some((style, start, url)) = self.open.pop() {
-                    let inline = self.inline.get_or_insert_with(Inline::default);
-                    let range = start..inline.text.len();
-                    if let Some(url) = url {
-                        inline.links.push((range.clone(), url));
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => self.close_style(None),
+            _ => {}
+        }
+    }
+
+    /// Ends the innermost open style (`Some`: only if it's that one).
+    fn close_style(&mut self, only: Option<Style>) {
+        if only.is_some_and(|style| self.open.last().is_none_or(|(open, ..)| *open != style)) {
+            return;
+        }
+        if let Some((style, start, url)) = self.open.pop() {
+            let inline = self.inline.get_or_insert_with(Inline::default);
+            let range = start..inline.text.len();
+            if let Some(url) = url {
+                inline.links.push((range.clone(), url));
+            }
+            inline.styles.push((range, style));
+        }
+    }
+
+    fn local_image(&self, src: &str) -> Option<PathBuf> {
+        self.base.as_ref().map(|b| b.join(src)).filter(|p| !src.contains("://") && p.is_file())
+    }
+
+    /// HTML, from a block or an inline tag: its tags as the Markdown they
+    /// stand for, its text as text.
+    fn html(&mut self, html: &str) {
+        if self.code.is_some() {
+            return;
+        }
+        for token in html_tokens(html) {
+            match token {
+                HtmlToken::Text(text) => {
+                    // Whitespace runs collapse to a space, as in HTML; none starts a line.
+                    let mut collapsed = String::with_capacity(text.len());
+                    for c in text.chars() {
+                        if !c.is_whitespace() {
+                            collapsed.push(c);
+                        } else if !collapsed.ends_with(' ') {
+                            collapsed.push(' ');
+                        }
                     }
-                    inline.styles.push((range, style));
+                    let at_start = self.inline.as_ref().is_none_or(|i| i.text.is_empty() || i.text.ends_with(['\n', ' ']));
+                    let text = decode_entities(if at_start { collapsed.trim_start() } else { &collapsed });
+                    if !text.is_empty() {
+                        self.text(&text);
+                    }
+                }
+                HtmlToken::Tag(tag) => self.html_tag(&tag),
+            }
+        }
+    }
+
+    fn html_tag(&mut self, tag: &HtmlTag) {
+        let at = self.inline.as_ref().map_or(0, |i| i.text.len());
+        let style = match tag.name.as_str() {
+            "b" | "strong" => Some(Style::Bold),
+            "i" | "em" => Some(Style::Italic),
+            "s" | "del" | "strike" => Some(Style::Strike),
+            "code" | "kbd" | "tt" => Some(Style::Code),
+            "a" => Some(Style::Link),
+            _ => None,
+        };
+        if let Some(style) = style {
+            if tag.closing {
+                self.close_style(Some(style));
+            } else {
+                // A link without an href (an anchor) is plain text.
+                let url = tag.attr("href").map(str::to_string);
+                if style != Style::Link || url.is_some() {
+                    self.open.push((style, at, url));
                 }
             }
+            return;
+        }
+        let heading = tag.name.strip_prefix('h').and_then(|n| n.parse::<u8>().ok()).filter(|n| (1..=6).contains(n));
+        match tag.name.as_str() {
+            "br" => self.text("\n"),
+            "hr" => self.event(Event::Rule),
+            "img" => {
+                let src = tag.attr("src").unwrap_or_default().to_string();
+                let alt = tag.attr("alt").unwrap_or_default().to_string();
+                let path = self.local_image(&src);
+                let alone = self.inline.as_ref().is_none_or(|i| i.text.trim().is_empty());
+                // A picture of its own; a remote one (badges) or one inside text, its description.
+                if path.is_some() && alone && self.table.is_none() {
+                    self.inline = None;
+                    let width = tag.attr("width").and_then(|w| w.trim_end_matches("px").parse::<f32>().ok());
+                    self.blocks().push(Block::Image { src, alt, path, width });
+                } else if !alt.is_empty() {
+                    self.text(&alt);
+                }
+            }
+            "p" | "div" | "center" | "details" | "section" | "header" | "footer" => {
+                self.flush_inline();
+                if tag.closing {
+                    self.close_html_block();
+                } else {
+                    let center = tag.name == "center" || tag.attr("align").is_some_and(|a| a.eq_ignore_ascii_case("center"));
+                    self.stack.push((Container::Html { center }, Vec::new()));
+                }
+            }
+            "summary" => {
+                // A details block shows open; its summary is a bold line.
+                if tag.closing {
+                    self.close_style(Some(Style::Bold));
+                    self.flush_inline();
+                } else {
+                    self.flush_inline();
+                    self.open.push((Style::Bold, 0, None));
+                }
+            }
+            _ if heading.is_some() => {
+                if tag.closing {
+                    if self.heading.is_some() {
+                        self.end(TagEnd::Heading(HeadingLevel::H1));
+                    }
+                    self.close_html_block();
+                } else {
+                    self.flush_inline();
+                    let center = tag.attr("align").is_some_and(|a| a.eq_ignore_ascii_case("center"));
+                    self.stack.push((Container::Html { center }, Vec::new()));
+                    self.heading = heading;
+                }
+            }
+            "table" if tag.closing => self.end(TagEnd::Table),
+            "table" => {
+                self.flush_inline();
+                self.table = Some((Vec::new(), Vec::new()));
+            }
+            "tr" if !tag.closing => self.start(Tag::TableRow),
+            "td" | "th" if tag.closing => self.end(TagEnd::TableCell),
+            "td" | "th" => self.start(Tag::TableCell),
+            "li" if !tag.closing => {
+                self.flush_inline();
+                self.text("• ");
+            }
+            "li" => self.flush_inline(),
             _ => {}
+        }
+    }
+
+    /// Closes the innermost HTML block element: centered contents as a
+    /// `Center` block, others in place.
+    fn close_html_block(&mut self) {
+        self.flush_inline();
+        if matches!(self.stack.last(), Some((Container::Html { .. }, _)))
+            && let Some((Container::Html { center }, blocks)) = self.stack.pop()
+        {
+            if center {
+                self.blocks().push(Block::Center(blocks));
+            } else {
+                self.blocks().extend(blocks);
+            }
         }
     }
 
@@ -281,6 +452,162 @@ impl Builder {
         }
         self.stack.pop().map(|(_, blocks)| blocks).unwrap_or_default()
     }
+}
+
+enum HtmlToken {
+    Text(String),
+    Tag(HtmlTag),
+}
+
+struct HtmlTag {
+    /// Lowercase.
+    name: String,
+    closing: bool,
+    attrs: Vec<(String, String)>,
+}
+
+impl HtmlTag {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Splits HTML into text and tags; comments, doctypes and stray `<` are dropped
+/// or kept as text the way a browser would.
+fn html_tokens(html: &str) -> Vec<HtmlToken> {
+    let mut tokens = Vec::new();
+    let mut rest = html;
+    while !rest.is_empty() {
+        let Some(lt) = rest.find('<') else {
+            tokens.push(HtmlToken::Text(rest.to_string()));
+            break;
+        };
+        if lt > 0 {
+            tokens.push(HtmlToken::Text(rest[..lt].to_string()));
+        }
+        rest = &rest[lt..];
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            rest = comment.find("-->").map_or("", |end| &comment[end + 3..]);
+            continue;
+        }
+        // The tag ends at the first `>` outside quotes.
+        let mut quote = None;
+        let end = rest.char_indices().skip(1).find(|&(_, c)| match quote {
+            Some(q) if c == q => {
+                quote = None;
+                false
+            }
+            Some(_) => false,
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                false
+            }
+            None => c == '>',
+        });
+        match end.and_then(|(end, _)| parse_tag(&rest[1..end]).map(|tag| (end, tag))) {
+            Some((end, tag)) => {
+                tokens.push(HtmlToken::Tag(tag));
+                rest = &rest[end + 1..];
+            }
+            // Not a tag ("a < b"): text.
+            None => {
+                tokens.push(HtmlToken::Text("<".into()));
+                rest = &rest[1..];
+            }
+        }
+    }
+    tokens
+}
+
+/// The inside of `<…>`: `/name`, `name attr="v" attr2=v bare /`, `!doctype`.
+fn parse_tag(inner: &str) -> Option<HtmlTag> {
+    let (closing, inner) = match inner.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, inner),
+    };
+    let inner = inner.trim_end_matches('/');
+    let name_end = inner.find(|c: char| !c.is_ascii_alphanumeric() && c != '-').unwrap_or(inner.len());
+    let name = inner[..name_end].to_ascii_lowercase();
+    if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        // `<!doctype …>`, `<?xml …>` aren't shown; anything else isn't a tag.
+        return inner.starts_with(['!', '?']).then(|| HtmlTag { name: String::new(), closing, attrs: Vec::new() });
+    }
+    let mut attrs = Vec::new();
+    let mut rest = inner[name_end..].trim_start();
+    while !rest.is_empty() {
+        let key_end = rest.find(|c: char| c.is_whitespace() || c == '=').unwrap_or(rest.len());
+        let key = rest[..key_end].to_ascii_lowercase();
+        rest = rest[key_end..].trim_start();
+        let value = if let Some(after) = rest.strip_prefix('=') {
+            let after = after.trim_start();
+            let (value, next) = match after.chars().next() {
+                Some(q @ ('"' | '\'')) => {
+                    let body = &after[1..];
+                    let close = body.find(q).unwrap_or(body.len());
+                    (&body[..close], body.get(close + 1..).unwrap_or(""))
+                }
+                _ => {
+                    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                    (&after[..end], &after[end..])
+                }
+            };
+            rest = next.trim_start();
+            decode_entities(value)
+        } else {
+            String::new()
+        };
+        if !key.is_empty() {
+            attrs.push((key, value));
+        } else {
+            break;
+        }
+    }
+    Some(HtmlTag { name, closing, attrs })
+}
+
+/// The entities HTML in Markdown uses.
+fn decode_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        let decoded = rest.find(';').filter(|&semi| semi <= 10).and_then(|semi| {
+            let name = &rest[1..semi];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some('\u{a0}'),
+                "copy" => Some('©'),
+                "mdash" => Some('—'),
+                "ndash" => Some('–'),
+                _ => match name.strip_prefix('#') {
+                    Some(hex) if hex.starts_with(['x', 'X']) => u32::from_str_radix(&hex[1..], 16).ok().and_then(char::from_u32),
+                    Some(dec) => dec.parse().ok().and_then(char::from_u32),
+                    None => None,
+                },
+            };
+            c.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &rest[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -338,9 +665,13 @@ fn render_block(block: &Block, ix: usize, d: Draw, cx: &App) -> AnyElement {
                 .into_any_element()
         }
         Block::Paragraph(inline) => render_inline(inline, ("md-p", ix), cx),
-        Block::Image { src, alt, path } => {
+        Block::Image { src, alt, path, width } => {
             match path {
-                Some(path) => img(path.clone()).max_w_full().rounded(px(6.)).into_any_element(),
+                Some(path) => img(path.clone())
+                    .max_w_full()
+                    .when_some(*width, |el, w| el.w(px(w * d.zoom)))
+                    .rounded(px(6.))
+                    .into_any_element(),
                 None => div().text_color(theme.text_dim).child(format!("[{}]", if alt.is_empty() { src } else { alt })).into_any_element(),
             }
         }
@@ -424,6 +755,21 @@ fn render_block(block: &Block, ix: usize, d: Draw, cx: &App) -> AnyElement {
             }))
             .into_any_element(),
         Block::Rule => div().h(px(1.)).my_1().bg(theme.border).into_any_element(),
+        // Text keeps the full width (a heading's rule spans it) and centers its
+        // lines; images center as boxes.
+        Block::Center(blocks) => div()
+            .flex()
+            .flex_col()
+            .text_center()
+            .gap(px(12. * d.zoom))
+            .children(blocks.iter().enumerate().map(|(i, b)| {
+                let el = render_block(b, ix * 1000 + i, d, cx);
+                match b {
+                    Block::Image { .. } => div().flex().justify_center().child(el),
+                    _ => div().child(el),
+                }
+            }))
+            .into_any_element(),
     }
 }
 
@@ -529,7 +875,41 @@ mod tests {
         let Block::Table { aligns, rows } = &blocks[6] else { panic!("{:?}", blocks[6]) };
         assert_eq!((aligns[1], rows.len(), rows[1][1].text.as_str()), (Alignment::Right, 2, "2"));
         assert_eq!(blocks[7], Block::Rule);
-        assert_eq!(blocks[8], Block::Image { src: "img.png".into(), alt: "logo".into(), path: Some(dir.join("img.png")) });
+        assert_eq!(blocks[8], Block::Image { src: "img.png".into(), alt: "logo".into(), path: Some(dir.join("img.png")), width: None });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renders_the_html_readmes_use() {
+        let dir = std::env::temp_dir().join(format!("kin-md-html-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("logo.png"), b"").unwrap();
+        let md = concat!(
+            "<!-- hidden -->\n",
+            "<p align=\"center\">\n  <img src=\"logo.png\" alt=\"Kin\" width=\"120\">\n</p>\n\n",
+            "<h1 align=\"center\">Kin &amp; co</h1>\n\n",
+            "<p align=\"center\">\n  <a href=\"https://ci\"><img src=\"https://badge.svg\" alt=\"CI\"></a>\n  A <b>fast</b>\n  editor\n</p>\n\n",
+            "Press <kbd>⌘K</kbd> then<br>commit, a < b.\n\n",
+            "<details>\n<summary>More</summary>\n\nHidden **text**.\n\n</details>\n\n",
+            "<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td><i>2</i></td></tr></table>\n",
+        );
+        let blocks = parse(md, Some(&dir));
+        let png = Some(dir.join("logo.png"));
+        assert_eq!(blocks[0], Block::Center(vec![Block::Image { src: "logo.png".into(), alt: "Kin".into(), path: png, width: Some(120.) }]));
+        assert!(matches!(&blocks[1], Block::Center(b) if matches!(&b[..], [Block::Heading(1, i)] if i.text == "Kin & co")), "{:?}", blocks[1]);
+        let Block::Center(inner) = &blocks[2] else { panic!("{:?}", blocks[2]) };
+        let [Block::Paragraph(p)] = &inner[..] else { panic!("{inner:?}") };
+        assert_eq!(p.text, "CI A fast editor");
+        assert_eq!(p.links, vec![(0..2, "https://ci".to_string())]);
+        assert!(p.styles.contains(&(5..9, Style::Bold)));
+        let Block::Paragraph(p) = &blocks[3] else { panic!("{:?}", blocks[3]) };
+        assert_eq!(p.text, "Press ⌘K then\ncommit, a < b.");
+        assert!(p.styles.contains(&(6..10, Style::Code)));
+        assert!(matches!(&blocks[4], Block::Paragraph(i) if i.text == "More" && i.styles == vec![(0..4, Style::Bold)]), "{:?}", blocks[4]);
+        assert!(matches!(&blocks[5], Block::Paragraph(i) if i.text == "Hidden text."));
+        let Block::Table { rows, .. } = &blocks[6] else { panic!("{:?}", blocks[6]) };
+        assert_eq!(rows.iter().map(|r| r.iter().map(|c| c.text.as_str()).collect::<Vec<_>>()).collect::<Vec<_>>(), vec![vec!["a", "b"], vec!["1", "2"]]);
+        assert_eq!(blocks.len(), 7, "{blocks:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -40,7 +40,10 @@ Everything Kin does, in one list. Each area has its own page with the details.
 - Markdown preview: the button at the top right of a Markdown file (or **Toggle Markdown Preview**,
   ⌘K V / Ctrl+K V in the VS Code and Zed keymaps) shows the rendered document beside the text,
   updated as you type: headings, emphasis, lists and task lists, quotes, tables, highlighted code
-  blocks, local images; links open in the browser. Zoom it with the − / + control at its top right
+  blocks, local images; links open in the browser. The HTML READMEs use is drawn too: centered
+  blocks (`align="center"`), `<img>` with its width, headings, `<b>`/`<i>`/`<code>`/`<kbd>`, links,
+  `<br>`, `<details>` (shown open) and tables; comments are hidden and other tags dropped with their
+  text kept. Remote images (badges) show their alt text. Zoom it with the − / + control at its top right
   (click the percentage to reset) or ⌘/Ctrl + scroll
 - Find/Replace bar with case, whole-word and regex options; Find/Replace in Files with preview
   (searches unsaved buffers too, honors .gitignore)
