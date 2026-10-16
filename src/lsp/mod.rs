@@ -239,6 +239,15 @@ pub struct LspStore {
     _tasks: Vec<Task<()>>,
 }
 
+/// A closing window drops its store. Its servers are asked to shut down and
+/// exit first (a server then ends its own helpers, such as tsserver), as on a
+/// project change, instead of only being killed as their clients go.
+impl Drop for LspStore {
+    fn drop(&mut self) {
+        self.shutdown_all();
+    }
+}
+
 /// How long the app's quit waits for servers to exit before killing them
 /// (GPUI itself waits only a moment for quit hooks).
 const QUIT_WAIT: std::time::Duration = std::time::Duration::from_millis(80);
@@ -1048,7 +1057,7 @@ impl LspStore {
         })
     }
 
-    /// Stops every server (a window closing, trust withdrawn), all at once
+    /// Stops every server (another project, the window closing, trust withdrawn), all at once
     /// and off the main thread.
     pub fn shutdown_all(&mut self) {
         let clients: Vec<Arc<Client>> = self.servers.keys().cloned().collect::<Vec<_>>().iter().filter_map(|k| self.client(k)).collect();
@@ -1214,9 +1223,11 @@ impl FileWatcher {
 /// Named "hints", it also gives an inlay hint at the end of the first line, and on a
 /// save checks the file as rust-analyzer does: "hints checked <first line>".
 /// Named "respell", it names the file in its answers as other servers may.
+/// Named "goodbye", it notes being told to shut down: a `<file>.shutdown` beside its file.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
+from urllib.parse import unquote, urlparse
 name = sys.argv[1]
 triggers = [t for t in sys.argv[2].split(",") if t] if len(sys.argv) > 2 else []
 def spelled(uri):
@@ -1316,6 +1327,12 @@ while True:
     elif method == "textDocument/codeAction":
         sent = len(m["params"]["context"]["diagnostics"])
         send({"jsonrpc": "2.0", "id": id, "result": [{"title": "%s fix (%d)" % (name, sent)}]})
+    elif method == "shutdown":
+        # Named "goodbye", it leaves a note beside its file when told to shut down.
+        if name == "goodbye" and last_uri:
+            path = unquote(urlparse(last_uri).path)
+            open((path[1:] if path[2:3] == ":" else path) + ".shutdown", "w").close()
+        send({"jsonrpc": "2.0", "id": id, "result": None})
     elif method == "exit":
         sys.exit(0)
     elif id is not None:
@@ -1412,6 +1429,46 @@ mod tests {
         cx.update(|_| {});
         cx.run_until_parked();
         assert!(store.read_with(cx, |s, _| !s.documents.contains_key(&hidden) && s.documents.contains_key(&shown)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A closing window drops its store: its servers are told to shut down
+    /// (and so end what they started), not only killed.
+    #[gpui::test]
+    fn a_dropped_store_shuts_its_servers_down(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+
+        use crate::document::Document;
+        if servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-goodbye-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("goodbye", "")]);
+            store
+        });
+        let editor = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let started = std::time::Instant::now();
+        while !editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for the server");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        drop(store);
+        cx.update(|_| {});
+        let note = dir.join("a.rs.shutdown");
+        let started = std::time::Instant::now();
+        while !note.exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the server wasn't told to shut down");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

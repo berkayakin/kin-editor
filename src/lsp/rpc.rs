@@ -188,8 +188,7 @@ impl Client {
             std::thread::sleep(Duration::from_millis(5));
         }
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::process::kill_tree(&mut child);
         }
     }
 }
@@ -257,8 +256,7 @@ pub(crate) fn for_each_line(stream: impl Read, mut f: impl FnMut(String)) {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::process::kill_tree(&mut child);
         }
     }
 }

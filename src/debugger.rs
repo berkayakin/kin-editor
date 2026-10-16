@@ -650,9 +650,9 @@ impl DebugSession {
         if !self.is_active() {
             return;
         }
-        // A build in progress is just killed.
+        // A build in progress is just killed (with the compilers it started).
         if let Some(mut child) = self.build.lock().unwrap().take() {
-            let _ = child.kill();
+            crate::process::kill_tree(&mut child);
         }
         self.end(if self.is_attach() { "Detached" } else { "Stopped" }.into(), cx);
     }

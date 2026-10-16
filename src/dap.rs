@@ -77,7 +77,7 @@ impl DapClient {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(err) => {
-                    let _ = child.kill();
+                    crate::process::kill_tree(&mut child);
                     let detail = tail.lock().map(|t| t.trim().to_string()).unwrap_or_default();
                     return Err(std::io::Error::other(if detail.is_empty() { err.to_string() } else { detail }));
                 }
@@ -161,8 +161,7 @@ impl DapClient {
 impl Drop for DapClient {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.lock().ok().and_then(|mut c| c.take()) {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::process::kill_tree(&mut child);
         }
     }
 }
