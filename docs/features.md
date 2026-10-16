@@ -23,7 +23,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
     (unexpected and missing tokens)
 - Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
   signature help, Go to Declaration / Implementation / Type Definition (on a declaration, ⌘B and
-  ⌘/Ctrl-click list its usages, as in JetBrains), Find Usages, highlighted
+  ⌘/Ctrl-click list its usages, as in JetBrains; holding ⌘/Ctrl over a symbol the server can
+  take you to underlines it and shows a pointing hand), Find Usages, highlighted
   uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
   (quick fixes and refactorings); see [Language servers](languages.md#language-servers)
 - Inlay hints from the language server (types, parameter names), rulers, visible whitespace,

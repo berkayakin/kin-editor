@@ -96,6 +96,15 @@ pub(super) struct EditorLsp {
     /// Closes a shown hover shortly after the pointer leaves its word, unless
     /// the pointer reaches the popover first.
     hover_hide: Option<Task<()>>,
+    /// The word under the pointer while ⌘/Ctrl is held, when the server knows
+    /// its declaration (where ⌘/Ctrl-click goes): drawn as a link.
+    pub(super) link: Option<std::ops::Range<usize>>,
+    /// The word a declaration request is out for, and the request.
+    link_pending: Option<std::ops::Range<usize>>,
+    link_task: Option<Task<()>>,
+    /// The words asked about for a document version and whether each has a
+    /// declaration, so going back over one doesn't ask again.
+    link_checked: (u64, Vec<(std::ops::Range<usize>, bool)>),
     pub(super) signature: Option<SignatureHelp>,
     signature_task: Option<Task<()>>,
     /// Each server's diagnostics as received (by `Server::id`), for code
@@ -229,6 +238,7 @@ impl Editor {
         self.lsp.hover = None;
         self.lsp.hover_task = None;
         self.lsp.hover_pending = None;
+        self.link_word(None, cx);
         cx.emit(EditorEvent::Edited);
     }
 
@@ -574,6 +584,7 @@ impl Editor {
     pub(super) fn pointer_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_pending_hover();
         self.hide_hover_soon(window, cx);
+        self.link_word(None, cx);
     }
 
     fn cancel_pending_hover(&mut self) {
@@ -649,6 +660,91 @@ impl Editor {
             layout.text_left - layout.bounds.left() + x - self.scroll.x,
             layout.line_height * drow as f32 - self.scroll.y,
         ))
+    }
+
+    // ---- ⌘/Ctrl-hover links --------------------------------------------------------------
+
+    /// The pointer moved, or ⌘/Ctrl went down or up (`held`): the word under
+    /// the pointer is a link while ⌘/Ctrl-click would go somewhere (like Zed
+    /// and VS Code, only once the server knows its declaration).
+    pub(super) fn update_link(&mut self, position: Point<Pixels>, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let word = if held && self.drag.is_none() { self.word_under(position, window, cx) } else { None };
+        self.link_word(word, cx);
+    }
+
+    /// ⌘/Ctrl went down or up. The workspace tells every shown editor, since
+    /// only the focused one hears it: the pointer may rest on another.
+    pub fn secondary_modifier_changed(&mut self, held: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if held || self.lsp.link.is_some() || self.lsp.link_pending.is_some() {
+            self.update_link(window.mouse_position(), held, window, cx);
+        }
+    }
+
+    /// Shows `word` as a link if the server has a declaration for it (asked
+    /// once per word and document version); `None` hides the link.
+    pub(super) fn link_word(&mut self, word: Option<std::ops::Range<usize>>, cx: &mut Context<Self>) {
+        if word.is_some() && (self.lsp.link == word || self.lsp.link_pending == word) {
+            return;
+        }
+        // Another word: what was asked about the last one no longer matters.
+        self.lsp.link_task = None;
+        self.lsp.link_pending = None;
+        if self.lsp.link.take().is_some() {
+            cx.notify();
+        }
+        let Some(word) = word else { return };
+        let version = self.doc.read(cx).version();
+        if self.lsp.link_checked.0 != version {
+            self.lsp.link_checked = (version, Vec::new());
+        }
+        if let Some((_, found)) = self.lsp.link_checked.1.iter().find(|(w, _)| *w == word) {
+            if *found {
+                self.lsp.link = Some(word);
+                cx.notify();
+            }
+            return;
+        }
+        let Some(server) = self.lsp_server_with("definitionProvider", cx) else { return };
+        let Some(params) = self.position_params(word.start, &server, cx) else { return };
+        self.lsp.link_pending = Some(word.clone());
+        self.lsp.link_task = Some(cx.spawn(async move |this, cx| {
+            let found = server.request("textDocument/definition", params).await.is_ok_and(|v| !protocol::locations(&v).is_empty());
+            this.update(cx, |e, cx| {
+                e.lsp.link_pending = None;
+                if e.lsp.link_checked.0 != version {
+                    return;
+                }
+                e.lsp.link_checked.1.push((word.clone(), found));
+                if found {
+                    e.lsp.link = Some(word);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// The word whose text is under `position`: not past the end of its line,
+    /// on rows between lines (problems, lenses), the gutter or pinned lines.
+    fn word_under(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        let layout = self.layout.clone()?;
+        let over_text = self.mode == EditorMode::Full
+            && layout.bounds.contains(&position)
+            && position.x >= layout.bounds.left() + layout.gutter_width
+            && position.x < layout.bounds.right() - px(super::SCROLLBAR_WIDTH);
+        if !over_text || self.sticky_at(position).is_some() {
+            return None;
+        }
+        self.sync_wrap(window, cx);
+        let word = super::word_range(self.doc.read(cx), self.offset_for_position(position, window, cx));
+        let drow = ((position.y - layout.bounds.top() + self.scroll.y) / layout.line_height).floor() as usize;
+        if word.is_empty() || self.display_row_of(word.start, cx) != drow || self.display_row_of(word.end, cx) != drow {
+            return None;
+        }
+        let left = layout.text_left - self.scroll.x;
+        let start = left + self.x_for_offset(word.start, window, cx);
+        let end = left + self.x_for_offset(word.end, window, cx);
+        (start <= position.x && position.x <= end).then_some(word)
     }
 
     // ---- Inlay hints ---------------------------------------------------------------------
@@ -1410,6 +1506,50 @@ mod tests {
         editor.update(cx, |e, cx| e.navigate_from(3, cx));
         wait_for(cx, "the usages", |_| events.borrow().len() == 2);
         assert_eq!(*events.borrow(), [("Declaration".to_string(), 1), ("Usages of a".to_string(), 2)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[gpui::test]
+    fn cmd_hover_links_only_words_with_a_declaration(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        // The fake server knows declarations on the first two lines only.
+        std::fs::write(&path, "fn a() {}\nfn b() { a() }\nlet x = 1;\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("link", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        wait_for(cx, "the server", |cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+        let link = |cx: &mut TestAppContext| editor.read_with(cx, |e, _| e.lsp.link.clone());
+        let answered = |cx: &mut TestAppContext| editor.read_with(cx, |e, _| e.lsp.link_pending.is_none());
+
+        // A usage of `a`: a link once the server answers.
+        editor.update(cx, |e, cx| e.link_word(Some(19..20), cx));
+        assert_eq!(link(cx), None);
+        wait_for(cx, "the link", |cx| link(cx) == Some(19..20));
+        // `x` has no declaration: no link.
+        editor.update(cx, |e, cx| e.link_word(Some(29..30), cx));
+        wait_for(cx, "the answer", answered);
+        assert_eq!(link(cx), None);
+        // Back on `a`: known already, a link right away.
+        editor.update(cx, |e, cx| e.link_word(Some(19..20), cx));
+        assert_eq!(link(cx), Some(19..20));
+        // ⌘/Ctrl up, or an edit: gone.
+        editor.update(cx, |e, cx| e.link_word(None, cx));
+        assert_eq!(link(cx), None);
+        editor.update(cx, |e, cx| e.link_word(Some(19..20), cx));
+        wait_for(cx, "the link", |cx| link(cx) == Some(19..20));
+        editor.update(cx, |e, cx| e.edit_and_remap(vec![(0..0, " ".into())], EditKind::Other, cx));
+        assert_eq!(link(cx), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

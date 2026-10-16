@@ -417,8 +417,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Detects a double tap of Shift (Search Everywhere).
+    /// Detects a double tap of Shift (Search Everywhere), and tells the shown
+    /// editors about ⌘/Ctrl (links under the pointer): only the focused one
+    /// hears it, and the pointer may rest on another.
     pub(super) fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|p| p.tabs.get(p.active).cloned()).collect();
+        for editor in shown {
+            editor.update(cx, |e, cx| e.secondary_modifier_changed(event.modifiers.secondary(), window, cx));
+        }
         let m = event.modifiers;
         if m.shift && !m.control && !m.alt && !m.platform && !m.function {
             self.shift_down = true;

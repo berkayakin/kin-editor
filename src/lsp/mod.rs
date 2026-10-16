@@ -1146,7 +1146,11 @@ while True:
         send({"jsonrpc": "2.0", "id": id, "result": lens})
     elif method == "textDocument/definition":
         uri = m["params"]["textDocument"]["uri"]
-        send({"jsonrpc": "2.0", "id": id, "result": {"uri": uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}}})
+        # Nothing from the third line on has a declaration.
+        if m["params"]["position"]["line"] >= 2:
+            send({"jsonrpc": "2.0", "id": id, "result": None})
+        else:
+            send({"jsonrpc": "2.0", "id": id, "result": {"uri": uri, "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 4}}}})
     elif method == "textDocument/references":
         uri = m["params"]["textDocument"]["uri"]
         at = lambda line, ch: {"uri": uri, "range": {"start": {"line": line, "character": ch}, "end": {"line": line, "character": ch + 1}}}

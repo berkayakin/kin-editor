@@ -2548,6 +2548,8 @@ impl Editor {
         let in_gutter = event.position.x < layout.bounds.left() + layout.gutter_width;
         // ⌘-click (Ctrl-click elsewhere): Go to Declaration.
         if event.modifiers.secondary() && !in_gutter && event.click_count == 1 && !self.is_chromeless() {
+            // Focus may go to the declaration's file, and ⌘ up with it.
+            self.link_word(None, cx);
             self.set_selections(vec![Selection::cursor(offset)], 0, cx);
             self.navigate_from(offset, cx);
             return;
@@ -2732,6 +2734,7 @@ impl Editor {
             } else {
                 self.hover_at(event.position, window, cx);
             }
+            self.update_link(event.position, event.modifiers.secondary(), window, cx);
             return;
         }
         if self.scrollbar_drag.is_some() {
@@ -2790,6 +2793,8 @@ impl Editor {
         self.scroll.y -= delta.y;
         self.scroll.x -= delta.x;
         self.clamp_scroll(cx);
+        // The word moved away from the pointer; the next move finds the new one.
+        self.link_word(None, cx);
         self.lsp.hover = None;
         cx.notify();
     }
@@ -3076,6 +3081,10 @@ impl Editor {
                 cuts.push(d.range.start.saturating_sub(line_start).min(text.len()));
                 cuts.push(d.range.end.saturating_sub(line_start).min(text.len()));
             }
+            if let Some(link) = self.lsp.link.as_ref().filter(|l| l.start < line_end && l.end > line_start) {
+                cuts.push(link.start.saturating_sub(line_start).min(text.len()));
+                cuts.push(link.end.saturating_sub(line_start).min(text.len()));
+            }
             cuts.sort_unstable();
             cuts.dedup();
 
@@ -3105,16 +3114,19 @@ impl Editor {
                 if len == 0 {
                     continue;
                 }
+                // ⌘/Ctrl-hover link: a plain underline, like the terminal's links.
+                let linked = self.lsp.link.as_ref().is_some_and(|l| l.start <= abs && abs < l.end);
+                let underline = if linked {
+                    Some(UnderlineStyle { thickness: px(1.), color: Some(theme.accent.into()), wavy: false })
+                } else {
+                    severity.map(|sev| UnderlineStyle { thickness: px(1.), color: Some(severity_color(&theme, sev)), wavy: true })
+                };
                 runs.push(TextRun {
                     len,
                     font: run_font,
                     color: theme.highlight_color(kind),
                     background_color: None,
-                    underline: severity.map(|sev| UnderlineStyle {
-                        thickness: px(1.),
-                        color: Some(severity_color(&theme, sev)),
-                        wavy: true,
-                    }),
+                    underline,
                     strikethrough: None,
                 });
             }
@@ -3723,6 +3735,14 @@ impl Editor {
                     theme.accent,
                 ));
             }
+        }
+
+        // The ⌘/Ctrl-hover link's word, for the pointing hand over it.
+        if let Some(link) = self.lsp.link.clone() {
+            let y = top + line_height * self.display_row_of(link.start, cx) as f32 - self.scroll.y;
+            let left = text_left - self.scroll.x;
+            let (start, end) = (left + self.x_for_offset(link.start, window, cx), left + self.x_for_offset(link.end, window, cx));
+            frame.link_bounds = Some(Bounds::from_corners(point(start, y), point(end, y + line_height)).intersect(&frame.text_bounds));
         }
 
         if self.blink_task.is_none() {
@@ -4787,6 +4807,9 @@ pub struct FrameLayout {
     /// Code lens titles, for the pointer cursor.
     lens_bounds: Vec<Bounds<Pixels>>,
     lens_hitboxes: Vec<Hitbox>,
+    /// The ⌘/Ctrl-hover link's word, for the pointer cursor.
+    link_bounds: Option<Bounds<Pixels>>,
+    link_hitbox: Option<Hitbox>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
     /// The scrollbar's strip, for its cursor and hover.
@@ -4850,6 +4873,7 @@ impl Element for EditorElement {
         frame.hitbox = Some(window.insert_hitbox(frame.text_bounds, HitboxBehavior::Normal));
         // Over the text's, so a code lens shows it can be clicked.
         frame.lens_hitboxes = frame.lens_bounds.iter().map(|b| window.insert_hitbox(*b, HitboxBehavior::Normal)).collect();
+        frame.link_hitbox = frame.link_bounds.map(|b| window.insert_hitbox(b, HitboxBehavior::Normal));
         frame.scrollbar_hitbox = frame.scrollbar_track.map(|b| window.insert_hitbox(b, HitboxBehavior::Normal));
         frame
     }
@@ -4869,7 +4893,7 @@ impl Element for EditorElement {
         if let Some(hitbox) = frame.hitbox.as_ref() {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
         }
-        for hitbox in &frame.lens_hitboxes {
+        for hitbox in frame.lens_hitboxes.iter().chain(&frame.link_hitbox) {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
         }
         if let Some(hitbox) = frame.scrollbar_hitbox.clone() {
