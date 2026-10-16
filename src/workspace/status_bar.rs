@@ -105,8 +105,7 @@ impl Workspace {
         };
 
         let mut right: Vec<AnyElement> = Vec::new();
-        // An image tab has no caret, indentation or line endings.
-        if let Some(e) = editor.filter(|e| e.doc.read(cx).image.is_none()) {
+        if let Some(e) = editor {
             if let Some(mode) = e.vim_status() {
                 right.push(
                     item(div().font_family(theme.mono_font.clone()).text_size(px(11.)).text_color(theme.text).child(mode).into_any_element())

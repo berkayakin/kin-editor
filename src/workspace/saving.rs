@@ -70,7 +70,7 @@ impl Workspace {
     }
 
     pub(super) fn auto_save_all(&mut self, cx: &mut Context<Self>) {
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             self.auto_save(&editor, cx);
         }
         if !self.documents.read(cx).kept(cx).is_empty() {
@@ -180,7 +180,7 @@ impl Workspace {
         }
         let background = self.documents.read(cx).kept(cx);
         let unsaved: Vec<String> = self
-            .tabs
+            .editors
             .iter()
             .map(|t| t.read(cx).doc.read(cx))
             .chain(background.iter().map(|d| d.read(cx)))
@@ -206,7 +206,7 @@ impl Workspace {
             this.update_in(cx, |ws, window, cx| match answer {
                 0 => {
                     ws.save_background(false, cx);
-                    for editor in ws.tabs.clone() {
+                    for editor in ws.editors.clone() {
                         if editor.read(cx).doc.read(cx).is_dirty()
                             && editor.read(cx).doc.read(cx).path.is_some()
                             && let Err(err) = editor.update(cx, |e, cx| e.save(cx))
@@ -216,7 +216,7 @@ impl Workspace {
                         }
                     }
                     // Untitled files need a name first; show the first one.
-                    if let Some(dirty) = ws.tabs.iter().find(|t| t.read(cx).doc.read(cx).is_dirty()).cloned() {
+                    if let Some(dirty) = ws.editors.iter().find(|t| t.read(cx).doc.read(cx).is_dirty()).cloned() {
                         ws.activate_editor(&dirty, window, cx);
                         if dirty.read(cx).doc.read(cx).path.is_none() {
                             ws.save_as(&SaveAs, window, cx);
@@ -255,8 +255,8 @@ impl Workspace {
     }
 
     pub(super) fn save_as(&mut self, _: &SaveAs, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_editor().cloned() else { return };
-        let current = editor.read(cx).doc.read(cx).path.clone();
+        let Some(item) = self.active_item().cloned() else { return };
+        let current = item.path(cx);
         let dir = current
             .as_deref()
             .and_then(Path::parent)
@@ -264,25 +264,46 @@ impl Workspace {
             .or_else(|| self.root.clone())
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let name = editor.read(cx).doc.read(cx).file_name();
+        let saving = item.read(cx).saving();
+        if saving == Saving::Nothing {
+            return;
+        }
+        let name = item.tab_title(cx);
         let rx = cx.prompt_for_new_path(&dir, Some(&name));
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 this.update_in(cx, |ws, window, cx| {
-                    let result = editor.update(cx, |e, cx| {
-                        e.set_path(path, cx);
-                        e.save(cx)
-                    });
+                    let result = match &item {
+                        PaneItem::Editor(editor) => {
+                            let result = editor.update(cx, |e, cx| {
+                                e.set_path(path, cx);
+                                e.save(cx)
+                            });
+                            // The store finds the document by its new path.
+                            let doc = editor.read(cx).doc.clone();
+                            ws.documents.update(cx, |s, cx| s.add(&doc, cx));
+                            match &current {
+                                Some(old) => ws.lsp.update(cx, |s, cx| s.moved(old, editor, cx)),
+                                None => ws.lsp.update(cx, |s, cx| s.register(editor, cx)),
+                            }
+                            result
+                        }
+                        // The picture as it is on disk, under the new name.
+                        PaneItem::Image(image) => match current.as_deref().map(|from| std::fs::copy(from, &path)) {
+                            Some(Ok(_)) => {
+                                image.update(cx, |i, cx| i.set_path(path, cx));
+                                Ok(())
+                            }
+                            Some(Err(err)) => Err(err),
+                            None => Ok(()),
+                        },
+                        PaneItem::Preview(_) => Ok(()),
+                    };
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
-                    let doc = editor.read(cx).doc.clone();
-                    ws.documents.update(cx, |s, cx| s.add(&doc, cx));
-                    match &current {
-                        Some(old) => ws.lsp.update(cx, |s, cx| s.moved(old, &editor, cx)),
-                        None => ws.lsp.update(cx, |s, cx| s.register(&editor, cx)),
-                    }
                     ws.tree.update(cx, |t, cx| t.rebuild(cx));
+                    ws.schedule_session_save(cx);
                     cx.notify();
                 })
                 .ok();
@@ -292,8 +313,17 @@ impl Workspace {
     }
 
     pub(super) fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self.active_editor().cloned() {
-            self.close_editor(&editor, window, cx);
+        if let Some(item) = self.active_item().cloned() {
+            self.close_item(&item, window, cx);
+        }
+    }
+
+    /// Closes a tab, asking first about unsaved changes it would lose.
+    pub(super) fn close_item(&mut self, item: &PaneItem, window: &mut Window, cx: &mut Context<Self>) {
+        match item {
+            PaneItem::Editor(editor) => self.close_editor(editor, window, cx),
+            // Nothing of their own to lose.
+            PaneItem::Image(_) | PaneItem::Preview(_) => self.remove_item(item, window, cx),
         }
     }
 
@@ -334,16 +364,16 @@ impl Workspace {
         }
     }
 
+    /// Closes a text tab without asking: what's per document goes to
+    /// another tab of it, else the document is closed (and its previews).
     pub(super) fn remove_tab(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ix) = self.tabs.iter().position(|t| t == editor) else { return };
-        self.tabs.remove(ix);
-        self.pinned.remove(&editor.entity_id());
-        self.tab_subscriptions.remove(&editor.entity_id());
-        let was_active_pane = self.locate(editor).is_some_and(|(p, _)| p == self.active_pane);
-        if let Some(sibling) = self.siblings(editor, cx).into_iter().next() {
+        let Some(ix) = self.editors.iter().position(|t| t == editor) else { return };
+        self.editors.remove(ix);
+        let sibling = self.siblings(editor, cx).into_iter().next();
+        if let Some(sibling) = &sibling {
             // The document stays open in another tab: it takes over.
             if let Some(path) = editor.read(cx).doc.read(cx).path.clone() {
-                self.lsp.update(cx, |s, _| s.rebind(&path, &sibling));
+                self.lsp.update(cx, |s, _| s.rebind(&path, sibling));
             }
             if let Some(unloaded) = editor.update(cx, |e, _| e.take_unloaded()) {
                 sibling.update(cx, |e, _| e.put_unloaded(unloaded));
@@ -358,25 +388,40 @@ impl Workspace {
                 self.breakpoints.insert(path, breakpoints);
             }
         }
-        self.schedule_session_save(cx);
         self.auto_save_tasks.remove(&editor.entity_id());
         self.auto_save_warned.remove(&editor.entity_id());
-        if let Some((pane_ix, tab_ix)) = self.locate(editor) {
-            let pane = &mut self.panes[pane_ix];
-            pane.tabs.remove(tab_ix);
-            if tab_ix < pane.active || pane.active >= pane.tabs.len() {
-                pane.active = pane.active.saturating_sub(1);
-            }
-            // A pane closes with its last tab (unless it's the only one).
-            if pane.tabs.is_empty() && self.panes.len() > 1 {
-                self.remove_pane(pane_ix);
+        self.remove_item(&PaneItem::Editor(editor.clone()), window, cx);
+        if sibling.is_none() {
+            // A preview follows a document that's open; this one no longer is.
+            for preview in self.previews_of(&editor.read(cx).doc.clone(), cx) {
+                self.remove_item(&preview, window, cx);
             }
         }
-        if self.tabs.is_empty() {
+    }
+
+    /// Takes a tab out of its pane (a pane closes with its last tab, unless
+    /// it's the only one) and shows the next one.
+    pub(super) fn remove_item(&mut self, item: &PaneItem, window: &mut Window, cx: &mut Context<Self>) {
+        let id = item.entity_id();
+        let Some((pane_ix, tab_ix)) = self.locate(id) else { return };
+        self.pinned.remove(&id);
+        self.tab_subscriptions.remove(&id);
+        let was_active_pane = pane_ix == self.active_pane;
+        let pane = &mut self.panes[pane_ix];
+        pane.tabs.remove(tab_ix);
+        if tab_ix < pane.active || pane.active >= pane.tabs.len() {
+            pane.active = pane.active.saturating_sub(1);
+        }
+        if pane.tabs.is_empty() && self.panes.len() > 1 {
+            self.remove_pane(pane_ix);
+        }
+        self.schedule_session_save(cx);
+        self.sync_previewed(cx);
+        if self.items().next().is_none() {
             self.show_find = false;
             self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
             window.focus(&self.focus_handle);
-        } else if was_active_pane || self.active_editor().is_none() {
+        } else if was_active_pane || self.active_item().is_none() {
             let pane = self.active_pane;
             match self.panes[pane].tabs.is_empty() {
                 true => window.focus(&self.focus_handle),

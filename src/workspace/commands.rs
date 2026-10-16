@@ -7,7 +7,7 @@ impl Workspace {
 
     pub(super) fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| Editor::new(Document::empty(), cx));
-        self.add_tab(editor, window, cx);
+        self.add_tab(editor.into(), window, cx);
     }
 
     pub(super) fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -117,7 +117,7 @@ impl Workspace {
         self.pending_input = None;
         self.show_find = false;
         self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
-        self.tabs.clear();
+        self.editors.clear();
         self.tab_subscriptions.clear();
         self.panes = vec![Pane::new()];
         self.active_pane = 0;

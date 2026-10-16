@@ -40,8 +40,9 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Soft wrap that keeps indentation, on by default for Markdown and plain text (View → Soft-Wrap
   toggles it per file)
 - Markdown preview: the button at the top right of a Markdown file (or **Toggle Markdown Preview**,
-  ⌘K V / Ctrl+K V in the VS Code and Zed keymaps) shows the rendered document beside the text,
-  updated as you type: headings, emphasis, lists and task lists, quotes, tables, highlighted code
+  ⌘K V / Ctrl+K V in the VS Code and Zed keymaps) opens the rendered document in a tab of its own
+  beside the text (a new split, or the next pane), updated as you type; the same button or shortcut
+  closes it again. It can be moved, pinned and split like any tab and comes back with the project: headings, emphasis, lists and task lists, quotes, tables, highlighted code
   blocks, local images; links open in the browser. The HTML READMEs use is drawn too: centered
   blocks (`align="center"`), `<img>` with its width, headings, `<b>`/`<i>`/`<code>`/`<kbd>`, links,
   `<br>`, `<details>` (shown open) and tables; comments are hidden and other tags dropped with their

@@ -147,7 +147,7 @@ impl Workspace {
     /// only from `render`: the tree is a cached view, and one told during
     /// another view's render isn't drawn again (a new file kept no color).
     pub(super) fn decorate_tree(&mut self, cx: &mut Context<Self>) {
-        let active_path = self.active_editor().and_then(|e| e.read(cx).doc.read(cx).path.clone());
+        let active_path = self.active_item().and_then(|t| t.path(cx));
         let menu_target = self.context_menu.as_ref().and_then(|m| m.target.clone());
         let (git_paths, git_ignored) = (self.git_paths.clone(), self.git_ignored.clone());
         self.tree.update(cx, |t, cx| t.decorate(git_paths, git_ignored, active_path, menu_target, cx));
@@ -306,6 +306,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_other_tabs))
             .on_action(cx.listener(Self::close_all_tabs))
             .on_action(cx.listener(Self::toggle_pin_tab))
+            .on_action(cx.listener(Self::toggle_markdown_preview))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(Self::open_keymap))

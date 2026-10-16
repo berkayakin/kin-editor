@@ -42,7 +42,7 @@ impl Workspace {
                     p.set_status(Arc::new(RepoStatus::default()), cx);
                 });
                 ws.refresh_git(cx);
-                ws.load_diff_bases(ws.tabs.clone(), cx);
+                ws.load_diff_bases(ws.editors.clone(), cx);
                 cx.notify();
             })
             .ok();
@@ -95,9 +95,9 @@ impl Workspace {
                 let new = ws.git_status.clone();
                 let blobs = |status: &git::RepoStatus, path: &Path| status.files.iter().find(|f| f.path == path).and_then(|f| f.blobs.clone());
                 let stale: Vec<Entity<Editor>> = if old.head_oid != new.head_oid {
-                    ws.tabs.clone()
+                    ws.editors.clone()
                 } else {
-                    ws.tabs
+                    ws.editors
                         .iter()
                         .filter(|t| t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| blobs(&old, p) != blobs(&new, p)))
                         .cloned()
@@ -123,10 +123,10 @@ impl Workspace {
         let mut wanted = Vec::new();
         let mut seen = HashSet::new();
         for editor in editors {
-            // A tab not read yet gets it when it is (`file_opened`); images have no lines to mark.
+            // A tab not read yet gets it when it is (`file_opened`).
             let doc = editor.read(cx).doc.clone();
             let d = doc.read(cx);
-            let Some(path) = d.path.clone().filter(|_| editor.read(cx).is_loaded() && d.image.is_none()) else { continue };
+            let Some(path) = d.path.clone().filter(|_| editor.read(cx).is_loaded()) else { continue };
             let encoding = d.encoding;
             let diff = self.documents.update(cx, |s, cx| s.diff_for(&doc, cx));
             editor.update(cx, |e, cx| e.set_git_diff(diff.clone(), cx));
@@ -162,8 +162,11 @@ impl Workspace {
 
     /// Picks up on-disk changes (checkout, pull, rollback) in unmodified tabs.
     pub(super) fn reload_changed_files(&mut self, cx: &mut Context<Self>) {
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             editor.update(cx, |e, cx| e.reload_if_changed(cx));
+        }
+        for image in self.images() {
+            image.update(cx, |i, cx| i.reload_if_changed(cx));
         }
         self.tree.update(cx, |t, cx| t.rebuild(cx));
     }
@@ -446,7 +449,7 @@ impl Workspace {
                 }
                 // Staging part of a file may leave its status as it was.
                 if matches!(op, GitOp::StageLines { .. } | GitOp::UnstageLines { .. }) {
-                    ws.load_diff_bases(ws.tabs.clone(), cx);
+                    ws.load_diff_bases(ws.editors.clone(), cx);
                 }
                 match &ws.modals.current {
                     Some(Modal::Diff(view)) => view.update(cx, |v, cx| v.reload(cx)),
@@ -670,7 +673,7 @@ impl Workspace {
 
     pub(super) fn open_diff(&mut self, file: FileStatus, staged: bool, window: &mut Window, cx: &mut Context<Self>) {
         let buffer = self
-            .tabs
+            .editors
             .iter()
             .find(|t| t.read(cx).doc.read(cx).path.as_deref() == Some(file.path.as_path()))
             .map(|t| t.read(cx).text(cx));

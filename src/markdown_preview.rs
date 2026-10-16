@@ -1,6 +1,6 @@
 //! Markdown preview: the document parsed with pulldown-cmark into a few
-//! block kinds, drawn with GPUI next to the text (see the editor's split
-//! view). Code blocks are highlighted with the editor's own grammars;
+//! block kinds, drawn with GPUI in a pane item of its own (`MarkdownPreview`,
+//! in `view.rs`). Code blocks are highlighted with the editor's own grammars;
 //! local images show; links open in the browser. HTML isn't rendered as such:
 //! the tags READMEs use (emphasis, links, images, line breaks, centered
 //! blocks, headings, tables, details) map onto the same blocks and styles,
@@ -22,6 +22,9 @@ use crate::{
     syntax::{Highlight, Language, Syntax},
     theme::Theme,
 };
+
+mod view;
+pub use view::MarkdownPreview;
 
 /// Text with inline styling: byte ranges of `text` and how they look.
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -50,7 +50,7 @@ impl Workspace {
             self.tree.update(cx, |t, cx| t.rebuild(cx));
             self.refresh_file_index(cx);
             self.refresh_git(cx);
-            for editor in self.tabs.clone() {
+            for editor in self.editors.clone() {
                 editor.update(cx, |e, cx| e.reload_if_changed(cx));
             }
             cx.notify();
@@ -108,9 +108,14 @@ impl Workspace {
         if git {
             self.refresh_git(cx);
         }
-        for editor in self.tabs.clone() {
+        for editor in self.editors.clone() {
             if editor.read(cx).doc.read(cx).path.as_ref().is_some_and(|p| paths.contains(p)) {
                 editor.update(cx, |e, cx| e.reload_if_changed(cx));
+            }
+        }
+        for image in self.images() {
+            if paths.iter().any(|p| p == image.read(cx).path()) {
+                image.update(cx, |i, cx| i.reload_if_changed(cx));
             }
         }
     }

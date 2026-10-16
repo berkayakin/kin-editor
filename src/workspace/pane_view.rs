@@ -11,20 +11,20 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
-        let names: Vec<String> = pane.tabs.iter().map(|e| e.read(cx).doc.read(cx).file_name()).collect();
+        let names: Vec<String> = pane.tabs.iter().map(|t| t.tab_title(cx)).collect();
         let name_widths = measure_tab_names(&names, window, &theme);
         let naturals: Vec<f32> = pane
             .tabs
             .iter()
             .zip(&name_widths)
-            .map(|(e, (w, _))| {
-                let errors = e.read(cx).doc.read(cx).diagnostics.iter().any(|d| d.severity == Severity::Error);
+            .map(|(t, (w, _))| {
+                let errors = t.read(cx).has_errors(cx);
                 (TAB_CHROME + w + if errors { TAB_ERROR_DOT } else { 0. }).ceil()
             })
             .collect();
         let slots = fit_tabs(&naturals, pane.active, available.unwrap_or(f32::INFINITY));
         let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i] != TabSlot::Hidden).collect();
-        let hidden: Vec<Entity<Editor>> =
+        let hidden: Vec<PaneItem> =
             (0..slots.len()).filter(|&i| slots[i] == TabSlot::Hidden).map(|i| pane.tabs[i].clone()).collect();
         div()
             .id(("tabs", pane_ix))
@@ -46,12 +46,12 @@ impl Workspace {
             .overflow_hidden()
             // Dropping on the bar's empty part moves the tab to the end.
             .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
-                ws.move_tab(&dragged.editor, pane_ix, None, window, cx);
+                ws.move_tab(&dragged.item, pane_ix, None, window, cx);
             }))
             .children(visible.iter().enumerate().map(|(pos, &ix)| {
-                let editor = &pane.tabs[ix];
+                let item = &pane.tabs[ix];
                 let slot = slots[ix];
-                let e = editor.read(cx);
+                let it = item.read(cx);
                 let active = ix == pane.active;
                 let next = visible.get(pos + 1).copied();
                 // Separators only between two tabs that sit on the chrome.
@@ -59,15 +59,18 @@ impl Workspace {
                 let after_active = pos > 0 && visible[pos - 1] == pane.active;
                 let icon_only = matches!(slot, TabSlot::Icon(_));
                 let compact = matches!(slot, TabSlot::Compact(_));
-                let pinned = self.pinned.contains(&editor.entity_id());
-                let dirty = e.doc.read(cx).is_dirty();
-                let errors = e.doc.read(cx).diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
-                let icon = file_icon(e.doc.read(cx).path.as_deref().unwrap_or(Path::new("")), px(15.), &theme);
-                let name = e.doc.read(cx).file_name();
+                let pinned = self.pinned.contains(&item.entity_id());
+                let dirty = it.is_dirty(cx);
+                let errors = it.has_errors(cx);
+                let icon = match it.tab_icon(cx) {
+                    TabIcon::File(path) => file_icon(&path, px(15.), &theme).into_any_element(),
+                    TabIcon::Ui(icon) => icon_el(icon, px(14.), theme.accent.into()).into_any_element(),
+                };
+                let name = names[ix].clone();
                 let shown_name = tab_label(&name, slot, naturals[ix], name_widths[ix]);
                 let name_color: Hsla = if active && focused_pane { theme.text.into() } else { theme.text_muted.into() };
                 let group = SharedString::from(format!("tab-{pane_ix}-{ix}"));
-                let (for_close, for_menu, for_drag, for_unpin) = (editor.clone(), editor.clone(), editor.clone(), editor.clone());
+                let (for_close, for_menu, for_drag, for_unpin) = (item.clone(), item.clone(), item.clone(), item.clone());
                 div()
                     .id(SharedString::from(format!("tab-{pane_ix}-{ix}")))
                     .group(group.clone())
@@ -87,7 +90,7 @@ impl Workspace {
                     .on_click(cx.listener(move |ws, _, window, cx| ws.activate_in(pane_ix, ix, window, cx)))
                     .on_mouse_down(
                         MouseButton::Middle,
-                        cx.listener(move |ws, _, window, cx| ws.close_editor(&for_close, window, cx)),
+                        cx.listener(move |ws, _, window, cx| ws.close_item(&for_close, window, cx)),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
@@ -96,14 +99,14 @@ impl Workspace {
                             ws.open_tab_menu(for_menu.clone(), event.position, window, cx);
                         }),
                     )
-                    .on_drag(DraggedTab { editor: for_drag, name: name.clone().into() }, |tab, _, _, cx| {
+                    .on_drag(DraggedTab { item: for_drag, name: name.clone().into() }, |tab, _, _, cx| {
                         cx.new(|_| DragLabel(tab.name.clone()))
                     })
                     // A drop lands before this tab; the accent edge shows where.
                     .drag_over::<DraggedTab>(move |style, _, _, _| style.border_l_2().border_color(accent))
                     .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
                         cx.stop_propagation();
-                        ws.move_tab(&dragged.editor, pane_ix, Some(ix), window, cx);
+                        ws.move_tab(&dragged.item, pane_ix, Some(ix), window, cx);
                     }))
                     .child(icon)
                     .when(!icon_only, |el| el.child(
@@ -118,7 +121,7 @@ impl Workspace {
                             .child(shown_name),
                     ))
                     // Files with errors get a small dot rather than a recolored name.
-                    .when(errors > 0 && !icon_only && !compact, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.error)))
+                    .when(errors && !icon_only && !compact, |el| el.child(div().flex_shrink_0().size(px(6.)).rounded_full().bg(theme.error)))
                     .when(!icon_only && !compact, |el| el.child(
                         div()
                             .id(SharedString::from(format!("close-{pane_ix}-{ix}")))
@@ -188,7 +191,7 @@ impl Workspace {
                         .hover(|s| s.text_color(theme.text))
                         .tooltip(move |_, cx| tooltip_view(format!("{count} more tab{}", plural(count)), cx))
                         .on_click(cx.listener(move |ws, event: &ClickEvent, window, cx| {
-                            let entries = hidden.iter().map(|e| MenuEntry::item(e.read(cx).doc.read(cx).file_name(), Icon::File)).collect();
+                            let entries = hidden.iter().map(|t| MenuEntry::item(t.tab_title(cx), Icon::File)).collect();
                             let actions = hidden.iter().map(|e| Some(MenuAction::Tab(TabAction::Activate, e.clone()))).collect();
                             ws.show_context_menu(entries, actions, event.position(), None, window, cx);
                         }))
@@ -321,7 +324,7 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let share = relative(self.pane_sizes.get(pane_ix).copied().unwrap_or(1.));
         let content: AnyElement = match pane.tabs.get(pane.active) {
-            Some(editor) => cached(editor).into_any_element(),
+            Some(item) => cached_view(item.view()).into_any_element(),
             None if self.panes.len() == 1 => self.render_welcome(window, cx).into_any_element(),
             None => div()
                 .size_full()
@@ -349,8 +352,9 @@ impl Workspace {
             .min_w_0()
             .min_h_0()
             .border_color(edge)
-            .when_some(pane.tabs.get(pane.active).cloned(), |el, editor| el.children(self.render_breadcrumbs(&editor, cx)))
-            .when(self.show_find && pane_ix == self.active_pane && !pane.tabs.is_empty(), |el| {
+            .when_some(pane.tabs.get(pane.active).cloned(), |el, item| el.children(self.render_breadcrumbs(&item, cx)))
+            // Find works in text.
+            .when(self.show_find && pane_ix == self.active_pane && pane.tabs.get(pane.active).is_some_and(|t| t.editor().is_some()), |el| {
                 el.child(self.find_bar.clone())
             })
             .child(
@@ -367,7 +371,7 @@ impl Workspace {
                         }
                     }))
                     .on_drop(cx.listener(move |ws, dragged: &DraggedTab, window, cx| {
-                        ws.move_tab(&dragged.editor, pane_ix, None, window, cx);
+                        ws.move_tab(&dragged.item, pane_ix, None, window, cx);
                     }))
                     .child(content),
             )
@@ -440,11 +444,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Under the tabs: the file's folders and name, then the definitions
-    /// around the caret; clicking one goes to it.
-    pub(super) fn render_breadcrumbs(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (path, symbols) = editor.update(cx, |e, cx| (e.doc.read(cx).path.clone(), e.doc.read(cx).image.is_none().then(|| e.breadcrumbs(cx))));
-        let path = path?;
+    /// Under the tabs: the file's folders and name, then (in text) the
+    /// definitions around the caret; clicking one goes to it.
+    pub(super) fn render_breadcrumbs(&self, item: &PaneItem, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let path = item.path(cx)?;
+        let symbols = item.editor().map(|editor| editor.update(cx, |e, cx| e.breadcrumbs(cx)));
         let theme = Theme::get(cx).clone();
         let inside = self.root.as_deref().is_some_and(|r| path.starts_with(r));
         let rel = self.display_rel(&path);
@@ -483,7 +487,7 @@ impl Workspace {
         let symbols = symbols.unwrap_or_default();
         let last = symbols.len().saturating_sub(1);
         for (ix, (name, offset)) in symbols.into_iter().enumerate() {
-            let editor = editor.clone();
+            let Some(editor) = item.editor().cloned() else { break };
             row = row.child(chevron()).child(
                 div()
                     .id(("breadcrumb", ix))

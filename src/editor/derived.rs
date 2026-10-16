@@ -11,7 +11,7 @@ use gpui::{Context, Task};
 /// How long after an edit to start: typing doesn't recompute per keystroke.
 const DEBOUNCE: Duration = Duration::from_millis(150);
 
-pub(super) struct Derived<K, T> {
+pub(crate) struct Derived<K, T> {
     /// What `value` was computed for (None: nothing yet).
     done: Option<K>,
     value: Arc<T>,
@@ -20,24 +20,24 @@ pub(super) struct Derived<K, T> {
 }
 
 impl<K: PartialEq + Clone + 'static, T: Default + Send + Sync + 'static> Derived<K, T> {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Derived { done: None, value: Arc::default(), pending: None }
     }
 
     /// The last result, whatever it was computed for: for drawing.
-    pub(super) fn last(&self) -> Arc<T> {
+    pub(crate) fn last(&self) -> Arc<T> {
         self.value.clone()
     }
 
     /// The result for `key` if it's ready.
-    pub(super) fn current(&self, key: &K) -> Option<Arc<T>> {
+    pub(crate) fn current(&self, key: &K) -> Option<Arc<T>> {
         (self.done.as_ref() == Some(key)).then(|| self.value.clone())
     }
 
     /// The result for `key`, computed here and now if it isn't ready: for
     /// actions on it (folding, resolving a conflict), which mustn't act on
     /// an older version's rows.
-    pub(super) fn now(&mut self, key: K, compute: impl FnOnce() -> T) -> Arc<T> {
+    pub(crate) fn now(&mut self, key: K, compute: impl FnOnce() -> T) -> Arc<T> {
         if self.done.as_ref() != Some(&key) {
             self.pending = None;
             self.value = Arc::new(compute());
@@ -50,7 +50,7 @@ impl<K: PartialEq + Clone + 'static, T: Default + Send + Sync + 'static> Derived
     /// underway; the view redraws when it arrives. The first one starts at
     /// once, later ones after a pause in editing. `field` finds this
     /// `Derived` in the view again.
-    pub(super) fn schedule<V: 'static>(
+    pub(crate) fn schedule<V: 'static>(
         &mut self,
         key: K,
         compute: impl FnOnce() -> T + Send + 'static,

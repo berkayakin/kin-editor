@@ -52,7 +52,7 @@ impl Workspace {
         self.save_state();
         let root = self.root.clone();
         self.lsp.update(cx, |s, _| s.set_root(root));
-        if self.tabs.is_empty() {
+        if self.items().next().is_none() {
             self.restore_session(window, cx);
         }
         self.start_terminal_panel(window, cx);
@@ -193,7 +193,7 @@ impl Workspace {
                     Some(MenuAction::Tree(action)) => ws.run_tree_action(action, window, cx),
                     Some(MenuAction::Run(action)) => window.dispatch_action(action, cx),
                     Some(MenuAction::CodeAction(server, action)) => ws.apply_code_action(server, action.raw, window, cx),
-                    Some(MenuAction::Tab(action, editor)) => ws.run_tab_action(action, &editor, window, cx),
+                    Some(MenuAction::Tab(action, item)) => ws.run_tab_action(action, &item, window, cx),
                     Some(MenuAction::LineEndings(crlf, editor)) => editor.update(cx, |e, cx| {
                         e.doc.as_mut(cx).set_crlf(crlf);
                         cx.emit(EditorEvent::Edited);

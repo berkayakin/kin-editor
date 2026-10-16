@@ -29,7 +29,7 @@ impl Workspace {
         if edits.is_empty() {
             return false;
         }
-        match self.tabs.iter().find(|t| t.read(cx).doc == *doc).cloned() {
+        match self.editors.iter().find(|t| t.read(cx).doc == *doc).cloned() {
             Some(editor) => {
                 editor.update(cx, |e, cx| e.replace_ranges(edits, cx));
                 false

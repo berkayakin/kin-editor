@@ -4,7 +4,7 @@
 mod fold;
 mod format;
 mod conflict;
-mod derived;
+pub(crate) mod derived;
 mod lsp;
 mod run;
 mod snippet;
@@ -196,6 +196,12 @@ pub struct EditorContextMenu(pub Point<Pixels>);
 
 impl EventEmitter<EditorContextMenu> for Editor {}
 
+/// The Markdown preview toggle was clicked: the workspace opens or closes
+/// the document's preview (`ToggleMarkdownPreview` reaches it directly).
+pub struct EditorPreviewToggle;
+
+impl EventEmitter<EditorPreviewToggle> for Editor {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DragMode {
     Char,
@@ -310,22 +316,15 @@ pub struct Editor {
     snippet: Option<crate::snippets::SnippetStops>,
     /// File Structure's symbols for a document version (breadcrumbs, sticky scroll).
     outline: derived::Derived<(u64, crate::syntax::Language), Vec<crate::syntax::Symbol>>,
-    /// Markdown: the rendered preview shows beside the text.
-    md_preview: bool,
-    md_blocks: derived::Derived<(u64, Option<std::path::PathBuf>), Vec<crate::markdown_preview::Block>>,
-    md_scroll: gpui::ScrollHandle,
-    /// The preview's text size, relative to the UI font.
-    md_zoom: f32,
-    /// ⌘-scrolling not yet turned into a zoom step (trackpads send small deltas).
-    md_zoom_rest: f32,
+    /// Markdown: a preview of the document is open (the workspace says so),
+    /// which the preview toggle shows.
+    previewed: bool,
     /// Pinned lines of sticky scroll, as last painted: bounds and where to go.
     sticky_rows: Vec<(Bounds<Pixels>, usize)>,
     /// The pointer is over the gutter, so fold arrows show.
     gutter_hovered: bool,
     /// Runnable targets for a version and path (gutter ▶).
     run_targets: derived::Derived<(u64, Option<std::path::PathBuf>, crate::syntax::Language), Vec<crate::run::RunTarget>>,
-    /// Format, dimensions and size of an image document (read on first show).
-    image_info: Option<crate::preview::ImageInfo>,
     /// Merge conflicts for a version.
     conflicts: derived::Derived<u64, Vec<crate::conflict::Conflict>>,
     /// Accept labels on screen last frame: (bounds, conflict start row, choice).
@@ -435,18 +434,13 @@ impl Editor {
             folds: Default::default(),
             snippet: None,
             outline: derived::Derived::new(),
-            md_preview: false,
-            md_blocks: derived::Derived::new(),
-            md_scroll: gpui::ScrollHandle::new(),
-            md_zoom: 1.,
-            md_zoom_rest: 0.,
+            previewed: false,
             sticky_rows: Vec::new(),
             gutter_hovered: false,
             run_targets: derived::Derived::new(),
             conflicts: derived::Derived::new(),
             conflict_hits: Vec::new(),
             lens_hits: Vec::new(),
-            image_info: None,
             unloaded: None,
         }
     }
@@ -1340,102 +1334,24 @@ impl Editor {
 
     // ---- Soft wrap -------------------------------------------------------------
 
-    fn toggle_markdown_preview(&mut self, _: &ToggleMarkdownPreview, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == EditorMode::Full && self.doc.read(cx).language == crate::syntax::Language::Markdown {
-            self.md_preview = !self.md_preview;
-            cx.notify();
+    /// A Markdown file's preview opens in a pane item of its own; the
+    /// workspace opens or closes it (see `Workspace::toggle_markdown_preview`).
+    fn request_markdown_preview(&mut self, cx: &mut Context<Self>) {
+        if self.is_markdown(cx) {
+            cx.emit(EditorPreviewToggle);
         }
     }
 
-    /// The preview beside a Markdown file, parsed again when the text changes.
-    fn render_markdown_preview(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let path = self.doc.read(cx).path.clone();
-        let rope = self.doc.read(cx).rope().clone();
-        let job = move || crate::markdown_preview::parse(&rope.to_string(), path.as_deref().and_then(std::path::Path::parent));
-        self.md_blocks.schedule((self.doc.read(cx).version(), self.doc.read(cx).path.clone()), job, |e| &mut e.md_blocks, cx);
-        let blocks = self.md_blocks.last();
-        let theme = Theme::get(cx).clone();
-        let zoom = self.md_zoom;
-        let step = |id: &'static str, icon: crate::assets::Icon, delta: f32, cx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .size(px(22.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(5.))
-                .cursor_pointer()
-                .hover_bg(theme.hover)
-                .on_click(cx.listener(move |e, _, _, cx| e.zoom_preview(delta, cx)))
-                .child(crate::ui::icon_el(icon, px(12.), theme.text_muted.into()))
-        };
-        // − 100% + at the top right; the percentage resets.
-        let zoom_bar = div()
-            .absolute()
-            .top(px(6.))
-            .right(px(10.))
-            .flex()
-            .items_center()
-            .p(px(2.))
-            .rounded(px(7.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.elevated)
-            .text_size(px(11.5))
-            .text_color(theme.text_muted)
-            .child(step("md-zoom-out", crate::assets::Icon::Minus, -0.1, cx))
-            .child(
-                div()
-                    .id("md-zoom-reset")
-                    .min_w(px(40.))
-                    .flex()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(theme.text))
-                    .tooltip(|_, cx| crate::ui::tooltip_view("Reset Zoom", cx))
-                    .on_click(cx.listener(|e, _, _, cx| e.zoom_preview(1. - e.md_zoom, cx)))
-                    .child(format!("{}%", (zoom * 100.).round())),
-            )
-            .child(step("md-zoom-in", crate::assets::Icon::Plus, 0.1, cx));
-        div()
-            .relative()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .border_l_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .id("markdown-preview")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.md_scroll)
-                    .bg(theme.background)
-                    .px_6()
-                    .py_5()
-                    // ⌘/Ctrl + wheel zooms, like a browser.
-                    .on_scroll_wheel(cx.listener(|e, event: &gpui::ScrollWheelEvent, _, cx| {
-                        if event.modifiers.secondary() {
-                            cx.stop_propagation();
-                            e.md_zoom_rest += f32::from(event.delta.pixel_delta(px(20.)).y);
-                            // About one wheel notch per step.
-                            while e.md_zoom_rest.abs() >= 20. {
-                                let up = e.md_zoom_rest > 0.;
-                                e.md_zoom_rest -= if up { 20. } else { -20. };
-                                e.zoom_preview(if up { 0.1 } else { -0.1 }, cx);
-                            }
-                        }
-                    }))
-                    .child(crate::markdown_preview::render(&blocks, crate::markdown_preview::Draw { zoom }, cx)),
-            )
-            .child(crate::ui::scrollbar("markdown-preview-scrollbar", &self.md_scroll, cx))
-            .child(zoom_bar)
+    fn is_markdown(&self, cx: &App) -> bool {
+        self.mode == EditorMode::Full && self.doc.read(cx).language == crate::syntax::Language::Markdown
     }
 
-    fn zoom_preview(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let zoom = ((self.md_zoom + delta) * 10.).round() / 10.;
-        self.md_zoom = zoom.clamp(0.5, 3.);
-        cx.notify();
+    /// Whether a preview of the document is open (the toggle shows it as on).
+    pub fn set_previewed(&mut self, previewed: bool, cx: &mut Context<Self>) {
+        if self.previewed != previewed {
+            self.previewed = previewed;
+            cx.notify();
+        }
     }
 
     /// For this editor, until settings change (like Toggle Soft Wrap).
@@ -4564,16 +4480,11 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(path) = self.doc.read(cx).image.clone() {
-            return self.render_image(path, cx).into_any_element();
-        }
         let popover = self.render_hunk_popover(cx);
         let lsp_popovers = self.render_lsp_popovers(window, cx);
-        let markdown = self.mode == EditorMode::Full && self.doc.read(cx).language == crate::syntax::Language::Markdown;
-        let preview = (markdown && self.md_preview).then(|| self.render_markdown_preview(cx).into_any_element());
-        let preview_toggle = markdown.then(|| {
+        let preview_toggle = self.is_markdown(cx).then(|| {
             let theme = Theme::get(cx);
-            let on = self.md_preview;
+            let on = self.previewed;
             div()
                 .id("markdown-preview-toggle")
                 .absolute()
@@ -4590,7 +4501,7 @@ impl Render for Editor {
                 .hover_fill(if on { Hsla::from(theme.accent_soft) } else { Hsla::from(theme.elevated) }, theme.hover)
                 .tooltip(move |_, cx| crate::ui::tooltip_view(if on { "Hide Preview" } else { "Show Preview" }, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|e, _, window, cx| e.toggle_markdown_preview(&ToggleMarkdownPreview, window, cx)))
+                .on_click(cx.listener(|e, _, _, cx| e.request_markdown_preview(cx)))
                 .child(crate::ui::icon_el(
                     crate::assets::Icon::SplitRight,
                     px(13.),
@@ -4598,7 +4509,7 @@ impl Render for Editor {
                 ))
         });
         let theme = Theme::get(cx);
-        let view = div()
+        div()
             .id("editor")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
@@ -4685,7 +4596,6 @@ impl Render for Editor {
             .on_action(cx.listener(Self::previous_change))
             .on_action(cx.listener(Self::toggle_inline_blame))
             .on_action(cx.listener(Self::toggle_soft_wrap))
-            .on_action(cx.listener(Self::toggle_markdown_preview))
             .on_action(cx.listener(Self::show_completions))
             .on_action(cx.listener(Self::quick_documentation))
             .on_action(cx.listener(Self::go_to_declaration))
@@ -4718,52 +4628,7 @@ impl Render for Editor {
             .child(EditorElement { editor: cx.entity() })
             .children(popover)
             .children(lsp_popovers)
-            .children(preview_toggle);
-        match preview {
-            // Side by side: the text keeps its own events; the preview only scrolls and links.
-            Some(preview) => div().size_full().flex().child(view.flex_1().min_w_0()).child(preview).into_any_element(),
-            None => view.into_any_element(),
-        }
-    }
-}
-
-impl Editor {
-    /// An image file: the picture, scaled down to fit, with its format,
-    /// dimensions and size underneath. No text input reaches it.
-    fn render_image(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
-        let info = self.image_info.get_or_insert_with(|| crate::preview::ImageInfo::read(&path)).label();
-        div()
-            .id("image")
-            .key_context("ImagePreview")
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.background)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .p_6()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(gpui::img(path).size_full().object_fit(gpui::ObjectFit::ScaleDown)),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(30.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_t_1()
-                    .border_color(theme.border_subtle)
-                    .text_size(px(12.))
-                    .text_color(theme.text_dim)
-                    .child(info),
-            )
+            .children(preview_toggle)
     }
 }
 
