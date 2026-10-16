@@ -107,7 +107,7 @@ impl Workspace {
             )
             .map(|el| match mac {
                 true => el.child(window_drag_area("titlebar-end").flex_shrink_0().w(px(GAP + 2.))),
-                false => el.child(div().w(px(GAP)).h_full().flex_shrink_0()).child(self.render_window_controls(cx)),
+                false => el.child(div().w(px(GAP)).h_full().flex_shrink_0()).child(self.render_window_controls(window, cx)),
             })
     }
 
@@ -486,8 +486,9 @@ impl Workspace {
         })
     }
 
-    pub(super) fn render_window_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_window_controls(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx);
+        let font = crate::theme::caption_font(cx);
         let button = |id: &'static str, glyph: &'static str, area: WindowControlArea, hover: Hsla| {
             div()
                 .id(id)
@@ -498,16 +499,18 @@ impl Workspace {
                 .justify_center()
                 .text_size(px(10.))
                 .text_color(theme.text_muted)
-                .font_family("Segoe Fluent Icons")
+                .font_family(font)
                 .hover(move |s| s.bg(hover))
                 .window_control_area(area)
                 .child(glyph)
         };
+        // Maximized, the middle one restores (and shows it).
+        let max = if window.is_maximized() { "\u{E923}" } else { "\u{E922}" };
         div()
             .flex()
             .h_full()
             .child(button("min", "\u{E921}", WindowControlArea::Min, theme.hover.into()))
-            .child(button("max", "\u{E922}", WindowControlArea::Max, theme.hover.into()))
+            .child(button("max", max, WindowControlArea::Max, theme.hover.into()))
             .child(button("close", "\u{E8BB}", WindowControlArea::Close, rgb(0xc42b1c).into()))
     }
 

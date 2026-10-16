@@ -874,9 +874,24 @@ const EXAMPLE_THEME: &str = r##"{
 }
 "##;
 
-/// The UI and editor fonts `pick_fonts` chose, kept by `apply_fonts`: listing
-/// the installed fonts takes tens of milliseconds, too slow for a render.
-struct DefaultFonts(SharedString, SharedString);
+/// The UI and editor fonts `pick_fonts` chose and the caption buttons' font,
+/// kept by `apply_fonts`: listing the installed fonts takes tens of
+/// milliseconds, too slow for a render.
+struct DefaultFonts(SharedString, SharedString, &'static str);
+
+/// The font with the glyphs of Windows' caption buttons (minimize, maximize,
+/// restore, close). Segoe Fluent Icons comes with Windows 11; Windows 10 has
+/// the same glyphs at the same code points in Segoe MDL2 Assets, and shows
+/// boxes for the other.
+pub fn caption_font(cx: &App) -> &'static str {
+    cx.try_global::<DefaultFonts>().map_or(FLUENT_ICONS, |fonts| fonts.2)
+}
+
+const FLUENT_ICONS: &str = "Segoe Fluent Icons";
+
+fn pick_caption_font(installed: &[String]) -> &'static str {
+    if installed.iter().any(|f| f == FLUENT_ICONS) { FLUENT_ICONS } else { "Segoe MDL2 Assets" }
+}
 
 impl Global for DefaultFonts {}
 
@@ -942,7 +957,7 @@ const DEFAULT_LINE_HEIGHT: f32 = 22.0 / 14.0;
 pub fn apply_fonts(cx: &mut App) {
     let installed = cx.text_system().all_font_names();
     let (ui_font, mono_font) = pick_fonts(&installed);
-    cx.set_global(DefaultFonts(ui_font.clone(), mono_font.clone()));
+    cx.set_global(DefaultFonts(ui_font.clone(), mono_font.clone(), pick_caption_font(&installed)));
     let settings = Settings::get(cx).clone();
     let mono_font = match settings.editor_font_family.as_deref() {
         Some(family) if installed.iter().any(|f| f == family) => family.to_string().into(),
@@ -999,6 +1014,15 @@ mod tests {
         assert_eq!(color("function.method.call"), Hsla::from(theme.syntax.method));
         // A misspelled base name is still reported.
         assert!(errors.iter().any(|e| e.contains("keywrd") && e.contains("keyword")), "{errors:?}");
+    }
+
+    #[test]
+    fn caption_buttons_use_the_icon_font_windows_has() {
+        let installed = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        // Windows 10.
+        assert_eq!(pick_caption_font(&installed(&["Segoe UI", "Segoe MDL2 Assets"])), "Segoe MDL2 Assets");
+        // Windows 11 has both.
+        assert_eq!(pick_caption_font(&installed(&["Segoe MDL2 Assets", "Segoe Fluent Icons"])), "Segoe Fluent Icons");
     }
 
     #[test]
