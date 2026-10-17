@@ -2,7 +2,8 @@
 //! `alacritty_terminal` and painted with GPUI like the editor. Keys go to
 //! the shell (the keymap turns off app shortcuts in the "Terminal"
 //! context); text arrives through the input handler, so dead keys and IMEs
-//! work. Find (⌘F) searches the scrollback and the screen.
+//! work (what an IME composes shows at the cursor until it's committed).
+//! Find (⌘F) searches the scrollback and the screen.
 
 use std::{
     borrow::Cow,
@@ -22,7 +23,8 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::{
         Config, Term, TermMode,
-        cell::Flags,
+        cell::{Cell, Flags},
+        color::{COUNT, Colors},
         search::{Match, RegexIter, RegexSearch},
         test::TermSize,
     },
@@ -32,7 +34,7 @@ use alacritty_terminal::{
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, GlobalElementId,
     Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
     ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle,
@@ -81,8 +83,10 @@ impl EventListener for Listener {
 
 pub enum TerminalEvent {
     TitleChanged,
-    /// The shell exited; the tab should close.
+    /// The shell exited; the tab should close. Once, after its last output.
     Exited,
+    /// The shell couldn't start (its pty starts in the background).
+    Failed(String),
     /// ⌘/Ctrl-click on a `path:line:col` in the output (1-based line and column).
     OpenFile { path: PathBuf, line: Option<u32>, column: Option<u32> },
 }
@@ -96,7 +100,7 @@ pub enum Link {
 
 pub struct TerminalView {
     term: Arc<FairMutex<Term<Listener>>>,
-    notifier: Notifier,
+    pty: Pty,
     title: SharedString,
     /// A name the user gave the tab, shown instead of the shell's title.
     custom_title: Option<SharedString>,
@@ -113,13 +117,42 @@ pub struct TerminalView {
     scroll_rest: f32,
     /// Set for a Run tab: what runs, and its exit code once it's done.
     run: Option<(RunTarget, RunState)>,
+    /// The program's exit code, from its exit until its output is all read.
+    exit_code: Option<i32>,
     /// Where the shell started, for relative paths in its output.
     cwd: PathBuf,
     /// The link under the pointer while ⌘/Ctrl is held: screen row, columns.
     link: Option<(usize, Range<usize>, Link)>,
     last_mouse: Option<Point<Pixels>>,
     search: Option<Search>,
+    /// What an input method is composing, not sent to the shell yet.
+    marked: Option<Marked>,
     _events: Task<()>,
+}
+
+/// The shell's pty, which starts in the background (`TerminalView::create`).
+enum Pty {
+    /// Starting: what's typed meanwhile waits here.
+    Starting(Vec<u8>),
+    Running(Notifier),
+    /// It couldn't start.
+    Failed,
+}
+
+/// A started pty, from the background.
+struct Started {
+    notifier: Notifier,
+    pid: Option<u32>,
+}
+
+/// Text an input method is composing (Chinese, Japanese, Korean, dead
+/// keys): drawn at the cursor, and sent to the shell once it's committed.
+#[derive(Debug, PartialEq)]
+struct Marked {
+    text: String,
+    /// The part the input method selected, in UTF-16 units of `text`: its
+    /// caret when empty, the clause being converted otherwise.
+    selected: Option<Range<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -133,82 +166,62 @@ impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl TerminalView {
     /// Starts a shell in `cwd`, or with `run`, a command in the user's shell
-    /// that stays on screen with its exit code when done.
-    pub fn create(cwd: PathBuf, run: Option<RunTarget>, cx: &mut App) -> std::io::Result<Entity<Self>> {
+    /// that stays on screen with its exit code when done. The tab is there
+    /// at once; its shell starts in the background (starting a process and
+    /// looking for the project's venv don't hold up the window), and
+    /// `TerminalEvent::Failed` says if it couldn't.
+    pub fn create(cwd: PathBuf, run: Option<RunTarget>, cx: &mut App) -> Entity<Self> {
         let configured = Settings::get(cx).terminal_shell.clone();
-        let venv = crate::python::venv(&cwd);
-        let shell = match &run {
-            // PowerShell (the user's when that's PowerShell 7) with their
-            // profile, as a login shell would read it. The script goes
-            // encoded: Windows hands a program one command line, unquoted.
-            Some(target) if cfg!(windows) => {
-                let program = configured.as_ref().and_then(|c| c.first()).filter(|p| is_powershell(p)).cloned();
-                let script = powershell_run_script(&target.command, &cwd, venv.as_deref());
-                Some(vec![program.unwrap_or_else(|| "powershell".into()), "-NoLogo".into(), "-EncodedCommand".into(), encoded_command(&script)])
-            }
-            Some(target) => {
-                // A login, interactive shell so PATH matches the user's terminal.
-                let program = configured
-                    .as_ref()
-                    .and_then(|c| c.first().cloned())
-                    .or_else(|| std::env::var("SHELL").ok())
-                    .unwrap_or_else(|| "/bin/sh".into());
-                // After the profile, which may reorder PATH.
-                let setup = venv.as_deref().map(crate::python::exports).unwrap_or_default();
-                Some(vec![program, "-l".into(), "-i".into(), "-c".into(), setup + &run_script(&target.command)])
-            }
-            None => configured.clone(),
-        };
-        // A new shell activates the project's venv, typed in like a user would:
-        // a login profile can reorder PATH set beforehand.
-        // The activate script is the project's own shell script.
-        let activate = match (&run, &venv) {
-            (None, Some(venv)) if crate::trust::is_trusted(&cwd) => {
-                let program = configured.as_ref().and_then(|c| c.first().cloned()).or_else(|| std::env::var("SHELL").ok());
-                let program = program.unwrap_or_else(|| if cfg!(windows) { "powershell".into() } else { "sh".into() });
-                crate::python::activate_command(venv, &program)
-            }
-            _ => None,
-        };
         let (tx, rx) = mpsc::unbounded();
         let listener = Listener(tx);
-        let mut env = HashMap::new();
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
-        env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "Kuana".to_string());
-        let shell = shell.and_then(|command| {
-            let (program, args) = command.split_first()?;
-            Some(tty::Shell::new(program.clone(), args.to_vec()))
-        });
-        // A Run tab must show everything the program printed before it exited.
-        let drain_on_exit = run.is_some();
-        // Windows has more options.
-        #[allow(clippy::needless_update)]
-        let options = tty::Options { shell, working_directory: Some(cwd.clone()), drain_on_exit, env, ..Default::default() };
-        let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
-        let pty = tty::new(&options, window_size, 0)?;
-        #[cfg(unix)]
-        let pid = Some(pty.child().id());
-        #[cfg(not(unix))]
-        let pid = None;
-        let term = Term::new(Config::default(), &TermSize::new(80, 24), listener.clone());
-        let term = Arc::new(FairMutex::new(term));
-        let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
-        let notifier = Notifier(event_loop.channel());
-        event_loop.spawn();
-        if let Some(line) = activate {
-            // The shell reads it once it's ready.
-            notifier.notify((line + "\r").into_bytes());
-        }
-        Ok(cx.new(|cx| {
-            let mut view = Self::new(term, notifier, rx, cwd, cx);
-            view.pid = pid;
+        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(80, 24), listener.clone())));
+        cx.new(|cx: &mut Context<Self>| {
+            let start = {
+                let (term, cwd, run) = (term.clone(), cwd.clone(), run.clone());
+                cx.background_executor().spawn(async move { start_pty(configured, &cwd, run.as_ref(), term, listener) })
+            };
+            cx.spawn(async move |this, cx| {
+                let mut started = Some(start.await);
+                this.update(cx, |view, cx| {
+                    if let Some(started) = started.take() {
+                        view.pty_started(started, cx);
+                    }
+                })
+                .ok();
+                // Closed before its shell was up: end the shell.
+                if let Some(Ok(pty)) = started {
+                    let _ = pty.notifier.0.send(Msg::Shutdown);
+                }
+            })
+            .detach();
+            let mut view = Self::new(term, rx, cwd, cx);
             if let Some(target) = run {
                 view.title = target.name.clone().into();
                 view.run = Some((target, RunState::Running));
             }
             view
-        }))
+        })
+    }
+
+    /// The pty is up: what was typed meanwhile goes to the shell, at the
+    /// size the view has by now.
+    fn pty_started(&mut self, started: std::io::Result<Started>, cx: &mut Context<Self>) {
+        match started {
+            Ok(Started { notifier, pid }) => {
+                let Pty::Starting(typed) = std::mem::replace(&mut self.pty, Pty::Running(notifier)) else { return };
+                self.pid = pid;
+                if let (Pty::Running(notifier), Some(size)) = (&mut self.pty, self.size) {
+                    notifier.on_resize(window_size(size));
+                }
+                if !typed.is_empty() {
+                    self.write(typed);
+                }
+            }
+            Err(err) => {
+                self.pty = Pty::Failed;
+                cx.emit(TerminalEvent::Failed(err.to_string()));
+            }
+        }
     }
 
     /// What a Run tab runs and how it went.
@@ -216,26 +229,9 @@ impl TerminalView {
         self.run.as_ref()
     }
 
-    /// Everything on screen and in the scrollback, as text (wrapped lines joined).
-    pub fn output_text(&self) -> String {
-        let term = self.term.lock();
-        let columns = term.columns();
-        let mut out = String::new();
-        for line in term.topmost_line().0..=term.bottommost_line().0 {
-            let row = &term.grid()[Line(line)];
-            let text: String = (0..columns)
-                .map(|c| &row[Column(c)])
-                .filter(|cell| !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER))
-                .map(|cell| cell.c)
-                .collect();
-            if row[Column(columns - 1)].flags.contains(Flags::WRAPLINE) {
-                out.push_str(&text);
-            } else {
-                out.push_str(text.trim_end());
-                out.push('\n');
-            }
-        }
-        out
+    /// The output, to read as text on another thread (a Run's problems).
+    pub fn output(&self) -> Output {
+        Output(self.term.clone())
     }
 
     /// Interrupts the running program (Ctrl+C).
@@ -243,13 +239,8 @@ impl TerminalView {
         self.input(&b"\x03"[..], cx);
     }
 
-    fn new(
-        term: Arc<FairMutex<Term<Listener>>>,
-        notifier: Notifier,
-        mut rx: mpsc::UnboundedReceiver<TermEvent>,
-        cwd: PathBuf,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// The view of a terminal whose pty starts later (`pty_started`).
+    fn new(term: Arc<FairMutex<Term<Listener>>>, mut rx: mpsc::UnboundedReceiver<TermEvent>, cwd: PathBuf, cx: &mut Context<Self>) -> Self {
         let events = cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {
                 // Handle everything that piled up, then redraw once.
@@ -276,7 +267,7 @@ impl TerminalView {
             .unwrap_or_else(|| "Terminal".into());
         Self {
             term,
-            notifier,
+            pty: Pty::Starting(Vec::new()),
             title: shell_name.into(),
             custom_title: None,
             pid: None,
@@ -287,10 +278,12 @@ impl TerminalView {
             selecting: false,
             scroll_rest: 0.,
             run: None,
+            exit_code: None,
             cwd,
             link: None,
             last_mouse: None,
             search: None,
+            marked: None,
             _events: events,
         }
     }
@@ -335,20 +328,15 @@ impl TerminalView {
                 self.write(format(color).into_bytes());
             }
             TermEvent::TextAreaSizeRequest(format) => {
-                if let Some((cols, rows, w, h)) = self.size {
-                    let size = WindowSize { num_lines: rows, num_cols: cols, cell_width: f32::from(w) as u16, cell_height: f32::from(h) as u16 };
-                    self.write(format(size).into_bytes());
+                if let Some(size) = self.size {
+                    self.write(format(window_size(size)).into_bytes());
                 }
             }
-            TermEvent::ChildExit(status) => {
-                if let Some((_, state)) = self.run.as_mut() {
-                    *state = RunState::Exited(status.code());
-                }
-                cx.emit(TerminalEvent::Exited);
-            }
+            // Output may still be draining (a Run tab's): the end comes with `Exit`.
+            TermEvent::ChildExit(status) => self.exit_code = status.code(),
             TermEvent::Exit => {
                 if let Some((_, state @ RunState::Running)) = self.run.as_mut() {
-                    *state = RunState::Exited(None);
+                    *state = RunState::Exited(self.exit_code);
                 }
                 cx.emit(TerminalEvent::Exited);
             }
@@ -365,8 +353,12 @@ impl TerminalView {
         }
     }
 
-    fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        self.notifier.notify(bytes);
+    fn write(&mut self, bytes: impl Into<Cow<'static, [u8]>>) {
+        match &mut self.pty {
+            Pty::Running(notifier) => notifier.notify(bytes),
+            Pty::Starting(typed) => typed.extend_from_slice(&bytes.into()),
+            Pty::Failed => {}
+        }
     }
 
     /// Sends typed input: back to the live screen, without a selection.
@@ -385,8 +377,9 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Keys typed into Find aren't for the shell.
-        if self.search.as_ref().is_some_and(|s| s.input.focus_handle(cx).is_focused(window)) {
+        // Keys typed into Find aren't for the shell, nor keys an input
+        // method left while it composes (they'd land before its text).
+        if self.marked.is_some() || self.search.as_ref().is_some_and(|s| s.input.focus_handle(cx).is_focused(window)) {
             return;
         }
         if let Some(bytes) = escape_for(&event.keystroke, self.mode()) {
@@ -777,8 +770,7 @@ impl TerminalView {
 
     fn layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) -> TerminalFrame {
         let theme = Theme::get(cx).clone();
-        let font_size = px(theme.editor_font_size - 1.);
-        let mono = font(theme.mono_font.clone());
+        let (mono, font_size) = terminal_font(&theme);
         let text_system = window.text_system().clone();
         let font_id = text_system.resolve_font(&mono);
         let cell_w = text_system.advance(font_id, font_size, 'm').map(|s| s.width).unwrap_or(font_size * 0.6);
@@ -790,20 +782,37 @@ impl TerminalView {
         if self.size != Some((cols, rows, cell_w, cell_h)) {
             self.size = Some((cols, rows, cell_w, cell_h));
             self.term.lock().resize(TermSize::new(cols as usize, rows as usize));
-            self.notifier.on_resize(WindowSize {
-                num_lines: rows,
-                num_cols: cols,
-                cell_width: f32::from(cell_w) as u16,
-                cell_height: f32::from(cell_h) as u16,
-            });
+            // A pty still starting gets the size when it's up.
+            if let Pty::Running(notifier) = &mut self.pty {
+                notifier.on_resize(window_size((cols, rows, cell_w, cell_h)));
+            }
         }
         self.origin = inner.origin;
         self.cell = (cell_w, cell_h);
         let focused = self.focus_handle.is_focused(window) && window.is_window_active();
-        let term = self.term.lock();
-        let content = term.renderable_content();
-        let offset = content.display_offset as i32;
+        // The cells on screen, gathered while the terminal is locked; colors
+        // and shaping wait until it isn't, so the shell's output doesn't.
+        let (cells, cursor, cursor_wide, colors, offset) = {
+            let term = self.term.lock();
+            let content = term.renderable_content();
+            let cursor = content.cursor;
+            // While an input method composes, its text is where the cursor shows.
+            let block_cursor = focused && self.marked.is_none() && cursor.shape == CursorShape::Block;
+            let offset = content.display_offset as i32;
+            let mut cells = FrameCells::default();
+            for indexed in content.display_iter {
+                let row = indexed.point.line.0 + offset;
+                if (0..rows as i32).contains(&row) {
+                    let selected = content.selection.is_some_and(|s| s.contains(indexed.point));
+                    cells.push(row as usize, indexed.point.column.0, indexed.cell, selected, block_cursor && indexed.point == cursor.point);
+                }
+            }
+            let wide = term.grid()[cursor.point].flags.contains(Flags::WIDE_CHAR);
+            (cells.finish(), cursor, wide, *content.colors, offset)
+        };
         let default_bg: Hsla = theme.background.into();
+        let x_of = |col: usize| inner.origin.x + cell_w * col as f32;
+        let y_of = |row: usize| inner.origin.y + cell_h * row as f32;
         let mut frame = TerminalFrame { bounds, line_height: cell_h, ..Default::default() };
         // Find's matches on screen, a row at a time (a match can wrap).
         if let Some(search) = &self.search {
@@ -820,131 +829,99 @@ impl TerminalView {
                     }
                     let from = if line == start.line.0 { start.column.0 } else { 0 };
                     let to = if line == end.line.0 { end.column.0 + 1 } else { cols as usize };
-                    let x = inner.origin.x + cell_w * from as f32;
-                    let y = inner.origin.y + cell_h * row as f32;
-                    frame.highlights.push(fill(Bounds::new(point(x, y), size(cell_w * (to - from) as f32, cell_h)), color));
+                    frame.highlights.push(fill(Bounds::new(point(x_of(from), y_of(row as usize)), size(cell_w * (to - from) as f32, cell_h)), color));
                 }
             }
         }
-        // Cells per row: (column, char, fg, bg, flags).
-        let mut rows_cells: Vec<Vec<(usize, char, Hsla, Hsla, Flags)>> = vec![Vec::new(); rows as usize];
-        let cursor = content.cursor;
-        let block_cursor = focused && cursor.shape == CursorShape::Block;
-        for indexed in content.display_iter {
-            let row = indexed.point.line.0 + offset;
-            if row < 0 || row >= rows as i32 {
-                continue;
+        let mut palette = Palette::new(&theme, colors);
+        for background in &cells.backgrounds {
+            let color = palette.get(background.ink);
+            if color != default_bg {
+                let origin = point(x_of(background.cols.start), y_of(background.row));
+                frame.backgrounds.push(fill(Bounds::new(origin, size(cell_w * background.cols.len() as f32, cell_h)), color));
             }
-            let cell = indexed.cell;
-            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let mut fg = resolve(&theme, content.colors, cell.fg, cell.flags);
-            let mut bg = resolve(&theme, content.colors, cell.bg, Flags::empty());
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if content.selection.is_some_and(|s| s.contains(indexed.point)) {
-                bg = theme.selection.into();
-            }
-            if block_cursor && indexed.point == cursor.point {
-                fg = default_bg;
-            }
-            rows_cells[row as usize].push((indexed.point.column.0, cell.c, fg, bg, cell.flags));
         }
 
         // The cursor, under the text.
         let cursor_row = cursor.point.line.0 + offset;
-        if cursor.shape != CursorShape::Hidden && (0..rows as i32).contains(&cursor_row) {
-            let x = inner.origin.x + cell_w * cursor.point.column.0 as f32;
-            let y = inner.origin.y + cell_h * cursor_row as f32;
+        let cursor_shown = (0..rows as i32).contains(&cursor_row);
+        let cursor_at = point(x_of(cursor.point.column.0), y_of(cursor_row.max(0) as usize));
+        if cursor.shape != CursorShape::Hidden && self.marked.is_none() && cursor_shown {
             let color: Hsla = theme.cursor.into();
-            let wide = term.grid()[cursor.point].flags.contains(Flags::WIDE_CHAR);
-            let width = if wide { cell_w * 2. } else { cell_w };
+            let width = if cursor_wide { cell_w * 2. } else { cell_w };
             let quad = match (focused, cursor.shape) {
-                (true, CursorShape::Beam) => fill(Bounds::new(point(x, y), size(px(2.), cell_h)), color),
-                (true, CursorShape::Underline) => fill(Bounds::new(point(x, y + cell_h - px(2.)), size(width, px(2.))), color),
-                (true, _) => fill(Bounds::new(point(x, y), size(width, cell_h)), color),
-                (false, _) => gpui::outline(Bounds::new(point(x, y), size(width, cell_h)), color, gpui::BorderStyle::Solid),
+                (true, CursorShape::Beam) => fill(Bounds::new(cursor_at, size(px(2.), cell_h)), color),
+                (true, CursorShape::Underline) => fill(Bounds::new(cursor_at + point(px(0.), cell_h - px(2.)), size(width, px(2.))), color),
+                (true, _) => fill(Bounds::new(cursor_at, size(width, cell_h)), color),
+                (false, _) => gpui::outline(Bounds::new(cursor_at, size(width, cell_h)), color, gpui::BorderStyle::Solid),
             };
             frame.cursor = Some(quad);
         }
-        drop(term);
 
-        for (row, cells) in rows_cells.iter().enumerate() {
-            let y = inner.origin.y + cell_h * row as f32;
-            // Backgrounds: runs of equal non-default color.
-            let mut i = 0;
-            while i < cells.len() {
-                let (col, _, _, bg, flags) = cells[i];
-                let width_of = |f: Flags| if f.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-                let mut end = col + width_of(flags);
-                let mut j = i + 1;
-                while j < cells.len() && cells[j].3 == bg && cells[j].0 == end {
-                    end = cells[j].0 + width_of(cells[j].4);
-                    j += 1;
-                }
-                if bg != default_bg {
-                    let x = inner.origin.x + cell_w * col as f32;
-                    frame.backgrounds.push(fill(Bounds::new(point(x, y), size(cell_w * (end - col) as f32, cell_h)), bg));
-                }
-                i = j;
+        for piece in cells.pieces {
+            let runs: Vec<TextRun> = piece.runs.iter().map(|&(len, style)| text_run(len, style, &mono, &mut palette)).collect();
+            let origin = point(x_of(piece.col), y_of(piece.row));
+            let line = text_system.shape_line(piece.text.into(), font_size, &runs, piece.grid.then_some(cell_w));
+            if !piece.grid || glyph_per_char(&line) {
+                frame.lines.push((origin, line));
+                continue;
             }
-            // Text: runs of equal style, each placed at its column so wide or
-            // fallback glyphs can't shift the rest of the row.
-            let mut i = 0;
-            while i < cells.len() {
-                let (col, c, fg, _, flags) = cells[i];
-                let mut text = String::new();
-                text.push(if c == '\0' { ' ' } else { c });
-                let mut j = i + 1;
-                let ascii = c.is_ascii() && !flags.contains(Flags::WIDE_CHAR);
-                while ascii
-                    && j < cells.len()
-                    && cells[j].2 == fg
-                    && cells[j].4 == flags
-                    && cells[j].0 == cells[j - 1].0 + 1
-                    && cells[j].1.is_ascii()
+            // A ligature, or a character the font split or reordered: the
+            // fixed width would put glyphs in the wrong cells, so each cell
+            // is shaped alone.
+            let mut chars = line.text.chars();
+            let mut x = origin.x;
+            for run in &runs {
+                let mut left = run.len;
+                while left > 0
+                    && let Some(c) = chars.next()
                 {
-                    text.push(if cells[j].1 == '\0' { ' ' } else { cells[j].1 });
-                    j += 1;
-                }
-                if !text.trim().is_empty() && !flags.contains(Flags::HIDDEN) {
-                    let mut run_font = mono.clone();
-                    if flags.intersects(Flags::BOLD) {
-                        run_font.weight = FontWeight::BOLD;
+                    left = left.saturating_sub(c.len_utf8());
+                    if c != ' ' || run.underline.is_some() || run.strikethrough.is_some() {
+                        let run = TextRun { len: c.len_utf8(), ..run.clone() };
+                        frame.lines.push((point(x, origin.y), text_system.shape_line(c.to_string().into(), font_size, &[run], None)));
                     }
-                    if flags.intersects(Flags::ITALIC) {
-                        run_font.style = FontStyle::Italic;
-                    }
-                    let color = if flags.contains(Flags::DIM) { fg.alpha(fg.a * 0.6) } else { fg };
-                    let run = TextRun {
-                        len: text.len(),
-                        font: run_font,
-                        color,
-                        background_color: None,
-                        underline: flags.intersects(Flags::ALL_UNDERLINES).then(|| UnderlineStyle {
-                            thickness: px(1.),
-                            color: Some(color),
-                            wavy: flags.contains(Flags::UNDERCURL),
-                        }),
-                        strikethrough: flags.contains(Flags::STRIKEOUT).then(|| gpui::StrikethroughStyle {
-                            thickness: px(1.),
-                            color: Some(color),
-                        }),
-                    };
-                    let shaped = text_system.shape_line(text.into(), font_size, &[run], None);
-                    frame.lines.push((point(inner.origin.x + cell_w * col as f32, y), shaped));
+                    x += cell_w;
                 }
-                i = j;
             }
+        }
+
+        // What an input method is composing, at the cursor over what's there.
+        if let Some(marked) = &self.marked
+            && cursor_shown
+        {
+            let text_color: Hsla = theme.text.into();
+            let line = text_system.shape_line(marked.text.clone().into(), font_size, &marked_runs(marked, &mono, text_color), None);
+            // Its caret, unless it selected a part (a clause to convert).
+            let caret = match &marked.selected {
+                Some(selected) if !selected.is_empty() => None,
+                Some(selected) => Some(utf16_to_byte(&marked.text, selected.start)),
+                None => Some(marked.text.len()),
+            };
+            let caret = caret
+                .filter(|_| focused)
+                .map(|at| fill(Bounds::new(cursor_at + point(line.x_for_index(at), px(0.)), size(px(2.), cell_h)), theme.cursor));
+            frame.marked = Some(Composition {
+                background: fill(Bounds::new(cursor_at, size(line.width.max(cell_w), cell_h)), default_bg),
+                origin: cursor_at,
+                line,
+                caret,
+            });
         }
         if let Some((row, cols, _)) = &self.link {
-            let y = inner.origin.y + cell_h * (*row + 1) as f32 - px(1.);
-            let x = inner.origin.x + cell_w * cols.start as f32;
-            frame.link = Some(fill(Bounds::new(point(x, y), size(cell_w * cols.len() as f32, px(1.))), theme.accent));
+            let y = y_of(*row + 1) - px(1.);
+            frame.link = Some(fill(Bounds::new(point(x_of(cols.start), y), size(cell_w * cols.len() as f32, px(1.))), theme.accent));
         }
         frame
+    }
+
+    /// Where the cursor's cell is in the window, as of the last frame.
+    fn cursor_origin(&self) -> Point<Pixels> {
+        let term = self.term.lock();
+        let cursor = term.grid().cursor.point;
+        let row = cursor.line.0 + term.grid().display_offset() as i32;
+        let (w, h) = self.cell;
+        self.origin + point(w * cursor.column.0 as f32, h * row as f32)
     }
 }
 
@@ -1051,8 +1028,39 @@ fn parse_link(text: &str, cwd: &Path) -> Option<Link> {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
-        // Closes the pty; the shell gets SIGHUP.
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        // Closes the pty; the shell gets SIGHUP. (One still starting is
+        // ended once it's up, in `create`.)
+        if let Pty::Running(notifier) = &self.pty {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
+    }
+}
+
+/// A terminal's output, to read on another thread (`TerminalView::output`).
+pub struct Output(Arc<FairMutex<Term<Listener>>>);
+
+impl Output {
+    /// Everything on screen and in the scrollback, as text (wrapped lines
+    /// joined, combining characters kept).
+    pub fn text(&self) -> String {
+        let term = self.0.lock();
+        let columns = term.columns();
+        let mut out = String::new();
+        for line in term.topmost_line().0..=term.bottommost_line().0 {
+            let row = &term.grid()[Line(line)];
+            let text: String = (0..columns)
+                .map(|c| &row[Column(c)])
+                .filter(|cell| !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER))
+                .flat_map(|cell| std::iter::once(cell.c).chain(cell.zerowidth().unwrap_or_default().iter().copied()))
+                .collect();
+            if row[Column(columns - 1)].flags.contains(Flags::WRAPLINE) {
+                out.push_str(&text);
+            } else {
+                out.push_str(text.trim_end());
+                out.push('\n');
+            }
+        }
+        out
     }
 }
 
@@ -1066,9 +1074,129 @@ pub struct TerminalFrame {
     highlights: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
+    /// What an input method is composing, over everything else.
+    marked: Option<Composition>,
     /// Under the link the pointer is on (⌘/Ctrl held).
     link: Option<PaintQuad>,
     hitbox: Option<Hitbox>,
+}
+
+/// Composed text as drawn: on the background color, so the cells it
+/// covers don't show through, with its caret.
+struct Composition {
+    background: PaintQuad,
+    origin: Point<Pixels>,
+    line: ShapedLine,
+    caret: Option<PaintQuad>,
+}
+
+/// Starts a terminal's shell, off the UI thread (`TerminalView::create`):
+/// the command, the venv it activates, the pty and the thread reading it.
+fn start_pty(
+    configured: Option<Vec<String>>,
+    cwd: &Path,
+    run: Option<&RunTarget>,
+    term: Arc<FairMutex<Term<Listener>>>,
+    listener: Listener,
+) -> std::io::Result<Started> {
+    let venv = crate::python::venv(cwd);
+    let shell = match run {
+        // PowerShell (the user's when that's PowerShell 7) with their
+        // profile, as a login shell would read it. The script goes
+        // encoded: Windows hands a program one command line, unquoted.
+        Some(target) if cfg!(windows) => {
+            let program = configured.as_ref().and_then(|c| c.first()).filter(|p| is_powershell(p)).cloned();
+            let script = powershell_run_script(&target.command, cwd, venv.as_deref());
+            Some(vec![program.unwrap_or_else(|| "powershell".into()), "-NoLogo".into(), "-EncodedCommand".into(), encoded_command(&script)])
+        }
+        Some(target) => {
+            // A login, interactive shell so PATH matches the user's terminal.
+            let program = configured
+                .as_ref()
+                .and_then(|c| c.first().cloned())
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "/bin/sh".into());
+            // After the profile, which may reorder PATH.
+            let setup = venv.as_deref().map(crate::python::exports).unwrap_or_default();
+            Some(vec![program, "-l".into(), "-i".into(), "-c".into(), setup + &run_script(&target.command)])
+        }
+        None => configured.clone(),
+    };
+    // A new shell activates the project's venv, typed in like a user would:
+    // a login profile can reorder PATH set beforehand.
+    // The activate script is the project's own shell script.
+    let activate = match (run, &venv) {
+        (None, Some(venv)) if crate::trust::is_trusted(cwd) => {
+            let program = configured.as_ref().and_then(|c| c.first().cloned()).or_else(|| std::env::var("SHELL").ok());
+            let program = program.unwrap_or_else(|| if cfg!(windows) { "powershell".into() } else { "sh".into() });
+            crate::python::activate_command(venv, &program)
+        }
+        _ => None,
+    };
+    let mut env = HashMap::new();
+    env.insert("TERM".to_string(), "xterm-256color".to_string());
+    env.insert("COLORTERM".to_string(), "truecolor".to_string());
+    env.insert("TERM_PROGRAM".to_string(), "Kuana".to_string());
+    let shell = shell.and_then(|command| {
+        let (program, args) = command.split_first()?;
+        Some(tty::Shell::new(program.clone(), args.to_vec()))
+    });
+    // A Run tab must show everything the program printed before it exited.
+    let drain_on_exit = run.is_some();
+    // Windows has more options.
+    #[allow(clippy::needless_update)]
+    let options = tty::Options { shell, working_directory: Some(cwd.to_path_buf()), drain_on_exit, env, ..Default::default() };
+    let window_size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+    let pty = {
+        #[cfg(unix)]
+        let _unblocked = SignalsUnblocked::new();
+        tty::new(&options, window_size, 0)?
+    };
+    #[cfg(unix)]
+    let pid = Some(pty.child().id());
+    #[cfg(not(unix))]
+    let pid = None;
+    let event_loop = EventLoop::new(term, listener, pty, false, false)?;
+    let notifier = Notifier(event_loop.channel());
+    event_loop.spawn();
+    if let Some(line) = activate {
+        // The shell reads it once it's ready.
+        notifier.notify((line + "\r").into_bytes());
+    }
+    Ok(Started { notifier, pid })
+}
+
+/// No signals blocked on this thread while it lives. A process inherits its
+/// starter's signal mask, and the background executor's threads (GCD's on
+/// macOS) block signals: a shell started there would never get ⌃C, SIGHUP
+/// or SIGTERM, nor would anything it runs.
+#[cfg(unix)]
+struct SignalsUnblocked(libc::sigset_t);
+
+#[cfg(unix)]
+impl SignalsUnblocked {
+    fn new() -> Self {
+        // SAFETY: this thread's own mask, set from an empty set; the old one is kept to restore.
+        unsafe {
+            let (mut none, mut old) = (std::mem::zeroed(), std::mem::zeroed());
+            libc::sigemptyset(&mut none);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &none, &mut old);
+            Self(old)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalsUnblocked {
+    fn drop(&mut self) {
+        // SAFETY: puts back the mask `new` found.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
+}
+
+/// Columns, rows and cell size (`TerminalView::size`), as the pty takes them.
+fn window_size((cols, rows, w, h): (u16, u16, Pixels, Pixels)) -> WindowSize {
+    WindowSize { num_lines: rows, num_cols: cols, cell_width: f32::from(w) as u16, cell_height: f32::from(h) as u16 }
 }
 
 /// The shell script for a Run tab: shows the command, runs it, then says
@@ -1111,6 +1239,293 @@ fn encoded_command(script: &str) -> String {
 fn is_powershell(program: &str) -> bool {
     let name = program.rsplit(['\\', '/']).next().unwrap_or_default().to_ascii_lowercase();
     matches!(name.strip_suffix(".exe").unwrap_or(&name), "pwsh" | "powershell")
+}
+
+// ---- Cells to draw -----------------------------------------------------------------
+
+/// Underlines and strikethrough, which draw on blank cells too.
+const DECORATIONS: Flags = Flags::ALL_UNDERLINES.union(Flags::STRIKEOUT);
+/// The flags that change how a cell's text draws.
+const STYLE_FLAGS: Flags = DECORATIONS.union(Flags::BOLD).union(Flags::ITALIC).union(Flags::DIM);
+const ZWJ: char = '\u{200D}';
+
+/// A cell's color before the theme resolves it, which `Palette` does after
+/// the terminal is unlocked, once per color and frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ink {
+    /// A palette index, bold's bright and dim's plain colors already picked.
+    Index(u16),
+    Rgb(Rgb),
+    Selection,
+    /// The default background: text under a block cursor.
+    Background,
+}
+
+impl Ink {
+    fn of(color: Color, bold: bool) -> Self {
+        match color {
+            Color::Spec(rgb) => Ink::Rgb(rgb),
+            Color::Indexed(i) => Ink::Index(i.into()),
+            Color::Named(named) => {
+                let n = named as u16;
+                let dim = NamedColor::DimBlack as u16;
+                Ink::Index(if bold && n < 8 {
+                    // Bold text in a basic color uses the bright variant, like most terminals.
+                    n + 8
+                } else if (dim..dim + 8).contains(&n) {
+                    // Dim colors aren't in the palette; DIM text is faded when painted.
+                    n - dim
+                } else {
+                    n
+                })
+            }
+        }
+    }
+}
+
+/// How a cell's text looks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CellStyle {
+    fg: Ink,
+    /// Only `STYLE_FLAGS`.
+    flags: Flags,
+}
+
+/// Text to shape at a cell: a run of cells that each hold one character
+/// (`grid`: shaped at once with a fixed cell width, which puts glyph n in
+/// cell n whatever font it comes from), or a wide character or one with
+/// zero-width characters after it (combining accents, emoji selectors and
+/// joiners), shaped alone so the shaper places them.
+#[derive(Debug)]
+struct Piece {
+    row: usize,
+    col: usize,
+    /// The column after its last character.
+    end: usize,
+    text: String,
+    /// Byte lengths and styles, in order.
+    runs: Vec<(usize, CellStyle)>,
+    grid: bool,
+    /// Blank cells after it so far: inside it if a character follows.
+    blanks: usize,
+}
+
+impl Piece {
+    fn new(row: usize, col: usize, grid: bool) -> Self {
+        Self { row, col, end: col, text: String::new(), runs: Vec::new(), grid, blanks: 0 }
+    }
+
+    fn push_str(&mut self, text: &str, style: CellStyle) {
+        self.text.push_str(text);
+        match self.runs.last_mut() {
+            Some((len, last)) if *last == style => *len += text.len(),
+            _ => self.runs.push((text.len(), style)),
+        }
+    }
+
+    /// A grid run's next character, after the blank cells before it: spaces
+    /// in the run's style (but not underlined or struck through).
+    fn push_char(&mut self, c: char, style: CellStyle) {
+        if self.blanks > 0 {
+            let last = self.runs.last().map_or(style, |&(_, last)| last);
+            let plain = CellStyle { flags: last.flags.difference(DECORATIONS), ..last };
+            for _ in 0..self.blanks {
+                self.push_str(" ", plain);
+            }
+        }
+        self.push_str(c.encode_utf8(&mut [0; 4]), style);
+        self.end += self.blanks + 1;
+        self.blanks = 0;
+    }
+}
+
+/// A row's cells of one background color.
+#[derive(Debug)]
+struct Background {
+    row: usize,
+    cols: Range<usize>,
+    ink: Ink,
+}
+
+/// A frame's cells, as text to shape and backgrounds to fill: gathered
+/// while the terminal is locked, so this only copies and compares.
+#[derive(Default, Debug)]
+struct FrameCells {
+    pieces: Vec<Piece>,
+    backgrounds: Vec<Background>,
+    /// The last piece ends with a zero-width joiner: the next character joins it.
+    joining: bool,
+}
+
+impl FrameCells {
+    /// The next cell on screen (row by row, left to right).
+    fn push(&mut self, row: usize, col: usize, cell: &Cell, selected: bool, under_cursor: bool) {
+        let flags = cell.flags;
+        // A wide character's second half (it covers it), or a line's end
+        // that couldn't fit one.
+        if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+            return;
+        }
+        let width = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        let mut fg = Ink::of(cell.fg, flags.contains(Flags::BOLD));
+        let mut bg = Ink::of(cell.bg, false);
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if selected {
+            bg = Ink::Selection;
+        }
+        if under_cursor {
+            fg = Ink::Background;
+        }
+        match self.backgrounds.last_mut() {
+            Some(last) if last.row == row && last.cols.end == col && last.ink == bg => last.cols.end = col + width,
+            _ => self.backgrounds.push(Background { row, cols: col..col + width, ink: bg }),
+        }
+
+        let zerowidth = cell.zerowidth().unwrap_or_default();
+        let style = CellStyle { fg, flags: flags.intersection(STYLE_FLAGS) };
+        // A tab's first cell holds the tab.
+        let c = if cell.c.is_control() { ' ' } else { cell.c };
+        // Nothing to draw: a space, or hidden text.
+        let blank = flags.contains(Flags::HIDDEN) || (c == ' ' && zerowidth.is_empty() && !flags.intersects(DECORATIONS));
+        let joining = std::mem::take(&mut self.joining);
+        let last = self.pieces.last_mut().filter(|p| p.row == row && p.end + p.blanks == col);
+        if blank {
+            if let Some(last) = last.filter(|p| p.grid) {
+                last.blanks += width;
+            }
+            return;
+        }
+        let text = || std::iter::once(c).chain(zerowidth.iter().copied()).collect::<String>();
+        match last {
+            // An emoji sequence (👨‍👩‍👧 is three joined) is one picture, at its first cell.
+            Some(last) if joining && !last.grid => {
+                last.push_str(&text(), style);
+                last.end = col + width;
+                self.joining = zerowidth.last() == Some(&ZWJ);
+            }
+            Some(last) if last.grid && width == 1 && zerowidth.is_empty() => last.push_char(c, style),
+            _ if width == 1 && zerowidth.is_empty() => {
+                let mut piece = Piece::new(row, col, true);
+                piece.push_char(c, style);
+                self.pieces.push(piece);
+            }
+            _ => {
+                let mut piece = Piece::new(row, col, false);
+                piece.push_str(&text(), style);
+                piece.end = col + width;
+                self.pieces.push(piece);
+                self.joining = zerowidth.last() == Some(&ZWJ);
+            }
+        }
+    }
+
+    /// An underline or strikethrough at a run's end would run to the
+    /// shaped line's own width; one more (undecorated) space ends it at the
+    /// cell's edge.
+    fn finish(mut self) -> Self {
+        for piece in self.pieces.iter_mut().filter(|p| p.grid) {
+            if let Some(&(_, style)) = piece.runs.last()
+                && style.flags.intersects(DECORATIONS)
+            {
+                piece.push_str(" ", CellStyle { flags: style.flags.difference(DECORATIONS), ..style });
+            }
+        }
+        self
+    }
+}
+
+/// Theme colors for `Ink`s, each palette entry worked out once a frame.
+struct Palette<'a> {
+    theme: &'a Theme,
+    /// Colors programs set (OSC 4, 10, 11…).
+    overrides: Colors,
+    resolved: [Option<Hsla>; COUNT],
+}
+
+impl<'a> Palette<'a> {
+    fn new(theme: &'a Theme, overrides: Colors) -> Self {
+        Self { theme, overrides, resolved: [None; COUNT] }
+    }
+
+    fn get(&mut self, ink: Ink) -> Hsla {
+        match ink {
+            Ink::Rgb(rgb) => to_hsla(rgb),
+            Ink::Selection => self.theme.selection.into(),
+            Ink::Background => self.theme.background.into(),
+            Ink::Index(i) => {
+                let i = usize::from(i).min(COUNT - 1);
+                *self.resolved[i].get_or_insert_with(|| {
+                    self.overrides[i].or_else(|| palette(self.theme, i)).map(to_hsla).unwrap_or(self.theme.text.into())
+                })
+            }
+        }
+    }
+}
+
+/// A style's text run.
+fn text_run(len: usize, style: CellStyle, font: &Font, palette: &mut Palette) -> TextRun {
+    let fg = palette.get(style.fg);
+    let color = if style.flags.contains(Flags::DIM) { fg.alpha(fg.a * 0.6) } else { fg };
+    let mut font = font.clone();
+    if style.flags.contains(Flags::BOLD) {
+        font.weight = FontWeight::BOLD;
+    }
+    if style.flags.contains(Flags::ITALIC) {
+        font.style = FontStyle::Italic;
+    }
+    TextRun {
+        len,
+        font,
+        color,
+        background_color: None,
+        underline: style.flags.intersects(Flags::ALL_UNDERLINES).then(|| UnderlineStyle {
+            thickness: px(1.),
+            color: Some(color),
+            wavy: style.flags.contains(Flags::UNDERCURL),
+        }),
+        strikethrough: style.flags.contains(Flags::STRIKEOUT).then(|| gpui::StrikethroughStyle { thickness: px(1.), color: Some(color) }),
+    }
+}
+
+/// Whether shaping gave every character one glyph, in order: what a fixed
+/// cell width needs to put each glyph in its cell.
+fn glyph_per_char(line: &ShapedLine) -> bool {
+    line.runs.iter().flat_map(|run| &run.glyphs).map(|glyph| glyph.index).eq(line.text.char_indices().map(|(i, _)| i))
+}
+
+/// The terminal's font and size: the editor's font, a point smaller.
+fn terminal_font(theme: &Theme) -> (Font, Pixels) {
+    (font(theme.mono_font.clone()), px(theme.editor_font_size - 1.))
+}
+
+/// Composed text's runs: underlined, the part being converted thicker.
+fn marked_runs(marked: &Marked, font: &Font, color: Hsla) -> Vec<TextRun> {
+    let run = |len: usize, thickness: f32| TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: Some(UnderlineStyle { thickness: px(thickness), color: Some(color), wavy: false }),
+        strikethrough: None,
+    };
+    let Some(selected) = marked.selected.as_ref().filter(|s| !s.is_empty()) else { return vec![run(marked.text.len(), 1.)] };
+    let (start, end) = (utf16_to_byte(&marked.text, selected.start), utf16_to_byte(&marked.text, selected.end));
+    [(start, 1.), (end - start, 2.), (marked.text.len() - end, 1.)].into_iter().filter(|&(len, _)| len > 0).map(|(len, thickness)| run(len, thickness)).collect()
+}
+
+/// The byte offset of a UTF-16 offset in `text` (input methods count in
+/// UTF-16), at a character boundary and at most its end.
+fn utf16_to_byte(text: &str, utf16: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in text.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    text.len()
 }
 
 // ---- Colors ------------------------------------------------------------------------
@@ -1160,27 +1575,6 @@ fn palette(theme: &Theme, index: usize) -> Option<Rgb> {
         i if i == NamedColor::Cursor as usize => to_rgb(theme.cursor),
         _ => return None,
     })
-}
-
-fn resolve(theme: &Theme, overrides: &alacritty_terminal::term::color::Colors, color: Color, flags: Flags) -> Hsla {
-    let index = match color {
-        Color::Spec(rgb) => return to_hsla(rgb),
-        Color::Indexed(i) => i as usize,
-        Color::Named(named) => {
-            let n = named as usize;
-            let dim_start = NamedColor::DimBlack as usize;
-            if flags.contains(Flags::BOLD) && n < 8 {
-                // Bold text in a basic color uses the bright variant, like most terminals.
-                n + 8
-            } else if (dim_start..dim_start + 8).contains(&n) {
-                // Dim colors aren't in the palette; DIM text is faded when painted.
-                n - dim_start
-            } else {
-                n
-            }
-        }
-    };
-    overrides[index].or_else(|| palette(theme, index)).map(to_hsla).unwrap_or(theme.text.into())
 }
 
 // ---- Keys --------------------------------------------------------------------------
@@ -1317,47 +1711,84 @@ impl Render for TerminalView {
     }
 }
 
-/// Text input (and IME composition) goes to the shell.
+/// Text input goes to the shell. What an input method composes stays here
+/// (`marked`) until it's committed: the shell can't take back what it got.
+/// That text is the only text the input method sees, at 0..its length.
 impl EntityInputHandler for TerminalView {
-    fn text_for_range(&mut self, _: Range<usize>, _: &mut Option<Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
-        None
+    fn text_for_range(&mut self, range: Range<usize>, adjusted: &mut Option<Range<usize>>, _: &mut Window, _: &mut Context<Self>) -> Option<String> {
+        let text = &self.marked.as_ref()?.text;
+        let end = utf16_to_byte(text, range.end);
+        let start = utf16_to_byte(text, range.start).min(end);
+        *adjusted = Some(text[..start].encode_utf16().count()..text[..end].encode_utf16().count());
+        Some(text[start..end].to_string())
     }
 
     fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: 0..0, reversed: false })
+        let range = match &self.marked {
+            Some(marked) => marked.selected.clone().unwrap_or_else(|| {
+                let end = marked.text.encode_utf16().count();
+                end..end
+            }),
+            None => 0..0,
+        };
+        Some(UTF16Selection { range, reversed: false })
     }
 
+    /// While there is one, macOS gives keys to the input method first, so
+    /// Enter commits the composition instead of reaching the shell ahead of it.
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.marked.as_ref().map(|marked| 0..marked.text.encode_utf16().count())
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    /// The composition is accepted as it is (Linux does this on a click).
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(marked) = self.marked.take() {
+            self.input(marked.text.into_bytes(), cx);
+        }
+    }
 
+    /// Typed or committed text; a commit replaces the composition, which
+    /// the shell never saw.
     fn replace_text_in_range(&mut self, _: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
+        let composed = self.marked.take().is_some();
         if !text.is_empty() {
             self.input(text.to_string().into_bytes(), cx);
+        } else if composed {
+            cx.notify();
         }
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
         _: Option<Range<usize>>,
-        _: &str,
-        _: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // Composition in progress; the final text comes via replace_text_in_range.
+        if text.is_empty() {
+            // Cancelled (Escape), or all of it deleted.
+            self.marked = None;
+        } else {
+            if self.marked.is_none() {
+                // It shows at the cursor, on the live screen.
+                self.term.lock().scroll_display(Scroll::Bottom);
+            }
+            self.marked = Some(Marked { text: text.to_string(), selected });
+        }
+        cx.notify();
     }
 
-    fn bounds_for_range(&mut self, _: Range<usize>, _: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
-        // Put the IME window at the cursor.
-        let cursor = self.term.lock().grid().cursor.point;
-        let (w, h) = self.cell;
-        Some(Bounds::new(
-            self.origin + point(w * cursor.column.0 as f32, h * cursor.line.0 as f32),
-            size(w, h),
-        ))
+    /// The input method's window goes under the composed text, at the cursor.
+    fn bounds_for_range(&mut self, range: Range<usize>, _: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) -> Option<Bounds<Pixels>> {
+        let mut origin = self.cursor_origin();
+        if let Some(marked) = &self.marked {
+            let (font, font_size) = terminal_font(Theme::get(cx));
+            let runs = marked_runs(marked, &font, Theme::get(cx).text.into());
+            let line = window.text_system().shape_line(marked.text.clone().into(), font_size, &runs, None);
+            origin.x += line.x_for_index(utf16_to_byte(&marked.text, range.start));
+        }
+        Some(Bounds::new(origin, size(self.cell.0, self.cell.1)))
     }
 
     fn character_index_for_point(&mut self, _: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
@@ -1438,6 +1869,13 @@ impl Element for TerminalElement {
             }
             for (origin, line) in &frame.lines {
                 line.paint(*origin, frame.line_height, window, cx).ok();
+            }
+            if let Some(marked) = frame.marked.take() {
+                window.paint_quad(marked.background);
+                marked.line.paint(marked.origin, frame.line_height, window, cx).ok();
+                if let Some(caret) = marked.caret {
+                    window.paint_quad(caret);
+                }
             }
         });
     }
@@ -1567,5 +2005,291 @@ mod tests {
         assert_eq!(palette(&theme, 16), Some(Rgb { r: 0, g: 0, b: 0 }));
         assert_eq!(palette(&theme, 231), Some(Rgb { r: 255, g: 255, b: 255 }));
         assert_eq!(palette(&theme, 232), Some(Rgb { r: 8, g: 8, b: 8 }));
+    }
+
+    // ---- Drawing -----------------------------------------------------------------------
+
+    fn parse(term: &mut Term<Listener>, output: &str) {
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        parser.advance(term, output.as_bytes());
+    }
+
+    /// A terminal `cols` wide that printed `output`.
+    fn printed(output: &str, cols: usize, rows: usize) -> Term<Listener> {
+        let (tx, _) = mpsc::unbounded();
+        let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), Listener(tx));
+        parse(&mut term, output);
+        term
+    }
+
+    /// The screen's cells, as a frame gathers them.
+    fn cells(term: &Term<Listener>) -> FrameCells {
+        let mut cells = FrameCells::default();
+        for indexed in term.renderable_content().display_iter {
+            cells.push(indexed.point.line.0 as usize, indexed.point.column.0, indexed.cell, false, false);
+        }
+        cells.finish()
+    }
+
+    /// A row's pieces: column, text, and whether it's shaped on the cell grid.
+    fn pieces(cells: &FrameCells, row: usize) -> Vec<(usize, &str, bool)> {
+        cells.pieces.iter().filter(|p| p.row == row).map(|p| (p.col, p.text.as_str(), p.grid)).collect()
+    }
+
+    /// A piece's runs: their text and color.
+    fn runs(piece: &Piece) -> Vec<(&str, Ink)> {
+        let mut at = 0;
+        piece
+            .runs
+            .iter()
+            .map(|&(len, style)| {
+                at += len;
+                (&piece.text[at - len..at], style.fg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_of_any_script_shape_as_one_run() {
+        // A TUI's border around text (lazygit, htop): box drawing and
+        // accented letters join the ASCII around them, colors are runs in
+        // the piece, and it ends at the last character, not the row's end.
+        let term = printed("\x1b[34m│\x1b[0m café ─┼─ naïve \x1b[34m│\x1b[0m\r\nab漢cd\r\n", 40, 3);
+        let cells = cells(&term);
+        assert_eq!(pieces(&cells, 0), [(0, "│ café ─┼─ naïve │", true)]);
+        let (blue, plain) = (Ink::Index(NamedColor::Blue as u16), Ink::Index(NamedColor::Foreground as u16));
+        assert_eq!(runs(&cells.pieces[0]), [("│ ", blue), ("café ─┼─ naïve ", plain), ("│", blue)]);
+        // A wide character is shaped alone; the columns after it stay right.
+        assert_eq!(pieces(&cells, 1), [(0, "ab", true), (2, "漢", false), (4, "cd", true)]);
+    }
+
+    #[test]
+    fn zero_width_characters_draw_with_their_cell() {
+        // The accent macOS writes after its letter (decomposed file names),
+        // the selector that makes ❤ an emoji, and joined emoji: one picture,
+        // at the first of their cells.
+        let output = "cafe\u{301} ok\r\n\u{2764}\u{fe0f}!\r\n\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}=3\r\n";
+        let term = printed(output, 40, 4);
+        let cells = cells(&term);
+        assert_eq!(pieces(&cells, 0), [(0, "caf", true), (3, "e\u{301}", false), (5, "ok", true)]);
+        assert_eq!(pieces(&cells, 1), [(0, "\u{2764}\u{fe0f}", false), (1, "!", true)]);
+        assert_eq!(pieces(&cells, 2), [(0, "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", false), (6, "=3", true)]);
+        // The text a Run's problems are read from keeps them too.
+        assert!(Output(Arc::new(FairMutex::new(term))).text().starts_with("cafe\u{301} ok\n\u{2764}\u{fe0f}!\n"));
+    }
+
+    #[test]
+    fn underlines_end_at_their_last_cell() {
+        let term = printed("\x1b[4mlink\x1b[0m and\r\nsee \x1b[4mhere\x1b[0m\r\n", 40, 3);
+        let cells = cells(&term);
+        let underlined = |piece: &Piece| piece.runs.iter().map(|&(len, style)| (len, style.flags.intersects(DECORATIONS))).collect::<Vec<_>>();
+        // The space after a link isn't underlined with it.
+        assert_eq!(underlined(&cells.pieces[0]), [(4, true), (4, false)]);
+        // At a row's end, a plain space stops the underline on its cell's
+        // edge (it would run to the shaped line's own width).
+        assert_eq!(cells.pieces[1].text, "see here ");
+        assert_eq!(underlined(&cells.pieces[1]), [(4, false), (4, true), (1, false)]);
+    }
+
+    /// A terminal view whose shell never starts: what it sends stays queued.
+    fn without_shell(cx: &mut Context<TerminalView>) -> TerminalView {
+        let (tx, rx) = mpsc::unbounded();
+        let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(40, 10), Listener(tx))));
+        TerminalView::new(term, rx, PathBuf::from("/"), cx)
+    }
+
+    /// What a view sent its shell so far.
+    fn sent(view: &TerminalView) -> String {
+        match &view.pty {
+            Pty::Starting(typed) => String::from_utf8_lossy(typed).into_owned(),
+            _ => panic!("the shell shouldn't have started"),
+        }
+    }
+
+    /// A view whose element lays the terminal out and keeps the frame.
+    struct Host {
+        terminal: Entity<TerminalView>,
+        frame: std::rc::Rc<std::cell::RefCell<Option<TerminalFrame>>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Probe { terminal: self.terminal.clone(), frame: self.frame.clone() }
+        }
+    }
+
+    struct Probe {
+        terminal: Entity<TerminalView>,
+        frame: std::rc::Rc<std::cell::RefCell<Option<TerminalFrame>>>,
+    }
+
+    impl IntoElement for Probe {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Probe {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+            let mut style = Style::default();
+            style.size.width = relative(1.).into();
+            style.size.height = relative(1.).into();
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) {
+            let frame = self.terminal.update(cx, |t, cx| t.layout(bounds, window, cx));
+            *self.frame.borrow_mut() = Some(frame);
+        }
+
+        fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window, _: &mut App) {}
+    }
+
+    /// A terminal without a shell, in an 800 by 600 window.
+    fn hosted(cx: &mut gpui::TestAppContext) -> (Entity<TerminalView>, Entity<Host>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| cx.set_global(Theme::blank_for_tests()));
+        let terminal = cx.new(without_shell);
+        let host = cx.new(|_| Host { terminal: terminal.clone(), frame: Default::default() });
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            window.activate_window();
+            window.focus(&terminal.focus_handle(cx));
+        });
+        (terminal, host, cx)
+    }
+
+    fn frame(host: &Entity<Host>, cx: &mut gpui::VisualTestContext) -> TerminalFrame {
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), |_, _| gpui::AnyView::from(host.clone()));
+        host.update(cx, |h, _| h.frame.borrow_mut().take()).expect("laid out")
+    }
+
+    #[gpui::test]
+    fn a_tui_row_is_shaped_once(cx: &mut gpui::TestAppContext) {
+        let (terminal, host, cx) = hosted(cx);
+        terminal.update(cx, |t, _| parse(&mut t.term.lock(), "\x1b[34m┌─┤\x1b[0m main.rs \x1b[1;34m├──┐\x1b[0m"));
+        let frame = frame(&host, cx);
+        let lines: Vec<(Point<Pixels>, &str)> = frame.lines.iter().map(|(at, line)| (*at, line.text.as_ref())).collect();
+        // At the text's top left, past the padding.
+        assert_eq!(lines, [(point(px(8.), px(4.)), "┌─┤ main.rs ├──┐")]);
+    }
+
+    #[gpui::test]
+    fn composed_text_waits_for_its_commit(cx: &mut gpui::TestAppContext) {
+        let (terminal, host, cx) = hosted(cx);
+        // かん, typed in a Japanese input method: shown, not sent.
+        cx.update(|window, cx| {
+            terminal.update(cx, |t, cx| {
+                t.replace_and_mark_text_in_range(None, "か", Some(1..1), window, cx);
+                t.replace_and_mark_text_in_range(None, "かん", Some(2..2), window, cx);
+                // While there is marked text, macOS hands Enter to the input method.
+                assert_eq!(t.marked_text_range(window, cx), Some(0..2));
+                assert_eq!(t.selected_text_range(false, window, cx).map(|s| s.range), Some(2..2));
+                let mut adjusted = None;
+                assert_eq!(t.text_for_range(1..9, &mut adjusted, window, cx).as_deref(), Some("ん"));
+                assert_eq!(adjusted, Some(1..2));
+            })
+        });
+        assert_eq!(terminal.read_with(cx, |t, _| sent(t)), "");
+        // It's drawn where the cursor is, which it replaces meanwhile.
+        let drawn = frame(&host, cx);
+        assert_eq!(drawn.marked.as_ref().map(|m| m.origin), Some(point(px(8.), px(4.))));
+        assert!(drawn.cursor.is_none());
+        // Committed (Enter): sent once, and the cursor is back.
+        cx.update(|window, cx| {
+            terminal.update(cx, |t, cx| {
+                t.replace_text_in_range(None, "漢", window, cx);
+                assert_eq!(t.marked_text_range(window, cx), None);
+            })
+        });
+        assert_eq!(terminal.read_with(cx, |t, _| sent(t)), "漢");
+        let drawn = frame(&host, cx);
+        assert!(drawn.marked.is_none() && drawn.cursor.is_some());
+        // Cancelled (Escape): nothing sent. Let go of (`unmark_text`): accepted.
+        cx.update(|window, cx| {
+            terminal.update(cx, |t, cx| {
+                t.replace_and_mark_text_in_range(None, "じ", None, window, cx);
+                t.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(t.marked_text_range(window, cx), None);
+                t.replace_and_mark_text_in_range(None, "字", None, window, cx);
+                t.unmark_text(window, cx);
+            })
+        });
+        assert_eq!(terminal.read_with(cx, |t, _| sent(t)), "漢字");
+    }
+
+    /// A Run's end: its exit code comes first, then its last output; it's
+    /// over (and its problems read) once, after both.
+    #[cfg(unix)]
+    #[gpui::test]
+    fn a_run_ends_once_after_its_output(cx: &mut gpui::TestAppContext) {
+        use std::os::unix::process::ExitStatusExt;
+        let terminal = cx.new(|cx| {
+            let mut view = without_shell(cx);
+            let target = RunTarget { name: "Test".into(), command: "exit 3".into(), cwd: "/".into(), row: None, rows: 0..0, debug: None };
+            view.run = Some((target, RunState::Running));
+            view
+        });
+        let ended = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = ended.clone();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, event: &TerminalEvent, _| counter.set(counter.get() + matches!(event, TerminalEvent::Exited) as u32))
+                .detach()
+        });
+        terminal.update(cx, |t, cx| {
+            t.handle_event(TermEvent::ChildExit(std::process::ExitStatus::from_raw(3 << 8)), cx);
+            assert_eq!(t.run().map(|(_, state)| *state), Some(RunState::Running));
+            t.handle_event(TermEvent::Exit, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(ended.get(), 1);
+        assert_eq!(terminal.read_with(cx, |t, _| t.run().map(|(_, state)| *state)), Some(RunState::Exited(Some(3))));
+    }
+
+    /// Shells start on a background thread, which may block signals (GCD's
+    /// workers do); the shell must still get them (⌃C, closing the tab).
+    #[cfg(unix)]
+    #[test]
+    fn shells_get_signals_whatever_thread_starts_them() {
+        let (started, mut events) = std::thread::spawn(|| {
+            // SAFETY: this new thread's own mask.
+            unsafe {
+                let mut all = std::mem::zeroed();
+                libc::sigfillset(&mut all);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &all, std::ptr::null_mut());
+            }
+            let (tx, rx) = mpsc::unbounded();
+            let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(80, 24), Listener(tx.clone()))));
+            let shell = Some(vec!["/bin/sleep".into(), "30".into()]);
+            (start_pty(shell, &std::env::temp_dir(), None, term, Listener(tx)).unwrap(), rx)
+        })
+        .join()
+        .unwrap();
+        // SAFETY: a signal to the child this test started.
+        unsafe { libc::kill(started.pid.unwrap() as i32, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match events.try_recv() {
+                Ok(TermEvent::Exit) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(std::time::Instant::now() < deadline, "SIGTERM didn't end the shell");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let _ = started.notifier.0.send(Msg::Shutdown);
     }
 }

@@ -850,6 +850,7 @@ impl Workspace {
             TerminalPanelEvent::RunExited(terminal) => ws.collect_run_problems(terminal, cx),
             TerminalPanelEvent::RunsChanged => ws.update_running(cx),
             TerminalPanelEvent::Close(terminal) => ws.remove_terminal(terminal, window, cx),
+            TerminalPanelEvent::Failed(terminal, error) => ws.terminal_failed(terminal, error.clone(), window, cx),
             TerminalPanelEvent::TabMenu { terminal, position } => ws.open_terminal_tab_menu(terminal.clone(), *position, window, cx),
             TerminalPanelEvent::Overflow { terminals, position } => {
                 let entries = terminals.iter().map(|(_, name)| MenuEntry::item(name.clone(), Icon::Terminal)).collect();
