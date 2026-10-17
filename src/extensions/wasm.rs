@@ -948,8 +948,11 @@ mod tests {
         let phpactor = timed(php, "phpactor").unwrap();
         let program = &phpactor.command.program;
         assert!(program.starts_with(work_dir("php").unwrap()) && program.ends_with("phpactor.phar"), "{phpactor:?}");
-        use std::os::unix::fs::PermissionsExt;
-        assert!(std::fs::metadata(program).unwrap().permissions().mode() & 0o111 != 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(std::fs::metadata(program).unwrap().permissions().mode() & 0o111 != 0);
+        }
         let servers = WasmServers { extension: php, ids: &["intelephense", "phpactor"] };
         let first = servers.start(&project, &settings).unwrap();
         assert_eq!(first.server, "intelephense");
