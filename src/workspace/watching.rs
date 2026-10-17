@@ -50,9 +50,7 @@ impl Workspace {
             self.tree.update(cx, |t, cx| t.rebuild(cx));
             self.refresh_file_index(cx);
             self.refresh_git(cx);
-            for editor in self.editors.clone() {
-                editor.update(cx, |e, cx| e.reload_if_changed(cx));
-            }
+            self.reload_documents(|_| true, cx);
             cx.notify();
             return;
         }
@@ -108,11 +106,7 @@ impl Workspace {
         if git {
             self.refresh_git(cx);
         }
-        for editor in self.editors.clone() {
-            if editor.read(cx).doc.read(cx).path.as_ref().is_some_and(|p| paths.contains(p)) {
-                editor.update(cx, |e, cx| e.reload_if_changed(cx));
-            }
-        }
+        self.reload_documents(|path| paths.contains(path), cx);
         for image in self.images() {
             if paths.iter().any(|p| p == image.read(cx).path()) {
                 image.update(cx, |i, cx| i.reload_if_changed(cx));
@@ -124,6 +118,18 @@ impl Workspace {
             && view.read(cx).working_tree_file().is_some_and(|p| paths.contains(p))
         {
             view.update(cx, |v, cx| v.reload(cx));
+        }
+    }
+
+    /// Has the documents whose files `wanted` picks read them again (in the
+    /// background), each through one of its tabs: splits share it.
+    pub(super) fn reload_documents(&mut self, wanted: impl Fn(&Path) -> bool, cx: &mut Context<Self>) {
+        let mut seen = HashSet::new();
+        for editor in self.editors.clone() {
+            let doc = editor.read(cx).doc.read(cx);
+            if editor.read(cx).is_loaded() && doc.path.as_deref().is_some_and(&wanted) && seen.insert(doc.id()) {
+                editor.update(cx, |e, cx| e.reload_if_changed(cx));
+            }
         }
     }
 

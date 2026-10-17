@@ -310,6 +310,10 @@ pub struct Editor {
     lsp: lsp::EditorLsp,
     /// A parse finishing in the background (see `schedule_parse`).
     parse_task: Option<Task<()>>,
+    /// The file being read again in the background (`reload_if_changed`),
+    /// and whether to read it once more after (asked again meanwhile).
+    reload_task: Option<Task<()>>,
+    reload_again: bool,
     /// The carets' bracket pairs, for a tree version and caret offsets.
     bracket_cache: Option<((u64, Vec<usize>), Arc<Vec<Range<usize>>>)>,
     /// Highlights of what was on screen: for a tree version, language and ranges.
@@ -438,6 +442,8 @@ impl Editor {
             lsp: lsp::EditorLsp::default(),
             highlight_cache: None,
             parse_task: None,
+            reload_task: None,
+            reload_again: false,
             bracket_cache: None,
             fold_regions: derived::Derived::new(),
             fold_pills: Vec::new(),
@@ -791,34 +797,65 @@ impl Editor {
     }
 
     /// Re-reads the file if it changed on disk and has no unsaved edits
-    /// (e.g. after a checkout, pull or discard).
+    /// (e.g. after a checkout, pull or discard): read and compared in the
+    /// background, then taken in as one edit if the text is still the same
+    /// (see `Document::apply_reload`).
     pub fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
         // An unloaded tab reads the file as it is when it's shown.
         if self.doc.read(cx).is_dirty() || !self.is_loaded() {
             return;
         }
-        let _ = self.reload(cx, Document::reload_from_disk);
+        if self.reload_task.is_some() {
+            self.reload_again = true;
+            return;
+        }
+        let Some(job) = self.doc.read(cx).reload_job() else { return };
+        self.reload_task = Some(cx.spawn(async move |this, cx| {
+            let read = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |editor, cx| {
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = editor.reload_task.take() {
+                    task.detach();
+                }
+                if let Ok(Some(reload)) = read {
+                    editor.reload(cx, |doc, selections| Ok(doc.apply_reload(reload, selections))).ok();
+                }
+                // Changed again while it was read.
+                if std::mem::take(&mut editor.reload_again) {
+                    editor.reload_if_changed(cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Reads the file again as `encoding`; unsaved edits are dropped.
     pub fn reload_with_encoding(&mut self, encoding: crate::encoding::TextEncoding, cx: &mut Context<Self>) -> std::io::Result<()> {
-        self.reload(cx, |doc| doc.reload_with_encoding(encoding).map(|()| true)).map(|_| ())
+        self.reload(cx, |doc, _| doc.reload_with_encoding(encoding).map(|()| true)).map(|_| ())
     }
 
-    /// Replaces the text with what `read` reads (true: it read something).
-    /// Carets and the line at the top of the view follow the text through
-    /// what changed (see `Document::replace_all`); what's derived from the
-    /// text is asked for again.
-    fn reload(&mut self, cx: &mut Context<Self>, read: impl FnOnce(&mut Document) -> std::io::Result<bool>) -> std::io::Result<bool> {
+    /// Replaces the text with what `read` reads (true: the text changed;
+    /// it gets the carets as they are, for undo). Carets and the line at the
+    /// top of the view follow the text through what changed (see
+    /// `Document::apply_reload`); what's derived from the text is asked for
+    /// again.
+    fn reload(
+        &mut self,
+        cx: &mut Context<Self>,
+        read: impl FnOnce(&mut Document, &[Selection]) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
         let version = self.doc.read(cx).version();
         // Not drawn since the last reload: its top line is still to place.
         let top = self.reloaded_top.or_else(|| self.top_line(cx).map(|line| (line, self.doc.read(cx).line_start(line))));
-        if !self.change_doc(cx, read)? {
+        let before = self.selections.clone();
+        if !self.change_doc(cx, |doc| read(doc, &before))? {
             return Ok(false);
         }
         let selections = self.moved_since(version, &self.selections, cx);
         let selections = self.clamp_selections(selections, cx);
         self.set_selections(selections, self.primary, cx);
+        // For redo.
+        self.doc.as_mut(cx).set_selections_after(&self.selections);
         if let Some((line, at)) = top {
             let at = self.moved_since(version, &[Selection::cursor(at)], cx)[0].head;
             match self.scroll_to_line.as_mut() {

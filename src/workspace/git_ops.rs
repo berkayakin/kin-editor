@@ -165,9 +165,7 @@ impl Workspace {
 
     /// Picks up on-disk changes (checkout, pull, rollback) in unmodified tabs.
     pub(super) fn reload_changed_files(&mut self, cx: &mut Context<Self>) {
-        for editor in self.editors.clone() {
-            editor.update(cx, |e, cx| e.reload_if_changed(cx));
-        }
+        self.reload_documents(|_| true, cx);
         for image in self.images() {
             image.update(cx, |i, cx| i.reload_if_changed(cx));
         }
