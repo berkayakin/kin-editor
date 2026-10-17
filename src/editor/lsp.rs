@@ -1977,6 +1977,56 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Drawing the editor tells it the lines in view, each frame: the hints
+    /// asked for are the ones around what it shows (here, scrolled to line 500).
+    #[gpui::test]
+    fn a_drawn_editor_asks_for_the_hints_it_shows(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        cx.update(|cx| cx.set_global(crate::theme::Theme::blank_for_tests()));
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-drawn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, (0..1000).map(|n| format!("line {n}\n")).collect::<String>()).unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("hints", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let cx = cx.add_empty_window();
+        let frame = |cx: &mut gpui::VisualTestContext| {
+            cx.draw(gpui::point(px(0.), px(0.)), gpui::size(px(800.), px(600.)), |_, _| gpui::AnyView::from(editor.clone()));
+        };
+        let rows = |cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, cx| {
+                let doc = e.doc.read(cx);
+                doc.inlay_hints().iter().map(|h| doc.row_of(h.offset)).collect::<Vec<_>>()
+            })
+        };
+        // The first frame scrolls to the caret; then the view moves on.
+        frame(cx);
+        editor.update(cx, |e, cx| e.scroll.y = e.line_height(cx) * 500.);
+        let started = Instant::now();
+        loop {
+            frame(cx);
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            if rows(cx).contains(&500) {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out waiting for the hints in view: {:?}", rows(cx));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rows(cx).iter().all(|row| (400..600).contains(row)), "{:?}", rows(cx));
+        store.update(cx, |s, _| s.shutdown_all());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The file's lenses are asked for all at once, but given their titles
     /// (`codeLens/resolve`, a search each for some servers) only in view;
     /// the others keep their rows meanwhile.
