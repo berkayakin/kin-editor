@@ -662,9 +662,18 @@ impl Syntax {
         self.tree.as_ref()
     }
 
+    /// How many trees an edit edits: the file's and its embedded languages'.
+    pub fn tree_count(&self) -> usize {
+        self.trees().count()
+    }
+
     /// Informs the old trees about an edit so the next parse can reuse nodes
     /// (embedded languages' trees too).
     pub fn edit(&mut self, edit: &InputEdit) {
+        /// Past this many edits since the last parse, what they touched is
+        /// kept as one range around them all, so an edit of many places
+        /// (carets, a reload) doesn't move each earlier one per edit.
+        const PENDING: usize = 64;
         for tree in self.tree.iter_mut().chain(self.injections.iter_mut().filter_map(|i| i.tree.as_mut())) {
             tree.edit(edit);
         }
@@ -672,6 +681,11 @@ impl Syntax {
             *range = shift_range(range.clone(), edit);
         }
         self.pending.push(edit.start_byte..edit.new_end_byte);
+        if self.pending.len() > PENDING {
+            let start = self.pending.iter().map(|r| r.start).min().unwrap_or(0);
+            let end = self.pending.iter().map(|r| r.end).max().unwrap_or(0);
+            self.pending = vec![start..end];
+        }
     }
 
     pub fn reparse(&mut self, rope: &Rope) {

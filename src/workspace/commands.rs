@@ -152,6 +152,8 @@ impl Workspace {
         self.git_status = Arc::new(RepoStatus::default());
         self.git_paths = Arc::new(HashMap::new());
         self.git_ignored = Arc::default();
+        self.status_task = None;
+        self.git_pending = git_ops::StatusWork::default();
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -200,7 +202,8 @@ impl Workspace {
                 let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
             }
         }
-        self.refresh_git(cx);
+        let saved = editor.read(cx).doc.read(cx).path.clone();
+        self.files_written(saved, cx);
     }
 }
 

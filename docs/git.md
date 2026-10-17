@@ -88,6 +88,9 @@ message instead of hanging; use an SSH agent or a credential helper.
   Commit, Update, Push, Fetch and Branches. In a folder that isn't a repository it offers
   **Initialize**.
 
-Status refreshes after saves and Git actions, when the window regains focus, and every few
-seconds. Open files without unsaved edits reload when a checkout, pull or rollback changes
-them on disk; carets, breakpoints, folds and problems stay with the lines they were on.
+Status follows changes on disk as they happen: a change in the working tree reads the status
+of the files it touched (not the whole repository), and all of it is read again after Git
+actions and when something else changes `.git` (a commit or checkout in a terminal). A project
+folder that can't be watched is read every few seconds instead. Open files without unsaved
+edits reload when a checkout, pull or rollback changes them on disk; carets, breakpoints, folds
+and problems stay with the lines they were on, and Undo brings back the text from before.

@@ -1476,6 +1476,8 @@ mod tests {
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
         editor.update(cx, |e, cx| e.reload_if_changed(cx));
+        // Read in the background.
+        cx.run_until_parked();
         assert_eq!(hints(cx), [24]);
         wait_for(cx, "the new hint", |cx| {
             cx.executor().advance_clock(Duration::from_millis(500));

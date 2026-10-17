@@ -758,9 +758,9 @@ pub struct Workspace {
     watcher: Option<Watcher>,
     watch_task: Option<Task<()>>,
     /// The project's .gitignore, to skip Git refreshes for ignored churn.
-    ignore: Option<ignore::gitignore::Gitignore>,
-    /// A Git refresh was asked for while one was running.
-    git_refresh_again: bool,
+    ignore: Option<Arc<ignore::gitignore::Gitignore>>,
+    /// Git status asked for while a read ran (`read_status`).
+    git_pending: git_ops::StatusWork,
     /// The running Go to Symbol request; replaced as the query changes.
     symbol_task: Option<Task<()>>,
     /// Welcome Setup, shown in place of everything below the title bar.
@@ -878,7 +878,10 @@ impl Workspace {
         let activation = cx.observe_window_activation(window, |ws, window, cx| {
             if window.is_window_active() {
                 ws.check_config(cx);
-                ws.refresh_git(cx);
+                // The watcher reports changes to Git status as they come.
+                if ws.watcher.is_none() {
+                    ws.refresh_git(cx);
+                }
                 ws.reload_changed_files(cx);
                 // Other windows may have opened projects meanwhile.
                 ws.recent_projects = SessionState::load().recent_projects;
@@ -1077,7 +1080,7 @@ impl Workspace {
             watcher: None,
             watch_task: None,
             ignore: None,
-            git_refresh_again: false,
+            git_pending: git_ops::StatusWork::default(),
             symbol_task: None,
             lsp,
             documents,

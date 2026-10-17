@@ -778,17 +778,23 @@ impl LspStore {
 
     /// Files changed on disk (created, changed or deleted): each server hears
     /// about the ones it watches.
+    #[cfg(test)]
     pub fn files_changed(&self, changes: &[(PathBuf, FileChange)]) {
-        for (key, registrations) in &self.watchers {
-            let events: Vec<Value> = changes
-                .iter()
-                .filter(|(path, change)| registrations.iter().flat_map(|(_, w)| w).any(|w| w.matches(path, *change)))
-                .map(|(path, change)| json!({ "uri": path_to_uri(path), "type": *change as u8 }))
-                .collect();
-            if !events.is_empty()
-                && let Some(client) = self.client(key)
-            {
-                client.notify("workspace/didChangeWatchedFiles", json!({ "changes": events }));
+        self.send_file_events(self.file_watchers().events(changes));
+    }
+
+    /// What the servers watch, to match changed files against off the UI
+    /// thread (`FileWatchers::events`).
+    pub fn file_watchers(&self) -> FileWatchers {
+        let watchers = self.watchers.iter().map(|(key, registrations)| (key.clone(), registrations.iter().flat_map(|(_, w)| w.iter().cloned()).collect()));
+        FileWatchers(watchers.collect())
+    }
+
+    /// Tells each server about the changes it watches (`FileWatchers::events`).
+    pub fn send_file_events(&self, events: Vec<(ServerKey, Value)>) {
+        for (key, params) in events {
+            if let Some(client) = self.client(&key) {
+                client.notify("workspace/didChangeWatchedFiles", params);
             }
         }
     }
@@ -1245,8 +1251,36 @@ pub enum FileChange {
     Deleted = 3,
 }
 
+/// The servers' file watchers, by server (`LspStore::file_watchers`).
+#[derive(Clone, Default)]
+pub struct FileWatchers(Vec<(ServerKey, Vec<FileWatcher>)>);
+
+impl FileWatchers {
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|(_, watchers)| watchers.is_empty())
+    }
+
+    /// Each server's `workspace/didChangeWatchedFiles` parameters: the
+    /// changes it watches, for those that watch any.
+    pub fn events(&self, changes: &[(PathBuf, FileChange)]) -> Vec<(ServerKey, Value)> {
+        let mut events = Vec::new();
+        for (key, watchers) in &self.0 {
+            let changes: Vec<Value> = changes
+                .iter()
+                .filter(|(path, change)| watchers.iter().any(|w| w.matches(path, *change)))
+                .map(|(path, change)| json!({ "uri": path_to_uri(path), "type": *change as u8 }))
+                .collect();
+            if !changes.is_empty() {
+                events.push((key.clone(), json!({ "changes": changes })));
+            }
+        }
+        events
+    }
+}
+
 /// One of a server's file watchers: a glob, relative to `base` when given
 /// (else matched against the whole path), and which changes it wants.
+#[derive(Clone)]
 struct FileWatcher {
     base: Option<PathBuf>,
     glob: globset::GlobMatcher,

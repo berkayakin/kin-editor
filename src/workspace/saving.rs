@@ -53,7 +53,8 @@ impl Workspace {
         match editor.update(cx, |e, cx| e.save(cx)) {
             Ok(()) => {
                 self.auto_save_warned.remove(&id);
-                self.refresh_git(cx);
+                let saved = editor.read(cx).doc.read(cx).path.clone();
+                self.files_written(saved, cx);
                 self.check_config(cx);
                 // The session may hold the text as unsaved.
                 self.schedule_session_save(cx);
@@ -273,6 +274,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 this.update_in(cx, |ws, window, cx| {
+                    let saved = path.clone();
                     let result = match &item {
                         PaneItem::Editor(editor) => {
                             let result = editor.update(cx, |e, cx| {
@@ -302,7 +304,7 @@ impl Workspace {
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
-                    ws.tree.update(cx, |t, cx| t.rebuild(cx));
+                    ws.tree.update(cx, |t, cx| t.paths_changed([saved.as_path()], cx));
                     ws.schedule_session_save(cx);
                     cx.notify();
                 })

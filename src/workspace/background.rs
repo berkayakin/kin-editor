@@ -72,7 +72,7 @@ impl Workspace {
     /// Saves the documents edited without a tab. `auto`: for auto-save,
     /// which leaves files changed on disk meanwhile alone (Save All doesn't).
     pub(super) fn save_background(&mut self, auto: bool, cx: &mut Context<Self>) {
-        let mut failed = Vec::new();
+        let (mut failed, mut saved) = (Vec::new(), Vec::new());
         for doc in self.documents.read(cx).kept(cx) {
             if auto && doc.read(cx).changed_on_disk() {
                 continue;
@@ -87,6 +87,7 @@ impl Workspace {
                     let d = doc.read(cx);
                     if let Some(path) = d.path.clone() {
                         self.lsp.read(cx).did_save(&path, d.rope());
+                        saved.push(path);
                     }
                 }
                 Err(err) => failed.push(format!("{}: {err}", doc.read(cx).file_name())),
@@ -95,7 +96,7 @@ impl Workspace {
         if !failed.is_empty() {
             self.toast(ToastKind::Error, "Some files couldn't be saved", Some(failed.join("\n")), cx);
         }
-        self.refresh_git(cx);
+        self.files_written(saved, cx);
         self.schedule_session_save(cx);
         cx.notify();
     }

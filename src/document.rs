@@ -103,7 +103,7 @@ static NEXT_DOCUMENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// How long an edit may parse on the UI thread; a longer parse finishes in
 /// the background (the editor shows the old tree, edited, meanwhile).
 const PARSE_BUDGET: Duration = Duration::from_millis(1);
-/// The same when a file opens or reloads.
+/// The same when a file opens.
 const OPEN_PARSE_BUDGET: Duration = Duration::from_millis(10);
 
 /// Above this, a file opens as plain text without language features.
@@ -376,30 +376,90 @@ impl Document {
         self.set_external_diagnostics(Vec::new());
     }
 
-    /// Replaces the contents with the file on disk. Returns whether anything
-    /// changed. Undo history is cleared since it no longer applies. A file
-    /// whose modification time is unchanged isn't read (window focus and Git
-    /// operations ask every open tab).
-    pub fn reload_from_disk(&mut self) -> std::io::Result<bool> {
-        let Some(path) = self.path.clone() else { return Ok(false) };
-        if self.disk_mtime.is_some() && !self.changed_on_disk() {
-            return Ok(false);
+    /// A job that reads the file again and compares it with the text as it
+    /// is now, to run in the background (window focus, Git operations and
+    /// the watcher ask every open file); give its result to `apply_reload`.
+    /// None without a file. The job finds nothing (`Ok(None)`) when the
+    /// file's modification time is the one last read or written.
+    pub fn reload_job(&self) -> Option<impl FnOnce() -> std::io::Result<Option<Reload>> + Send + 'static> {
+        let path = self.path.clone()?;
+        let (id, version, encoding, known, rope) = (self.id, self.version, self.encoding, self.disk_mtime, self.rope.clone());
+        Some(move || {
+            // Before reading: a write after it is noticed next time.
+            let mtime = mtime(&path);
+            if known.is_some() && mtime == known {
+                return Ok(None);
+            }
+            let bytes = std::fs::read(&path)?;
+            let (text, encoding) = encoding::decode(&bytes, Some(encoding));
+            let text = encoding::to_lf(text);
+            let changes = if rope == text.as_str() { Changes::default() } else { Changes::between(&String::from(&rope), &text) };
+            Ok(Some(Reload { id, version, known, encoding, mtime, changes }))
+        })
+    }
+
+    /// Takes in a reload read for the text as it is (else it's dropped:
+    /// unsaved edits, or the text changed or was saved while the file was
+    /// read). The lines that changed are one edit, undone like any other,
+    /// and the text counts as saved after it. True when the text changed.
+    pub fn apply_reload(&mut self, reload: Reload, selections: &[Selection]) -> bool {
+        if (reload.id, reload.version, reload.known) != (self.id, self.version, self.disk_mtime) || self.is_dirty() {
+            return false;
         }
-        let bytes = std::fs::read(&path)?;
-        let (text, encoding) = encoding::decode(&bytes, Some(self.encoding));
-        self.encoding = encoding;
-        self.disk_mtime = mtime(&path);
-        Ok(self.replace_all(encoding::to_lf(text)))
+        self.encoding = reload.encoding;
+        self.disk_mtime = reload.mtime;
+        if reload.changes.edits.is_empty() {
+            return false;
+        }
+        self.take_changes(reload.changes, selections);
+        self.saved_version = self.version;
+        true
+    }
+
+    /// Makes a reload's changes one undoable edit: change by change (the
+    /// trees reparse just around them) unless there are so many that the
+    /// trees' edits would take long (each edit edits every embedded
+    /// language's tree too); then one edit from the first change to the
+    /// last, which what follows the text and soft wrap still see as the
+    /// changes they are.
+    fn take_changes(&mut self, changes: Changes, selections: &[Selection]) {
+        /// Edits times trees at most for a reload taken change by change.
+        const ONE_BY_ONE: usize = 2_000;
+        let Changes { edits, span } = changes;
+        let (Some(first), Some(last)) = (edits.first(), edits.last()) else { return };
+        if edits.len() * self.syntax.tree_count().max(1) <= ONE_BY_ONE {
+            self.edit(edits, selections, EditKind::Other);
+            return;
+        }
+        let range = first.0.start..last.0.end;
+        let before = self.rope.clone();
+        let old = self.slice(range.clone());
+        // Logged as `edit` logs them: the last first, each in the text before it.
+        let logged: Vec<LineEdit> = edits.iter().rev().map(|(range, text)| LineEdit::of(&before, range.clone(), text)).collect();
+        self.replace_logging(range.clone(), &span, LineEdit::of(&before, range.clone(), &span), &logged);
+        let patch = Patch::new(edits.iter().map(|(range, text)| (range.clone(), text.len())).collect());
+        self.shift_tracked(&patch, &before);
+        self.version += 1;
+        self.log_patch(patch);
+        self.reparse();
+        self.redo_stack.clear();
+        let record = EditRecord { start: range.start, old, new: span };
+        self.undo_stack.push(Transaction { edits: vec![record], before: selections.to_vec(), after: Vec::new(), at: Instant::now(), kind: EditKind::Other });
     }
 
     /// Reads the file again as `encoding` (when it was guessed wrong).
-    /// Unsaved edits are lost; callers ask first.
+    /// Unsaved edits are lost; callers ask first. Nothing to undo after it.
     pub fn reload_with_encoding(&mut self, encoding: TextEncoding) -> std::io::Result<()> {
         let path = self.path.clone().ok_or_else(|| std::io::Error::other("document has no path"))?;
         let bytes = std::fs::read(&path)?;
         self.encoding = encoding;
         self.disk_mtime = mtime(&path);
-        self.replace_all(encoding::to_lf(encoding::decode_as(&bytes, encoding)));
+        let text = encoding::to_lf(encoding::decode_as(&bytes, encoding));
+        if self.rope != text.as_str() {
+            self.take_changes(Changes::between(&String::from(&self.rope), &text), &[]);
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
         self.saved_version = self.version;
         Ok(())
     }
@@ -423,41 +483,6 @@ impl Document {
     /// A change that isn't an edit (encoding, line endings) still needs a save.
     fn mark_unsaved(&mut self) {
         self.saved_version = u64::MAX;
-    }
-
-    /// Replaces all text, as when the file changed on disk. Returns whether
-    /// anything changed; undo history goes since it no longer applies.
-    /// What follows the text (diagnostics, editors' folds, breakpoints, the debug
-    /// line, inlay hints, code lenses, other editors' carets) moves as
-    /// through an edit made of the lines that changed (`changed_ranges`):
-    /// on lines that stayed it follows them, in changed text it goes.
-    fn replace_all(&mut self, text: String) -> bool {
-        if self.rope == text.as_str() {
-            return false;
-        }
-        let old = std::mem::replace(&mut self.rope, Rope::from_str(&text));
-        let changes = changed_ranges(&String::from(&old), &text);
-        // Logged as `edit` logs them: the last first, each in the text before it.
-        if self.line_edits.len() + changes.len() >= LINE_EDIT_LOG {
-            self.line_edits.clear();
-            self.line_edits_base = self.version + 1;
-        } else {
-            for (range, new) in changes.iter().rev() {
-                self.line_edits.push((self.version + 1, LineEdit::of(&old, range.clone(), &text[new.clone()])));
-            }
-        }
-        self.long_lines = long_lines(&self.rope, 0..usize::MAX);
-        let (syntax, parsed) = Syntax::new_within(self.language, &self.rope, OPEN_PARSE_BUDGET);
-        self.set_syntax(syntax, parsed);
-        self.lsp_changes.mark_full();
-        let patch = Patch::new(changes.into_iter().map(|(range, new)| (range, new.len())).collect());
-        self.shift_tracked(&patch, &old);
-        self.version += 1;
-        self.log_patch(patch);
-        self.saved_version = self.version;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
-        true
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -732,16 +757,23 @@ impl Document {
     }
 
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
+        let lines = LineEdit::of(&self.rope, range.clone(), text);
+        self.replace_logging(range, text, lines, &[lines]);
+    }
+
+    /// `raw_replace`, whose `lines` are logged as the edits in it (one
+    /// replacement can stand for several changes, each logged).
+    fn replace_logging(&mut self, range: Range<usize>, text: &str, lines: LineEdit, logged: &[LineEdit]) {
         self.lsp_changes.record(&self.rope, range.clone(), text);
         // Every caller bumps the version once its edits are done.
-        if self.line_edits.len() >= LINE_EDIT_LOG {
+        if self.line_edits.len() + logged.len() > LINE_EDIT_LOG {
             // From after this transaction: part of it would mislead.
             self.line_edits.clear();
             self.line_edits_base = self.version + 1;
+        } else {
+            self.line_edits.extend(logged.iter().map(|lines| (self.version + 1, *lines)));
         }
-        let lines = LineEdit::of(&self.rope, range.clone(), text);
         let row = lines.row;
-        self.line_edits.push((self.version + 1, lines));
         self.long_lines -= long_lines(&self.rope, row..row + lines.old_rows);
         let edit = input_edit(&self.rope, range.clone(), text);
         if self.parse_behind {
@@ -1209,9 +1241,46 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// How long a reload may diff the old text with the new (on the UI
-/// thread); past it the diff is coarser, and fewer things keep their place.
+/// How long a reload may diff the old text with the new (in the
+/// background); past it the diff is coarser, and fewer things keep their place.
 const RELOAD_DIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The file as read again in the background (`Document::reload_job`), as
+/// the changes that turn the document's text into it.
+pub struct Reload {
+    /// The document and version it was compared with, and the file's
+    /// modification time the document knew then.
+    id: u64,
+    version: u64,
+    known: Option<SystemTime>,
+    encoding: TextEncoding,
+    /// The file's modification time when it was read.
+    mtime: Option<SystemTime>,
+    changes: Changes,
+}
+
+/// What a reload changes: the lines that changed (`changed_ranges`). What
+/// follows the text (diagnostics, editors' folds and carets, breakpoints,
+/// the debug line, inlay hints, code lenses) moves with them: on lines that
+/// stayed it follows them, in changed text it goes.
+#[derive(Default)]
+struct Changes {
+    /// Ranges of the old text (sorted, apart) and what replaces them.
+    edits: Vec<(Range<usize>, String)>,
+    /// The new text from the first edit's start to the last one's end.
+    span: String,
+}
+
+impl Changes {
+    fn between(old: &str, new: &str) -> Self {
+        let ranges = changed_ranges(old, new);
+        let span = match (ranges.first(), ranges.last()) {
+            (Some((_, first)), Some((_, last))) => new[first.start..last.end].to_string(),
+            _ => String::new(),
+        };
+        Changes { edits: ranges.into_iter().map(|(range, by)| (range, new[by].to_string())).collect(), span }
+    }
+}
 
 /// What turns `old` into `new`, as the byte ranges of `old` that change
 /// with the ranges of `new` that replace them (sorted, apart). Found by
@@ -1382,7 +1451,8 @@ impl Patch {
 /// How many of `rows` are longer than `wrap::LONG_LINE`.
 fn long_lines(rope: &Rope, rows: Range<usize>) -> usize {
     let rows = rows.start.min(rope.len_lines())..rows.end.min(rope.len_lines());
-    rows.filter(|&row| rope.line(row).len_bytes() > crate::wrap::LONG_LINE).count()
+    // One walk along the lines, not a lookup per row.
+    rope.lines_at(rows.start).take(rows.len()).filter(|line| line.len_bytes() > crate::wrap::LONG_LINE).count()
 }
 
 fn moved(offset: usize, delta: isize) -> usize {
@@ -1698,22 +1768,114 @@ mod tests {
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
         assert!(doc.changed_on_disk());
-        doc.reload_from_disk().unwrap();
+        reload(&mut doc).unwrap();
         assert!(!doc.changed_on_disk());
 
         // Without a newer modification time the file isn't read again.
         let same = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::fs::write(&path, "other").unwrap();
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(same).unwrap();
-        assert!(!doc.reload_from_disk().unwrap());
+        assert!(!reload(&mut doc).unwrap());
         assert_eq!(doc.rope().to_string(), "one!");
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(later + Duration::from_secs(5)).unwrap();
-        assert!(doc.reload_from_disk().unwrap());
+        assert!(reload(&mut doc).unwrap());
         assert_eq!(doc.rope().to_string(), "other");
+
+        // Read while the text changed: dropped, and the file still counts as
+        // changed (auto-save leaves it alone).
+        std::fs::write(&path, "third").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later + Duration::from_secs(10)).unwrap();
+        let read = doc.reload_job().unwrap()().unwrap().unwrap();
+        doc.edit(vec![(0..0, "typed ".into())], &[], EditKind::Typing);
+        assert!(!doc.apply_reload(read, &[]));
+        assert_eq!(doc.rope().to_string(), "typed other");
+        assert!(doc.changed_on_disk());
+        // Unsaved edits are never replaced, even read for this version.
+        let read = doc.reload_job().unwrap()().unwrap().unwrap();
+        assert!(!doc.apply_reload(read, &[]));
+        assert_eq!(doc.rope().to_string(), "typed other");
+        // Nor what was saved while the file was read.
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later + Duration::from_secs(15)).unwrap();
+        doc.saved_version = doc.version;
+        let read = doc.reload_job().unwrap()().unwrap().unwrap();
+        doc.save().unwrap();
+        assert!(!doc.apply_reload(read, &[]));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "typed other");
 
         std::fs::remove_file(&path).unwrap();
         assert!(doc.changed_on_disk(), "a deleted file counts as changed");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What the editor does in the background, here and now: true when
+    /// the text changed.
+    fn reload(doc: &mut Document) -> std::io::Result<bool> {
+        let Some(read) = doc.reload_job().expect("a file")()? else { return Ok(false) };
+        Ok(doc.apply_reload(read, &[]))
+    }
+
+    /// Takes in `text` as if the file had changed to it.
+    fn reload_to(doc: &mut Document, text: &str, selections: &[Selection]) -> bool {
+        let changes = Changes::between(&doc.rope().to_string(), text);
+        let reload = Reload { id: doc.id(), version: doc.version(), known: doc.disk_mtime, encoding: doc.encoding, mtime: None, changes };
+        doc.apply_reload(reload, selections)
+    }
+
+    /// Thousands of changed lines are one edit for the trees and undo, but
+    /// what follows the text still moves through each change, and soft
+    /// wrap measures only the changed lines.
+    #[test]
+    fn a_reload_of_many_changes_is_one_edit_that_moves_things_like_many() {
+        let line = |i: usize, new: bool| format!("let x{i} = {};\n", if new && i.is_multiple_of(2) { i + 1 } else { i });
+        let old: String = (0..5000).map(|i| line(i, false)).collect();
+        let new: String = (0..5000).map(|i| line(i, true)).collect();
+        let mut doc = Document::from_text(old.clone(), Some("a.rs".into()));
+        doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(4001)]);
+        let name = |doc: &Document, row: usize| doc.line_start(row) + 4..doc.line_start(row) + 6;
+        let problem = Diagnostic { range: name(&doc, 3001), severity: crate::lint::Severity::Warning, message: "m".into(), rule: "r".into() };
+        doc.set_lsp_diagnostics(vec![problem]);
+        let version = doc.version();
+        assert!(reload_to(&mut doc, &new, &[]));
+        assert_eq!(doc.rope().to_string(), new);
+        assert_eq!(doc.undo_stack.last().map(|t| t.edits.len()), Some(1), "one edit");
+        assert_eq!(doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(), [1, 4001]);
+        assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [name(&doc, 3001)]);
+        let lines: Vec<LineEdit> = doc.line_edits_since(version).unwrap().copied().collect();
+        assert!(lines.len() == 2500 && lines.iter().all(|l| l.old_rows == 1 && l.new_rows == 1));
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), old);
+    }
+
+    /// A reload is an edit like any other: undo brings back the text before
+    /// it (unsaved then), redo the file's.
+    #[test]
+    fn a_reload_can_be_undone() {
+        let mut doc = Document::from_text("fn a() {\n    one();\n}\n".into(), Some("a.rs".into()));
+        doc.edit(vec![(13..16, "two".into())], &[Selection::cursor(13)], EditKind::Other);
+        // Saved, and the server told.
+        doc.saved_version = doc.version;
+        doc.take_lsp_changes();
+        let caret = [Selection::cursor(16)];
+        assert!(reload_to(&mut doc, "use x;\nfn a() {\n    two(1);\n}\n", &caret));
+        assert!(!doc.is_dirty());
+        assert!(doc.syntax().tree().is_some_and(|t| !t.root_node().has_error()), "parsed again from the edited tree");
+        // The edits reach language servers as edits.
+        let sent = doc.take_lsp_changes();
+        assert!(!sent.full && sent.changes.len() == 2, "{sent:?}");
+
+        assert_eq!(doc.undo(), Some(caret.to_vec()));
+        assert_eq!(doc.rope().to_string(), "fn a() {\n    two();\n}\n");
+        assert!(doc.is_dirty(), "the file has the reloaded text");
+        // The edit before the reload is still there to undo.
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "fn a() {\n    one();\n}\n");
+        doc.redo();
+        doc.redo();
+        assert_eq!(doc.rope().to_string(), "use x;\nfn a() {\n    two(1);\n}\n");
+        // Typing after a reload is an undo step of its own.
+        doc.edit(vec![(0..0, "x".into())], &[], EditKind::Typing);
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), "use x;\nfn a() {\n    two(1);\n}\n");
     }
 
     /// `old` with `changes` made, checking they're sorted and apart.
@@ -1805,7 +1967,7 @@ mod tests {
         doc.take_lsp_changes();
         let version = doc.version();
 
-        assert!(doc.replace_all(new.into()));
+        assert!(reload_to(&mut doc, new, &[]));
         assert_eq!(doc.rope().to_string(), new);
         // Things on lines that stayed follow them; ones in changed text go.
         let ranges = doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>();
@@ -1832,9 +1994,11 @@ mod tests {
         }
         assert_eq!(lines.len(), doc.line_count());
         assert_eq!(lines[5..], [Some(4), Some(5), Some(6), Some(7)]);
-        // Saved, with nothing to undo; the server gets all of it.
-        assert!(!doc.is_dirty() && doc.undo().is_none());
-        assert!(doc.take_lsp_changes().full);
+        // Saved; the server gets the edits; undo brings back the text before.
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.take_lsp_changes().changes.len(), 3);
+        doc.undo();
+        assert_eq!(doc.rope().to_string(), old);
     }
 
     #[test]
@@ -1843,7 +2007,7 @@ mod tests {
         doc.set_breakpoints(&[Breakpoint::at(0), Breakpoint::at(1), Breakpoint::at(2)]);
         doc.set_lsp_diagnostics(vec![Diagnostic { range: 5..6, severity: crate::lint::Severity::Error, message: "m".into(), rule: "r".into() }]);
         let version = doc.version();
-        assert!(doc.replace_all("    a();\n    b();\n    c();\n".into()));
+        assert!(reload_to(&mut doc, "    a();\n    b();\n    c();\n", &[]));
         assert_eq!(doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(), [0, 1, 2]);
         assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [13..14]);
         let patch = doc.patches_since(version).unwrap().next().unwrap();

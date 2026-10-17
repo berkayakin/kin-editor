@@ -1,5 +1,7 @@
 //! Git: running operations, refreshing status, diffs and blame.
 
+use std::collections::BTreeSet;
+
 use super::*;
 
 impl Workspace {
@@ -41,6 +43,9 @@ impl Workspace {
                     p.set_repo(repo, project, cx);
                     p.set_status(Arc::new(RepoStatus::default()), cx);
                 });
+                // What was read or asked for is the last repository's.
+                ws.status_task = None;
+                ws.git_pending = StatusWork::default();
                 ws.refresh_git(cx);
                 ws.load_diff_bases(ws.editors.clone(), cx);
                 cx.notify();
@@ -50,68 +55,104 @@ impl Workspace {
         .detach();
     }
 
-    /// Re-reads `git status` in the background.
+    /// Reads all of `git status` again in the background: a project
+    /// opened, `.git` changed (HEAD, the index, refs), a Git operation ran.
     pub(super) fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        self.read_status(StatusWork::all(), cx);
+    }
+
+    /// The Commit view opens: it lists the whole repository's changes, and
+    /// the watcher only sees the project folder's (and `.git`), so one
+    /// above the project folder is read again, as is one not watched.
+    pub(super) fn refresh_commit_view(&mut self, cx: &mut Context<Self>) {
+        let outside = self.repo.as_ref().zip(self.root.as_ref()).is_some_and(|(repo, root)| repo != root);
+        if outside || self.watcher.is_none() {
+            self.refresh_git(cx);
+        }
+    }
+
+    /// Kuana wrote these files (saves, file operations): the watcher
+    /// reports them like any change, unless there's none for the project
+    /// or they're outside it; those get their status read here.
+    pub(super) fn files_written(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
+        let watched = |path: &Path| self.watcher.is_some() && self.root.as_ref().is_some_and(|root| path.starts_with(root));
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|path| !watched(path)).collect();
+        if !paths.is_empty() {
+            self.read_status(StatusWork::paths(paths), cx);
+        }
+    }
+
+    /// Reads Git status again in the background, of what `work` covers
+    /// (paths are merged into what's known). One read at a time: what's
+    /// asked for meanwhile is read together after it.
+    pub(super) fn read_status(&mut self, work: StatusWork, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.clone() else { return };
-        if self.status_task.is_some() {
-            // Changes made while git was reading must not be missed.
-            self.git_refresh_again = true;
+        self.git_pending.add(work);
+        if self.status_task.is_some() || self.git_pending.is_empty() {
             return;
         }
+        let work = std::mem::take(&mut self.git_pending);
+        let (known, ignored) = (self.git_status.clone(), self.git_ignored.clone());
         self.status_task = Some(cx.spawn(async move |this, cx| {
             let repo2 = repo.clone();
-            let (result, last_commit, stashes) = cx
-                .background_executor()
-                .spawn(async move { (git::status(&repo2), git::last_commit(&repo2), git::stashes(&repo2)) })
-                .await;
+            let read = cx.background_executor().spawn(async move { StatusRead::read(&repo2, work, &known, &ignored) }).await;
             this.update(cx, |ws, cx| {
-                ws.status_task = None;
-                if std::mem::take(&mut ws.git_refresh_again) {
-                    ws.refresh_git(cx);
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = ws.status_task.take() {
+                    task.detach();
                 }
-                ws.git_panel.update(cx, |p, cx| p.set_stashes(stashes, cx));
-                if ws.last_commit != last_commit {
-                    ws.last_commit = last_commit;
-                    cx.notify();
+                // Not for another repository opened meanwhile.
+                if ws.repo.as_ref() == Some(&repo) {
+                    ws.show_status(read, cx);
                 }
-                let Ok(status) = result else { return };
-                if *ws.git_status == status {
-                    return;
-                }
-                let moved = (&ws.git_status.head_oid, &ws.git_status.branch, ws.git_status.ahead, ws.git_status.behind)
-                    != (&status.head_oid, &status.branch, status.ahead, status.behind);
-                if moved && ws.shows(BottomPanel::GitLog) {
-                    ws.git_log.update(cx, |l, cx| l.reload(cx));
-                }
-                ws.git_paths = Arc::new(status.path_map(&repo));
-                if ws.git_ignored.len() != status.ignored.len() || !status.ignored.iter().all(|p| ws.git_ignored.contains(p)) {
-                    ws.git_ignored = Arc::new(status.ignored.iter().cloned().collect());
-                }
-                ws.decorate_tree(cx);
-                // Diff bases are read again only where HEAD or a file's index
-                // blob moved (commits, staging, checkouts), not for every
-                // change in the working tree.
-                let old = std::mem::replace(&mut ws.git_status, Arc::new(status));
-                let new = ws.git_status.clone();
-                let blobs = |status: &git::RepoStatus, path: &Path| status.files.iter().find(|f| f.path == path).and_then(|f| f.blobs.clone());
-                let stale: Vec<Entity<Editor>> = if old.head_oid != new.head_oid {
-                    ws.editors.clone()
-                } else {
-                    ws.editors
-                        .iter()
-                        .filter(|t| t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| blobs(&old, p) != blobs(&new, p)))
-                        .cloned()
-                        .collect()
-                };
-                ws.load_diff_bases(stale, cx);
-                if let Some(Modal::Diff(view)) = &ws.modals.current {
-                    view.update(cx, |v, cx| v.status_changed(&new, cx));
-                }
-                ws.git_panel.update(cx, |p, cx| p.set_status(new, cx));
-                cx.notify();
+                // Once it's shown: a read of some paths merges into it.
+                ws.read_status(StatusWork::default(), cx);
             })
             .ok();
         }));
+    }
+
+    /// Shows a status read in the background: the tree's colors, diff
+    /// bases, the Git panel, the diff view.
+    fn show_status(&mut self, read: StatusRead, cx: &mut Context<Self>) {
+        if let Some((last_commit, stashes)) = read.head {
+            self.git_panel.update(cx, |p, cx| p.set_stashes(stashes, cx));
+            if self.last_commit != last_commit {
+                self.last_commit = last_commit;
+                cx.notify();
+            }
+        }
+        let Some(changed) = read.changed else { return };
+        let (old, status) = (&self.git_status, &changed.status);
+        let moved = (&old.head_oid, &old.branch, old.ahead, old.behind) != (&status.head_oid, &status.branch, status.ahead, status.behind);
+        if moved && self.shows(BottomPanel::GitLog) {
+            self.git_log.update(cx, |l, cx| l.reload(cx));
+        }
+        self.git_paths = changed.paths;
+        if let Some(ignored) = changed.ignored {
+            self.git_ignored = ignored;
+        }
+        self.decorate_tree(cx);
+        self.git_status = Arc::new(changed.status);
+        let new = self.git_status.clone();
+        // Diff bases are read again only where HEAD or a file's index blob
+        // moved (commits, staging, checkouts), not for every change in the
+        // working tree.
+        let stale: Vec<Entity<Editor>> = if changed.head_moved {
+            self.editors.clone()
+        } else {
+            self.editors
+                .iter()
+                .filter(|t| t.read(cx).doc.read(cx).path.as_ref().is_some_and(|p| changed.blobs_moved.contains(p)))
+                .cloned()
+                .collect()
+        };
+        self.load_diff_bases(stale, cx);
+        if let Some(Modal::Diff(view)) = &self.modals.current {
+            view.update(cx, |v, cx| v.status_changed(&new, cx));
+        }
+        self.git_panel.update(cx, |p, cx| p.set_status(new, cx));
+        cx.notify();
     }
 
     /// Loads the file's HEAD and index text so the editor can show changed lines.
@@ -165,13 +206,14 @@ impl Workspace {
 
     /// Picks up on-disk changes (checkout, pull, rollback) in unmodified tabs.
     pub(super) fn reload_changed_files(&mut self, cx: &mut Context<Self>) {
-        for editor in self.editors.clone() {
-            editor.update(cx, |e, cx| e.reload_if_changed(cx));
-        }
+        self.reload_documents(|_| true, cx);
         for image in self.images() {
             image.update(cx, |i, cx| i.reload_if_changed(cx));
         }
-        self.tree.update(cx, |t, cx| t.rebuild(cx));
+        // The watcher tells the tree what changed, if there's one.
+        if self.watcher.is_none() {
+            self.tree.update(cx, |t, cx| t.relist_all(cx));
+        }
     }
 
     pub(super) fn run_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {
@@ -763,6 +805,100 @@ impl Workspace {
 
 
 
+/// Git status to read: all of it, or what's under some paths (files Kuana
+/// wrote, changes in the work tree).
+#[derive(Debug, Default)]
+pub(super) struct StatusWork {
+    pub(super) all: bool,
+    pub(super) paths: BTreeSet<PathBuf>,
+}
+
+impl StatusWork {
+    pub(super) fn all() -> Self {
+        StatusWork { all: true, paths: BTreeSet::new() }
+    }
+
+    pub(super) fn paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        StatusWork { all: false, paths: paths.into_iter().collect() }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        !self.all && self.paths.is_empty()
+    }
+
+    pub(super) fn add(&mut self, more: StatusWork) {
+        self.all |= more.all;
+        if self.all {
+            self.paths.clear();
+        } else {
+            self.paths.extend(more.paths);
+        }
+    }
+
+    pub(super) fn add_path(&mut self, path: PathBuf) {
+        if !self.all {
+            self.paths.insert(path);
+        }
+    }
+}
+
+/// A Git status read in the background, with what showing it needs.
+struct StatusRead {
+    /// With all of it read: the last commit and the stashes.
+    head: Option<(Option<git::CommitInfo>, Vec<git::Stash>)>,
+    /// When it differs from the status shown.
+    changed: Option<ChangedStatus>,
+}
+
+struct ChangedStatus {
+    status: RepoStatus,
+    /// Its colors for the tree (`RepoStatus::path_map`).
+    paths: Arc<HashMap<PathBuf, Change>>,
+    /// What Git ignores, when that changed.
+    ignored: Option<Arc<HashSet<PathBuf>>>,
+    /// HEAD moved: every file's diff base may have.
+    head_moved: bool,
+    /// The files whose HEAD or index blob moved: their diff bases did.
+    blobs_moved: HashSet<PathBuf>,
+}
+
+impl StatusRead {
+    /// Reads the status (blocking): all of it, or `work`'s paths', merged
+    /// into `known` (the status shown, `ignored` its ignored set).
+    fn read(repo: &Path, work: StatusWork, known: &RepoStatus, ignored: &HashSet<PathBuf>) -> Self {
+        let pathspecs = if work.all { None } else { git::pathspecs(repo, work.paths.iter().map(PathBuf::as_path)) };
+        let (status, head) = match pathspecs {
+            // All outside the repository.
+            Some(rels) if rels.is_empty() => return StatusRead { head: None, changed: None },
+            Some(rels) => {
+                let status = git::status_of(repo, &rels).map(|scoped| {
+                    let mut status = known.clone();
+                    status.merge(repo, &rels, scoped);
+                    status
+                });
+                (status, None)
+            }
+            None => (git::status(repo), Some((git::last_commit(repo), git::stashes(repo)))),
+        };
+        let changed = status.ok().filter(|status| status != known).map(|status| {
+            let blobs = |status: &RepoStatus| -> HashMap<PathBuf, String> {
+                status.files.iter().filter_map(|f| Some((f.path.clone(), f.blobs.clone()?))).collect()
+            };
+            let (before, after) = (blobs(known), blobs(&status));
+            let blobs_moved = before.keys().chain(after.keys()).filter(|path| before.get(*path) != after.get(*path)).cloned().collect();
+            let now_ignored: HashSet<PathBuf> = status.ignored.iter().cloned().collect();
+            ChangedStatus {
+                paths: Arc::new(status.path_map(repo)),
+                ignored: (now_ignored != *ignored).then(|| Arc::new(now_ignored)),
+                head_moved: status.head_oid != known.head_oid,
+                blobs_moved,
+                status,
+            }
+        });
+        StatusRead { head, changed }
+    }
+}
+
 /// What to ask before an operation that loses something: message, detail,
 /// button, and whether it can be undone (else Cancel is the default).
 fn confirmation(op: &GitOp) -> Option<(String, &'static str, &'static str, bool)> {
@@ -927,4 +1063,63 @@ pub(super) fn perform_git(dir: &Path, op: GitOp, status: &RepoStatus) -> Result<
         GitOp::Reset { sha, mode } => git::reset(dir, &sha, mode).map(|_| Some(format!("Reset to {}", short(&sha)))),
     };
     message.map(Outcome::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read of some paths merges into the status shown, and tells what
+    /// showing it needs to know.
+    #[test]
+    fn a_read_of_some_paths_merges_into_the_status_shown() {
+        if !git::is_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kuana-status-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git::init(&root).unwrap();
+        let root = git::discover(&root).unwrap();
+        for args in [["config", "user.name", "Test"], ["config", "user.email", "test@example.com"]] {
+            git::run(&root, &args).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git::stage(&root, &[".gitignore".into(), "a.txt".into()]).unwrap();
+        git::commit(&root, "first", false).unwrap();
+
+        // All of it: with the last commit, and HEAD moved from nothing.
+        let read = StatusRead::read(&root, StatusWork::all(), &RepoStatus::default(), &HashSet::new());
+        assert!(read.head.as_ref().is_some_and(|(commit, _)| commit.is_some()));
+        let shown = read.changed.expect("HEAD is known now");
+        assert!(shown.head_moved && shown.status.files.is_empty());
+
+        // A file written and a log: only they are read, and merge in.
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        std::fs::write(root.join("new.log"), "").unwrap();
+        let ignored: HashSet<PathBuf> = shown.status.ignored.iter().cloned().collect();
+        let read = StatusRead::read(&root, StatusWork::paths([root.join("a.txt"), root.join("new.log")]), &shown.status, &ignored);
+        assert!(read.head.is_none(), "no need for the last commit");
+        let changed = read.changed.expect("a.txt changed");
+        assert_eq!(changed.status.head_oid, shown.status.head_oid);
+        assert_eq!(changed.status.files.iter().map(|f| (f.rel.as_str(), f.unstaged)).collect::<Vec<_>>(), [("a.txt", Some(Change::Modified))]);
+        assert!(changed.ignored.is_some_and(|i| i.contains(&root.join("new.log"))), "the tree dims it");
+        // Its blobs are known now: the diff base is read again.
+        assert!(!changed.head_moved && changed.blobs_moved.iter().eq([&root.join("a.txt")]));
+        assert_eq!(changed.paths.get(&root.join("a.txt")), Some(&Change::Modified));
+
+        // Read again unchanged: nothing to show. Outside the repository: nothing read.
+        let ignored: HashSet<PathBuf> = changed.status.ignored.iter().cloned().collect();
+        assert!(StatusRead::read(&root, StatusWork::paths([root.join("a.txt")]), &changed.status, &ignored).changed.is_none());
+        let outside = StatusWork::paths([std::env::temp_dir().join("elsewhere.txt")]);
+        assert!(StatusRead::read(&root, outside, &changed.status, &ignored).changed.is_none());
+
+        // Asked for together: all of it covers any paths.
+        let mut work = StatusWork::paths([root.join("a.txt")]);
+        work.add(StatusWork::all());
+        work.add(StatusWork::paths([root.join("b.txt")]));
+        assert!(work.all && work.paths.is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
