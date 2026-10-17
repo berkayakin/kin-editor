@@ -88,7 +88,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Encodings and line endings: files keep their encoding (UTF-8 with or without BOM, UTF-16,
   Windows-125x, ISO-8859-2, Shift JIS, EUC-KR, GBK, Big5) and line endings when saved; the status
   bar shows both, and clicking them reloads the file in another encoding or converts it (as in
-  JetBrains). Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
+  JetBrains). A lone CR (old Mac files) reads as a line end and is saved as the file's line ending,
+  as in Zed. Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
   encoding can't hold is never saved in it. Files over 20 MB open as plain text without language
   features; over 500 MB they don't open
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
