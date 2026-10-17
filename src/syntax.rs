@@ -316,16 +316,20 @@ pub(crate) struct OutlineConfig {
 }
 
 impl OutlineConfig {
-    pub(crate) fn build(language: TsLanguage, source: &str) -> Result<Self, String> {
+    /// None for a query that marks no items: Zed's outline queries for
+    /// template languages (EEx, HEEx) mark only comments, `@annotation`.
+    pub(crate) fn build(language: TsLanguage, source: &str) -> Result<Option<Self>, String> {
         let query = Query::new(&language, source).map_err(|e| format!("outline query, line {}: {}", e.row + 1, e.message))?;
-        let kinds = query
+        let kinds: Vec<Option<&'static str>> = query
             .capture_names()
             .iter()
             .map(|n| if *n == "item" { Some("symbol") } else { n.strip_prefix("definition.").map(symbol_kind) })
             .collect();
-        let name = query.capture_index_for_name("name").ok_or("the outline query has no @name")?;
+        let Some(name) = query.capture_index_for_name("name") else {
+            return if kinds.iter().any(Option::is_some) { Err("the outline query has no @name".into()) } else { Ok(None) };
+        };
         let context = query.capture_index_for_name("context");
-        Ok(Self { query, kinds, name, context })
+        Ok(Some(Self { query, kinds, name, context }))
     }
 }
 
@@ -1470,6 +1474,12 @@ mod tests {
                 assert!(outline_config(language).is_some(), "{language:?}");
             }
         }
+        // A query marking only comments (Zed's for templates) has no items;
+        // one marking items needs their names.
+        let rust: TsLanguage = tree_sitter_rust::LANGUAGE.into();
+        assert!(OutlineConfig::build(rust.clone(), "(line_comment) @annotation").unwrap().is_none());
+        assert!(OutlineConfig::build(rust.clone(), "(function_item) @item").is_err());
+        assert!(OutlineConfig::build(rust, "(function_item name: (identifier) @name) @item").unwrap().is_some());
     }
 
     #[test]

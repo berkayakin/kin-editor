@@ -265,7 +265,7 @@ impl LanguageDef {
             LangConfig::build(language.clone(), "")
         })?;
         let outline = self.outline.as_deref().and_then(|source| match OutlineConfig::build(language.clone(), source) {
-            Ok(config) => Some(&*Box::leak(Box::new(config))),
+            Ok(config) => config.map(|config| &*Box::leak(Box::new(config))),
             Err(err) => {
                 add_problem(&self.extension, format!("{}: {err}", self.name));
                 None
