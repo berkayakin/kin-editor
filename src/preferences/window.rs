@@ -4,8 +4,6 @@
 //! it forward on the page asked for. It reopens where it was last, on the
 //! page shown last; files it opens go to the project window used last.
 
-use std::time::Duration;
-
 use gpui::{
     Action, App, AppContext, Context, Entity, FocusHandle, Focusable, Global, IntoElement, ParentElement, Render,
     Styled, Subscription, Task, TitlebarOptions, Window, WindowOptions, div, point, prelude::*, px, size,
@@ -114,14 +112,8 @@ impl PreferencesWindow {
 
     fn remember_placement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placement = workspace::placement_of(window, cx);
-        self.placement_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor().timer(Duration::from_millis(400)).await;
-            let mut state = SessionState::load();
-            state.preferences_window = Some(placement);
-            if let Err(err) = state.save() {
-                eprintln!("couldn't save the Preferences window's place: {err}");
-            }
-        }));
+        SessionState::change_soon("preferences_window", 0, move |state| state.preferences_window = Some(placement.clone()));
+        self.placement_task = Some(crate::state::write_soon(cx));
     }
 }
 

@@ -451,7 +451,7 @@ impl Workspace {
         }
         if self.terminals.read(cx).is_empty() {
             self.hide_bottom(BottomPanel::Terminal);
-            self.save_state();
+            self.save_state(cx);
             self.focus_active(window, cx);
         } else if was_focused {
             self.focus_terminal(window, cx);

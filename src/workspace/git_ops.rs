@@ -782,9 +782,9 @@ impl Workspace {
             }
             DiffViewEvent::Layout { side_by_side } => {
                 // App-wide, like the font zoom.
-                let mut state = SessionState::load();
-                state.diff_side_by_side = Some(*side_by_side);
-                state.save().ok();
+                let side_by_side = *side_by_side;
+                SessionState::change_soon("diff_side_by_side", 0, move |state| state.diff_side_by_side = Some(side_by_side));
+                ws.state_task = Some(crate::state::write_soon(cx));
             }
         });
         self.modals.open(Modal::Diff(view), subscription);
@@ -798,7 +798,7 @@ impl Workspace {
         if had_terminal && self.shows(BottomPanel::Problems) {
             self.focus_active(window, cx);
         }
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 }

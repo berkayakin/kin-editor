@@ -759,8 +759,9 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
-    /// Debounced write of the window's place on screen.
-    placement_task: Option<Task<()>>,
+    /// Debounced write of `state.json` (layout, the window's place on
+    /// screen: see `save_state`).
+    state_task: Option<Task<()>>,
     /// Watches the project folder; `watch_task` applies what it reports.
     watcher: Option<Watcher>,
     watch_task: Option<Task<()>>,
@@ -861,7 +862,7 @@ impl Workspace {
             TerminalPanelEvent::Hide => {
                 ws.hide_bottom(BottomPanel::Terminal);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.save_state(cx);
                 ws.schedule_session_save(cx);
                 cx.notify();
             }
@@ -879,7 +880,7 @@ impl Workspace {
             GitLogEvent::Close => {
                 ws.hide_bottom(BottomPanel::GitLog);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.save_state(cx);
                 cx.notify();
             }
         });
@@ -1086,7 +1087,7 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
-            placement_task: None,
+            state_task: None,
             onboarding: None,
             trust_waits: false,
             watcher: None,

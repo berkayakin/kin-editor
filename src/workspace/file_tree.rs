@@ -49,7 +49,7 @@ impl Workspace {
         if let Some(root) = self.root.clone() {
             self.detect_repo(root, cx);
         }
-        self.save_state();
+        self.save_state(cx);
         let root = self.root.clone();
         self.lsp.update(cx, |s, _| s.set_root(root));
         if self.items().next().is_none() {
