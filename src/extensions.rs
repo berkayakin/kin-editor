@@ -917,13 +917,19 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Removes an extension: a linked folder is only unlinked; an installed one
-/// goes to the Trash.
+/// goes to the Trash. What its code downloaded goes too.
 pub fn uninstall(path: &Path) -> Result<(), String> {
+    let id = read_toml(&path.join("extension.toml")).ok().and_then(|m| m.get("id").and_then(Value::as_str).map(str::to_string));
+    let id = id.or_else(|| Some(path.file_name()?.to_string_lossy().into_owned()));
     if path.is_symlink() {
-        std::fs::remove_file(path).map_err(|e| e.to_string())
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
     } else {
-        trash::delete(path).map_err(|e| e.to_string())
+        trash::delete(path).map_err(|e| e.to_string())?;
     }
+    if let Some(id) = id {
+        wasm::forget(&id);
+    }
+    Ok(())
 }
 
 // ---- Grammars ----------------------------------------------------------------------

@@ -11,7 +11,11 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::{extensions::wasm::WasmServers, settings::LspSettings, syntax::Language};
+use crate::{
+    extensions::wasm::{Asking, WasmServers},
+    settings::LspSettings,
+    syntax::Language,
+};
 
 pub struct ServerSpec {
     /// Shared by languages one server handles (JS/TS/TSX).
@@ -247,20 +251,23 @@ pub struct ServerConfig {
 }
 
 /// What extensions' code said about a server: its own extension's, with
-/// what other extensions add to it (`WasmServers::additional`).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// what other extensions add to it.
+#[derive(Clone, Debug, Default)]
 pub struct FromCode {
     /// Zed's id for the server, when its extension's code started it: its
-    /// `lsp.<id>` settings go by that.
+    /// `lsp.<id>` settings go by that, and reach it through that code.
     pub server: Option<String>,
     pub initialization_options: Value,
     pub settings: Value,
+    /// Whom to ask for `settings` again when the user's settings change.
+    pub asking: Option<Asking>,
 }
 
 /// A server's configuration: Kuana's defaults for its program, then its
 /// extension's manifest's, then what extensions' code said (taken as it is:
 /// no dotted keys expanded), then the user's `lsp.<id>`, each merged over the
-/// one before.
+/// one before. A server its extension's code started gets the user's
+/// settings from that code instead, as in Zed (Dart's put them in a section).
 pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSettings>, code: &FromCode) -> ServerConfig {
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (mut initialization_options, mut settings) = defaults(&name);
@@ -271,7 +278,9 @@ pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSetti
     let entry = code.server.as_deref().and_then(|id| user.get(id)).or_else(|| user_entry(spec, Some(&name), user));
     if let Some(entry) = entry {
         merge(&mut initialization_options, entry.initialization_options.as_ref().unwrap_or(&Value::Null));
-        merge(&mut settings, &expand_dotted(entry.settings.as_ref().unwrap_or(&Value::Null)));
+        if code.server.is_none() {
+            merge(&mut settings, &expand_dotted(entry.settings.as_ref().unwrap_or(&Value::Null)));
+        }
     }
     ServerConfig { initialization_options, settings }
 }
@@ -572,10 +581,14 @@ mod tests {
         assert_eq!(config(&ServerSpec { id: EXT.id, ..ext }, Path::new("/bin/x"), &user, &FromCode::default()).settings, json!({ "x": { "a": 1, "b": 3 } }));
 
         // What an extension's code said comes before the user's entry, which
-        // goes by Zed's id for the server it started (the program is node).
-        let code = FromCode { server: Some("html".into()), initialization_options: json!({ "a": 1, "b": 1 }), settings: json!({ "x.y": 1 }) };
-        let user: HashMap<String, LspSettings> =
-            [("html".to_string(), LspSettings { initialization_options: Some(json!({ "b": 2 })), ..Default::default() })].into();
+        // goes by Zed's id for the server it started (the program is node);
+        // the user's settings reach that server through the code.
+        let code = FromCode { server: Some("html".into()), initialization_options: json!({ "a": 1, "b": 1 }), settings: json!({ "x.y": 1 }), asking: None };
+        let user: HashMap<String, LspSettings> = [(
+            "html".to_string(),
+            LspSettings { initialization_options: Some(json!({ "b": 2 })), settings: Some(json!({ "z": 1 })), ..Default::default() },
+        )]
+        .into();
         let from_code = config(&EXT, Path::new("/bin/node"), &user, &code);
         assert_eq!((from_code.initialization_options, from_code.settings), (json!({ "a": 1, "b": 2 }), json!({ "x.y": 1 })));
 

@@ -464,21 +464,30 @@ fn install_node() -> Result<(), String> {
 // ---- Files ------------------------------------------------------------------------------
 
 /// Unpacks a .zip or .tar.gz with `tar`, which macOS, Linux and Windows 10+
-/// have (bsdtar reads zips too).
+/// have (bsdtar reads zips too). GNU tar doesn't, so on Linux a zip (by its
+/// first bytes: the name may not say) goes to `unzip`.
 pub(crate) fn unzip(archive: &Path, into: &Path) -> Result<(), String> {
-    let output = crate::process::command("tar")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(into)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("couldn't run tar: {e}"))?;
+    let mut command = if cfg!(target_os = "linux") && is_zip(archive) {
+        let mut unzip = crate::process::command("unzip");
+        unzip.args(["-o", "-q"]).arg(archive).arg("-d").arg(into);
+        unzip
+    } else {
+        let mut tar = crate::process::command("tar");
+        tar.arg("-xf").arg(archive).arg("-C").arg(into);
+        tar
+    };
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = command.stdin(std::process::Stdio::null()).output().map_err(|e| format!("couldn't run {program}: {e}"))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(format!("couldn't unpack {}: {}", archive.display(), String::from_utf8_lossy(&output.stderr).trim()))
     }
+}
+
+fn is_zip(path: &Path) -> bool {
+    let mut magic = [0; 4];
+    std::fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic)).is_ok() && magic == *b"PK\x03\x04"
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -561,6 +570,13 @@ mod tests {
             assert!(wanted, "{} isn't a candidate of any built-in server", installer.command);
         }
         assert_eq!(folder_name("2026-10-12"), "2026-10-12");
+        // Zips go by their first bytes (an extension's download has no suffix).
+        let file = std::env::temp_dir().join(format!("kuana-is-zip-{}", std::process::id()));
+        std::fs::write(&file, b"PK\x03\x04 rest").unwrap();
+        assert!(is_zip(&file));
+        std::fs::write(&file, b"\x1f\x8b gzip").unwrap();
+        assert!(!is_zip(&file));
+        std::fs::remove_file(&file).ok();
         assert_eq!(folder_name("v1.2/x"), "v1.2_x");
         assert!(rust_analyzer_asset().is_some() && taplo_asset().is_some());
     }

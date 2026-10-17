@@ -129,12 +129,15 @@ scanners need.
 Zed extensions' own WebAssembly code (`extension.wasm`) runs for their language servers when it's
 built for extension API 0.6 or 0.7 (`[lib] version` in `extension.toml`): Kuana asks it for the
 command, which it may download first (into `~/.config/kuana/extensions/work/<id>/`, the only folder
-it can reach), the initialization options and the workspace configuration, and `lsp.<id>` settings
-go by Zed's server id. It runs sandboxed in the same runtime as grammars; it can reach the network
-only through Kuana (GitHub releases, HTTP, npm with Kuana's Node.js), and runs programs only for
-trusted projects. A built-in language's own server still comes first, so an extension's server
-for the same program (PHP's intelephense, HTML's) doesn't start beside it. Extensions' other code
-(slash commands, context servers, debug adapters, completion labels) isn't run.
+it can reach, removed with the extension), the initialization options and the workspace
+configuration. `lsp.<id>` settings go by Zed's server id; as in Zed, a server's `settings` reach it
+through the extension's code (which may put them in a section of their own), asked again when they
+change. It runs sandboxed in the same runtime as grammars, with limits on how long it computes and
+how much memory it takes; it can reach the network only through Kuana (GitHub releases, HTTP, npm
+with Kuana's Node.js), and runs programs only for trusted projects. A built-in language's own server
+still comes first, so an extension's server for the same program (PHP's intelephense, HTML's)
+doesn't start beside it. Extensions' other code (slash commands, context servers, debug adapters,
+completion labels) isn't run.
 
 Icon themes are chosen with `icon_theme` (Settings → Appearance → Icon theme); without one, Kuana uses
 its built-in Charmed Icons.

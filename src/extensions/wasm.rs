@@ -8,11 +8,13 @@
 //!
 //! The code runs in WASI's sandbox with one folder of its own,
 //! `<config>/extensions/work/<id>/` (its current directory, where servers are
-//! downloaded to). Everything else goes through the host functions here,
-//! which use what Kuana has: `curl` for HTTP and GitHub, its Node.js and npm,
-//! the augmented PATH, the `lsp.<id>` settings (by Zed's server id). Running a
-//! program (`process`) needs the project to be trusted. Slash commands,
-//! context servers, the docs database and debug adapters answer with errors.
+//! downloaded to; removed with the extension). Everything else goes through
+//! the host functions here, which use what Kuana has: `curl` for HTTP and
+//! GitHub, its Node.js and npm, the augmented PATH, the `lsp.<id>` settings
+//! (by Zed's server id). Running a program (`process`) needs the project to be
+//! trusted. A call may run only so much of the code (`FUEL`), in so much
+//! memory (`MEMORY`). Slash commands, context servers, the docs database and
+//! debug adapters answer with errors.
 
 use std::{
     collections::HashMap,
@@ -28,7 +30,7 @@ use std::{
 
 use serde_json::{Value, json};
 use wasmtime::{
-    Engine, Store,
+    Engine, Store, StoreLimits, StoreLimitsBuilder, Trap,
     component::{Component as WasmComponent, HasSelf, Linker, Resource, ResourceTable},
 };
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -92,8 +94,59 @@ pub struct Started {
     pub server: &'static str,
     pub command: servers::Command,
     pub initialization_options: Option<Value>,
-    pub settings: Option<Value>,
 }
+
+/// Whom to ask for a server's workspace configuration when extensions' code
+/// has a say: its own extension, when that started it, and the others for
+/// its language, which may add to it. Asked again when settings change, since
+/// the code reads them (and shapes them as its server wants).
+#[derive(Clone, Debug)]
+pub struct Asking {
+    /// The server's own extension and Zed's id for it.
+    pub own: Option<(&'static WasmExtension, &'static str)>,
+    pub others: Vec<&'static WasmServers>,
+    /// Zed's id for the server, as the others know it.
+    pub target: String,
+    pub root: PathBuf,
+    pub tab_sizes: Vec<(String, usize)>,
+}
+
+impl Asking {
+    /// The server's workspace configuration from extensions' code. Blocking.
+    pub fn workspace_configuration(&self, lsp: &HashMap<String, LspSettings>) -> Value {
+        let settings = CallSettings { lsp: lsp.clone(), tab_sizes: self.tab_sizes.clone() };
+        let mut value = Value::Null;
+        if let Some((extension, server)) = self.own {
+            let answer = extension.call(&self.root, &settings, &|e, store, project| e.call_language_server_workspace_configuration(store, server, project));
+            match answer.and_then(json_answer) {
+                Ok(own) => value = own.unwrap_or_default(),
+                Err(err) => eprintln!("kuana: {} extension, {server}: {err}", extension.id),
+            }
+        }
+        for other in &self.others {
+            let more = other.additional(&self.target, &self.root, &settings, &|e, store, server, target, project| {
+                e.call_language_server_additional_workspace_configuration(store, server, target, project)
+            });
+            servers::merge(&mut value, &more.unwrap_or_default());
+        }
+        value
+    }
+
+    /// What the other extensions add to its initialization options. Blocking.
+    pub fn additional_options(&self, lsp: &HashMap<String, LspSettings>) -> Value {
+        let settings = CallSettings { lsp: lsp.clone(), tab_sizes: self.tab_sizes.clone() };
+        let mut value = Value::Null;
+        for other in &self.others {
+            let more = other.additional(&self.target, &self.root, &settings, &|e, store, server, target, project| {
+                e.call_language_server_additional_initialization_options(store, server, target, project)
+            });
+            servers::merge(&mut value, &more.unwrap_or_default());
+        }
+        value
+    }
+}
+
+type Additional = dyn Fn(&Extension, &mut Store<State>, &str, &str, Resource<ProjectRoot>) -> wasmtime::Result<Result<Option<String>, String>>;
 
 impl WasmServers {
     /// Asks the extension's code to start its first server it can, for the
@@ -112,30 +165,19 @@ impl WasmServers {
         Err(first_error.unwrap_or_else(|| format!("the {} extension has no language server", self.extension.id)))
     }
 
-    /// What this extension's servers add to another server's initialization
-    /// options and workspace configuration (`target`, by Zed's id): Vue's
-    /// TypeScript plugin for vtsls, say.
-    pub fn additional(&self, target: &str, root: &Path, settings: &CallSettings) -> (Option<Value>, Option<Value>) {
-        let mut options = None;
-        let mut configuration = None;
+    /// What this extension's servers add (through `ask`: initialization
+    /// options or workspace configuration) to another server's, `target` by
+    /// Zed's id: Vue's TypeScript plugin for vtsls, say.
+    fn additional(&self, target: &str, root: &Path, settings: &CallSettings, ask: &Additional) -> Option<Value> {
+        let mut out = None;
         for &server in self.ids.iter().filter(|id| **id != target) {
-            let ask = |f: &dyn Fn(&Extension, &mut Store<State>, Resource<ProjectRoot>) -> wasmtime::Result<Result<Option<String>, String>>| {
-                match self.extension.call(root, settings, f).and_then(json_answer) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        eprintln!("kuana: {} extension, {server} for {target}: {err}", self.extension.id);
-                        None
-                    }
-                }
-            };
-            if let Some(value) = ask(&|e, store, project| e.call_language_server_additional_initialization_options(store, server, target, project)) {
-                servers::merge(options.get_or_insert(Value::Null), &value);
-            }
-            if let Some(value) = ask(&|e, store, project| e.call_language_server_additional_workspace_configuration(store, server, target, project)) {
-                servers::merge(configuration.get_or_insert(Value::Null), &value);
+            match self.extension.call(root, settings, &|e, store, project| ask(e, store, server, target, project)).and_then(json_answer) {
+                Ok(Some(value)) => servers::merge(out.get_or_insert(Value::Null), &value),
+                Ok(None) => {}
+                Err(err) => eprintln!("kuana: {} extension, {server} for {target}: {err}", self.extension.id),
             }
         }
-        (options, configuration)
+        out
     }
 }
 
@@ -147,15 +189,11 @@ impl WasmExtension {
         let initialization_options =
             json_answer(self.call(root, settings, &|e, store, project| e.call_language_server_initialization_options(store, server, project))?)
                 .map_err(own)?;
-        let configuration =
-            json_answer(self.call(root, settings, &|e, store, project| e.call_language_server_workspace_configuration(store, server, project))?)
-                .map_err(own)?;
         let work = work_dir(&self.id)?;
         Ok(Started {
             server,
             command: servers::Command { program: program_path(&work, &command.command), args: command.args, env: command.env },
             initialization_options,
-            settings: configuration,
         })
     }
 
@@ -178,6 +216,7 @@ impl WasmExtension {
         }
         let instance = slot.as_mut().expect("just made");
         let store = &mut instance.store;
+        store.set_fuel(FUEL).map_err(|e| e.to_string())?;
         store.data_mut().call = Some(Call { root: root.to_path_buf(), settings: settings.clone() });
         let project = store.data_mut().table.push(ProjectRoot { root: root.to_path_buf() }).map_err(|e| e.to_string())?;
         let rep = project.rep();
@@ -186,6 +225,9 @@ impl WasmExtension {
         store.data_mut().call = None;
         result.map_err(|trap| {
             *slot = None;
+            if trap.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+                return format!("the {} extension's code ran too long", self.id);
+            }
             format!("the {} extension's code failed: {trap:#}", self.id)
         })
     }
@@ -215,19 +257,38 @@ fn program_path(work: &Path, command: &str) -> PathBuf {
 
 /// Where an extension's code keeps its files (and runs).
 pub fn work_dir(id: &str) -> Result<PathBuf, String> {
-    if id.is_empty() || id.contains(['/', '\\']) || id.starts_with('.') {
-        return Err(format!("\"{id}\" isn't a usable extension id"));
-    }
-    let dir = super::extensions_dir().ok_or("no config folder")?.join("work").join(id);
+    let dir = work_dir_of(id).ok_or_else(|| format!("\"{id}\" isn't a usable extension id"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
     Ok(dir)
 }
 
+fn work_dir_of(id: &str) -> Option<PathBuf> {
+    let usable = !id.is_empty() && !id.contains(['/', '\\']) && !id.starts_with('.');
+    usable.then(|| Some(super::extensions_dir()?.join("work").join(id))).flatten()
+}
+
+/// An uninstalled extension: its instance ends and its work folder (the
+/// servers its code downloaded) goes.
+pub fn forget(id: &str) {
+    INSTANCES.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    if let Some(dir) = work_dir_of(id) {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
 // ---- Instances -------------------------------------------------------------------------
+
+/// How much of its own code an extension may run per call (about one unit
+/// per WebAssembly instruction): far more than finding a server takes, so a
+/// loop ends with an error instead of hanging the server's start. Waiting for
+/// downloads and npm, in Kuana, doesn't count.
+const FUEL: u64 = 10_000_000_000;
+/// How large an extension's memory may grow.
+const MEMORY: usize = 512 << 20;
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
+    config.wasm_component_model(true).consume_fuel(true);
     Engine::new(&config).expect("wasmtime's default configuration")
 });
 
@@ -264,8 +325,11 @@ impl Instance {
         wasi.inherit_stdout().inherit_stderr().allow_blocking_current_thread(true).env("PWD", &work_name);
         wasi.preopened_dir(&work, ".", DirPerms::all(), FilePerms::all()).map_err(failed)?;
         wasi.preopened_dir(&work, &work_name, DirPerms::all(), FilePerms::all()).map_err(failed)?;
-        let state = State { wasi: wasi.build(), table: ResourceTable::new(), extension: extension.id.clone(), work, call: None };
+        let limits = StoreLimitsBuilder::new().memory_size(MEMORY).build();
+        let state = State { wasi: wasi.build(), table: ResourceTable::new(), limits, extension: extension.id.clone(), work, call: None };
         let mut store = Store::new(&ENGINE, state);
+        store.limiter(|state| &mut state.limits);
+        store.set_fuel(FUEL).map_err(failed)?;
         let bindings = Extension::instantiate(&mut store, &component, linker).map_err(failed)?;
         bindings.call_init_extension(&mut store).map_err(failed)?;
         Ok(Instance { store, bindings, wasm, modified })
@@ -278,6 +342,7 @@ impl Instance {
 pub struct State {
     wasi: WasiCtx,
     table: ResourceTable,
+    limits: StoreLimits,
     extension: String,
     /// The extension's own folder (its WASI sandbox).
     work: PathBuf,
@@ -843,10 +908,14 @@ mod tests {
             started
         };
 
-        // Dart: `which`, then the user's `lsp.dart` settings.
-        let dart = timed(extension("dart"), "dart").unwrap();
+        // Dart: `which`, then the user's `lsp.dart` settings, which its code
+        // puts in a section of their own.
+        let dart_extension = extension("dart");
+        let dart = timed(dart_extension, "dart").unwrap();
         assert!(dart.command.program.ends_with("dart") && dart.command.args == ["language-server", "--protocol=lsp"], "{dart:?}");
-        assert!(dart.settings.is_some());
+        let asking = Asking { own: Some((dart_extension, "dart")), others: Vec::new(), target: "dart".into(), root: project.clone(), tab_sizes: Vec::new() };
+        let lsp: HashMap<String, LspSettings> = [("dart".to_string(), LspSettings { settings: Some(json!({ "lineLength": 100 })), ..Default::default() })].into();
+        assert_eq!(asking.workspace_configuration(&lsp), json!({ "dart": { "lineLength": 100 } }));
 
         // HTML: npm into its work folder, run by node (an absolute path from
         // its current directory, which must be the work folder).
@@ -869,7 +938,13 @@ mod tests {
         let servers = WasmServers { extension: php, ids: &["intelephense", "phpactor"] };
         let first = servers.start(&project, &settings).unwrap();
         assert_eq!(first.server, "intelephense");
-        assert_eq!(servers.additional("vtsls", &project, &settings), (None, None));
+        let asking = Asking { own: None, others: vec![Box::leak(Box::new(servers))], target: "vtsls".into(), root: project.clone(), tab_sizes: Vec::new() };
+        assert_eq!((asking.workspace_configuration(&settings.lsp), asking.additional_options(&settings.lsp)), (Value::Null, Value::Null));
+
+        // Uninstalled (`extensions::uninstall`, which also trashes the
+        // extension), an extension's downloads go with it.
+        forget("html");
+        assert!(!work.exists());
         std::fs::remove_dir_all(&config).ok();
     }
 
