@@ -167,6 +167,7 @@ impl Workspace {
         if self.auto_save != AutoSave::Off {
             self.auto_save_all(cx);
         }
+        self.flush_state_save();
         // A project keeps unsaved edits in its session and brings them back
         // next time ("hot exit"), so there's nothing to ask.
         if self.root.is_some() {

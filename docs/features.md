@@ -70,8 +70,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   menu (macOS) and the taskbar's jump list (Windows)
 - Integrated terminal (⌥F12 / Alt+F12): your login shell in tabs, full colors, mouse support for
   full-screen programs, selection and copy/paste, Find in the output and scrollback; shell keys
-  like Ctrl+R reach the shell; split groups, renamable tabs, and each project's terminals come back
-  in their folders
+  like Ctrl+R reach the shell; input methods (Chinese, Japanese, Korean) compose at the cursor;
+  split groups, renamable tabs, and each project's terminals come back in their folders
 - Code folding by indentation (Markdown by section), with gutter arrows and a `⋯` placeholder;
   folds are kept with the project
 - Split panes (side by side or stacked, a file in both if you like) with draggable dividers; drag tabs to reorder them or

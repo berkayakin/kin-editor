@@ -236,22 +236,52 @@ impl Workspace {
 
     /// Remembers layout and the open folder for the next launch.
     pub(super) fn save_state(&self) {
-        let saved = SessionState::load();
-        let state = SessionState {
-            // Opening a lone file shouldn't forget the remembered project.
-            last_root: self.root.clone().or(saved.last_root),
-            sidebar_width: Some(self.sidebar_width.into()),
-            problems_height: Some(self.problems_height.into()),
+        write_state(self.state_update());
+    }
+
+    /// `save_state` once things settle, written off the UI thread (it reads
+    /// the file again and syncs it to disk): opening terminals, several at
+    /// once when they're restored, shouldn't wait for that.
+    pub(super) fn schedule_state_save(&mut self, cx: &mut Context<Self>) {
+        self.state_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let Ok(update) = this.update(cx, |ws, _| ws.state_update()) else { return };
+            cx.background_executor().spawn(async move { write_state(update) }).await;
+            this.update(cx, |ws, _| ws.state_task = None).ok();
+        }));
+    }
+
+    /// Writes a scheduled `save_state` now (the window closes, the app quits).
+    pub(super) fn flush_state_save(&mut self) {
+        if self.state_task.take().is_some() {
+            self.save_state();
+        }
+    }
+
+    /// This window's part of `state.json`, laid over what's on disk when
+    /// it's written.
+    fn state_update(&self) -> impl FnOnce(SessionState) -> SessionState + Send + use<> {
+        let root = self.root.clone();
+        let sidebar_width: f32 = self.sidebar_width.into();
+        let problems_height: f32 = self.problems_height.into();
+        let show_sidebar = self.show_sidebar;
+        let [show_problems, show_terminal, show_git_log] = [BottomPanel::Problems, BottomPanel::Terminal, BottomPanel::GitLog].map(|p| self.shows(p));
+        let sidebar_mode = match self.sidebar_mode {
+            SidebarMode::Files => "files",
+            SidebarMode::Commit => "commit",
+        };
+        move |saved| SessionState {
             // The sidebar's visibility is remembered for projects only; it's
             // always closed without one.
-            show_sidebar: if self.root.is_some() { Some(self.show_sidebar) } else { saved.show_sidebar },
-            show_problems: Some(self.shows(BottomPanel::Problems)),
-            show_terminal: Some(self.shows(BottomPanel::Terminal)),
-            sidebar_mode: Some(match self.sidebar_mode {
-                SidebarMode::Files => "files".into(),
-                SidebarMode::Commit => "commit".into(),
-            }),
-            show_git_log: Some(self.shows(BottomPanel::GitLog)),
+            show_sidebar: if root.is_some() { Some(show_sidebar) } else { saved.show_sidebar },
+            // Opening a lone file shouldn't forget the remembered project.
+            last_root: root.or(saved.last_root),
+            sidebar_width: Some(sidebar_width),
+            problems_height: Some(problems_height),
+            show_problems: Some(show_problems),
+            show_terminal: Some(show_terminal),
+            sidebar_mode: Some(sidebar_mode.into()),
+            show_git_log: Some(show_git_log),
             // Shared with other windows, so keep what's on disk.
             font_zoom: saved.font_zoom,
             diff_side_by_side: saved.diff_side_by_side,
@@ -261,9 +291,6 @@ impl Workspace {
             preferences_window: saved.preferences_window,
             welcome_done: saved.welcome_done,
             other: saved.other,
-        };
-        if let Err(err) = state.save() {
-            eprintln!("couldn't save window state: {err}");
         }
     }
 
@@ -337,6 +364,13 @@ pub fn update_recent_projects(f: impl FnOnce(&mut Vec<PathBuf>), cx: &mut App) -
     state.recent_projects
 }
 
+
+/// Writes `state.json`: what's there now, with `update` laid over it.
+fn write_state(update: impl FnOnce(SessionState) -> SessionState) {
+    if let Err(err) = update(SessionState::load()).save() {
+        eprintln!("couldn't save window state: {err}");
+    }
+}
 
 /// A session to write, its unsaved texts still ropes (see `session_snapshot`).
 pub(super) struct SessionSnapshot {

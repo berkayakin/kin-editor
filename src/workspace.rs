@@ -759,6 +759,8 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
+    /// Debounced background write of `state.json` (see `schedule_state_save`).
+    state_task: Option<Task<()>>,
     /// Debounced write of the window's place on screen.
     placement_task: Option<Task<()>>,
     /// Watches the project folder; `watch_task` applies what it reports.
@@ -844,6 +846,7 @@ impl Workspace {
             TerminalPanelEvent::RunExited(terminal) => ws.collect_run_problems(terminal, cx),
             TerminalPanelEvent::RunsChanged => ws.update_running(cx),
             TerminalPanelEvent::Close(terminal) => ws.remove_terminal(terminal, window, cx),
+            TerminalPanelEvent::Failed(terminal, error) => ws.terminal_failed(terminal, error.clone(), window, cx),
             TerminalPanelEvent::TabMenu { terminal, position } => ws.open_terminal_tab_menu(terminal.clone(), *position, window, cx),
             TerminalPanelEvent::Overflow { terminals, position } => {
                 let entries = terminals.iter().map(|(_, name)| MenuEntry::item(name.clone(), Icon::Terminal)).collect();
@@ -861,7 +864,7 @@ impl Workspace {
             TerminalPanelEvent::Hide => {
                 ws.hide_bottom(BottomPanel::Terminal);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.schedule_state_save(cx);
                 ws.schedule_session_save(cx);
                 cx.notify();
             }
@@ -909,6 +912,7 @@ impl Workspace {
             if let Err(err) = ws.save_session(cx) {
                 eprintln!("couldn't save the session: {err}");
             }
+            ws.flush_state_save();
             ws.lsp.update(cx, |s, _| s.shutdown_all());
             if let Some((session, _)) = ws.debug.take() {
                 session.update(cx, |s, cx| s.stop(cx));
@@ -1086,6 +1090,7 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
+            state_task: None,
             placement_task: None,
             onboarding: None,
             trust_waits: false,

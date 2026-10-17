@@ -15,6 +15,8 @@ pub(super) enum TerminalPanelEvent {
     RunsChanged,
     /// Close this tab (its close button, a middle click, its shell exited).
     Close(Entity<TerminalView>),
+    /// This tab's shell couldn't start.
+    Failed(Entity<TerminalView>, String),
     /// A tab was right-clicked.
     TabMenu { terminal: Entity<TerminalView>, position: gpui::Point<Pixels> },
     /// The tabs that don't fit, to pick from.
@@ -108,6 +110,7 @@ impl TerminalPanel {
                 cx.emit(TerminalPanelEvent::RunsChanged);
             }
             TerminalEvent::Exited => cx.emit(TerminalPanelEvent::Close(terminal)),
+            TerminalEvent::Failed(error) => cx.emit(TerminalPanelEvent::Failed(terminal, error.clone())),
             TerminalEvent::OpenFile { path, line, column } => {
                 cx.emit(TerminalPanelEvent::OpenFile { path: path.clone(), line: *line, column: *column })
             }

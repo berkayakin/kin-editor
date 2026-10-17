@@ -26,7 +26,7 @@ impl Workspace {
                 self.focus_terminal(window, cx);
             }
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         self.schedule_session_save(cx);
         cx.notify();
     }
@@ -176,13 +176,14 @@ impl Workspace {
     }
 
     /// A Run tab finished: what its output reports goes to Problems (a run
-    /// without problems clears the last one's).
+    /// without problems clears the last one's). The output is read as text
+    /// in the background too: it's the whole scrollback.
     pub(super) fn collect_run_problems(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) {
         let Some((target, _)) = terminal.read(cx).run().cloned() else { return };
-        let output = terminal.read(cx).output_text();
+        let output = terminal.read(cx).output();
         let task = cx.spawn(async move |ws, cx| {
             let cwd = target.cwd.clone();
-            let problems = cx.background_executor().spawn(async move { run::output_problems(&output, &cwd) }).await;
+            let problems = cx.background_executor().spawn(async move { run::output_problems(&output.text(), &cwd) }).await;
             ws.update(cx, |ws, cx| {
                 let run = (!problems.is_empty()).then_some((target.name, problems));
                 ws.problems.update(cx, |p, cx| p.set_run(run, cx));
@@ -311,7 +312,8 @@ impl Workspace {
     }
 
     /// Adds a terminal where `place` says. A Run tab stays open when its
-    /// program ends, showing how it went.
+    /// program ends, showing how it went. Its shell starts in the background
+    /// (`TerminalPanelEvent::Failed` if it can't).
     pub(super) fn open_terminal(
         &mut self,
         cwd: PathBuf,
@@ -321,25 +323,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match TerminalView::create(cwd, run, cx) {
-            Ok(terminal) => {
-                self.terminals.update(cx, |p, cx| p.add(terminal, place, cx));
-                self.bottom = Some(BottomPanel::Terminal);
-                if focus {
-                    self.focus_terminal(window, cx);
-                }
-                self.save_state();
-                self.schedule_session_save(cx);
-            }
-            Err(err) => {
-                // Don't retry on every frame.
-                if self.terminals.read(cx).is_empty() {
-                    self.hide_bottom(BottomPanel::Terminal);
-                }
-                self.toast(ToastKind::Error, "Couldn't start the terminal", Some(err.to_string()), cx);
-            }
+        let terminal = TerminalView::create(cwd, run, cx);
+        self.terminals.update(cx, |p, cx| p.add(terminal, place, cx));
+        self.bottom = Some(BottomPanel::Terminal);
+        if focus {
+            self.focus_terminal(window, cx);
         }
+        self.schedule_state_save(cx);
+        self.schedule_session_save(cx);
         cx.notify();
+    }
+
+    /// A terminal's shell couldn't start: its tab goes, with a message.
+    pub(super) fn terminal_failed(&mut self, terminal: &Entity<TerminalView>, error: String, window: &mut Window, cx: &mut Context<Self>) {
+        // Closing the last one hides the panel, so it doesn't start another.
+        self.remove_terminal(terminal, window, cx);
+        self.toast(ToastKind::Error, "Couldn't start the terminal", Some(error), cx);
     }
 
     /// The terminal panel in the bottom area, as tall as it is, with its grab edge.
