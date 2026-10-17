@@ -2089,8 +2089,8 @@ impl Preferences {
         let folder = extensions::extensions_dir().map(|d| theme::display_path(&d)).unwrap_or_default();
         self.body()
             .child(section("Install", vec![install.into_any_element()], &theme))
-            .child(section("Available", available, &theme))
             .child(section("Installed", rows, &theme))
+            .child(section("Available", available, &theme))
             .when(!zed.is_empty(), |el| el.child(section("Installed in Zed", zed, &theme)))
             .child(
                 div()
