@@ -529,6 +529,11 @@ pub struct Preferences {
     /// Extensions' icon theme names, read from their files once rather than
     /// every frame; cleared when extensions change.
     icon_themes: Option<Arc<Vec<String>>>,
+    /// Zed's installed extensions not added here, read from their manifests
+    /// in the background when the Extensions page opens or extensions
+    /// change, not every frame (`zed_extensions`).
+    zed_extensions: Option<Arc<Vec<(String, std::path::PathBuf)>>>,
+    zed_extensions_task: Option<Task<()>>,
     language: Language,
     shell: Entity<Editor>,
     rulers: Entity<Editor>,
@@ -580,6 +585,7 @@ impl Preferences {
             // A grammar finished building, an extension came or went.
             cx.observe_global::<ExtensionsChanged>(|this, cx| {
                 this.icon_themes = None;
+                (this.zed_extensions, this.zed_extensions_task) = (None, None);
                 cx.notify();
             }),
             cx.observe_global::<crate::trust::TrustChanged>(|_, cx| cx.notify()),
@@ -611,6 +617,8 @@ impl Preferences {
             fonts: None,
             fonts_task: None,
             icon_themes: None,
+            zed_extensions: None,
+            zed_extensions_task: None,
             language: Language::JavaScript,
             shell,
             rulers,
@@ -663,6 +671,8 @@ impl Preferences {
         }
         if page == Page::Extensions {
             self.fetch_registry(cx);
+            // Zed may have installed some meanwhile.
+            (self.zed_extensions, self.zed_extensions_task) = (None, None);
         }
         cx.notify();
     }
@@ -1933,6 +1943,29 @@ impl Preferences {
         cx.notify();
     }
 
+    /// Zed's installed extensions not added here: as read last, or none
+    /// while they're read (in the background).
+    fn zed_extensions(&mut self, cx: &mut Context<Self>) -> Arc<Vec<(String, std::path::PathBuf)>> {
+        if let Some(found) = &self.zed_extensions {
+            return found.clone();
+        }
+        if self.zed_extensions_task.is_none() {
+            self.zed_extensions_task = Some(cx.spawn(async move |this, cx| {
+                let found = cx.background_executor().spawn(async { extensions::zed_extensions() }).await;
+                this.update(cx, |this, cx| {
+                    // This task is running; let it finish instead of dropping it.
+                    if let Some(task) = this.zed_extensions_task.take() {
+                        task.detach();
+                    }
+                    this.zed_extensions = Some(Arc::new(found));
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+        Arc::default()
+    }
+
     /// Gets the registry's list of extensions, unless it's here or coming.
     fn fetch_registry(&mut self, cx: &mut Context<Self>) {
         if matches!(self.registry, Some(Ok(_))) || self.registry_fetch.is_some() {
@@ -2073,8 +2106,10 @@ impl Preferences {
         };
 
         // Zed's installed extensions come with prebuilt grammars.
-        let zed: Vec<AnyElement> = extensions::zed_extensions()
-            .into_iter()
+        let zed: Vec<AnyElement> = self
+            .zed_extensions(cx)
+            .iter()
+            .cloned()
             .enumerate()
             .map(|(ix, (name, path))| {
                 div()
