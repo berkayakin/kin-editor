@@ -291,14 +291,13 @@ impl Workspace {
         hover: Option<Hsla>,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> crate::ui::Button {
         let (rest, hover) = match hover {
             Some(hover) => (color, hover),
             None => (color.alpha(color.a * 0.8), color),
         };
         div()
             .id(id)
-            .group(id)
             .size(px(30.))
             .flex()
             .flex_shrink_0()
@@ -307,7 +306,11 @@ impl Workspace {
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(on_click))
-            .child(svg().path(icon.path()).size(px(18.)).flex_shrink_0().text_color(rest).group_hover(id, move |s| s.text_color(hover)))
+            // The icon eases to its hover color like the other buttons' fills
+            // (an svg takes its own color, so it's added here, from the progress).
+            .with_hover_transition(SharedString::from(format!("{id}-hover")), transition::FOCUS, move |el, t| {
+                el.child(svg().path(icon.path()).size(px(18.)).flex_shrink_0().text_color(transition::mix(rest, hover, t)))
+            })
     }
 
     /// The open project: a pill like the branch chip beside it, with a round
