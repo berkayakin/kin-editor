@@ -96,6 +96,7 @@ impl Client {
         args: &[String],
         cwd: &Path,
         path_env: &std::ffi::OsStr,
+        env: &[(String, String)],
     ) -> std::io::Result<(Arc<Client>, async_mpsc::UnboundedReceiver<Incoming>)> {
         let mut command = crate::process::command(program);
         command
@@ -103,6 +104,8 @@ impl Client {
             .current_dir(cwd)
             // Node-based servers start with `#!/usr/bin/env node`.
             .env("PATH", path_env)
+            // What an extension's code set (its PATH too).
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -234,7 +234,7 @@ fn verified_manifest(data: &[u8], signature: &[u8], public_key: &str) -> Result<
 
 /// Whether `candidate` is a later version than `current` ("1.2.3", with an
 /// optional "-pre" suffix that sorts before the release).
-fn is_newer(candidate: &str, current: &str) -> bool {
+pub(crate) fn is_newer(candidate: &str, current: &str) -> bool {
     fn parse(version: &str) -> Option<(Vec<u64>, bool)> {
         let version = version.trim().trim_start_matches('v');
         let (numbers, pre) = match version.split_once('-') {

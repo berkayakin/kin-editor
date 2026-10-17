@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use crate::{
     document::{Document, LspChanges},
     editor::Editor,
+    extensions::wasm::{Asking, CallSettings, WasmServers},
     settings::Settings,
     syntax::Language,
 };
@@ -223,8 +224,9 @@ pub struct LspStore {
     generations: HashMap<ServerKey, u64>,
     next_generation: u64,
     /// Each started server's spec, program and the configuration it was
-    /// given, to answer `workspace/configuration` and notice changes.
-    configs: HashMap<ServerKey, (&'static servers::ServerSpec, PathBuf, servers::ServerConfig)>,
+    /// given (with what extensions' code said), to answer
+    /// `workspace/configuration` and notice changes.
+    configs: HashMap<ServerKey, (&'static servers::ServerSpec, PathBuf, servers::ServerConfig, servers::FromCode)>,
     /// Files each server asked to hear about (`workspace/didChangeWatchedFiles`),
     /// by registration id.
     watchers: HashMap<ServerKey, Vec<(String, Vec<FileWatcher>)>>,
@@ -441,34 +443,75 @@ impl LspStore {
         self.generations.insert(key.clone(), generation);
         cx.notify();
         let user = Settings::get(cx).lsp.clone();
+        // What extensions' code may read, and the other extensions' servers
+        // for the language, which may add to this one's configuration.
+        let tab_size = Settings::get(cx).for_file(language, Some(&file)).tab_size;
+        let call_settings = CallSettings { lsp: user.clone(), tab_sizes: vec![(language.name().to_string(), tab_size)] };
+        let others: Vec<&'static WasmServers> =
+            servers::specs(language).into_iter().filter(|s| !std::ptr::eq(*s, spec)).filter_map(|s| s.wasm).collect();
         let task = cx.spawn(async move |this, cx| {
-            // Finding the executable (and the login shell's PATH) touches the disk.
+            // Finding the executable (and the login shell's PATH) touches the
+            // disk; an extension's code may download its server.
             let root = key.root.clone();
             let user_for_find = user.clone();
-            let spawned = cx
+            let (spawned, code) = cx
                 .background_executor()
                 .spawn(async move {
                     // Python servers find the project's packages through `python` on PATH.
                     let venv = (language == Language::Python).then(|| crate::python::venv(file.parent()?)).flatten();
+                    let mut code = servers::FromCode::default();
+                    let mut own = None;
+                    // `lsp.<id>.binary`, else the extension's code, else where Kuana finds it.
                     let command = match &custom {
-                        Some(command) => servers::custom(command),
-                        // `lsp.<id>.binary`, else where Kuana finds it.
-                        None => servers::user_binary(spec, &user_for_find).or_else(|| servers::find(spec, &file, venv.as_deref())),
+                        Some(command) => Ok(servers::custom(command)),
+                        None => match (servers::user_binary(spec, &user_for_find), spec.wasm) {
+                            (Some(command), _) => Ok(Some(command)),
+                            (None, Some(wasm)) => match wasm.start(&root, &call_settings) {
+                                Ok(started) => {
+                                    code.server = Some(started.server.to_string());
+                                    code.initialization_options = started.initialization_options.unwrap_or_default();
+                                    own = Some((wasm.extension, started.server));
+                                    Ok(Some(started.command))
+                                }
+                                // Kuana's guess, else what the code said.
+                                Err(err) => servers::find(spec, &file, venv.as_deref()).map(Some).ok_or(err),
+                            },
+                            (None, None) => Ok(servers::find(spec, &file, venv.as_deref())),
+                        },
                     };
+                    if let Ok(Some(command)) = &command
+                        && (own.is_some() || !others.is_empty())
+                    {
+                        let program = command.program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let target = code.server.clone().unwrap_or_else(|| servers::zed_id(&program).to_string());
+                        let asking = Asking { own, others, target, root: root.clone(), tab_sizes: call_settings.tab_sizes };
+                        servers::merge(&mut code.initialization_options, &asking.additional_options(&user_for_find));
+                        code.settings = asking.workspace_configuration(&user_for_find);
+                        code.asking = Some(asking);
+                    }
                     // Kuana's own Node.js runs the npm servers it installed.
                     let path = crate::python::path_with(venv.as_deref(), &install::path_with(install::node_bin().as_deref()));
-                    let spawned = command.map(|c| (Client::spawn(&c.program, &c.args, &root, &path), c));
-                    if let Some((Ok(_), c)) = &spawned {
+                    let spawned = command.map(|c| c.map(|c| (Client::spawn(&c.program, &c.args, &root, &path, &c.env), c)));
+                    if let Ok(Some((Ok(_), c))) = &spawned {
                         let program = c.program.clone();
                         std::thread::spawn(move || install::check_for_update(&program));
                     }
-                    spawned
+                    (spawned, code)
                 })
                 .await;
             // Stopped or restarted meanwhile: this start is history.
             let current = |s: &Self| s.generations.get(&key) == Some(&generation);
             let (client, incoming, command) = match spawned {
-                None => {
+                Err(message) => {
+                    this.update(cx, |s, cx| {
+                        if current(s) {
+                            s.fail(&key, message, cx);
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+                Ok(None) => {
                     this.update(cx, |s, cx| {
                         if current(s) {
                             s.servers.insert(key.clone(), ServerState::Missing(spec));
@@ -478,7 +521,7 @@ impl LspStore {
                     .ok();
                     return;
                 }
-                Some((Err(err), c)) => {
+                Ok(Some((Err(err), c))) => {
                     let message = format!("Couldn't start {}: {err}", c.program.display());
                     this.update(cx, |s, cx| {
                         if current(s) {
@@ -488,21 +531,21 @@ impl LspStore {
                     .ok();
                     return;
                 }
-                Some((Ok((client, incoming)), c)) => (client, incoming, c),
+                Ok(Some((Ok((client, incoming)), c))) => (client, incoming, c),
             };
             // Shown in the status bar: "pyright", not "pyright.cmd" on Windows.
             let program = &command.program;
             let windows_ext = program.extension().is_some_and(|e| ["exe", "cmd", "bat"].iter().any(|w| e.eq_ignore_ascii_case(w)));
             let name = if windows_ext { program.file_stem() } else { program.file_name() };
             let name = name.map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let config = servers::config(spec, &command.program, &user);
+            let config = servers::config(spec, &command.program, &user, &code);
             let initialization_options = config.initialization_options.clone();
             let started = this.update(cx, |s, cx| {
                 if !current(s) {
                     return false;
                 }
                 s.servers.insert(key.clone(), ServerState::Starting(client.clone(), spec));
-                s.configs.insert(key.clone(), (spec, command.program.clone(), config));
+                s.configs.insert(key.clone(), (spec, command.program.clone(), config, code));
                 s.listen(key.clone(), generation, incoming, cx);
                 s.started.retain(|c| c.strong_count() > 0);
                 s.started.push(Arc::downgrade(&client));
@@ -536,7 +579,7 @@ impl LspStore {
             };
             client.notify("initialized", json!({}));
             // Servers that don't ask (`workspace/configuration`) take their settings this way.
-            if let Ok(Some(settings)) = this.update(cx, |s, _| s.configs.get(&key).map(|(_, _, c)| c.settings.clone()))
+            if let Ok(Some(settings)) = this.update(cx, |s, _| s.configs.get(&key).map(|(_, _, c, _)| c.settings.clone()))
                 && !settings.is_null()
             {
                 client.notify("workspace/didChangeConfiguration", json!({ "settings": settings }));
@@ -656,7 +699,7 @@ impl LspStore {
                 match method.as_str() {
                     // From `lsp.<id>.settings` (and Kuana's defaults); null means "use yours".
                     "workspace/configuration" => {
-                        let settings = self.configs.get(key).map_or(Value::Null, |(_, _, c)| c.settings.clone());
+                        let settings = self.configs.get(key).map_or(Value::Null, |(_, _, c, _)| c.settings.clone());
                         let items = params.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
                         let answers = items.iter().map(|item| servers::configuration(&settings, item.get("section").and_then(Value::as_str)));
                         client.respond(id, Value::Array(answers.collect()));
@@ -986,17 +1029,43 @@ impl LspStore {
 
     /// Settings changed: running servers whose settings differ now are told
     /// (initialization options and programs apply when a server restarts).
-    pub fn settings_changed(&mut self, cx: &App) {
-        let user = &Settings::get(cx).lsp;
-        for (key, (spec, program, config)) in &mut self.configs {
-            let fresh = servers::config(spec, program, user);
-            if fresh.settings == config.settings {
-                continue;
-            }
-            config.settings = fresh.settings;
-            if let Some(ServerState::Running(server)) = self.servers.get(key) {
-                server.client.notify("workspace/didChangeConfiguration", json!({ "settings": config.settings }));
-            }
+    /// Extensions' code is asked again for the servers it configures.
+    pub fn settings_changed(&mut self, cx: &mut Context<Self>) {
+        let user = Settings::get(cx).lsp.clone();
+        let keys: Vec<ServerKey> = self.configs.keys().cloned().collect();
+        for key in keys {
+            self.update_settings(&key, None, &user);
+            let Some(asking) = self.configs.get(&key).and_then(|(_, _, _, code)| code.asking.clone()) else { continue };
+            let generation = self.generations.get(&key).copied();
+            let user = user.clone();
+            cx.spawn(async move |this, cx| {
+                let lsp = user.clone();
+                let settings = cx.background_executor().spawn(async move { asking.workspace_configuration(&lsp) }).await;
+                this.update(cx, |s, _| {
+                    if s.generations.get(&key).copied() == generation {
+                        s.update_settings(&key, Some(settings), &user);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// A server's settings again, with what extensions' code said now
+    /// (`from_code`); tells it when they changed.
+    fn update_settings(&mut self, key: &ServerKey, from_code: Option<Value>, user: &HashMap<String, crate::settings::LspSettings>) {
+        let Some((spec, program, config, code)) = self.configs.get_mut(key) else { return };
+        if let Some(settings) = from_code {
+            code.settings = settings;
+        }
+        let fresh = servers::config(spec, program, user, code);
+        if fresh.settings == config.settings {
+            return;
+        }
+        config.settings = fresh.settings;
+        if let Some(ServerState::Running(server)) = self.servers.get(key) {
+            server.client.notify("workspace/didChangeConfiguration", json!({ "settings": config.settings }));
         }
     }
 

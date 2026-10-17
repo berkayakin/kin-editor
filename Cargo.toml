@@ -68,6 +68,11 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 tree-sitter-yaml = "0.7.2"
 url = "2.5.8"
+# Zed extensions' own code (`extension.wasm`, a WebAssembly component) for their
+# language servers: the wasmtime tree-sitter already brings, with components and WASI,
+# compiling on several threads (with the rayon Kuana already has).
+wasmtime = { version = "36.0.18", default-features = false, features = ["component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime-wasi = { version = "36.0.18", default-features = false }
 notify = "8"
 encoding_rs = "0.8"
 pulldown-cmark = { version = "0.13", default-features = false }

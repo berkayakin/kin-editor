@@ -219,7 +219,7 @@ impl BuiltinDef {
             // Built-in queries are Kuana's own, checked by tests: a mistake is a bug.
             let highlights = LangConfig::build(grammar.clone(), &self.source("highlights").unwrap_or_default())
                 .unwrap_or_else(|e| panic!("{}: {e}", self.name));
-            let outline = self.source("outline").map(|source| OutlineConfig::build(grammar.clone(), &source).unwrap_or_else(|e| panic!("{}: {e}", self.name)));
+            let outline = self.source("outline").and_then(|source| OutlineConfig::build(grammar.clone(), &source).unwrap_or_else(|e| panic!("{}: {e}", self.name)));
             let mut problems = Vec::new();
             let queries = LanguageQueries::build(&grammar, |file| self.source(file.strip_suffix(".scm").unwrap_or(file)), &mut problems);
             assert!(problems.is_empty(), "{}: {problems:?}", self.name);
