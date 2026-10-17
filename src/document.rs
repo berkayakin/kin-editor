@@ -4,6 +4,7 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -147,6 +148,12 @@ pub struct Document {
     redo_stack: Vec<Transaction>,
     /// Merged view of built-in and external diagnostics, sorted by position.
     pub diagnostics: Vec<Diagnostic>,
+    /// Counts the times `diagnostics` was built again (not moved by edits,
+    /// which change `version`), for what's drawn from it.
+    diagnostics_generation: u64,
+    /// How many of `diagnostics` there are of each severity (a tab's error
+    /// dot, the status bar's counts), so drawing doesn't count them.
+    severities: [usize; 4],
     builtin_diagnostics: Vec<Diagnostic>,
     external_diagnostics: Vec<Diagnostic>,
     /// Each language server's diagnostics (by server id), apart: a publish
@@ -202,6 +209,8 @@ pub struct Document {
     inlay_generation: u64,
     /// Language servers' code lenses, by line (shown above it).
     code_lenses: Vec<CodeLens>,
+    /// Counts `set_code_lenses` calls (lenses following edits change `version`).
+    code_lens_generation: u64,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -301,6 +310,8 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             diagnostics: Vec::new(),
+            diagnostics_generation: 0,
+            severities: [0; 4],
             builtin_diagnostics: Vec::new(),
             external_diagnostics: Vec::new(),
             lsp_diagnostics: Vec::new(),
@@ -324,6 +335,7 @@ impl Document {
             inlay_hints: Vec::new(),
             inlay_generation: 1,
             code_lenses: Vec::new(),
+            code_lens_generation: 0,
             disk_mtime: None,
         }
     }
@@ -878,6 +890,8 @@ impl Document {
         for (_, list) in &mut self.lsp_diagnostics {
             shift_diagnostics(list, patch);
         }
+        // Edits drop the problems they touch.
+        self.severities = count_severities(&self.diagnostics);
     }
 
     pub fn code_lenses(&self) -> &[CodeLens] {
@@ -887,6 +901,12 @@ impl Document {
     pub fn set_code_lenses(&mut self, mut lenses: Vec<CodeLens>) {
         lenses.sort_by_key(|l| l.line_start);
         self.code_lenses = lenses;
+        self.code_lens_generation += 1;
+    }
+
+    /// Changes when the lenses are replaced (see `code_lens_generation`).
+    pub fn code_lens_generation(&self) -> u64 {
+        self.code_lens_generation
     }
 
     pub fn inlay_hints(&self) -> &[InlayHint] {
@@ -1000,7 +1020,9 @@ impl Document {
     }
 
     pub fn breakpoint(&self, row: usize) -> Option<&Breakpoint> {
-        self.breakpoints.iter().map(|(_, b)| b).find(|b| b.row == row)
+        // Sorted by line start, so by row: drawing asks for every line on screen.
+        let ix = self.breakpoints.partition_point(|(_, b)| b.row < row);
+        self.breakpoints.get(ix).map(|(_, b)| b).filter(|b| b.row == row)
     }
 
     pub fn set_breakpoints(&mut self, breakpoints: &[Breakpoint]) {
@@ -1115,7 +1137,32 @@ impl Document {
             .collect();
         self.diagnostics
             .sort_by_key(|d| (d.range.start, d.severity));
+        self.diagnostics_generation += 1;
+        self.severities = count_severities(&self.diagnostics);
     }
+
+    /// Changes when the diagnostics are built again; with `version`, it
+    /// tells when they may have changed.
+    pub fn diagnostics_generation(&self) -> u64 {
+        self.diagnostics_generation
+    }
+
+    /// How many diagnostics have `severity`, without looking at them all.
+    pub fn severity_count(&self, severity: crate::lint::Severity) -> usize {
+        self.severities[severity as usize]
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.severity_count(crate::lint::Severity::Error) > 0
+    }
+}
+
+fn count_severities(diagnostics: &[Diagnostic]) -> [usize; 4] {
+    let mut counts = [0; 4];
+    for d in diagnostics {
+        counts[d.severity as usize] += 1;
+    }
+    counts
 }
 
 /// Lines `row..row + old_rows` became `new_rows` lines.
@@ -1145,16 +1192,17 @@ pub struct InlayHint {
 }
 
 /// A language server's code lens ("3 references", "▶ Run"): shown above its
-/// line, which it keeps across edits (it goes with a line that does).
+/// line, which it keeps across edits (it goes with a line that does). Cheap
+/// to copy: what it shows and runs is shared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodeLens {
     /// The start of its line.
     pub line_start: usize,
-    pub title: String,
+    pub title: Arc<str>,
     /// The LSP `Command` it runs.
-    pub command: serde_json::Value,
+    pub command: Arc<serde_json::Value>,
     /// The id of the server that sent it.
-    pub server: String,
+    pub server: Arc<str>,
 }
 
 /// One replacement in LSP terms: where it was (as line plus UTF-8 and
@@ -1413,7 +1461,7 @@ mod tests {
     #[test]
     fn code_lenses_follow_their_lines() {
         let mut doc = Document::from_text("fn a() {}\nfn b() {}\nfn c() {}\n".into(), None);
-        let lens = |line_start: usize| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
+        let lens = |line_start: usize| CodeLens { line_start, title: "1 reference".into(), command: Arc::new(serde_json::Value::Null), server: "s".into() };
         doc.set_code_lenses(vec![lens(10), lens(20)]);
         // A line above pushes them down; deleting a lens's line drops it.
         doc.edit(vec![(0..0, "// top\n".into())], &[], EditKind::Other);
@@ -1794,7 +1842,7 @@ mod tests {
         doc.set_lsp_diagnostics(vec![diagnostic(13..16), diagnostic(16..18), diagnostic(24..28), diagnostic(47..50)]);
         let hint = |offset| InlayHint { offset, label: ": T".into(), pad_left: false, pad_right: false };
         doc.set_inlay_hints(vec![hint(16), hint(28), hint(50)]);
-        let lens = |line_start| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
+        let lens = |line_start| CodeLens { line_start, title: "1 reference".into(), command: Arc::new(serde_json::Value::Null), server: "s".into() };
         doc.set_code_lenses(vec![lens(0), lens(34)]);
         let condition = Some("x > 1".to_string());
         doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(2), Breakpoint::at(3), Breakpoint { condition: condition.clone(), ..Breakpoint::at(5) }]);

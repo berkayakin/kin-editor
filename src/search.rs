@@ -80,6 +80,44 @@ impl SearchQuery {
     }
 }
 
+/// A search's matches in one document, shared by the find bar and the
+/// editor: one letter in a big file finds hundreds of thousands, so they're
+/// never copied, and drawing looks up only the ones on screen.
+#[derive(Clone, Default)]
+pub struct SearchMatches {
+    /// Sorted by start, apart.
+    pub ranges: Arc<Vec<Range<usize>>>,
+    /// The lines they start on, each once, in order (the scrollbar's markers).
+    pub rows: Arc<Vec<usize>>,
+}
+
+impl SearchMatches {
+    /// `ranges` (sorted) in `rope`'s text.
+    pub fn new(ranges: Vec<Range<usize>>, rope: &ropey::Rope) -> Self {
+        let mut rows: Vec<usize> = Vec::new();
+        // The next line's start: offsets before it are on the last line found.
+        let mut next = 0;
+        for r in &ranges {
+            if r.start >= next || rows.is_empty() {
+                let row = rope.byte_to_line(r.start.min(rope.len_bytes()));
+                next = if row + 1 < rope.len_lines() { rope.line_to_byte(row + 1) } else { usize::MAX };
+                if rows.last() != Some(&row) {
+                    rows.push(row);
+                }
+            }
+        }
+        SearchMatches { ranges: Arc::new(ranges), rows: Arc::new(rows) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProjectMatch {
     pub path: PathBuf,
@@ -247,6 +285,17 @@ pub fn context_lines(contents: &str, line_start: usize, line: usize, context: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_know_their_lines() {
+        let text = "ab\nb\n\nbb b\nx";
+        let rope = ropey::Rope::from_str(text);
+        let q = SearchQuery::new("b", SearchOptions::default()).unwrap().unwrap();
+        let matches = SearchMatches::new(q.find_all(text), &rope);
+        assert_eq!(matches.len(), 5);
+        assert_eq!(*matches.rows, [0, 1, 3]);
+        assert!(SearchMatches::new(Vec::new(), &rope).rows.is_empty());
+    }
 
     #[test]
     fn options() {

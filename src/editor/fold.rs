@@ -37,7 +37,9 @@ impl Editor {
     /// The fold whose header is `row`.
     pub(super) fn fold_under(&self, row: usize, cx: &App) -> Option<Range<usize>> {
         let start = self.doc.read(cx).line_start(row + 1);
-        self.folds.ranges().iter().find(|f| f.start == start).cloned()
+        // Sorted by start: drawing asks for every line on screen.
+        let folds = self.folds.ranges();
+        folds.get(folds.partition_point(|f| f.start < start)).filter(|f| f.start == start).cloned()
     }
 
     fn fold(&mut self, region: &FoldRegion, cx: &mut Context<Self>) {

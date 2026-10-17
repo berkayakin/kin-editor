@@ -12,6 +12,10 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use gpui::{Font, LineFragment, LineWrapperHandle, Pixels, SharedString, TextSystem};
@@ -22,7 +26,7 @@ use crate::{
     editor::{DisplayLine, control_symbol},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Break {
     /// Display-text byte offset where the row starts.
     pub ix: u32,
@@ -30,6 +34,22 @@ pub struct Break {
     pub byte: u32,
     /// Leading spaces drawn before the row's text.
     pub indent: u32,
+    /// Where building the row's display text from the buffer starts, so a
+    /// long line's rows on screen are built without the rest of it (see
+    /// `DisplayLine::window`).
+    pub from: Resume,
+}
+
+/// A place in a line to build its display text from: a character (`byte`
+/// in the line's text), where its display starts (`ix`, before the hints at
+/// it) and its column, which tab stops count from. The row starting at a
+/// break can start inside what that character shows (a tab's spaces, a
+/// control character's name) or inside the hints before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resume {
+    pub byte: u32,
+    pub ix: u32,
+    pub col: u32,
 }
 
 /// What line breaks depend on; a change means measuring every line again.
@@ -51,11 +71,13 @@ pub struct WrapMap {
     pub key: WrapKey,
     /// The document version the breaks are for.
     pub version: u64,
+    /// Changes whenever display rows do (see `generation`).
+    generation: u64,
     /// The folded byte ranges whose lines take no rows.
     folds: Vec<Range<usize>>,
     /// Block rows above buffer lines: (line, rows), sorted; a line one past
     /// the last means after it.
-    blocks: Vec<(usize, usize)>,
+    blocks: Arc<Vec<(usize, usize)>>,
     /// Breaks per buffer line; empty for lines that fit.
     breaks: Vec<Vec<Break>>,
     /// The hints each line was measured with (see `fingerprint`), to tell
@@ -74,6 +96,9 @@ pub struct WrapMap {
 pub const LONG_LINE: usize = 1024;
 /// The most display columns on a row of a long line without soft wrap.
 const LONG_LINE_ROW: usize = 512;
+
+/// Generations of every map, so a new map's never is an old one's.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
 /// The inlay hints shown in the text, which lines are measured with.
 #[derive(Clone, Copy)]
@@ -177,9 +202,16 @@ impl<'a> Measure<'a> {
         let text = text.strip_suffix('\n').unwrap_or(&text);
         let inlays: Vec<(usize, &str, bool, bool)> = hints.iter().map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right)).collect();
         let dl = DisplayLine::with_inlays(text, self.tab_size, &inlays);
-        let at = |ix: usize, indent: u32| Break { ix: ix as u32, byte: dl.to_buffer(ix) as u32, indent };
+        let at = |rows: Vec<(usize, u32)>| {
+            let ixs: Vec<usize> = rows.iter().map(|(ix, _)| *ix).collect();
+            let resumes = resumes(text, &dl, self.tab_size, &ixs);
+            rows.into_iter()
+                .zip(resumes)
+                .map(|((ix, indent), from)| Break { ix: ix as u32, byte: dl.to_buffer(ix) as u32, indent, from })
+                .collect()
+        };
         if !self.wrap {
-            return dl.text.char_indices().map(|(ix, _)| ix).step_by(LONG_LINE_ROW).skip(1).map(|ix| at(ix, 0)).collect();
+            return at(dl.text.char_indices().map(|(ix, _)| (ix, 0)).step_by(LONG_LINE_ROW).skip(1).collect());
         }
         // A hint is one piece: rows break before or after it, not inside; so
         // is a control character's name (a Control Picture is one character).
@@ -199,8 +231,32 @@ impl<'a> Measure<'a> {
         if from < dl.text.len() {
             fragments.push(LineFragment::text(&dl.text[from..]));
         }
-        self.wrapper.wrap_line(&fragments, self.width).map(|b| at(b.ix, b.next_indent)).collect()
+        at(self.wrapper.wrap_line(&fragments, self.width).map(|b| (b.ix, b.next_indent)).collect())
     }
+}
+
+/// Where the rows starting at display offsets `ixs` (ascending) of `text`
+/// shown as `dl` resume in the buffer (see `Resume`): the character whose
+/// hints or display hold their first offset.
+fn resumes(text: &str, dl: &DisplayLine, tab_size: usize, ixs: &[usize]) -> Vec<Resume> {
+    let mut out = Vec::with_capacity(ixs.len());
+    let mut next = ixs.iter().peekable();
+    let mut col = 0;
+    for (i, ch) in text.char_indices() {
+        // The next character's hints start where this one's display ends.
+        let end = dl.to_display(i + ch.len_utf8());
+        while next.next_if(|&&ix| ix < end).is_some() {
+            out.push(Resume { byte: i as u32, ix: dl.to_display(i) as u32, col: col as u32 });
+        }
+        col += match ch {
+            '\t' => tab_size - col % tab_size,
+            ch => control_symbol(ch).map_or(1, |symbol| symbol.chars().count()),
+        };
+    }
+    // In the hints after the last character.
+    let last = Resume { byte: text.len() as u32, ix: dl.to_display(text.len()) as u32, col: col as u32 };
+    out.extend(next.map(|_| last));
+    out
 }
 
 impl WrapMap {
@@ -220,8 +276,9 @@ impl WrapMap {
         let mut map = WrapMap {
             key,
             version,
+            generation: 0,
             folds: folds.to_vec(),
-            blocks: Vec::new(),
+            blocks: Arc::default(),
             breaks,
             inlays: fingerprints,
             inlay_generation: inlays.generation,
@@ -295,15 +352,27 @@ impl WrapMap {
     }
 
     /// Sets the block rows (see `blocks`); rows are counted again from the
-    /// first line whose blocks changed.
-    pub fn set_blocks(&mut self, blocks: &[(usize, usize)], rope: &Rope) {
-        if self.blocks == blocks {
+    /// first line whose blocks changed. The same list again (asked every
+    /// frame) costs nothing.
+    pub fn set_blocks(&mut self, blocks: &Arc<Vec<(usize, usize)>>, rope: &Rope) {
+        if Arc::ptr_eq(&self.blocks, blocks) {
             return;
         }
-        let first = self.blocks.iter().zip(blocks).position(|(a, b)| a != b).unwrap_or(self.blocks.len().min(blocks.len()));
+        if self.blocks == *blocks {
+            self.blocks = blocks.clone();
+            return;
+        }
+        let first = self.blocks.iter().zip(blocks.iter()).position(|(a, b)| a != b).unwrap_or(self.blocks.len().min(blocks.len()));
         let from = [self.blocks.get(first), blocks.get(first)].into_iter().flatten().map(|(line, _)| *line).min().unwrap_or(0);
-        self.blocks = blocks.to_vec();
+        self.blocks = blocks.clone();
         self.count_rows(rope, from);
+    }
+
+    /// Changes whenever display rows may have (an edit, folds, blocks): what's
+    /// computed from them (the scrollbar's markers) is kept until it does.
+    /// Unique across maps.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The first display row of the blocks above `line` (where its text
@@ -342,6 +411,7 @@ impl WrapMap {
 
     /// Display rows from buffer line `from` on (the ones before it stand).
     fn count_rows(&mut self, rope: &Rope, from: usize) {
+        self.generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
         let lines = self.breaks.len();
         let last_line = lines.saturating_sub(1);
         // Rows hidden by folds take no display rows: (first, last) per fold.
@@ -608,7 +678,8 @@ mod tests {
         assert!(doc.has_long_lines());
         let map = WrapMap::new(key.clone(), doc.version(), &[], Inlays::NONE, doc.rope(), &text_system, gpui::font("Test"), gpui::px(7.));
         assert!(map.breaks(0).is_empty());
-        assert_eq!(map.breaks(1), [Break { ix: 512, byte: 512, indent: 0 }, Break { ix: 1024, byte: 1024, indent: 0 }]);
+        let at = |n: u32| Break { ix: n, byte: n, indent: 0, from: Resume { byte: n, ix: n, col: n } };
+        assert_eq!(map.breaks(1), [at(512), at(1024)]);
         assert_eq!(map.row_count(), 1 + 3 + 1);
         // Shortened below the limit, it's an ordinary line again.
         let start = doc.line_start(1);
@@ -616,9 +687,62 @@ mod tests {
         assert!(!doc.has_long_lines());
     }
 
+    /// A long line's rows built on their own (`DisplayLine::window` from a
+    /// break's `from`) are the whole line's rows: the same text, hints and
+    /// symbols, and columns map the same ways. Tabs, control characters,
+    /// wide characters and hints make the display text differ from the
+    /// buffer's, and breaks fall inside them.
+    #[gpui::test]
+    fn rows_built_alone_are_the_lines_rows(cx: &mut gpui::TestAppContext) {
+        let text_system = cx.update(|cx| cx.text_system().clone());
+        let line = "a\tbé\u{85}c\u{2028}世d \t".repeat(150);
+        assert!(line.len() > LONG_LINE);
+        let rope = Rope::from_str(&line);
+        let hints: Vec<InlayHint> = line
+            .char_indices()
+            .map(|(i, _)| i)
+            .step_by(37)
+            .map(|offset| InlayHint { offset, label: ": T".into(), pad_left: offset % 2 == 0, pad_right: true })
+            .collect();
+        let all: Vec<(usize, &str, bool, bool)> = hints.iter().map(|h| (h.offset, h.label.as_str(), h.pad_left, h.pad_right)).collect();
+        let whole = DisplayLine::with_inlays(&line, 4, &all);
+        for wrap in [false, true] {
+            let key = WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 4, wrap };
+            let map = WrapMap::new(key, 0, &[], Inlays { hints: &hints, generation: 1 }, &rope, &text_system, gpui::font("Test"), gpui::px(7.));
+            let breaks = map.breaks(0);
+            assert!(breaks.len() > 2, "breaks into rows");
+            for first in 0..=breaks.len() {
+                for last in first..=(first + 2).min(breaks.len()) {
+                    let from = if first == 0 { Resume::default() } else { breaks[first - 1].from };
+                    let to = breaks.get(last).map_or(line.len(), |b| b.byte as usize);
+                    let shown = from.byte as usize..=to;
+                    let inlays: Vec<_> = all.iter().filter(|h| shown.contains(&h.0)).copied().collect();
+                    let part = DisplayLine::window(&line[from.byte as usize..to], from, 4, &inlays);
+                    assert_eq!(part.columns(), from.byte as usize..to);
+                    for seg in first..=last {
+                        let (range, _) = segment(breaks, seg, whole.end());
+                        assert_eq!(segment(breaks, seg, part.end()).0, range, "rows {first}..={last}, row {seg}");
+                        assert_eq!(part.slice(range.clone()), whole.slice(range.clone()), "row {seg}");
+                        for ix in range.clone() {
+                            assert_eq!(part.to_buffer(ix), whole.to_buffer(ix), "display {ix}");
+                        }
+                        let inside = |r: &Range<usize>| range.start <= r.start && r.end <= range.end;
+                        let spans = |dl: &DisplayLine| dl.inlays.iter().map(|s| (s.whole.clone(), s.label.clone(), s.column)).filter(|s| inside(&s.0)).collect::<Vec<_>>();
+                        assert_eq!(spans(&part), spans(&whole));
+                        let symbols = |dl: &DisplayLine| dl.controls.iter().filter(|r| inside(r)).cloned().collect::<Vec<_>>();
+                        assert_eq!(symbols(&part), symbols(&whole));
+                    }
+                    for col in part.columns().filter(|&c| line.is_char_boundary(c)) {
+                        assert_eq!(part.to_display(col), whole.to_display(col), "column {col}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn segments_cover_the_line() {
-        let breaks = [Break { ix: 10, byte: 10, indent: 4 }, Break { ix: 20, byte: 20, indent: 4 }];
+        let breaks = [Break { ix: 10, byte: 10, indent: 4, ..Break::default() }, Break { ix: 20, byte: 20, indent: 4, ..Break::default() }];
         assert_eq!(segment(&breaks, 0, 25), (0..10, 0));
         assert_eq!(segment(&breaks, 1, 25), (10..20, 4));
         assert_eq!(segment(&breaks, 2, 25), (20..25, 4));
@@ -640,11 +764,12 @@ mod tests {
     #[test]
     fn maps_display_rows_to_lines() {
         let map = WrapMap {
-            blocks: Vec::new(),
+            blocks: Arc::default(),
             key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: true },
             version: 0,
+            generation: 0,
             folds: Vec::new(),
-            breaks: vec![vec![], vec![Break { ix: 5, byte: 5, indent: 0 }, Break { ix: 9, byte: 9, indent: 0 }], vec![]],
+            breaks: vec![vec![], vec![Break { ix: 5, byte: 5, ..Break::default() }, Break { ix: 9, byte: 9, ..Break::default() }], vec![]],
             inlays: vec![0; 3],
             inlay_generation: 0,
             row_starts: vec![0, 1, 4, 5],
@@ -664,7 +789,7 @@ mod tests {
         let key = WrapKey { width: gpui::px(400.), font_family: "Menlo".into(), font_size: gpui::px(13.), tab_size: 4, wrap: false };
         let mut map = cx.update(|cx| WrapMap::new(key, 0, &[], Inlays::NONE, &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
         // Two rows above line 1 ("b"), one after the last line.
-        map.set_blocks(&[(1, 2), (4, 1)], &rope);
+        map.set_blocks(&Arc::new(vec![(1, 2), (4, 1)]), &rope);
         assert_eq!(map.row_count(), 4 + 3);
         assert_eq!(map.first_display_row(1), 3);
         assert_eq!((map.block_at(1), map.block_at(2), map.block_at(3)), (Some((1, 0)), Some((1, 1)), None));
@@ -672,7 +797,7 @@ mod tests {
         // A block row maps to the line above it, for clicks and carets.
         assert_eq!(map.line_of(2), (0, 0));
         assert_eq!(map.line_of(3), (1, 0));
-        map.set_blocks(&[], &rope);
+        map.set_blocks(&Arc::default(), &rope);
         assert_eq!((map.row_count(), map.first_display_row(1)), (4, 1));
     }
 
@@ -687,7 +812,7 @@ mod tests {
         let fold = rope.line_to_byte(5)..rope.line_to_byte(7) - 1;
         let mut map = cx.update(|cx| WrapMap::new(key, 0, std::slice::from_ref(&fold), Inlays::NONE, &rope, cx.text_system(), gpui::font("Menlo"), gpui::px(8.)));
         let blocks = [(0, 1), (2, 2), (2, 1), (5, 3), (9, 1), (13, 2)];
-        map.set_blocks(&blocks, &rope);
+        map.set_blocks(&Arc::new(blocks.to_vec()), &rope);
         // Every display row by hand: (line, Some(block row)) or (line, None)
         // for its text; one past the last line holds the blocks after it.
         let lines = rope.len_lines();
@@ -713,9 +838,10 @@ mod tests {
     fn folded_lines_take_no_rows() {
         // Lines 1 and 2 are hidden: row_starts repeats.
         let map = WrapMap {
-            blocks: Vec::new(),
+            blocks: Arc::default(),
             key: WrapKey { width: gpui::px(100.), font_family: "".into(), font_size: gpui::px(14.), tab_size: 4, wrap: false },
             version: 0,
+            generation: 0,
             folds: Vec::new(),
             breaks: vec![vec![], vec![], vec![], vec![]],
             inlays: vec![0; 4],

@@ -876,7 +876,12 @@ impl Editor {
                         let title = command.get("title")?.as_str()?.trim().to_string();
                         let start = protocol::Position::from_json(lens.pointer("/range/start")?)?;
                         let offset = protocol::position_to_offset(doc.rope(), start, server.encoding);
-                        (!title.is_empty()).then(|| CodeLens { line_start: doc.line_start(doc.row_of(offset)), title, command, server: server.id.clone() })
+                        (!title.is_empty()).then(|| CodeLens {
+                            line_start: doc.line_start(doc.row_of(offset)),
+                            title: title.into(),
+                            command: Arc::new(command),
+                            server: server.id.as_str().into(),
+                        })
                     })
                     .collect();
                 e.doc.as_mut(cx).set_code_lenses(lenses);
@@ -892,7 +897,7 @@ impl Editor {
     pub(super) fn run_code_lens(&mut self, lens: CodeLens, cx: &mut Context<Self>) {
         let name = lens.command["command"].as_str().unwrap_or_default().to_string();
         let args = lens.command.get("arguments").cloned().unwrap_or(Value::Null);
-        let server = self.lsp_servers(cx).into_iter().find(|s| s.id == lens.server);
+        let server = self.lsp_servers(cx).into_iter().find(|s| *s.id == *lens.server);
         let row = self.doc.read(cx).row_of(lens.line_start);
         let navigate = |locations: Vec<protocol::Location>, server: Option<Arc<Server>>, cx: &mut Context<Self>| match server {
             Some(server) if !locations.is_empty() => {
@@ -921,7 +926,7 @@ impl Editor {
                 }
             }
             _ => match server.filter(|s| s.executes(&name)) {
-                Some(server) => cx.emit(EditorLspEvent::Command { server, command: lens.command.clone() }),
+                Some(server) => cx.emit(EditorLspEvent::Command { server, command: (*lens.command).clone() }),
                 None => cx.emit(EditorLspEvent::Message(format!("Kuana can't run “{}”", lens.title).into())),
             },
         }
@@ -1427,8 +1432,8 @@ mod tests {
             editor.read_with(cx, |e, cx| !e.doc.read(cx).code_lenses().is_empty())
         });
         let lens = editor.read_with(cx, |e, cx| e.doc.read(cx).code_lenses()[0].clone());
-        assert_eq!((lens.title.as_str(), lens.line_start), ("lens lens", 0));
-        editor.read_with(cx, |e, cx| assert_eq!(e.block_rows(cx), [(0, 1)]));
+        assert_eq!((&*lens.title, lens.line_start), ("lens lens", 0));
+        editor.update(cx, |e, cx| assert_eq!(*e.block_rows(cx), [(0, 1)]));
 
         // Clicked: a references lens opens the usages list.
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

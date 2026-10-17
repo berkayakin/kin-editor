@@ -1,6 +1,6 @@
 //! In-file Find / Replace bar shown above the active editor (Ctrl+F / Ctrl+R).
 
-use std::{ops::Range, time::Duration};
+use std::time::Duration;
 
 use gpui::{
     Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Hsla, IntoElement, Render, Subscription,
@@ -12,7 +12,7 @@ use crate::{
     editor::{
         Cancel, Editor, EditorEvent, Indent, MoveDown, MoveUp, Newline, NewlineBelow, Outdent,
     },
-    search::{SearchOptions, SearchQuery},
+    search::{SearchMatches, SearchOptions, SearchQuery},
     theme::Theme,
     ui::{icon_button, input_box, text_button, toggle, tooltip_view},
 };
@@ -28,7 +28,8 @@ pub struct FindBar {
     options: SearchOptions,
     target: Option<Entity<Editor>>,
     target_subscription: Option<Subscription>,
-    matches: Vec<Range<usize>>,
+    /// Shared with the editor, never copied: there can be hundreds of thousands.
+    matches: SearchMatches,
     /// What `matches` were found for: editor, document version, query, options.
     searched: Option<(EntityId, u64, String, SearchOptions)>,
     /// A search running in the background.
@@ -52,7 +53,7 @@ impl FindBar {
             options: SearchOptions::default(),
             target: None,
             target_subscription: None,
-            matches: Vec::new(),
+            matches: SearchMatches::default(),
             searched: None,
             search_task: None,
             active: None,
@@ -89,7 +90,7 @@ impl FindBar {
             return;
         }
         if let Some(old) = self.target.take() {
-            old.update(cx, |e, cx| e.set_search_highlights(Vec::new(), None, cx));
+            old.update(cx, |e, cx| e.set_search_highlights(SearchMatches::default(), None, cx));
         }
         self.target_subscription = target
             .as_ref()
@@ -100,7 +101,7 @@ impl FindBar {
 
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
         if let Some(target) = self.target.as_ref() {
-            target.update(cx, |e, cx| e.set_search_highlights(Vec::new(), None, cx));
+            target.update(cx, |e, cx| e.set_search_highlights(SearchMatches::default(), None, cx));
         }
         self.target = None;
         self.target_subscription = None;
@@ -128,7 +129,7 @@ impl FindBar {
             result => {
                 self.error = result.err();
                 self.search_task = None;
-                self.matches.clear();
+                self.matches = SearchMatches::default();
                 self.searched = Some(key);
                 self.show_matches(jump, cx);
                 return;
@@ -140,7 +141,10 @@ impl FindBar {
         let delay = Duration::from_millis(if jump { 30 } else { 100 });
         self.search_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let matches = cx.background_executor().spawn(async move { query.find_all(&rope.to_string()) }).await;
+            let matches = cx
+                .background_executor()
+                .spawn(async move { SearchMatches::new(query.find_all(&rope.to_string()), &rope) })
+                .await;
             this.update(cx, |this, cx| {
                 let current = this.target.as_ref().map(|t| (t.entity_id(), t.read(cx).doc.read(cx).version()));
                 if current != Some((key.0, key.1)) {
@@ -169,8 +173,11 @@ impl FindBar {
         }
         self.search_task = None;
         self.matches = match SearchQuery::new(&key.2, self.options) {
-            Ok(Some(query)) => query.find_all(&target.read(cx).doc.read(cx).rope().to_string()),
-            _ => Vec::new(),
+            Ok(Some(query)) => {
+                let rope = target.read(cx).doc.read(cx).rope();
+                SearchMatches::new(query.find_all(&rope.to_string()), rope)
+            }
+            _ => SearchMatches::default(),
         };
         self.searched = Some(key);
         self.show_matches(false, cx);
@@ -184,13 +191,14 @@ impl FindBar {
         self.active = if self.matches.is_empty() {
             None
         } else {
-            Some(self.matches.partition_point(|m| m.end <= cursor) % self.matches.len())
+            Some(self.matches.ranges.partition_point(|m| m.end <= cursor) % self.matches.len())
         };
         let (matches, active) = (self.matches.clone(), self.active);
         target.update(cx, |e, cx| {
-            e.set_search_highlights(matches.clone(), active, cx);
-            if jump && let Some(a) = active {
-                e.select_range(matches[a].clone(), cx);
+            let selected = active.map(|a| matches.ranges[a].clone());
+            e.set_search_highlights(matches, active, cx);
+            if let Some(range) = selected.filter(|_| jump) {
+                e.select_range(range, cx);
             }
         });
         cx.notify();
@@ -212,13 +220,15 @@ impl FindBar {
         }
         let sel = target.read(cx).primary_selection().range();
         let n = self.matches.len();
+        // Sorted by start: the next or previous one by binary search.
+        let ranges = &self.matches.ranges;
         let ix = if forward {
-            self.matches.iter().position(|m| m.start > sel.start).unwrap_or(0)
+            Some(ranges.partition_point(|m| m.start <= sel.start)).filter(|&ix| ix < n).unwrap_or(0)
         } else {
-            self.matches.iter().rposition(|m| m.start < sel.start).unwrap_or(n - 1)
+            ranges.partition_point(|m| m.start < sel.start).checked_sub(1).unwrap_or(n - 1)
         };
         self.active = Some(ix);
-        let (matches, range) = (self.matches.clone(), self.matches[ix].clone());
+        let (matches, range) = (self.matches.clone(), self.matches.ranges[ix].clone());
         target.update(cx, |e, cx| {
             e.set_search_highlights(matches, Some(ix), cx);
             e.select_range(range, cx);
@@ -231,7 +241,7 @@ impl FindBar {
         let (Some(target), Some(ix), Ok(Some(query))) = (self.target.clone(), self.active, self.query(cx)) else {
             return;
         };
-        let range = self.matches[ix].clone();
+        let range = self.matches.ranges[ix].clone();
         if target.read(cx).primary_selection().range() != range {
             self.select_next(cx);
             return;
@@ -256,6 +266,7 @@ impl FindBar {
         let replacement = self.replacement.read(cx).text(cx);
         let edits: Vec<_> = self
             .matches
+            .ranges
             .iter()
             .map(|m| (m.clone(), query.replacement_for(&text, m.clone(), &replacement)))
             .collect();
