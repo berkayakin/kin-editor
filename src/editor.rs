@@ -131,6 +131,8 @@ actions!(
         AcceptBoth,
         NextChange,
         PreviousChange,
+        NextProblem,
+        PreviousProblem,
         ToggleInlineBlame,
         ToggleSoftWrap,
         ToggleInlayHints,
@@ -3831,6 +3833,17 @@ fn word_right(doc: &Document, mut o: usize) -> usize {
     o
 }
 
+/// Where Next (`forward`) or Previous Problem goes from `head`: the nearest
+/// problem start after (before) it, else around the file, the first (last).
+/// `starts` is sorted.
+fn problem_from(starts: &[usize], head: usize, forward: bool) -> Option<usize> {
+    if forward {
+        starts.iter().copied().find(|&s| s > head).or(starts.first().copied())
+    } else {
+        starts.iter().rev().copied().find(|&s| s < head).or(starts.last().copied())
+    }
+}
+
 fn word_range(doc: &Document, offset: usize) -> Range<usize> {
     let kind = match (doc.char_at(offset), doc.char_before(offset)) {
         (Some(c), _) if char_kind(c) == CharKind::Word => CharKind::Word,
@@ -4080,6 +4093,26 @@ impl Editor {
 
     fn previous_change(&mut self, _: &PreviousChange, _: &mut Window, cx: &mut Context<Self>) {
         self.jump_to_change(false, cx);
+    }
+
+    /// Next / Previous Problem: the caret goes to where the next (previous)
+    /// problem in the file starts, built-in lint's and language servers'
+    /// alike, around the end; its message shows on that line.
+    fn jump_to_problem(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let doc = self.doc.read(cx);
+        let starts: Vec<usize> = doc.diagnostics.iter().filter(|d| d.severity.is_problem()).map(|d| d.range.start).collect();
+        match problem_from(&starts, self.primary_selection().head, forward) {
+            Some(at) => self.select_range(at..at, cx),
+            None => cx.emit(EditorLspEvent::Message("No problems in this file".into())),
+        }
+    }
+
+    fn next_problem(&mut self, _: &NextProblem, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_problem(true, cx);
+    }
+
+    fn previous_problem(&mut self, _: &PreviousProblem, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_problem(false, cx);
     }
 
     fn toggle_inline_blame(&mut self, _: &ToggleInlineBlame, _: &mut Window, cx: &mut Context<Self>) {
@@ -4644,6 +4677,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::accept_both))
             .on_action(cx.listener(Self::next_change))
             .on_action(cx.listener(Self::previous_change))
+            .on_action(cx.listener(Self::next_problem))
+            .on_action(cx.listener(Self::previous_problem))
             .on_action(cx.listener(Self::toggle_inline_blame))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::show_completions))
@@ -4958,6 +4993,35 @@ mod block_tests {
             e.set_selections(vec![Selection::cursor(0), Selection::cursor(12)], 0, cx);
             assert!(e.caret_problem_rows(cx).is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn next_problem_steps_through_the_files_problems(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::new(Document::from_text("let a = 1;\nlet b = 2;\nlet c = 3;\n".into(), None), cx));
+        let at = |start: usize, severity: lint::Severity| lint::Diagnostic { range: start..start + 1, severity, message: "m".into(), rule: "r".into() };
+        editor.update(cx, |e, cx| {
+            // A language server's problem, a built-in one, and a hint, which isn't one.
+            e.doc.as_mut(cx).set_lsp_diagnostics(vec![at(15, lint::Severity::Warning), at(26, lint::Severity::Hint)]);
+            e.doc.as_mut(cx).set_builtin_diagnostics(vec![at(4, lint::Severity::Error)]);
+            let mut steps = Vec::new();
+            for forward in [true, true, true, false, false] {
+                e.jump_to_problem(forward, cx);
+                steps.push(e.primary_selection().head);
+            }
+            // In document order, around the end both ways.
+            assert_eq!(steps, [4, 15, 4, 15, 4]);
+        });
+    }
+
+    #[test]
+    fn problems_are_found_around_the_file() {
+        let starts = [5, 5, 20, 40];
+        assert_eq!(problem_from(&starts, 0, true), Some(5));
+        assert_eq!(problem_from(&starts, 5, true), Some(20));
+        assert_eq!(problem_from(&starts, 40, true), Some(5));
+        assert_eq!(problem_from(&starts, 30, false), Some(20));
+        assert_eq!(problem_from(&starts, 5, false), Some(40));
+        assert_eq!(problem_from(&[], 3, true), None);
     }
 }
 

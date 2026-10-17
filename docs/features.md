@@ -33,7 +33,7 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Vim mode (`vim_mode`): Normal, Insert, Visual and Visual Line; see [Vim mode](editing.md#vim-mode)
 - Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
   (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
-- Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
+- Inline diagnostics, gutter markers, scrollbar markers, a Problems panel and Next / Previous Problem
 - Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
 - Matching-bracket highlight (ignores brackets in strings and comments) and an editor right-click menu

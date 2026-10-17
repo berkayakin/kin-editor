@@ -53,6 +53,7 @@ The table below is the JetBrains keymap.
 | Push / Update Project (pull) | ⌘⇧K / ⌘T | Ctrl+Shift+K / Ctrl+T |
 | Rollback lines (change under caret) | ⌥⌘Z | Ctrl+Alt+Z |
 | Next / previous change | ⌃⌥⇧↓ / ⌃⌥⇧↑ | Ctrl+Alt+Shift+↓ / ↑ |
+| Next / previous problem (VS Code, Zed: F8 / ⇧F8; Sublime Text: F4 / ⇧F4) | F2 / ⇧F2 | F2 / Shift+F2 |
 | Git log | ⌘9 | Alt+9 |
 | Next / previous change (in a diff) | F7 / ⇧F7 | F7 / Shift+F7 |
 | Settings | ⌘, | Ctrl+Alt+S |
