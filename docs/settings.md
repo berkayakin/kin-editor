@@ -43,7 +43,8 @@ and theme colors.
 | `code_lens` | `true` | the language server's code lenses above lines ("3 references", "▶ Run \| Debug") |
 | `minimap` | `false` | the document in miniature at the editor's right edge, in place of the scrollbar: code as colored blocks, the visible part as a slider, problems, search matches and Git changes along its edge |
 | `minimap_width` | `100` | the minimap's width in pixels (40–240) |
-| `languages` | | per-language overrides of the eleven above (all but `minimap_width`), by the name in the status bar |
+| `syntax_errors` | `true` (`false` for extension languages) | parse errors in Problems when no language server covers the file. Extensions' grammars may not know all valid code (tree-sitter-sql rejects Postgres' `ON CONFLICT (…)`), so turn it on per language for the ones you trust, e.g. `"languages": {"Gleam": {"syntax_errors": true}}` |
+| `languages` | | per-language overrides of the twelve above (all but `minimap_width`), by the name in the status bar |
 | `vim_mode` | `false` | Vim's modes and keys; see [Vim mode](editing.md#vim-mode) |
 | `icon_theme` | built-in | an extension's icon theme by name, e.g. `"Soft Charmed Icons"` |
 | `visual_effects` | `"full"` | how much decoration the interface draws: `"full"`, `"reduced"` (solid colors instead of gradients) or `"minimal"` (also no shadows, glows or animations); Settings → Appearance. The older `"reduce_visual_effects": true` still works, as `"minimal"` |

@@ -420,16 +420,18 @@ enum LanguageOption {
     TrimWhitespace,
     FinalNewline,
     FormatOnSave,
+    SyntaxErrors,
 }
 
 impl LanguageOption {
-    const ALL: [LanguageOption; 6] = [
+    const ALL: [LanguageOption; 7] = [
         LanguageOption::TabSize,
         LanguageOption::HardTabs,
         LanguageOption::SoftWrap,
         LanguageOption::TrimWhitespace,
         LanguageOption::FinalNewline,
         LanguageOption::FormatOnSave,
+        LanguageOption::SyntaxErrors,
     ];
 
     fn key(self) -> &'static str {
@@ -440,6 +442,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => "trim_trailing_whitespace",
             LanguageOption::FinalNewline => "insert_final_newline",
             LanguageOption::FormatOnSave => "format_on_save",
+            LanguageOption::SyntaxErrors => "syntax_errors",
         }
     }
 
@@ -451,6 +454,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => "Trim trailing whitespace",
             LanguageOption::FinalNewline => "Insert final newline",
             LanguageOption::FormatOnSave => "Reformat on save",
+            LanguageOption::SyntaxErrors => "Show syntax errors",
         }
     }
 
@@ -462,6 +466,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => s.trim_trailing_whitespace.is_some(),
             LanguageOption::FinalNewline => s.insert_final_newline.is_some(),
             LanguageOption::FormatOnSave => s.format_on_save.is_some(),
+            LanguageOption::SyntaxErrors => s.syntax_errors.is_some(),
         }
     }
 
@@ -473,6 +478,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => s.trim_trailing_whitespace = None,
             LanguageOption::FinalNewline => s.insert_final_newline = None,
             LanguageOption::FormatOnSave => s.format_on_save = None,
+            LanguageOption::SyntaxErrors => s.syntax_errors = None,
         }
     }
 
@@ -484,6 +490,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => f.trim_trailing_whitespace,
             LanguageOption::FinalNewline => f.insert_final_newline,
             LanguageOption::FormatOnSave => f.format_on_save,
+            LanguageOption::SyntaxErrors => f.syntax_errors,
         }
     }
 }
@@ -2240,8 +2247,18 @@ impl Preferences {
                         .into_any_element()
                 }
             };
-            let note: SharedString =
-                if set { format!("Set for {}", language.name()).into() } else { "Same as the general setting".into() };
+            // An extension's grammar may reject valid code, so its parse
+            // errors stay off unless asked for.
+            let extension_default = option == LanguageOption::SyntaxErrors
+                && language.extension().is_some()
+                && settings.editor.syntax_errors.is_none();
+            let note: SharedString = if set {
+                format!("Set for {}", language.name()).into()
+            } else if extension_default {
+                "Off for extension languages, whose grammars may reject valid code".into()
+            } else {
+                "Same as the general setting".into()
+            };
             editor_rows.push(setting_row(option.label(), Some(note), control, reset, &theme).into_any_element());
         }
 

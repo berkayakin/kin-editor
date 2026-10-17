@@ -306,6 +306,10 @@ pub struct EditorSettings {
     /// The document in miniature at the editor's right edge, in place of the
     /// scrollbar (off by default).
     pub minimap: Option<bool>,
+    /// Parse errors from the built-in linter in Problems. On for built-in
+    /// languages; off for extensions', whose grammars may not know all valid
+    /// code (tree-sitter-sql and Postgres' `ON CONFLICT`), as in Zed.
+    pub syntax_errors: Option<bool>,
 }
 
 impl EditorSettings {
@@ -323,6 +327,7 @@ impl EditorSettings {
             inlay_hints: self.inlay_hints.or(base.inlay_hints),
             code_lens: self.code_lens.or(base.code_lens),
             minimap: self.minimap.or(base.minimap),
+            syntax_errors: self.syntax_errors.or(base.syntax_errors),
         }
     }
 
@@ -342,6 +347,7 @@ impl EditorSettings {
             // Prose reads better wrapped; code keeps its lines (JetBrains does the same).
             s.soft_wrap = Some(true);
         }
+        s.syntax_errors = Some(language.extension().is_none());
         s
     }
 }
@@ -388,6 +394,7 @@ const EDITOR_KEYS: &[&str] = &[
     "inlay_hints",
     "code_lens",
     "minimap",
+    "syntax_errors",
 ];
 
 /// Editor options resolved for one file.
@@ -406,6 +413,7 @@ pub struct FileSettings {
     pub inlay_hints: bool,
     pub code_lens: bool,
     pub minimap: bool,
+    pub syntax_errors: bool,
 }
 
 impl Settings {
@@ -573,6 +581,7 @@ impl Settings {
             "inlay_hints" => self.editor.inlay_hints.is_some(),
             "code_lens" => self.editor.code_lens.is_some(),
             "minimap" => self.editor.minimap.is_some(),
+            "syntax_errors" => self.editor.syntax_errors.is_some(),
             "minimap_width" => self.minimap_width.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
@@ -639,6 +648,7 @@ impl Settings {
             inlay_hints: None,
             code_lens: None,
             minimap: None,
+            syntax_errors: None,
         };
         let s = from_config
             .or(language_overrides)
@@ -658,6 +668,7 @@ impl Settings {
             inlay_hints: s.inlay_hints.unwrap_or(true),
             code_lens: s.code_lens.unwrap_or(true),
             minimap: s.minimap.unwrap_or(false),
+            syntax_errors: s.syntax_errors.unwrap_or(true),
         }
     }
 }
@@ -856,6 +867,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you
   // scrollbar, and its width in pixels.
   // "minimap": false,
   // "minimap_width": 100,
+  // Parse errors in Problems when no language server covers the file. On
+  // for built-in languages, off for extensions' (their grammars may reject
+  // valid code); set it per language under "languages".
+  // "syntax_errors": true,
   // Vim keys (Normal, Insert and Visual modes).
   // "vim_mode": false,
 
@@ -1246,6 +1261,16 @@ mod tests {
         assert_eq!(Settings::parse(r#"{"theme": "a // b /* c"}"#).unwrap().theme.as_deref(), Some("a // b /* c"));
         assert!(Settings::parse("{ \"tab_size\": ").is_err());
         assert!(Settings::parse(SETTINGS_TEMPLATE).unwrap() == Settings::default());
+    }
+
+    #[test]
+    fn syntax_errors_are_on_for_built_in_languages_unless_turned_off() {
+        let on = |json: &str, language| Settings::parse(json).unwrap().for_file(language, None).syntax_errors;
+        assert!(on("{}", Language::Rust));
+        assert!(!on(r#"{"syntax_errors": false}"#, Language::Rust));
+        assert!(!on(r#"{"languages": {"Go": {"syntax_errors": false}}}"#, Language::Go));
+        assert!(on(r#"{"languages": {"Go": {"syntax_errors": false}}}"#, Language::Rust));
+        assert!(Settings::unknown_keys(r#"{"languages": {"SQL": {"syntax_errors": true}}}"#).is_empty());
     }
 
     #[test]

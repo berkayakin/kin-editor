@@ -847,8 +847,13 @@ impl Editor {
         if self.applied_settings.as_ref() == Some(&fs) {
             return;
         }
+        let relint = self.file_settings.syntax_errors != fs.syntax_errors;
         self.applied_settings = Some(fs.clone());
         self.file_settings = fs.clone();
+        if relint {
+            self.linted_version = None;
+            self.schedule_lint(Duration::ZERO, cx);
+        }
         self.tab_size = fs.tab_size;
         let configured = if fs.hard_tabs { "\t".to_string() } else { " ".repeat(fs.tab_size) };
         // A file's own indentation wins over settings, but not over .editorconfig.
@@ -1169,7 +1174,9 @@ impl Editor {
                     // A language server reports syntax errors itself. Asked
                     // of the document's servers, not this editor: a split
                     // showing the file never gets the diagnostics itself.
-                    if editor.lsp.active || !editor.lsp_servers(cx).is_empty() {
+                    // `syntax_errors: false` (extension languages' default)
+                    // drops them too.
+                    if editor.lsp.active || !editor.lsp_servers(cx).is_empty() || !editor.file_settings.syntax_errors {
                         diagnostics.retain(|d| d.rule != "syntax");
                     }
                     editor.doc.as_mut(cx).set_builtin_diagnostics(diagnostics);

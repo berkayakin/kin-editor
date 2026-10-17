@@ -20,7 +20,7 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   - **ESLint** — if the file's project has `node_modules/.bin/eslint`, it runs on open/save with the
     project's own config (JavaScript and TypeScript); built-in rules then drop back to syntax errors only
   - **CSS, Rust, Go, Python, PHP, shell, JSON, YAML, TOML** — syntax errors from the tree-sitter parser
-    (unexpected and missing tokens)
+    (unexpected and missing tokens); extension languages too when their `syntax_errors` setting is on
 - Language servers (LSP) for code intelligence: diagnostics, completion, hover documentation,
   signature help, Go to Declaration / Implementation / Type Definition (on a declaration, ⌘B and
   ⌘/Ctrl-click list its usages, as in JetBrains; holding ⌘/Ctrl over a symbol the server can

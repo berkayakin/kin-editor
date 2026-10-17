@@ -97,9 +97,11 @@ formatter = ["mylang-fmt", "-"] # Kuana only: reads stdin, writes stdout ({file}
 
 Without `highlights.scm` (or `outline.scm`), the grammar's own `queries/highlights.scm` (and
 `tags.scm`) are used. A language from an extension gets highlighting, File Structure, breadcrumbs,
-sticky scroll, syntax errors in Problems, comment toggling, its indentation, snippets, its
-language server and formatter, and a row in **Settings → Languages**. Built-in languages win for
-their file extensions, except that a language naming an exact file (`docker-compose.yml`) gets it.
+sticky scroll, comment toggling, its indentation, snippets, its language server and formatter,
+and a row in **Settings → Languages**. The grammar's parse errors show in Problems only once
+turned on there (`syntax_errors`), since a grammar may reject valid code; Zed doesn't show them
+either. Built-in languages win for their file extensions, except that a language naming an exact
+file (`docker-compose.yml`) gets it.
 
 A language named like a built-in one (`name = "Rust"`) without a grammar of its own changes the
 built-in language's queries instead: each of its `.scm` files replaces Kuana's of the same kind, and the
