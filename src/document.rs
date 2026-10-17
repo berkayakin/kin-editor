@@ -2,6 +2,7 @@
 //! throughout so they line up with tree-sitter and oxc spans.
 
 use std::{
+    borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
@@ -468,7 +469,7 @@ impl Document {
         let logged: Vec<LineEdit> = edits.iter().rev().map(|(range, text)| LineEdit::of(&before, range.clone(), text)).collect();
         self.replace_logging(range.clone(), &span, LineEdit::of(&before, range.clone(), &span), &logged);
         let patch = Patch::new(edits.iter().map(|(range, text)| (range.clone(), text.len())).collect());
-        self.shift_tracked(&patch, &before);
+        self.shift_tracked(&patch, &before, &ExactLines::new());
         self.version += 1;
         self.log_patch(patch);
         self.reparse();
@@ -668,7 +669,7 @@ impl Document {
         let patch = Patch::new(
             groups.iter().filter(|g| !(g.range.is_empty() && g.text.is_empty())).map(|g| (g.range.clone(), g.text.len())).collect(),
         );
-        self.shift_tracked(&patch, &before);
+        self.shift_tracked(&patch, &before, &ExactLines::new());
         let mut patch = Some(patch);
 
         // Compute post-edit ranges by accumulating deltas front to back.
@@ -746,22 +747,14 @@ impl Document {
         }
     }
 
+    /// Undoes the last transaction as one batch of edits (see
+    /// `make_at_once`): thousands of carets' typing is as many edits as
+    /// carets, and what follows the text moves once.
     pub fn undo(&mut self) -> Option<Vec<Selection>> {
         let t = self.undo_stack.pop()?;
-        let mut steps = Vec::new();
-        for rec in t.edits.iter().rev() {
-            let range = rec.start..rec.start + rec.new.len();
-            let before = self.rope.clone();
-            self.raw_replace(range.clone(), &rec.old);
-            let patch = Patch::new(vec![(range, rec.old.len())]);
-            self.shift_tracked(&patch, &before);
-            steps.push(patch);
-        }
-        self.version += 1;
-        // One patch for the version, however many records: other editors
-        // catch up through a log of limited length.
-        self.log_patch(Patch::compose(&steps));
-        self.reparse();
+        // Its records undone, the last first.
+        let undone: Vec<Replaced> = t.edits.iter().rev().map(|r| Replaced { start: r.start, old: &r.new, new: &r.old }).collect();
+        self.make_at_once(&undone);
         let selections = t.before.clone();
         self.redo_stack.push(t);
         Some(selections)
@@ -769,21 +762,77 @@ impl Document {
 
     pub fn redo(&mut self) -> Option<Vec<Selection>> {
         let t = self.redo_stack.pop()?;
-        let mut steps = Vec::new();
-        for rec in &t.edits {
-            let range = rec.start..rec.start + rec.old.len();
-            let before = self.rope.clone();
-            self.raw_replace(range.clone(), &rec.new);
-            let patch = Patch::new(vec![(range, rec.new.len())]);
-            self.shift_tracked(&patch, &before);
-            steps.push(patch);
-        }
-        self.version += 1;
-        self.log_patch(Patch::compose(&steps));
-        self.reparse();
+        let redone: Vec<Replaced> = t.edits.iter().map(|r| Replaced { start: r.start, old: &r.old, new: &r.new }).collect();
+        self.make_at_once(&redone);
         let selections = t.after.clone();
         self.undo_stack.push(t);
         Some(selections)
+    }
+
+    /// Makes edits (made one after another, each in the text of its time)
+    /// as one version: composed (see `compose`), the rope and trees take
+    /// touching ones as one replacement (a word typed letter by letter),
+    /// and what follows the text moves once, as through the edits one by
+    /// one. Except at line starts where edits touch or merge, there which
+    /// went first decides: those are moved edit by edit.
+    fn make_at_once(&mut self, edits: &[Replaced<'_>]) {
+        let composed = compose(edits.iter().copied());
+        let exact = self.exact_line_starts(&composed, edits);
+        // Typed and deleted again: nothing to make.
+        let composed: Vec<Composed> = composed.into_iter().filter(|e| !(e.old.is_empty() && e.new_text.is_empty())).collect();
+        let before = self.rope.clone();
+        // From the last, so the ranges before stay valid.
+        let mut end = composed.len();
+        while end > 0 {
+            let mut start = end - 1;
+            while start > 0 && composed[start - 1].old.end == composed[start].old.start {
+                start -= 1;
+            }
+            let range = composed[start].old.start..composed[end - 1].old.end;
+            match &composed[start..end] {
+                [edit] => self.raw_replace(range, &edit.new_text),
+                touching => self.raw_replace(range, &touching.iter().map(|e| &*e.new_text).collect::<String>()),
+            }
+            end = start;
+        }
+        let patch = Patch::new(composed.iter().map(|e| (e.old.clone(), e.new_text.len())).collect());
+        self.shift_tracked(&patch, &before, &exact);
+        self.version += 1;
+        // One patch for the version, however many edits: other editors
+        // catch up through a log of limited length.
+        self.log_patch(patch);
+        self.reparse();
+    }
+
+    /// The tracked line starts (breakpoints, the debug line, code lenses)
+    /// that `composed` edits reach where they touch each other or merged,
+    /// moved through `edits` one by one (see `line_starts_one_by_one`).
+    fn exact_line_starts(&self, composed: &[Composed], edits: &[Replaced]) -> ExactLines {
+        let mut starts: Vec<usize> = self.breakpoints.iter().map(|(start, _)| *start).chain(self.debug_line).chain(self.code_lenses.iter().map(|l| l.line_start)).collect();
+        if starts.is_empty() {
+            return ExactLines::new();
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        let mut wanted = Vec::new();
+        let mut first = 0;
+        while first < composed.len() {
+            let mut end = first + 1;
+            while end < composed.len() && composed[end - 1].old.end == composed[end].old.start {
+                end += 1;
+            }
+            if end - first > 1 || composed[first].merged {
+                let (from, to) = (composed[first].old.start, composed[end - 1].old.end);
+                let at = starts.partition_point(|&s| s < from);
+                wanted.extend(starts[at..].iter().take_while(|&&s| s <= to));
+            }
+            first = end;
+        }
+        if wanted.is_empty() {
+            return ExactLines::new();
+        }
+        let moved = line_starts_one_by_one(&self.rope, edits, &wanted);
+        wanted.into_iter().zip(moved).collect()
     }
 
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
@@ -921,16 +970,21 @@ impl Document {
     /// hints, code lenses, diagnostics) across a transaction's
     /// edits, once for all of them. Runs after the rope changed; `old` is
     /// the text before.
-    fn shift_tracked(&mut self, patch: &Patch, old: &Rope) {
+    fn shift_tracked(&mut self, patch: &Patch, old: &Rope, exact: &ExactLines) {
         if patch.edits.is_empty() {
             return;
         }
-        self.shift_breakpoints(patch, old);
-        self.debug_line = self.debug_line.and_then(|offset| self.shift_line(offset, patch, old));
+        #[cfg(test)]
+        {
+            let tracked = self.breakpoints.len() + self.inlay_hints.len() + self.code_lenses.len() + self.diagnostics.len();
+            WORK.with(|work| work.set(work.get() + 1 + tracked));
+        }
+        self.shift_breakpoints(patch, old, exact);
+        self.debug_line = self.debug_line.and_then(|offset| self.line_moved(offset, patch, old, exact));
         self.shift_inlay_hints(patch);
         self.code_lenses = std::mem::take(&mut self.code_lenses)
             .into_iter()
-            .filter_map(|lens| Some(CodeLens { line_start: self.shift_line(lens.line_start, patch, old)?, ..lens }))
+            .filter_map(|lens| Some(CodeLens { line_start: self.line_moved(lens.line_start, patch, old, exact)?, ..lens }))
             .collect();
         // The merged list too: shifting keeps its order, so it needn't be
         // built and sorted again.
@@ -1202,13 +1256,13 @@ impl Document {
     /// Breakpoints follow their line's text: an edit before a line moves
     /// it, one that removes the line (see `shift_line`) removes it. (Runs
     /// after the rope changed, so lines can be looked up again.)
-    fn shift_breakpoints(&mut self, patch: &Patch, old: &Rope) {
+    fn shift_breakpoints(&mut self, patch: &Patch, old: &Rope, exact: &ExactLines) {
         if self.breakpoints.is_empty() {
             return;
         }
         let mut moved = Vec::with_capacity(self.breakpoints.len());
         for (offset, breakpoint) in std::mem::take(&mut self.breakpoints) {
-            if let Some(start) = self.shift_line(offset, patch, old) {
+            if let Some(start) = self.line_moved(offset, patch, old, exact) {
                 moved.push((start, Breakpoint { row: self.row_of(start), ..breakpoint }));
             }
         }
@@ -1216,37 +1270,13 @@ impl Document {
         self.breakpoints = moved;
     }
 
-    /// Where the line starting at `offset` starts after `patch` (`old` is
-    /// the text before it); None when the edits removed the line: replaced
-    /// text around its start, joined it with the line above, or deleted it
-    /// whole, line break included.
-    fn shift_line(&self, offset: usize, patch: &Patch, old: &Rope) -> Option<usize> {
-        let (mut delta, near) = patch.around(offset..offset);
-        for (range, new_len) in near {
-            if range.start < offset && offset < range.end {
-                return None;
-            }
-            if range.start == offset && offset < range.end && *new_len == 0 && old.byte_to_line(range.end) > old.byte_to_line(offset) {
-                // Deleted from its start through its line break: the line
-                // after takes its place, with its own things.
-                return None;
-            }
-            if range.start < offset && offset == range.end {
-                // Text before it went (lines above deleted, or its line
-                // break): it's still a line if a line ends where that text did.
-                let end = moved(range.start, delta) + new_len;
-                if self.line_start(self.row_of(end)) != end {
-                    return None;
-                }
-            }
-            if offset >= range.end {
-                delta += Patch::change(range, *new_len);
-            }
+    /// Where the line starting at `offset` starts after `patch` (see
+    /// `shift_line`), unless it was worked out edit by edit (`exact`).
+    fn line_moved(&self, offset: usize, patch: &Patch, old: &Rope, exact: &ExactLines) -> Option<usize> {
+        match exact.get(&offset) {
+            Some(moved) => *moved,
+            None => shift_line(&self.rope, offset, patch, old),
         }
-        // Typing at the start of a line leaves it where it is; a new line
-        // inserted there pushes it down.
-        let row = self.row_of(moved(offset, delta).min(self.rope.len_bytes()));
-        Some(self.line_start(row))
     }
 
     /// The row a debug session is paused on, following edits.
@@ -1550,39 +1580,6 @@ impl Patch {
         new_len as isize - range.len() as isize
     }
 
-    /// Patches applied one after another as one: ranges in the text before
-    /// the first, new lengths in the text after the last. Edits that touch
-    /// merge, so a position inside the merged range maps to its end.
-    pub fn compose(steps: &[Patch]) -> Patch {
-        // (range in the text before, range in the text now), sorted, apart.
-        let mut done: Vec<(Range<usize>, Range<usize>)> = Vec::new();
-        for step in steps {
-            // From the last: the earlier ranges stay valid in the text now.
-            for (range, new_len) in step.edits.iter().rev() {
-                let first = done.partition_point(|(_, now)| now.end < range.start);
-                let last = first + done[first..].partition_point(|(_, now)| now.start <= range.end);
-                let delta_before: isize = done[..first].iter().map(|(old, now)| now.len() as isize - old.len() as isize).sum();
-                let touched = &done[first..last];
-                let (now_start, old_start) = match touched.first() {
-                    Some((old, now)) if now.start <= range.start => (now.start, old.start),
-                    _ => (range.start, (range.start as isize - delta_before) as usize),
-                };
-                let (now_end, old_end) = match touched.last() {
-                    Some((old, now)) if now.end >= range.end => (now.end, old.end),
-                    Some((old, now)) => (range.end, old.end + (range.end - now.end)),
-                    None => (range.end, (range.end as isize - delta_before) as usize),
-                };
-                let change = *new_len as isize - range.len() as isize;
-                let merged = (old_start..old_end, now_start..(now_end as isize + change) as usize);
-                for (_, now) in &mut done[last..] {
-                    *now = (now.start as isize + change) as usize..(now.end as isize + change) as usize;
-                }
-                done.splice(first..last, [merged]);
-            }
-        }
-        Patch::new(done.into_iter().map(|(old, now)| (old, now.len())).collect())
-    }
-
     /// Where `offset` is after the edits: moved by the ones before it; inside
     /// a replaced range, the end of the new text; at an insertion, before it.
     pub fn map(&self, offset: usize) -> usize {
@@ -1607,6 +1604,350 @@ impl Patch {
         let last = first + self.edits[first..].partition_point(|(range, _)| range.start <= span.end);
         (self.before[first], &self.edits[first..last])
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What composing transactions and moving tracked positions visited, for
+    /// tests that check undo's work grows with the edits, not their square.
+    static WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// An edit as a transaction's record keeps it, borrowed: in the text of
+/// its time, `start..start + old.len()` held `old` and became `new`.
+#[derive(Clone, Copy)]
+struct Replaced<'a> {
+    start: usize,
+    old: &'a str,
+    new: &'a str,
+}
+
+/// One edit of edits taken as a whole (see `compose`): `old`, a range of
+/// the text before them holding `old_text`, became `new`, a range of the
+/// text after them holding `new_text`.
+struct Composed<'a> {
+    old: Range<usize>,
+    new: Range<usize>,
+    old_text: Cow<'a, str>,
+    new_text: Cow<'a, str>,
+    /// Made of edits that overlapped.
+    merged: bool,
+}
+
+impl Composed<'_> {
+    fn change(&self) -> isize {
+        self.new.len() as isize - self.old.len() as isize
+    }
+}
+
+/// Edits made one after another (each in the text of its time: a
+/// transaction's records, or them undone from the last) as one set of
+/// edits, sorted and apart, to make in one go. Edits merge only where they
+/// overlap (typed, then deleted again); letters typed one after another stay
+/// apart, so what follows the text moves as through them one by one.
+/// Edits that can't touch each other (one `edit`'s, at carets apart) are
+/// one step; steps are composed in pairs, then pairs of pairs, each a merge
+/// walk: the work grows with the edits times the log of the steps, never
+/// with their square.
+fn compose<'a>(edits: impl IntoIterator<Item = Replaced<'a>>) -> Vec<Composed<'a>> {
+    let mut steps = Vec::new();
+    let mut run: Vec<Replaced<'a>> = Vec::new();
+    for edit in edits {
+        // In the same text as the run's: before the last one (an `edit`'s
+        // records, made from the last), or after the text it put there
+        // (them undone, from the first).
+        let ascending = run.len() > 1 && run[1].start > run[0].start;
+        let fits = run.last().is_none_or(|last| {
+            let before = edit.start + edit.old.len() < last.start;
+            let after = edit.start > last.start + last.new.len();
+            match run.len() {
+                1 => before || after,
+                _ if ascending => after,
+                _ => before,
+            }
+        });
+        if !fits {
+            steps.push(step_of(std::mem::take(&mut run)));
+        }
+        run.push(edit);
+    }
+    if !run.is_empty() {
+        steps.push(step_of(run));
+    }
+    while steps.len() > 1 {
+        let mut paired = Vec::with_capacity(steps.len().div_ceil(2));
+        let mut steps_left = steps.into_iter();
+        while let Some(first) = steps_left.next() {
+            paired.push(match steps_left.next() {
+                Some(second) => compose_two(first, second),
+                None => first,
+            });
+        }
+        steps = paired;
+    }
+    steps.pop().unwrap_or_default()
+}
+
+/// Edits that can't touch each other, made from the last (each ending
+/// before the one before it starts, so all in the text before them) or
+/// from the first (each starting after the text the one before put
+/// there), as composed edits.
+fn step_of(mut run: Vec<Replaced<'_>>) -> Vec<Composed<'_>> {
+    let ascending = run.len() > 1 && run[1].start > run[0].start;
+    if !ascending {
+        run.reverse();
+    }
+    // The length change of the edits before.
+    let mut delta = 0;
+    run.into_iter()
+        .map(|edit| {
+            #[cfg(test)]
+            WORK.with(|work| work.set(work.get() + 1));
+            let (old, new) = if ascending { (moved(edit.start, -delta), edit.start) } else { (edit.start, moved(edit.start, delta)) };
+            delta += edit.new.len() as isize - edit.old.len() as isize;
+            Composed {
+                old: old..old + edit.old.len(),
+                new: new..new + edit.new.len(),
+                old_text: Cow::Borrowed(edit.old),
+                new_text: Cow::Borrowed(edit.new),
+                merged: false,
+            }
+        })
+        .collect()
+}
+
+/// `first`, then `second` (whose old ranges are in the text `first` made),
+/// as one: a merge walk along the text in between, where each edit is
+/// either apart from the other side's (and only moves by the length changes
+/// before it) or merges with the ones it can't be kept apart from, and
+/// with what those can't, in turn.
+fn compose_two<'a>(first: Vec<Composed<'a>>, second: Vec<Composed<'a>>) -> Vec<Composed<'a>> {
+    // `y`, made later, shares text with `x` (or one is empty strictly
+    // inside the other).
+    let merges = |x: &Composed, y: &Composed| x.new.end > y.old.start && y.old.end > x.new.start;
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    let (mut firsts, mut seconds) = (first.into_iter().peekable(), second.into_iter().peekable());
+    // The length changes of the edits passed: `firsts`' lead from the text
+    // before to the one between, `seconds`' from there to the text after.
+    let (mut before, mut after) = (0, 0);
+    loop {
+        #[cfg(test)]
+        WORK.with(|work| work.set(work.get() + 1));
+        let (x, y) = match (firsts.peek(), seconds.peek()) {
+            (None, None) => break,
+            (Some(x), Some(y)) if merges(x, y) => (firsts.next(), seconds.next()),
+            // Apart: whichever comes first; at a tie (both empty there),
+            // the earlier one.
+            (Some(x), Some(y)) if x.new.end <= y.old.start => (firsts.next(), None),
+            (Some(_), None) => (firsts.next(), None),
+            (_, Some(_)) => (None, seconds.next()),
+        };
+        let edit = match (x, y) {
+            (Some(x), None) => {
+                before += x.change();
+                Composed { new: moved(x.new.start, after)..moved(x.new.end, after), ..x }
+            }
+            (None, Some(y)) => {
+                after += y.change();
+                Composed { old: moved(y.old.start, -before)..moved(y.old.end, -before), ..y }
+            }
+            (Some(x), Some(y)) => {
+                // All that merges, in turn: an edit of either side can only
+                // merge with the other side's last one so far.
+                let (mut xs, mut ys) = (vec![x], vec![y]);
+                loop {
+                    #[cfg(test)]
+                    WORK.with(|work| work.set(work.get() + 1));
+                    if let Some(x) = firsts.next_if(|x| merges(x, &ys[ys.len() - 1])) {
+                        xs.push(x);
+                    } else if let Some(y) = seconds.next_if(|y| merges(&xs[xs.len() - 1], y)) {
+                        ys.push(y);
+                    } else {
+                        break;
+                    }
+                }
+                let edit = merge(&xs, &ys, before, after);
+                before += xs.iter().map(Composed::change).sum::<isize>();
+                after += ys.iter().map(Composed::change).sum::<isize>();
+                edit
+            }
+            (None, None) => unreachable!("one side has an edit"),
+        };
+        out.push(edit);
+    }
+    out
+}
+
+/// Edits of `first` (`xs`) and `second` (`ys`) that merge in turn, as one;
+/// `before` and `after` are the length changes of the edits before them.
+/// The text between is `xs`' new text where they are, else `ys`' old text
+/// (one of them covers every part of it).
+fn merge<'a>(xs: &[Composed<'a>], ys: &[Composed<'a>], before: isize, after: isize) -> Composed<'a> {
+    let (x0, xn, y0, yn) = (&xs[0], &xs[xs.len() - 1], &ys[0], &ys[ys.len() - 1]);
+    let (lo, hi) = (x0.new.start.min(y0.old.start), xn.new.end.max(yn.old.end));
+    let before_after = before + xs.iter().map(Composed::change).sum::<isize>();
+    let after_after = after + ys.iter().map(Composed::change).sum::<isize>();
+    let old_start = if x0.new.start <= y0.old.start { x0.old.start } else { moved(lo, -before) };
+    let old_end = if xn.new.end >= yn.old.end { xn.old.end } else { moved(hi, -before_after) };
+    let new_start = if y0.old.start <= x0.new.start { y0.new.start } else { moved(lo, after) };
+    let new_end = if yn.old.end >= xn.new.end { yn.new.end } else { moved(hi, after_after) };
+    // The text before: `xs`' old texts, and between them what `ys` replaced.
+    let mut old_text = String::with_capacity(old_end - old_start);
+    let mut between = Between { edits: ys, ix: 0, old: true };
+    let mut at = lo;
+    for x in xs {
+        between.read(at..x.new.start, &mut old_text);
+        old_text.push_str(&x.old_text);
+        at = x.new.end;
+    }
+    between.read(at..hi, &mut old_text);
+    // The text after: `ys`' new texts, and between them what `xs` put there.
+    let mut new_text = String::with_capacity(new_end - new_start);
+    let mut between = Between { edits: xs, ix: 0, old: false };
+    at = lo;
+    for y in ys {
+        between.read(at..y.old.start, &mut new_text);
+        new_text.push_str(&y.new_text);
+        at = y.old.end;
+    }
+    between.read(at..hi, &mut new_text);
+    debug_assert_eq!((old_text.len(), new_text.len()), (old_end - old_start, new_end - new_start));
+    Composed { old: old_start..old_end, new: new_start..new_end, old_text: Cow::Owned(old_text), new_text: Cow::Owned(new_text), merged: true }
+}
+
+/// Reads parts of the text between two composed steps, in order, from the
+/// edits (sorted) covering them there: `second`'s old side or `first`'s new.
+struct Between<'e, 'a> {
+    edits: &'e [Composed<'a>],
+    ix: usize,
+    old: bool,
+}
+
+impl Between<'_, '_> {
+    fn read(&mut self, range: Range<usize>, out: &mut String) {
+        let mut at = range.start;
+        while at < range.end {
+            let edit = &self.edits[self.ix];
+            let (span, text) = if self.old { (&edit.old, &edit.old_text) } else { (&edit.new, &edit.new_text) };
+            if span.end <= at {
+                self.ix += 1;
+                continue;
+            }
+            debug_assert!(span.start <= at, "{span:?} covers {at}");
+            let end = span.end.min(range.end);
+            out.push_str(&text[at - span.start..end - span.start]);
+            at = end;
+        }
+    }
+}
+
+/// Line starts moved through edits one at a time, by their old offset;
+/// None for a line an edit removed (see `Document::exact_line_starts`).
+type ExactLines = std::collections::HashMap<usize, Option<usize>>;
+
+/// Where the line starting at `offset` starts after `patch` (`old` is the
+/// text before it, `new` the text after); None when the edits removed the
+/// line: replaced text around its start, joined it with the line above,
+/// or deleted it whole, line break included.
+fn shift_line(new: &Rope, offset: usize, patch: &Patch, old: &Rope) -> Option<usize> {
+    let line_start = |at: usize| new.line_to_byte(new.byte_to_line(at.min(new.len_bytes())));
+    let (mut delta, near) = patch.around(offset..offset);
+    for (range, new_len) in near {
+        if range.start < offset && offset < range.end {
+            return None;
+        }
+        if range.start == offset && offset < range.end && *new_len == 0 && old.byte_to_line(range.end) > old.byte_to_line(offset) {
+            // Deleted from its start through its line break: the line
+            // after takes its place, with its own things.
+            return None;
+        }
+        if range.start < offset && offset == range.end {
+            // Text before it went (lines above deleted, or its line
+            // break): it's still a line if a line ends where that text did.
+            let end = moved(range.start, delta) + new_len;
+            if line_start(end) != end {
+                return None;
+            }
+        }
+        if offset >= range.end {
+            delta += Patch::change(range, *new_len);
+        }
+    }
+    // Typing at the start of a line leaves it where it is; a new line
+    // inserted there pushes it down.
+    Some(line_start(moved(offset, delta)))
+}
+
+/// Line starts (sorted, in `before`) moved through `edits` one at a time,
+/// as if each were a version of its own: where edits touch or overlap,
+/// which went first decides where a line start goes (Enter, then a letter
+/// typed in front of the new line break, pushes the line down; the letter
+/// first doesn't), which edits taken as a whole can't tell. Each edit
+/// finds the line starts it reaches by binary search and moves the ones
+/// after it at once, in a Fenwick tree of length changes, so it's the
+/// edits times a log, not times the line starts.
+fn line_starts_one_by_one(before: &Rope, edits: &[Replaced], starts: &[usize]) -> Vec<Option<usize>> {
+    // `changes[i]` sums, Fenwick style, what's been added to line starts
+    // `i..`: a start's offset is its first one plus the sum up to it.
+    let mut changes = vec![0isize; starts.len() + 1];
+    let add_from = |changes: &mut Vec<isize>, from: usize, delta: isize| {
+        let mut i = from + 1;
+        while i < changes.len() {
+            changes[i] += delta;
+            i += i & i.wrapping_neg();
+        }
+    };
+    let offset = |changes: &[isize], ix: usize| {
+        let (mut sum, mut i) = (0, ix + 1);
+        while i > 0 {
+            sum += changes[i];
+            i -= i & i.wrapping_neg();
+        }
+        moved(starts[ix], sum)
+    };
+    let mut gone = vec![false; starts.len()];
+    let mut text = before.clone();
+    for edit in edits {
+        let range = edit.start..edit.start + edit.old.len();
+        // The line starts the edit reaches: offsets stay sorted.
+        #[cfg(test)]
+        WORK.with(|work| work.set(work.get() + 1 + starts.len().ilog2() as usize));
+        let (mut lo, mut hi) = (0, starts.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if offset(&changes, mid) < range.start {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut end = lo;
+        while end < starts.len() && offset(&changes, end) <= range.end {
+            end += 1;
+        }
+        let old = text.clone();
+        let (from, to) = (text.byte_to_char(range.start), text.byte_to_char(range.end));
+        text.remove(from..to);
+        text.insert(from, edit.new);
+        let patch = Patch::new(vec![(range.clone(), edit.new.len())]);
+        for ix in lo..end {
+            #[cfg(test)]
+            WORK.with(|work| work.set(work.get() + 1));
+            if gone[ix] {
+                continue;
+            }
+            let at = offset(&changes, ix);
+            // A removed line keeps a place at the edit, so the order holds.
+            let to = shift_line(&text, at, &patch, &old).unwrap_or_else(|| {
+                gone[ix] = true;
+                range.start
+            });
+            add_from(&mut changes, ix, to as isize - at as isize);
+            add_from(&mut changes, ix + 1, at as isize - to as isize);
+        }
+        add_from(&mut changes, end, Patch::change(&range, edit.new.len()));
+    }
+    (0..starts.len()).map(|ix| (!gone[ix]).then(|| offset(&changes, ix))).collect()
 }
 
 /// How many of `rows` are longer than `wrap::LONG_LINE`.
@@ -1783,26 +2124,79 @@ mod tests {
         assert_eq!(doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(), [5..6]);
     }
 
-    /// Composed patches move positions outside the edits like the steps one
-    /// after another, and a large undo stays one entry of the patch log, so
-    /// another editor of the document can still follow it.
-    #[test]
-    fn composed_patches_map_like_their_steps() {
-        let steps = [
-            Patch::new(vec![(2..4, 3), (10..10, 2)]),
-            Patch::new(vec![(0..1, 0), (5..9, 1)]),
-            Patch::new(vec![(1..1, 4), (12..14, 0)]),
-        ];
-        let composed = Patch::compose(&steps);
-        for offset in [0, 1, 5, 9, 11, 13, 16, 20, 30] {
-            let one_by_one = steps.iter().fold(offset, |o, p| p.map(o));
-            // Positions the edits didn't touch land in the same place.
-            if !composed.edits.iter().any(|(r, _)| r.start < offset && offset < r.end) {
-                assert_eq!(composed.map(offset), one_by_one, "offset {offset}");
-            }
+    /// A small random generator, the same run after run.
+    fn xorshift(mut seed: u64) -> impl FnMut(usize) -> usize {
+        move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
         }
-        let total: isize = steps.iter().map(|p| p.before[p.edits.len()]).sum();
-        assert_eq!(composed.before[composed.edits.len()], total);
+    }
+
+    /// `text` with sorted, apart `edits` (a range of it, the new text) made.
+    fn with_edits(text: &str, edits: impl IntoIterator<Item = (Range<usize>, String)>) -> String {
+        let (mut out, mut at) = (String::new(), 0);
+        for (range, new) in edits {
+            assert!(range.start >= at && range.start <= range.end, "sorted and apart");
+            out.push_str(&text[at..range.start]);
+            out.push_str(&new);
+            at = range.end;
+        }
+        out + &text[at..]
+    }
+
+    /// Random edits of many places at once, some overlapping, made into
+    /// one transaction: composed, they turn the text before into the text
+    /// after and back, and positions outside them map like the records one
+    /// after another (as undo and redo moved them, record by record). Undo
+    /// and redo take the whole transaction and log one patch.
+    #[test]
+    fn transactions_compose_into_edits_that_map_like_their_steps() {
+        let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
+        let words = ["a", "bc", "\n", "é", "🦀", "", "", "xyz\n"];
+        for round in 0..400 {
+            let text: String = (0..next(30) + 1).map(|_| words[next(words.len())]).collect();
+            let mut doc = Document::from_text(text.clone(), None);
+            let (start, mark) = (doc.version(), doc.undo_mark());
+            for _ in 0..next(6) + 1 {
+                let edits: Vec<(Range<usize>, String)> = (0..next(4) + 1)
+                    .map(|_| {
+                        let at = doc.clip(next(doc.len() + 1));
+                        let end = doc.clip(at + next(4)).max(at);
+                        (at..end, words[next(words.len())].to_string())
+                    })
+                    .collect();
+                doc.edit(edits, &[], EditKind::Other);
+            }
+            doc.merge_undo_since(mark);
+            let after = doc.rope().to_string();
+            let Some(t) = doc.undo_stack.last() else { continue };
+            let composed = compose(t.edits.iter().map(|r| Replaced { start: r.start, old: &r.old, new: &r.new }));
+            assert_eq!(with_edits(&text, composed.iter().map(|e| (e.old.clone(), e.new_text.to_string()))), after, "round {round}");
+            assert_eq!(with_edits(&after, composed.iter().map(|e| (e.new.clone(), e.old_text.to_string()))), text, "round {round}");
+            let patch = Patch::new(composed.iter().map(|e| (e.old.clone(), e.new.len())).collect());
+            let records: Vec<Patch> = t.edits.iter().map(|r| Patch::new(vec![(r.start..r.start + r.old.len(), r.new.len())])).collect();
+            // Where records overlap they merge, and a position at the edge
+            // of the whole may land elsewhere than through them one by one.
+            let merged = composed.iter().any(|e| e.merged);
+            for offset in (0..=text.len()).filter(|&o| text.is_char_boundary(o)) {
+                // Positions the edits didn't touch land in the same place.
+                if !composed.iter().any(|e| e.old.start < offset && offset < e.old.end || merged && (e.old.start..=e.old.end).contains(&offset)) {
+                    assert_eq!(patch.map(offset), records.iter().fold(offset, |o, p| p.map(o)), "round {round}, offset {offset}");
+                }
+            }
+            assert!(doc.patches_since(start).is_some());
+
+            let version = doc.version();
+            doc.undo();
+            assert_eq!(doc.rope().to_string(), text, "round {round}");
+            assert_eq!(doc.patches_since(version).map(Iterator::count), Some(1), "one patch for the undo");
+            doc.redo();
+            assert_eq!(doc.rope().to_string(), after);
+            doc.undo();
+            assert_eq!(doc.rope().to_string(), text);
+        }
 
         let mut doc = Document::from_text("x\n".repeat(700), None);
         let all: Vec<(Range<usize>, String)> = (0..700).map(|i| (i * 2..i * 2 + 1, "yy".into())).collect();
@@ -1812,6 +2206,150 @@ mod tests {
         assert!(doc.patches_since(before_undo).is_some_and(|mut p| p.next().is_some()), "the undo's patch is kept");
         // Line 1 started at 3 ("yy\n" above it), and at 2 again after the undo.
         assert_eq!(doc.offset_since(before_undo, 3), Some(2));
+    }
+
+    /// Undo and redo as they were: each record undone (the last first) or
+    /// redone in turn, with what follows the text moved by each.
+    fn each_record(doc: &mut Document, undo: bool) {
+        let t = if undo { doc.undo_stack.pop() } else { doc.redo_stack.pop() }.unwrap();
+        let records: Vec<(usize, &str, &str)> = match undo {
+            true => t.edits.iter().rev().map(|r| (r.start, r.new.as_str(), r.old.as_str())).collect(),
+            false => t.edits.iter().map(|r| (r.start, r.old.as_str(), r.new.as_str())).collect(),
+        };
+        for (start, old, new) in records {
+            let before = doc.rope.clone();
+            doc.raw_replace(start..start + old.len(), new);
+            doc.shift_tracked(&Patch::new(vec![(start..start + old.len(), new.len())]), &before, &ExactLines::new());
+        }
+        doc.version += 1;
+        doc.reparse();
+        if undo { doc.redo_stack.push(t) } else { doc.undo_stack.push(t) }
+    }
+
+    /// Many carets typing (Enter too) or deleting, undone and redone at
+    /// once: what follows the text lands where undoing or redoing the keys
+    /// one by one put it. Mixed (Vim's insert mode: one undo step), where
+    /// keys delete what others typed and those edits merge, the text still
+    /// comes back and what follows it stays on lines that exist.
+    #[test]
+    fn undo_moves_things_like_undoing_each_key() {
+        let mut next = xorshift(0x2545_f491_4f6c_dd1d);
+        for round in 0..500 {
+            let lines: Vec<String> = (0..next(8) + 2).map(|i| "ab cd".repeat(next(3)) + &i.to_string()).collect();
+            let text = lines.join("\n") + "\n";
+            let setup = || {
+                let mut doc = Document::from_text(text.clone(), None);
+                let rows = doc.line_count();
+                doc.set_breakpoints(&(0..rows).filter(|r| r % 2 == 0).map(Breakpoint::at).collect::<Vec<_>>());
+                doc.set_debug_row(Some(rows / 2));
+                let diagnostic = |range: Range<usize>| Diagnostic { range, severity: crate::lint::Severity::Warning, message: "m".into(), rule: "r".into() };
+                doc.set_lsp_diagnostics((0..rows).map(|r| doc.line_start(r)..doc.line_end(r)).map(diagnostic).collect());
+                doc.set_inlay_hints((0..rows).map(|r| InlayHint { offset: doc.line_end(r), label: ": T".into(), pad_left: false, pad_right: false }).collect());
+                let lens = |line_start| CodeLens { id: 0, line_start, title: "1 reference".into(), command: Arc::new(serde_json::Value::Null), server: "s".into(), unresolved: None };
+                doc.set_code_lenses((0..rows).filter(|r| r % 3 == 0).map(|r| lens(doc.line_start(r))).collect(), doc.lens_stamp());
+                doc
+            };
+            let mut carets: Vec<usize> = {
+                let doc = setup();
+                let mut carets: Vec<usize> = (0..next(4) + 1).map(|_| doc.clip(next(doc.len()))).collect();
+                carets.sort();
+                carets.dedup();
+                carets
+            };
+            let (mut batch, mut one_by_one) = (setup(), setup());
+            let mark = batch.undo_mark();
+            // Typing, Backspace, Delete, or all of them.
+            let mode = next(4);
+            for _ in 0..next(8) + 1 {
+                let keys = [&["x", "\n", "yz"][..], &["⌫"], &["⌦"], &["x", "\n", "yz", "⌫", "⌦"]][mode];
+                let key = keys[next(keys.len())];
+                let edits: Vec<(Range<usize>, String)> = carets
+                    .iter()
+                    .map(|&at| match key {
+                        "⌫" => (batch.prev_char_boundary(at)..at, String::new()),
+                        "⌦" => (at..batch.next_char_boundary(at), String::new()),
+                        _ => (at..at, key.to_string()),
+                    })
+                    .collect();
+                let kind = if key.len() == 1 { EditKind::Typing } else { EditKind::Deleting };
+                let ranges = batch.edit(edits.clone(), &[], kind);
+                one_by_one.edit(edits, &[], kind);
+                carets = ranges.iter().map(|r| if key == "⌦" { r.start } else { r.end }).collect();
+                carets.dedup();
+            }
+            batch.merge_undo_since(mark);
+            one_by_one.merge_undo_since(mark);
+            if batch.undo_mark() == mark {
+                continue;
+            }
+            let after = batch.rope().to_string();
+            let snapshot = |doc: &Document| {
+                (
+                    doc.rope().to_string(),
+                    doc.diagnostics.iter().map(|d| d.range.clone()).collect::<Vec<_>>(),
+                    doc.inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>(),
+                    doc.breakpoints().iter().map(|b| b.row).collect::<Vec<_>>(),
+                    doc.code_lenses().iter().map(|l| l.line_start).collect::<Vec<_>>(),
+                    doc.debug_row(),
+                )
+            };
+            for (undo, expected) in [(true, &text), (false, &after), (true, &text)] {
+                if undo { batch.undo() } else { batch.redo() };
+                each_record(&mut one_by_one, undo);
+                assert_eq!(&batch.rope().to_string(), expected);
+                let (same, expected) = (snapshot(&batch), snapshot(&one_by_one));
+                if mode < 3 {
+                    assert_eq!(same, expected, "round {round}, mode {mode}, undo {undo}: {text:?}");
+                } else {
+                    // Problems and hints come again soon anyway; lines are the user's.
+                    assert_eq!((same.0, same.3, same.4, same.5), (expected.0, expected.3, expected.4, expected.5), "round {round}, undo {undo}: {text:?}");
+                }
+            }
+        }
+    }
+
+    /// Undoing thousands of carets' typing does work in proportion to the
+    /// edits and what follows the text: eight times the carets (and lines,
+    /// breakpoints, problems, hints) is about eight times the work, where
+    /// each key undone in turn, moving everything each time, made it 64.
+    /// Typed where lines start, each breakpoint is moved key by key (see
+    /// `line_starts_one_by_one`), and that grows by a log at most.
+    #[test]
+    fn undoing_many_carets_typing_takes_linear_work() {
+        let work = |carets: usize, column: usize| {
+            let mut doc = Document::from_text("let value = 1;\n".repeat(carets), Some("a.rs".into()));
+            let rows = carets;
+            doc.set_breakpoints(&(0..rows).map(Breakpoint::at).collect::<Vec<_>>());
+            let diagnostic = |range: Range<usize>| Diagnostic { range, severity: crate::lint::Severity::Warning, message: "m".into(), rule: "r".into() };
+            doc.set_lsp_diagnostics((0..rows).map(|r| doc.line_start(r) + 4..doc.line_start(r) + 9).map(diagnostic).collect());
+            doc.set_inlay_hints((0..rows).map(|r| InlayHint { offset: doc.line_start(r) + 9, label: ": i32".into(), pad_left: false, pad_right: false }).collect());
+            let text = doc.rope().to_string();
+            // A caret after each `value` (or where each line starts), ten
+            // keys typed there.
+            let mut carets: Vec<usize> = (0..rows).map(|r| doc.line_start(r) + column).collect();
+            let mark = doc.undo_mark();
+            for key in "_renamed!!".chars() {
+                let edits = carets.iter().map(|&at| (at..at, key.to_string())).collect();
+                carets = doc.edit(edits, &[], EditKind::Typing).into_iter().map(|r| r.end).collect();
+            }
+            doc.merge_undo_since(mark);
+            let version = doc.version();
+            // Line edits logged from here (the typing filled the log).
+            (doc.line_edits_base, doc.line_edits) = (version, Vec::new());
+            WORK.with(|work| work.set(0));
+            doc.undo();
+            let work = WORK.with(|work| work.get());
+            assert_eq!(doc.rope().to_string(), text);
+            // A word typed at a caret is one replacement for the rope and trees.
+            assert_eq!(doc.line_edits_since(version).map(Iterator::count), Some(carets.len()));
+            assert_eq!(doc.breakpoints().iter().map(|b| doc.line_start(b.row)).collect::<Vec<_>>(), (0..rows).map(|r| doc.line_start(r)).collect::<Vec<_>>());
+            assert_eq!(doc.diagnostics.len(), rows, "the problems apart from the carets stay");
+            work
+        };
+        let (small, large) = (work(500, 9), work(4000, 9));
+        assert!(large <= small * 9, "{small} for 500 carets, {large} for 4000");
+        let (small, large) = (work(500, 0), work(4000, 0));
+        assert!(large <= small * 12, "{small} for 500 carets, {large} for 4000, at line starts");
     }
 
     #[test]
