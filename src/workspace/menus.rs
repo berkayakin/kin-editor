@@ -779,7 +779,7 @@ impl Workspace {
         self.show_sidebar = true;
         self.sidebar_mode = SidebarMode::Files;
         self.tree.update(cx, |t, cx| t.reveal_and_scroll(&path, cx));
-        self.save_state();
+        self.schedule_state_save(cx);
         self.schedule_session_save(cx);
         cx.notify();
     }

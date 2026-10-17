@@ -982,12 +982,12 @@ pub fn apply_fonts(cx: &mut App) {
 /// Changes the editor zoom by `delta` points (or resets it with `None`)
 /// and remembers it for the next launch.
 pub fn zoom(delta: Option<f32>, cx: &mut App) {
-    let mut state = SessionState::load();
     let base = Settings::get(cx).editor_font_size.unwrap_or(DEFAULT_EDITOR_FONT_SIZE);
-    state.font_zoom = delta
-        .map(|d| (state.font_zoom.unwrap_or(0.) + d).clamp(6. - base, 72. - base))
-        .filter(|z| *z != 0.);
-    if let Err(err) = state.save() {
+    // Written now: `apply_fonts` reads it back.
+    let zoomed = SessionState::update(|state| {
+        state.font_zoom = delta.map(|d| (state.font_zoom.unwrap_or(0.) + d).clamp(6. - base, 72. - base)).filter(|z| *z != 0.);
+    });
+    if let Err(err) = zoomed {
         eprintln!("couldn't save the zoom: {err}");
     }
     apply_fonts(cx);

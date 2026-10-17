@@ -882,7 +882,7 @@ impl Workspace {
             GitLogEvent::Close => {
                 ws.hide_bottom(BottomPanel::GitLog);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.schedule_state_save(cx);
                 cx.notify();
             }
         });

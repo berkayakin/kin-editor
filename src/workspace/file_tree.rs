@@ -41,6 +41,9 @@ impl Workspace {
         let venv = session.and_then(|s| s.python_venv).map(|saved| crate::python::Choice::from_saved(&saved));
         crate::python::set_choice(&root, venv);
         self.venv_shown.take();
+        // A sidebar toggle saved a moment ago counts (written for the
+        // project it was in, before this one replaces it).
+        self.flush_state_save();
         self.root = Some(root.clone());
         self.show_sidebar = SessionState::load().show_sidebar.unwrap_or(true);
         self.tree.update(cx, |t, cx| t.set_root(Some(root), expanded, cx));
@@ -49,7 +52,7 @@ impl Workspace {
         if let Some(root) = self.root.clone() {
             self.detect_repo(root, cx);
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         let root = self.root.clone();
         self.lsp.update(cx, |s, _| s.set_root(root));
         if self.items().next().is_none() {

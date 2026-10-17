@@ -283,7 +283,7 @@ impl Workspace {
         if self.git_panel.focus_handle(cx).contains_focused(window, cx) {
             self.focus_active(window, cx);
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 
@@ -297,7 +297,7 @@ impl Workspace {
         if visible && self.sidebar_mode == SidebarMode::Commit {
             self.refresh_commit_view(cx);
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 
@@ -310,7 +310,7 @@ impl Workspace {
         if self.git_panel.focus_handle(cx).contains_focused(window, cx) {
             self.focus_active(window, cx);
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 
@@ -319,7 +319,7 @@ impl Workspace {
         self.sidebar_mode = SidebarMode::Commit;
         self.refresh_commit_view(cx);
         self.git_panel.read(cx).focus_message(window, cx);
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 
@@ -327,7 +327,7 @@ impl Workspace {
         if self.show_sidebar && self.sidebar_mode == SidebarMode::Commit {
             self.show_sidebar = false;
             self.focus_active(window, cx);
-            self.save_state();
+            self.schedule_state_save(cx);
             cx.notify();
         } else {
             self.show_commit(&ShowCommit, window, cx);

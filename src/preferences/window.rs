@@ -116,9 +116,8 @@ impl PreferencesWindow {
         let placement = workspace::placement_of(window, cx);
         self.placement_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_millis(400)).await;
-            let mut state = SessionState::load();
-            state.preferences_window = Some(placement);
-            if let Err(err) = state.save() {
+            let saved = cx.background_executor().spawn(async move { SessionState::update(|state| state.preferences_window = Some(placement)) });
+            if let Err(err) = saved.await {
                 eprintln!("couldn't save the Preferences window's place: {err}");
             }
         }));

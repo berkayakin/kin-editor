@@ -40,7 +40,7 @@ impl Workspace {
             self.git_log.update(cx, |l, cx| l.show_path(None, cx));
             self.open_git_log(window, cx);
         }
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 
@@ -61,7 +61,7 @@ impl Workspace {
     pub(super) fn show_history_of(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
         self.git_log.update(cx, |l, cx| l.show_path(Some(rel), cx));
         self.open_git_log(window, cx);
-        self.save_state();
+        self.schedule_state_save(cx);
         cx.notify();
     }
 

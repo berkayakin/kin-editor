@@ -177,9 +177,7 @@ impl SessionState {
     }
 
     pub fn set_onboarded() {
-        let mut state = Self::load();
-        state.welcome_done = Some(true);
-        if let Err(err) = state.save() {
+        if let Err(err) = Self::update(|state| state.welcome_done = Some(true)) {
             eprintln!("couldn't save window state: {err}");
         }
     }
@@ -188,17 +186,40 @@ impl SessionState {
     /// file that isn't JSON at all is kept aside (and reported) rather than
     /// overwritten with defaults.
     pub fn load() -> Self {
-        let Some(path) = Self::path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
+        Self::path().map(|path| Self::load_from(&path)).unwrap_or_default()
+    }
+
+    fn load_from(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else { return Self::default() };
         read_lenient(&text).unwrap_or_else(|err| {
-            set_aside(&path, "Kuana's window state (state.json)", err);
+            set_aside(path, "Kuana's window state (state.json)", err);
             Self::default()
         })
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-        write_atomic(&path, (serde_json::to_string_pretty(self)? + "\n").as_bytes())
+    /// Changes `state.json`: reads it, lets `f` change it, and writes it back
+    /// if that changed anything. One change at a time across the app: windows
+    /// save theirs on background threads, and a change written over a copy
+    /// read before another one would undo it. (`f` runs without a config
+    /// folder too, on the defaults.)
+    pub fn update(f: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        let Some(path) = Self::path() else {
+            f(&mut Self::default());
+            return Err(std::io::Error::other("no config directory"));
+        };
+        Self::update_at(&path, f)
+    }
+
+    fn update_at(path: &Path, f: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        static UPDATING: Mutex<()> = Mutex::new(());
+        let _one_at_a_time = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
+        let before = Self::load_from(path);
+        let mut state = before.clone();
+        f(&mut state);
+        if state == before {
+            return Ok(());
+        }
+        write_atomic(path, (serde_json::to_string_pretty(&state)? + "\n").as_bytes())
     }
 }
 
@@ -508,6 +529,30 @@ mod tests {
         // State with one bad value keeps the rest.
         let state: SessionState = read_lenient(r#"{ "sidebar_width": "wide", "welcome_done": true }"#).unwrap();
         assert_eq!((state.sidebar_width, state.welcome_done), (None, Some(true)));
+    }
+
+    /// Windows change state.json from background threads: changes made at
+    /// the same time all land, and one that changes nothing doesn't write.
+    #[test]
+    fn state_changes_at_once_all_land() {
+        let dir = std::env::temp_dir().join(format!("kuana-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("state.json");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || SessionState::update_at(&file, |state| state.recent_projects.push(format!("/p/{i}").into())))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        assert_eq!(SessionState::load_from(&file).recent_projects.len(), 8);
+        // Written compactly by hand: a rewrite would pretty-print it.
+        std::fs::write(&file, r#"{"welcome_done":true}"#).unwrap();
+        SessionState::update_at(&file, |state| state.welcome_done = Some(true)).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"welcome_done":true}"#);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -234,14 +234,10 @@ impl Workspace {
         self.recent_projects = update_recent_projects(f, cx);
     }
 
-    /// Remembers layout and the open folder for the next launch.
-    pub(super) fn save_state(&self) {
-        write_state(self.state_update());
-    }
-
-    /// `save_state` once things settle, written off the UI thread (it reads
-    /// the file again and syncs it to disk): opening terminals, several at
-    /// once when they're restored, shouldn't wait for that.
+    /// Remembers layout and the open folder for the next launch, once things
+    /// settle and off the UI thread (it reads the file again and syncs it to
+    /// disk): toggling a panel, ending a resize or opening a terminal (several
+    /// at once when they're restored) shouldn't wait for that.
     pub(super) fn schedule_state_save(&mut self, cx: &mut Context<Self>) {
         self.state_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(300)).await;
@@ -251,16 +247,18 @@ impl Workspace {
         }));
     }
 
-    /// Writes a scheduled `save_state` now (the window closes, the app quits).
+    /// Writes a scheduled state save now: the window closes, the app quits,
+    /// or the file is about to be read back.
     pub(super) fn flush_state_save(&mut self) {
         if self.state_task.take().is_some() {
-            self.save_state();
+            write_state(self.state_update());
         }
     }
 
-    /// This window's part of `state.json`, laid over what's on disk when
-    /// it's written.
-    fn state_update(&self) -> impl FnOnce(SessionState) -> SessionState + Send + use<> {
+    /// This window's part of `state.json`, laid over what's on disk when it's
+    /// written. The rest (zoom, recent projects, placements…) is shared with
+    /// other windows and stays as it is there.
+    fn state_update(&self) -> impl FnOnce(&mut SessionState) + Send + use<> {
         let root = self.root.clone();
         let sidebar_width: f32 = self.sidebar_width.into();
         let problems_height: f32 = self.problems_height.into();
@@ -270,27 +268,20 @@ impl Workspace {
             SidebarMode::Files => "files",
             SidebarMode::Commit => "commit",
         };
-        move |saved| SessionState {
-            // The sidebar's visibility is remembered for projects only; it's
-            // always closed without one.
-            show_sidebar: if root.is_some() { Some(show_sidebar) } else { saved.show_sidebar },
-            // Opening a lone file shouldn't forget the remembered project.
-            last_root: root.or(saved.last_root),
-            sidebar_width: Some(sidebar_width),
-            problems_height: Some(problems_height),
-            show_problems: Some(show_problems),
-            show_terminal: Some(show_terminal),
-            sidebar_mode: Some(sidebar_mode.into()),
-            show_git_log: Some(show_git_log),
-            // Shared with other windows, so keep what's on disk.
-            font_zoom: saved.font_zoom,
-            diff_side_by_side: saved.diff_side_by_side,
-            recent_projects: saved.recent_projects,
-            trusted_folders: saved.trusted_folders,
-            window: saved.window,
-            preferences_window: saved.preferences_window,
-            welcome_done: saved.welcome_done,
-            other: saved.other,
+        move |state| {
+            // The sidebar's visibility is remembered for projects only (it's
+            // always closed without one), and opening a lone file shouldn't
+            // forget the remembered project.
+            if let Some(root) = root {
+                state.show_sidebar = Some(show_sidebar);
+                state.last_root = Some(root);
+            }
+            state.sidebar_width = Some(sidebar_width);
+            state.problems_height = Some(problems_height);
+            state.show_problems = Some(show_problems);
+            state.show_terminal = Some(show_terminal);
+            state.sidebar_mode = Some(sidebar_mode.into());
+            state.show_git_log = Some(show_git_log);
         }
     }
 
@@ -300,11 +291,7 @@ impl Workspace {
         let placement = placement_of(window, cx);
         self.placement_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_millis(400)).await;
-            let mut state = SessionState::load();
-            state.window = Some(placement);
-            if let Err(err) = state.save() {
-                eprintln!("couldn't save window state: {err}");
-            }
+            cx.background_executor().spawn(async move { write_state(|state| state.window = Some(placement)) }).await;
         }));
     }
 
@@ -349,25 +336,25 @@ impl Workspace {
 /// entries, and shown where the system lists recent items (the Dock, the
 /// jump list: `cli::show_recent_projects`).
 pub fn update_recent_projects(f: impl FnOnce(&mut Vec<PathBuf>), cx: &mut App) -> Vec<PathBuf> {
-    let mut state = SessionState::load();
-    let before = state.recent_projects.clone();
-    f(&mut state.recent_projects);
-    state.recent_projects.truncate(MAX_RECENT_PROJECTS);
-    // What the user removed from the jump list goes from here too.
-    let removed = crate::cli::show_recent_projects(&state.recent_projects, cx);
-    state.recent_projects.retain(|p| !removed.contains(p));
-    if state.recent_projects != before
-        && let Err(err) = state.save()
-    {
+    let mut recent = Vec::new();
+    let updated = SessionState::update(|state| {
+        f(&mut state.recent_projects);
+        state.recent_projects.truncate(MAX_RECENT_PROJECTS);
+        // What the user removed from the jump list goes from here too.
+        let removed = crate::cli::show_recent_projects(&state.recent_projects, cx);
+        state.recent_projects.retain(|p| !removed.contains(p));
+        recent = state.recent_projects.clone();
+    });
+    if let Err(err) = updated {
         eprintln!("couldn't save recent projects: {err}");
     }
-    state.recent_projects
+    recent
 }
 
 
-/// Writes `state.json`: what's there now, with `update` laid over it.
-fn write_state(update: impl FnOnce(SessionState) -> SessionState) {
-    if let Err(err) = update(SessionState::load()).save() {
+/// Changes `state.json` (see `SessionState::update`).
+fn write_state(update: impl FnOnce(&mut SessionState)) {
+    if let Err(err) = SessionState::update(update) {
         eprintln!("couldn't save window state: {err}");
     }
 }
