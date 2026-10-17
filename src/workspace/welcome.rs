@@ -152,17 +152,19 @@ impl Workspace {
             .grid()
             .grid_cols(if wide { 4 } else { 2 })
             .gap_3()
+            // Opening a project is what most people come here for: its card
+            // comes first, and the file card says it's for files on their own.
             .child(
-                tile("w-new-file", Icon::FilePlus, "New File", "Start from an empty buffer", binding_label(&NewFile, window))
-                    .on_click(cx.listener(|ws, _, w, cx| ws.new_file(&NewFile, w, cx))),
+                tile("w-open-folder", Icon::FolderSearch, "Open Folder…", "Open a project with its file tree", binding_label(&OpenFolder, window))
+                    .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))),
             )
             .child(
-                tile("w-open-file", Icon::FileCode, "Open File…", "Edit one or more files", binding_label(&OpenFile, window))
+                tile("w-open-file", Icon::FileCode, "Open File…", "Edit files without a project", binding_label(&OpenFile, window))
                     .on_click(cx.listener(|ws, _, w, cx| ws.open_file(&OpenFile, w, cx))),
             )
             .child(
-                tile("w-open-folder", Icon::FolderSearch, "Open Folder…", "Browse a project with its file tree", binding_label(&OpenFolder, window))
-                    .on_click(cx.listener(|ws, _, w, cx| ws.open_folder(&OpenFolder, w, cx))),
+                tile("w-new-file", Icon::FilePlus, "New File", "Start from an empty buffer", binding_label(&NewFile, window))
+                    .on_click(cx.listener(|ws, _, w, cx| ws.new_file(&NewFile, w, cx))),
             )
             .child(
                 tile("w-clone", Icon::Download, "Clone Repository…", "From GitHub, GitLab or any Git URL", None)
