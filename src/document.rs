@@ -960,6 +960,12 @@ impl Document {
         self.parse_behind
     }
 
+    /// The file's own syntax tree for the text as it is, to read off the UI
+    /// thread (see `Syntax::tree_job`).
+    pub fn tree_job(&self) -> impl FnOnce() -> Option<tree_sitter::Tree> + Send + use<> {
+        self.syntax.tree_job(&self.rope, !self.parse_behind)
+    }
+
     /// Changes whenever the syntax trees do.
     pub fn tree_version(&self) -> u64 {
         self.tree_version
@@ -2623,6 +2629,23 @@ mod tests {
         // An old result arriving late changes nothing.
         assert!(!doc.finish_parse(opened, Syntax::new(Language::Rust, &Rope::from_str("fn old() {}"))));
         assert_eq!(doc.syntax().tree().unwrap().root_node().to_sexp(), fresh.tree().unwrap().root_node().to_sexp());
+    }
+
+    /// What the syntax check reads: the document's own tree when it's
+    /// parsed for the text, else a parse from it of the text as it is.
+    #[test]
+    fn the_tree_to_lint_is_the_documents_own() {
+        let text: String = (0..300).map(|i| format!("fn f{i}() {{ let x = {i}; }}\n")).collect();
+        let mut doc = Document::from_text(text, Some("a.rs".into()));
+        let tree = doc.tree_job()().unwrap();
+        let first = |tree: &tree_sitter::Tree| tree.root_node().child(0).unwrap().id();
+        assert_eq!(first(&tree), first(doc.syntax().tree().unwrap()), "the same tree, not parsed again");
+        doc.parse_budget = Duration::ZERO;
+        doc.edit(vec![(3..5, "renamed(".into())], &[], EditKind::Other);
+        assert!(doc.parse_job().is_some(), "the edit's parse ran out of time");
+        let tree = doc.tree_job()().unwrap();
+        assert!(tree.root_node().has_error());
+        assert_eq!(tree.root_node().to_sexp(), Syntax::new(Language::Rust, doc.rope()).tree().unwrap().root_node().to_sexp());
     }
 
     #[test]

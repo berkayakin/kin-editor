@@ -1290,35 +1290,50 @@ impl Editor {
     }
 
     fn schedule_lint(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if !self.doc.read(cx).language.is_lintable() {
+        let language = self.doc.read(cx).language;
+        if !language.is_lintable() {
             self.doc.as_mut(cx).set_builtin_diagnostics(Vec::new());
             return;
         }
-        let syntax_only = self.external.is_some() && self.external_error.is_none();
         let version = self.doc.read(cx).version();
         if self.linted_version == Some(version) {
             return;
         }
-        let rope = self.doc.read(cx).rope().clone();
-        let language = self.doc.read(cx).language;
+        // Where the built-in lint is only syntax errors and they aren't
+        // wanted, there's nothing to run.
+        if lint::syntax_only(language) && !self.wants_syntax_errors(cx) {
+            self.lint_task = None;
+            self.doc.as_mut(cx).set_builtin_diagnostics(Vec::new());
+            self.linted_version = Some(version);
+            return;
+        }
+        let syntax_only = self.external.is_some() && self.external_error.is_none();
         let path = self.doc.read(cx).path.clone();
         self.lint_task = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
             }
+            // The text as it is after the pause, with its syntax tree (the
+            // document's: parsed already, it's no work to read).
+            let Ok((version, rope, tree)) = this.update(cx, |editor, cx| {
+                let doc = editor.doc.read(cx);
+                (doc.version(), doc.rope().clone(), lint::syntax_only(language).then(|| doc.tree_job()))
+            }) else {
+                return;
+            };
             let diagnostics = cx
                 .background_executor()
-                .spawn(async move { lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only) })
+                .spawn(async move {
+                    match tree {
+                        Some(tree) => tree().map_or_else(Vec::new, |tree| lint::syntax_errors(&tree, &rope)),
+                        None => lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only),
+                    }
+                })
                 .await;
             this.update(cx, |editor, cx| {
                 if editor.doc.read(cx).version() == version {
                     let mut diagnostics = diagnostics;
-                    // A language server reports syntax errors itself. Asked
-                    // of the document's servers, not this editor: a split
-                    // showing the file never gets the diagnostics itself.
-                    // `syntax_errors: false` (extension languages' default)
-                    // drops them too.
-                    if editor.lsp.active || !editor.lsp_servers(cx).is_empty() || !editor.file_settings.syntax_errors {
+                    if !editor.wants_syntax_errors(cx) {
                         diagnostics.retain(|d| d.rule != "syntax");
                     }
                     editor.doc.as_mut(cx).set_builtin_diagnostics(diagnostics);
@@ -1328,6 +1343,14 @@ impl Editor {
             })
             .ok();
         }));
+    }
+
+    /// Whether the built-in lint reports syntax errors: not where a
+    /// language server does (asked of the document's servers, not this
+    /// editor: a split showing the file never gets the diagnostics itself),
+    /// nor with `syntax_errors: false` (extension languages' default).
+    fn wants_syntax_errors(&self, cx: &App) -> bool {
+        !self.lsp.active && self.lsp_servers(cx).is_empty() && self.file_settings.syntax_errors
     }
 
     /// Blinks the caret while the editor has the keyboard in the active
@@ -5567,6 +5590,43 @@ mod save_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "b a zero one\n");
         editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).changed_on_disk()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod lint_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Syntax errors come from the document's tree, and where a language
+    /// server reports them (or they're turned off) nothing runs at all.
+    #[gpui::test]
+    fn syntax_errors_unless_a_server_reports_them(cx: &mut TestAppContext) {
+        let doc = Document::from_text("fn main() {\n    let x = ;\n}\n".into(), Some("a.rs".into()));
+        let editor = cx.new(|cx| Editor::new(doc, cx));
+        cx.run_until_parked();
+        let syntax_errors = |editor: &Entity<Editor>, cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().filter(|d| d.rule == "syntax").count())
+        };
+        assert_eq!(syntax_errors(&editor, cx), 1);
+        editor.update(cx, |e, cx| {
+            e.lsp.active = true;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+            assert!(e.lint_task.is_none(), "nothing to run");
+        });
+        assert_eq!(syntax_errors(&editor, cx), 0);
+        editor.update(cx, |e, cx| {
+            e.lsp.active = false;
+            e.file_settings.syntax_errors = false;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+            assert!(e.lint_task.is_none());
+            e.file_settings.syntax_errors = true;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+        });
+        // After the pause after typing.
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(syntax_errors(&editor, cx), 1);
     }
 }
 

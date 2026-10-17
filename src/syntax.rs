@@ -662,6 +662,21 @@ impl Syntax {
         self.tree.as_ref()
     }
 
+    /// The file's own tree for `rope`, to read off the UI thread: this one
+    /// when it's `parsed` for that text (a cheap clone), else parsed again
+    /// from it as edited (only what changed: an edit's parse still running).
+    pub fn tree_job(&self, rope: &Rope, parsed: bool) -> impl FnOnce() -> Option<Tree> + Send + use<> {
+        let tree = self.tree.clone();
+        let grammar = if parsed { None } else { grammar(self.language) };
+        let rope = rope.clone();
+        move || match grammar {
+            Some(grammar) => {
+                with_parser(&grammar, |parser| parser.parse_with_options(&mut |byte, _| rope_chunk(&rope, byte), tree.as_ref(), None)).flatten()
+            }
+            None => tree,
+        }
+    }
+
     /// How many trees an edit edits: the file's and its embedded languages'.
     pub fn tree_count(&self) -> usize {
         self.trees().count()

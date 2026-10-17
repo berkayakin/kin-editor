@@ -8,7 +8,7 @@ mod syntax_errors;
 
 use std::{borrow::Cow, ops::Range, sync::Arc};
 
-use crate::syntax::{self, Language};
+use crate::syntax::Language;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -38,7 +38,34 @@ pub struct Diagnostic {
     pub rule: Cow<'static, str>,
 }
 
-/// Runs the built-in linter. With `syntax_only`, style/correctness rules are
+/// Whether `language`'s built-in lint is only its syntax errors, which
+/// come from the document's syntax tree (`syntax_errors`), not from `lint`.
+pub fn syntax_only(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Css
+            | Language::Rust
+            | Language::Go
+            | Language::Python
+            | Language::Php
+            | Language::Shell
+            | Language::Json
+            | Language::Yaml
+            | Language::Toml
+            | Language::Extension(_)
+    )
+}
+
+/// The syntax errors in `tree`, the document's for `rope` (see `syntax_only`).
+pub fn syntax_errors(tree: &tree_sitter::Tree, rope: &ropey::Rope) -> Vec<Diagnostic> {
+    let mut diagnostics = syntax_errors::lint(tree, rope);
+    let next_char = |at: usize| rope.get_char(rope.byte_to_char(at));
+    finish(&mut diagnostics, rope.len_bytes(), next_char);
+    diagnostics
+}
+
+/// Runs the built-in linter of languages with rules of their own (the
+/// others: `syntax_errors`). With `syntax_only`, style/correctness rules are
 /// skipped because an external linter with project config takes over.
 /// `path` locates project config (e.g. `.markdownlint.json`) and relative links.
 pub fn lint(language: Language, text: &str, path: Option<&std::path::Path>, syntax_only: bool) -> Vec<Diagnostic> {
@@ -57,36 +84,26 @@ pub fn lint(language: Language, text: &str, path: Option<&std::path::Path>, synt
             js::lint(text, 0, js::Context::File, dialect)
         }
         Language::Html => html::lint(text),
-        Language::Css
-        | Language::Rust
-        | Language::Go
-        | Language::Python
-        | Language::Php
-        | Language::Shell
-        | Language::Json
-        | Language::Yaml
-        | Language::Toml
-        | Language::Extension(_) => syntax::grammar(language).map_or_else(Vec::new, |g| syntax_errors::lint(&g, text)),
         Language::Markdown => markdown::lint(text, path),
-        Language::PlainText => Vec::new(),
+        _ => Vec::new(),
     };
     if syntax_only {
         diagnostics.retain(|d| d.rule == "syntax");
     }
-    for d in &mut diagnostics {
-        d.range.start = d.range.start.min(text.len());
-        d.range.end = d.range.end.clamp(d.range.start, text.len());
+    finish(&mut diagnostics, text.len(), |at| text[at..].chars().next());
+    diagnostics
+}
+
+/// Clamps diagnostics to the text (`len` bytes, `next_char` the character
+/// at an offset), widens empty ones to cover a character, and sorts them.
+fn finish(diagnostics: &mut [Diagnostic], len: usize, next_char: impl Fn(usize) -> Option<char>) {
+    for d in diagnostics.iter_mut() {
+        d.range.start = d.range.start.min(len);
+        d.range.end = d.range.end.clamp(d.range.start, len);
         // Make zero-width diagnostics visible by covering at least one char.
         if d.range.is_empty() {
-            let next = text[d.range.start..]
-                .chars()
-                .next()
-                .filter(|c| *c != '\n')
-                .map(char::len_utf8)
-                .unwrap_or(0);
-            d.range.end += next;
+            d.range.end += next_char(d.range.start).filter(|c| *c != '\n').map_or(0, char::len_utf8);
         }
     }
     diagnostics.sort_by_key(|d| (d.range.start, d.severity));
-    diagnostics
 }
