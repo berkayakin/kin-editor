@@ -202,7 +202,7 @@ impl Workspace {
     pub(super) fn edit_breakpoint_at_caret(&mut self, edit: BreakpointEdit, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_editor().cloned() else { return };
         if !editor.read(cx).can_break(cx) {
-            self.toast(ToastKind::Info, "Breakpoints work in Rust, Go, Python, JavaScript and TypeScript files", None, cx);
+            self.toast(ToastKind::Info, crate::debugger::launch::NO_DEBUGGER, None, cx);
             return;
         }
         let row = editor.read(cx).caret_row(cx);

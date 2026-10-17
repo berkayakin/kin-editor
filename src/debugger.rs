@@ -410,7 +410,8 @@ impl DebugSession {
             let _ = client.request("setBreakpoints", breakpoints_arguments(path, breakpoints));
         }
         if self.capabilities["exceptionBreakpointFilters"].is_array() {
-            let _ = client.request("setExceptionBreakpoints", json!({ "filters": [] }));
+            let filters = default_exception_filters(&self.capabilities);
+            let _ = client.request("setExceptionBreakpoints", json!({ "filters": filters }));
         }
         let _ = client.request("configurationDone", json!({}));
         if !self.is_paused() {
@@ -835,6 +836,14 @@ fn frame_name(name: &str) -> String {
     decoded.join("::")
 }
 
+/// The exception filters an adapter has on unless told otherwise (`default`,
+/// as debugpy's uncaught exceptions): `setExceptionBreakpoints` replaces the
+/// adapter's set, so it names them to keep them.
+fn default_exception_filters(capabilities: &Value) -> Vec<&str> {
+    let filters = capabilities["exceptionBreakpointFilters"].as_array().into_iter().flatten();
+    filters.filter(|f| f["default"] == true).filter_map(|f| f["filter"].as_str()).collect()
+}
+
 fn breakpoints_arguments(path: &std::path::Path, breakpoints: &[Breakpoint]) -> Value {
     let breakpoints: Vec<Value> = breakpoints
         .iter()
@@ -1179,6 +1188,18 @@ mod tests {
         assert_eq!(args["breakpoints"], json!([{ "line": 5, "condition": "i > 2" }, { "line": 7, "logMessage": "i = {i}" }]));
         assert_eq!(pause_reason(&json!({"reason": "breakpoint", "description": "breakpoint 1.1"})), "Paused at a breakpoint");
         assert_eq!(pause_reason(&json!({"reason": "exception", "text": "ZeroDivisionError"})), "Exception: ZeroDivisionError");
+    }
+
+    #[test]
+    fn exception_filters_on_by_default_stay_on() {
+        // debugpy's: it stops on uncaught exceptions unless told otherwise.
+        let capabilities = json!({ "exceptionBreakpointFilters": [
+            { "filter": "raised", "label": "Raised Exceptions", "default": false },
+            { "filter": "uncaught", "label": "Uncaught Exceptions", "default": true },
+            { "filter": "userUnhandled", "label": "User Uncaught Exceptions" },
+        ] });
+        assert_eq!(default_exception_filters(&capabilities), ["uncaught"]);
+        assert!(default_exception_filters(&json!({})).is_empty());
     }
 
     /// The whole protocol against a real adapter: build, launch, stop at a
