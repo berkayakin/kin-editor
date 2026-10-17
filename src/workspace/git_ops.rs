@@ -104,6 +104,9 @@ impl Workspace {
                         .collect()
                 };
                 ws.load_diff_bases(stale, cx);
+                if let Some(Modal::Diff(view)) = &ws.modals.current {
+                    view.update(cx, |v, cx| v.status_changed(&new, cx));
+                }
                 ws.git_panel.update(cx, |p, cx| p.set_status(new, cx));
                 cx.notify();
             })

@@ -118,6 +118,13 @@ impl Workspace {
                 image.update(cx, |i, cx| i.reload_if_changed(cx));
             }
         }
+        // An edit from outside (a formatter in the terminal, another editor)
+        // that leaves Git's status as it was: the diff of the file shows it.
+        if let Some(Modal::Diff(view)) = &self.modals.current
+            && view.read(cx).working_tree_file().is_some_and(|p| paths.contains(p))
+        {
+            view.update(cx, |v, cx| v.reload(cx));
+        }
     }
 
     /// Scans the project's files in the background (a new project, new

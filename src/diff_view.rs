@@ -194,6 +194,29 @@ impl DiffView {
         .detach();
     }
 
+    /// The repository's status changed (a commit, staging, maybe outside
+    /// Kuana): a working tree diff follows its file, and closes once the file
+    /// has nothing left on its side, as after staging the whole file here.
+    pub fn status_changed(&mut self, status: &git::RepoStatus, cx: &mut Context<Self>) {
+        let DiffSource::Working { file, staged, .. } = &mut self.source else { return };
+        let side = |f: &FileStatus| if *staged { f.staged } else { f.unstaged };
+        match status.files.iter().find(|f| f.rel == file.rel && side(f).is_some()) {
+            Some(now) => {
+                *file = now.clone();
+                self.reload(cx);
+            }
+            None => cx.emit(DiffViewEvent::Close),
+        }
+    }
+
+    /// The working tree file an unstaged diff shows, which it reloads with.
+    pub fn working_tree_file(&self) -> Option<&Path> {
+        match &self.source {
+            DiffSource::Working { file, staged: false, .. } => Some(&file.path),
+            _ => None,
+        }
+    }
+
     /// The file this diff is of, for its tab: the path and the path shown.
     pub fn tab_file(&self) -> (PathBuf, String) {
         let (path, rel, _) = self.file_label();
