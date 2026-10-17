@@ -210,7 +210,14 @@ impl Blame {
                 return Some(Some(BlameLine::uncommitted()));
             }
         }
-        if edited && (old >= self.text.len_lines() || doc.rope().line(row) != self.text.line(old)) {
+        // The same text, line break or not (a last line that got one).
+        fn text(line: ropey::RopeSlice<'_>) -> ropey::RopeSlice<'_> {
+            match line.len_chars() {
+                n if n > 0 && line.char(n - 1) == '\n' => line.slice(..n - 1),
+                _ => line,
+            }
+        }
+        if edited && (old >= self.text.len_lines() || text(doc.rope().line(row)) != text(self.text.line(old))) {
             return Some(Some(BlameLine::uncommitted()));
         }
         Some(self.lines.line(old).cloned())
@@ -5716,6 +5723,14 @@ mod blame_tests {
         // Lines added above move the rest down.
         doc.edit(vec![(0..0, "x\ny\n".into())], &[], EditKind::Other);
         assert_eq!(shown(&doc), ["new", "new", "a", "new", "b", "new", "c"]);
+
+        // A last line without a line break keeps its commit when it gets one.
+        let mut doc = Document::from_text("a\nb".into(), None);
+        let lines = git::FileBlame::of(vec![commit("a"), commit("b")], vec![0, 1]);
+        let blame = Blame { git_file: blame.git_file.clone(), doc: doc.id(), version: doc.version(), text: doc.rope().clone(), lines };
+        doc.edit(vec![(3..3, "\n".into())], &[], EditKind::Other);
+        let summary = |row| blame.line(row, &doc).flatten().map(|l| if l.uncommitted { "new".to_string() } else { l.summary });
+        assert_eq!((summary(0), summary(1)), (Some("a".into()), Some("b".into())));
     }
 }
 
