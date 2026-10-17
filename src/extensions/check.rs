@@ -90,6 +90,10 @@ pub fn check(dir: &Path) -> Vec<Finding> {
         add(level, problem);
     }
     if runs_code {
+        let adapters = manifest.get("debug_adapters").and_then(Value::as_table).into_iter().flatten();
+        for (id, _) in adapters.filter(|(_, adapter)| adapter.get("command").is_none()) {
+            add(Level::Note, format!("debug adapter {id}: its code starts it, which Kuana doesn't run yet"));
+        }
         match super::wasm::check(dir, &info.id) {
             Ok(()) => add(Level::Note, "extension.wasm: its code loads".into()),
             Err(err) => add(Level::Error, format!("extension.wasm: {err}")),

@@ -654,9 +654,14 @@ fn read_extension(dir: &Path) -> Read {
 
     // Debug adapters: Zed extensions start theirs in code; here it's the
     // `command` (with `{port}` in `args` when `tcp`).
+    // An extension with code starts its adapters there, which Kuana doesn't
+    // run yet: nothing for its user to fix, so not a problem.
+    let has_code = wasm::supported(&manifest, dir);
     for (id, adapter) in manifest.get("debug_adapters").and_then(Value::as_table).into_iter().flatten() {
         let Some(command) = adapter.get("command").and_then(Value::as_str) else {
-            info.problems.push(format!("debug adapter {id}: it needs a command"));
+            if !has_code {
+                info.problems.push(format!("debug adapter {id}: it needs a command"));
+            }
             continue;
         };
         info.adapters.push(Box::leak(Box::new(crate::debugger::launch::ExtensionAdapter {
