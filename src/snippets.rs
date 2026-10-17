@@ -4,7 +4,13 @@
 //! `typescript.json`…) for one language, `*.code-snippets` for several (with
 //! an optional `"scope": "rust,go"`). Comments and trailing commas are fine.
 
-use std::{ops::Range, path::PathBuf};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+    time::SystemTime,
+};
 
 use serde_json::Value;
 
@@ -81,32 +87,108 @@ pub fn snippets_dir() -> Option<PathBuf> {
     config_dir().map(|d| d.join("snippets"))
 }
 
-/// The user's snippets for `language`. Read on each use: the files are small,
-/// and edits to them apply right away.
+/// The user's snippets for `language`, the user's own and extensions' (Zed
+/// and VS Code use the same files). Asked for on every completion request
+/// and Tab, so files are read again only when they changed (see `Cache`):
+/// edits to them still apply right away.
 pub fn user_snippets(language: Language) -> Vec<UserSnippet> {
-    // The user's own and extensions' (Zed and VS Code use the same files).
     let mut dirs: Vec<PathBuf> = snippets_dir().into_iter().collect();
     dirs.extend(crate::extensions::snippet_dirs());
-    let id = language_id(language);
+    snippets_in(&dirs, language_id(language))
+}
+
+/// The snippets for language `id` in the files of `dirs`.
+fn snippets_in(dirs: &[PathBuf], id: &str) -> Vec<UserSnippet> {
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
-    for entry in dirs.iter().filter_map(|dir| std::fs::read_dir(dir).ok()).flatten().flatten() {
-        let path = entry.path();
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let global = name.ends_with(".code-snippets");
-        if !global && name != format!("{id}.json") {
-            continue;
-        }
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            out.extend(parse(&text, global.then_some(id)));
+    for dir in dirs {
+        for path in cache.files_in(dir) {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // A language's own file, or one for several (`scope` says which).
+            let global = name.ends_with(".code-snippets");
+            if !global && name != format!("{id}.json") {
+                continue;
+            }
+            let snippets = cache.snippets(&path);
+            out.extend(snippets.iter().filter(|s| !global || s.applies_to(id)).map(|s| s.snippet.clone()));
         }
     }
     out.sort_by(|a, b| a.prefix.cmp(&b.prefix));
     out
 }
 
-/// Parses a snippet file. `scope_for`: in a `.code-snippets` file, keep only
-/// snippets without a scope or whose scope lists this language id.
-fn parse(text: &str, scope_for: Option<&str>) -> Vec<UserSnippet> {
+/// Snippet folders and files as last read, to read again only what changed.
+#[derive(Default)]
+struct Cache {
+    /// Each folder's snippet files, as of its modification time (adding,
+    /// removing or renaming a file changes it); None: list it again.
+    dirs: HashMap<PathBuf, (Option<SystemTime>, Vec<PathBuf>)>,
+    /// Each file's snippets, as of its modification time and size; None:
+    /// read it again.
+    files: HashMap<PathBuf, (Option<(SystemTime, u64)>, Vec<Scoped>)>,
+}
+
+static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+
+/// Whether a modification time is old enough that a change made after it
+/// gets a later one: file systems' clocks tick coarsely (Linux's every few
+/// milliseconds), so a change right after a read could keep its time.
+fn settled(modified: SystemTime) -> bool {
+    SystemTime::now().duration_since(modified).is_ok_and(|age| age > std::time::Duration::from_secs(1))
+}
+
+impl Cache {
+    fn files_in(&mut self, dir: &Path) -> Vec<PathBuf> {
+        let modified = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+        if let Some((Some(at), files)) = self.dirs.get(dir)
+            && Some(*at) == modified
+        {
+            return files.clone();
+        }
+        let files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "json" || e == "code-snippets"))
+            .collect();
+        // Files that went are forgotten.
+        self.files.retain(|path, _| path.parent() != Some(dir) || files.contains(path));
+        self.dirs.insert(dir.to_path_buf(), (modified.filter(|m| settled(*m)), files.clone()));
+        files
+    }
+
+    /// A file's snippets (none when it doesn't read), parsed again when its
+    /// modification time or size changed.
+    fn snippets(&mut self, path: &Path) -> &[Scoped] {
+        let Some(stamp) = std::fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.len()))) else {
+            self.files.remove(path);
+            return &[];
+        };
+        if !matches!(self.files.get(path), Some((Some(at), _)) if *at == stamp) {
+            let snippets = std::fs::read_to_string(path).map(|text| parse(&text)).unwrap_or_default();
+            self.files.insert(path.to_path_buf(), (settled(stamp.0).then_some(stamp), snippets));
+        }
+        &self.files[path].1
+    }
+}
+
+/// A snippet and, in a `.code-snippets` file, the language ids its `scope`
+/// lists (None: every language).
+#[derive(Clone, Debug)]
+struct Scoped {
+    scope: Option<String>,
+    snippet: UserSnippet,
+}
+
+impl Scoped {
+    fn applies_to(&self, id: &str) -> bool {
+        self.scope.as_deref().is_none_or(|scope| scope.split(',').any(|s| s.trim() == id))
+    }
+}
+
+/// Parses a snippet file: every snippet, with its scope.
+fn parse(text: &str) -> Vec<Scoped> {
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&strip_jsonc(text)) else { return Vec::new() };
     let lines = |v: Option<&Value>| -> Vec<String> {
         match v {
@@ -117,15 +199,11 @@ fn parse(text: &str, scope_for: Option<&str>) -> Vec<UserSnippet> {
     };
     let mut out = Vec::new();
     for (name, snippet) in map {
-        if let (Some(id), Some(scope)) = (scope_for, snippet.get("scope").and_then(Value::as_str))
-            && !scope.split(',').any(|s| s.trim() == id)
-        {
-            continue;
-        }
+        let scope = snippet.get("scope").and_then(Value::as_str).map(str::to_string);
         let body = lines(snippet.get("body")).join("\n");
         let description = snippet.get("description").and_then(Value::as_str).map_or(name.clone(), str::to_string);
         for prefix in lines(snippet.get("prefix")) {
-            out.push(UserSnippet { prefix, body: body.clone(), description: description.clone() });
+            out.push(Scoped { scope: scope.clone(), snippet: UserSnippet { prefix, body: body.clone(), description: description.clone() } });
         }
     }
     out
@@ -202,13 +280,44 @@ mod tests {
             "Log": { "prefix": ["log", "cl"], "body": ["console.log($1);", "$0"], "description": "Log it", },
             "Rust only": { "scope": "rust", "prefix": "t", "body": "x" },
         }"#;
-        let all = parse(text, None);
+        let all = parse(text);
         assert_eq!(all.len(), 3);
-        let log = all.iter().find(|s| s.prefix == "cl").unwrap();
+        let log = &all.iter().find(|s| s.snippet.prefix == "cl").unwrap().snippet;
         assert_eq!((log.body.as_str(), log.description.as_str()), ("console.log($1);\n$0", "Log it"));
-        let js = parse(text, Some("javascript"));
-        assert!(js.iter().all(|s| s.prefix != "t"));
-        assert!(parse(text, Some("rust")).iter().any(|s| s.prefix == "t"));
+        let prefixes = |id: &str| all.iter().filter(|s| s.applies_to(id)).map(|s| s.snippet.prefix.clone()).collect::<Vec<_>>();
+        assert!(!prefixes("javascript").contains(&"t".to_string()));
+        assert!(prefixes("rust").contains(&"t".to_string()));
         assert_eq!(indent_body("a {\n\t$0\n}", "    ", "  "), "a {\n      $0\n    }");
+    }
+
+    #[test]
+    fn snippet_files_are_read_again_when_they_change() {
+        let dir = std::env::temp_dir().join(format!("kuana-snippets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dirs = [dir.clone()];
+        let prefixes = || snippets_in(&dirs, "rust").into_iter().map(|s| s.prefix).collect::<Vec<_>>();
+        std::fs::write(dir.join("rust.json"), r#"{ "A": { "prefix": "a", "body": "x" } }"#).unwrap();
+        std::fs::write(dir.join("go.json"), r#"{ "G": { "prefix": "g", "body": "x" } }"#).unwrap();
+        assert_eq!(prefixes(), ["a"]);
+        // Changed in place, then a file for several languages added.
+        std::fs::write(dir.join("rust.json"), r#"{ "B": { "prefix": "bb", "body": "y" } }"#).unwrap();
+        assert_eq!(prefixes(), ["bb"]);
+        std::fs::write(dir.join("all.code-snippets"), r#"{ "C": { "prefix": "c", "body": "z", "scope": "rust" } }"#).unwrap();
+        assert_eq!(prefixes(), ["bb", "c"]);
+        // Removed.
+        std::fs::remove_file(dir.join("rust.json")).unwrap();
+        assert_eq!(prefixes(), ["c"]);
+        // A file not changed since it was read isn't read again: one rewritten
+        // behind the cache's back (same size and time) still gives what was read.
+        let an_hour_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let rewrite = |prefix: &str| {
+            std::fs::write(dir.join("rust.json"), format!(r#"{{ "S": {{ "prefix": "{prefix}", "body": "x" }} }}"#)).unwrap();
+            std::fs::File::options().write(true).open(dir.join("rust.json")).unwrap().set_modified(an_hour_ago).unwrap();
+        };
+        rewrite("aa");
+        assert_eq!(prefixes(), ["aa", "c"]);
+        rewrite("zz");
+        assert_eq!(prefixes(), ["aa", "c"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
