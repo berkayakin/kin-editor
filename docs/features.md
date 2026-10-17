@@ -34,7 +34,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
   (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
 - Inline diagnostics, gutter markers, scrollbar markers, a Problems panel and Next / Previous Problem
-- Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
+- Multi-cursor (next/all occurrences, of the caret's word as a whole word with its case; ⌥-click,
+  add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
 - Matching-bracket highlight (ignores brackets in strings and comments) and an editor right-click menu
 - Soft wrap that keeps indentation, on by default for Markdown and plain text (View → Soft-Wrap

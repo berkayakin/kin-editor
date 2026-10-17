@@ -243,6 +243,10 @@ pub struct Editor {
     /// Selections before each ExtendSelection, for ShrinkSelection.
     expand_stack: Vec<Vec<Selection>>,
     expanding: bool,
+    /// The selections Add Selection for Next Occurrence made, when it
+    /// started from a caret: while they're still the selections, it adds
+    /// only whole words (case-sensitively, as VS Code and Zed do).
+    occurrence_words: Option<Vec<Selection>>,
     selections: Vec<Selection>,
     /// Index of the most recently added selection.
     primary: usize,
@@ -388,6 +392,7 @@ impl Editor {
             active_match: None,
             expand_stack: Vec::new(),
             expanding: false,
+            occurrence_words: None,
             selections: vec![Selection::cursor(0)],
             primary: 0,
             goal_x: None,
@@ -2201,6 +2206,12 @@ impl Editor {
     }
 
     fn select_next_occurrence(&mut self, _: &SelectNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_next_occurrence(cx);
+    }
+
+    /// From carets, the words at them; then the next occurrence of the
+    /// primary selection's text (around the end), as another selection.
+    fn add_next_occurrence(&mut self, cx: &mut Context<Self>) {
         let primary = self.primary_selection();
         if primary.is_empty() {
             let selections = self
@@ -2212,21 +2223,24 @@ impl Editor {
                 })
                 .collect();
             self.set_selections(selections, self.primary, cx);
+            self.occurrence_words = Some(self.selections.clone());
             return;
         }
-        let needle = self.doc.read(cx).slice(primary.range());
-        let haystack = self.doc.read(cx).rope().to_string();
+        let whole_words = self.occurrence_words.as_ref() == Some(&self.selections);
+        let doc = self.doc.read(cx);
+        let needle = doc.slice(primary.range());
         let from = self.selections.iter().map(|s| s.range().end).max().unwrap_or(0);
-        let found = haystack[from..]
-            .find(&needle)
-            .map(|i| i + from)
-            .or_else(|| haystack.find(&needle))
+        let found = find_occurrence(doc, &needle, from, doc.len(), whole_words)
+            .or_else(|| find_occurrence(doc, &needle, 0, from, whole_words))
             .filter(|&i| !self.selections.iter().any(|s| s.range().start == i));
         if let Some(start) = found {
             let mut selections = self.selections.clone();
             selections.push(Selection { anchor: start, head: start + needle.len() });
             let primary = selections.len() - 1;
             self.set_selections(selections, primary, cx);
+            if whole_words {
+                self.occurrence_words = Some(self.selections.clone());
+            }
         }
     }
 
@@ -3833,6 +3847,51 @@ fn word_right(doc: &Document, mut o: usize) -> usize {
     o
 }
 
+/// Where `needle` first occurs in `doc` starting from `from` up to (not
+/// from) `to`, matching case; with `whole_words`, only where no word
+/// character goes on past either end of it. Reads the rope chunk by chunk
+/// rather than copying the text.
+fn find_occurrence(doc: &Document, needle: &str, from: usize, to: usize, whole_words: bool) -> Option<usize> {
+    let pattern = needle.as_bytes();
+    if pattern.is_empty() || from >= to || from >= doc.len() {
+        return None;
+    }
+    let is_word = |c: Option<char>| c.is_some_and(|c| char_kind(c) == CharKind::Word);
+    let (word_start, word_end) = (is_word(needle.chars().next()), is_word(needle.chars().next_back()));
+    let whole = |start: usize| {
+        let joined_before = word_start && is_word(doc.char_before(start));
+        let joined_after = word_end && is_word(doc.char_at(start + pattern.len()));
+        !whole_words || !(joined_before || joined_after)
+    };
+    // The bytes from `window_start` on: what's left of the chunks before
+    // (shorter than a match) and the current chunk.
+    let (chunks, mut chunk_start, _, _) = doc.rope().chunks_at_byte(from);
+    let (mut window, mut window_start) = (Vec::new(), from);
+    for chunk in chunks {
+        let bytes = chunk.as_bytes();
+        window.extend_from_slice(&bytes[from.saturating_sub(chunk_start).min(bytes.len())..]);
+        chunk_start += bytes.len();
+        let mut at = 0;
+        while let Some(i) = window[at..].windows(pattern.len()).position(|w| w == pattern) {
+            let start = window_start + at + i;
+            if start >= to {
+                return None;
+            }
+            if whole(start) {
+                return Some(start);
+            }
+            at += i + 1;
+        }
+        let keep = window.len().min(pattern.len() - 1);
+        window_start += window.len() - keep;
+        window.drain(..window.len() - keep);
+        if window_start >= to {
+            return None;
+        }
+    }
+    None
+}
+
 /// Where Next (`forward`) or Previous Problem goes from `head`: the nearest
 /// problem start after (before) it, else around the file, the first (last).
 /// `starts` is sorted.
@@ -4312,26 +4371,45 @@ impl Editor {
         if self.selections.len() < 2 {
             return;
         }
+        let whole_words = self.occurrence_words.as_ref() == Some(&self.selections);
         let mut selections = self.selections.clone();
         selections.remove(self.primary);
         let primary = self.primary.saturating_sub(1).min(selections.len() - 1);
         self.set_selections(selections, primary, cx);
+        if whole_words {
+            self.occurrence_words = Some(self.selections.clone());
+        }
     }
 
     fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_occurrences(cx);
+    }
+
+    fn select_occurrences(&mut self, cx: &mut Context<Self>) {
         let p = self.primary_selection();
-        let range = if p.is_empty() { word_range(self.doc.read(cx), p.head) } else { p.range() };
+        // From a caret, the word there wherever it's a whole word (as Add
+        // Selection for Next Occurrence goes on from one).
+        let whole_words = p.is_empty() || self.occurrence_words.as_ref() == Some(&self.selections);
+        let doc = self.doc.read(cx);
+        let range = if p.is_empty() { word_range(doc, p.head) } else { p.range() };
         if range.is_empty() {
             return;
         }
-        let needle = self.doc.read(cx).slice(range.clone());
-        let haystack = self.doc.read(cx).rope().to_string();
-        let selections: Vec<Selection> = haystack
-            .match_indices(&needle)
-            .map(|(i, _)| Selection { anchor: i, head: i + needle.len() })
-            .collect();
+        let needle = doc.slice(range.clone());
+        let mut selections = Vec::new();
+        let mut from = 0;
+        while let Some(start) = find_occurrence(doc, &needle, from, doc.len(), whole_words) {
+            selections.push(Selection { anchor: start, head: start + needle.len() });
+            from = start + needle.len();
+        }
+        if selections.is_empty() {
+            return;
+        }
         let primary = selections.iter().position(|s| s.anchor == range.start).unwrap_or(0);
         self.set_selections(selections, primary, cx);
+        if whole_words {
+            self.occurrence_words = Some(self.selections.clone());
+        }
     }
 
     fn toggle_case(&mut self, _: &ToggleCase, _: &mut Window, cx: &mut Context<Self>) {
@@ -5011,6 +5089,45 @@ mod block_tests {
             // In document order, around the end both ways.
             assert_eq!(steps, [4, 15, 4, 15, 4]);
         });
+    }
+
+    #[gpui::test]
+    fn occurrences_of_a_word_at_the_caret_are_whole_words(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::new(Document::from_text("foo foobar Foo foo_x foo\nfoo\n".into(), None), cx));
+        editor.update(cx, |e, cx| {
+            let selected = |e: &Editor| e.selections.iter().map(Selection::range).collect::<Vec<_>>();
+            // From a caret: its word, then the same word, matching case.
+            e.set_selections(vec![Selection::cursor(1)], 0, cx);
+            for _ in 0..4 {
+                e.add_next_occurrence(cx);
+            }
+            assert_eq!(selected(e), [0..3, 21..24, 25..28]);
+            // Selected by hand: any match, still matching case.
+            e.set_selections(vec![Selection { anchor: 0, head: 3 }], 0, cx);
+            e.add_next_occurrence(cx);
+            assert_eq!(selected(e), [0..3, 4..7]);
+            // Select All Occurrences from a caret: whole words too.
+            e.set_selections(vec![Selection::cursor(22)], 0, cx);
+            e.select_occurrences(cx);
+            assert_eq!(selected(e), [0..3, 21..24, 25..28]);
+        });
+    }
+
+    #[test]
+    fn occurrences_are_found_across_the_ropes_chunks() {
+        let needle = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let text: String = (0..200).map(|i| format!("{needle}-{i:04}|")).collect();
+        let doc = Document::from_text(text.clone(), None);
+        assert!(doc.rope().chunks().count() > 4);
+        for from in (0..text.len()).step_by(7) {
+            let expected = text[from..].find(needle).map(|i| i + from);
+            assert_eq!(find_occurrence(&doc, needle, from, text.len(), false), expected, "from {from}");
+        }
+        // Only matches starting before `to`; whole words with word characters around fail.
+        assert_eq!(find_occurrence(&doc, needle, 1, 46, false), None);
+        assert_eq!(find_occurrence(&doc, needle, 0, 1, false), Some(0));
+        assert_eq!(find_occurrence(&doc, "efgh", 0, text.len(), true), None);
+        assert_eq!(find_occurrence(&doc, "-0001|", 0, text.len(), true), Some(86));
     }
 
     #[test]
