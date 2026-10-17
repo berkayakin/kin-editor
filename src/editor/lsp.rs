@@ -549,17 +549,19 @@ impl Editor {
         }
         let items = menu.items.clone();
         let cancel = renew(&mut self.lsp.rank_cancel);
-        let ranking = cx.background_executor().spawn(async move { rank_completions(&items, &typed, &cancel).map(|ranked| (typed, ranked)) });
+        let ranked = items.clone();
+        let ranking = cx.background_executor().spawn(async move { rank_completions(&ranked, &typed, &cancel).map(|ranked| (typed, ranked)) });
         self.lsp.rank_task = Some(cx.spawn(async move |this, cx| {
             let Some((typed, (matches, selected))) = ranking.await else { return };
-            this.update(cx, |e, cx| e.show_ranking(typed, matches, selected, cx)).ok();
+            this.update(cx, |e, cx| e.show_ranking(&items, typed, matches, selected, cx)).ok();
         }));
     }
 
-    /// A ranking for `typed` is done: the menu shows it, unless something
-    /// else is typed by now (a newer one is on its way).
-    fn show_ranking(&mut self, typed: String, matches: Vec<usize>, selected: usize, cx: &mut Context<Self>) {
-        let Some(start) = self.lsp.completion.as_ref().map(|m| m.start) else { return };
+    /// A ranking of `items` for `typed` is done: the menu shows it, unless
+    /// it lists other items by now, or something else is typed (a newer
+    /// ranking is on its way).
+    fn show_ranking(&mut self, items: &Arc<Vec<CompletionItem>>, typed: String, matches: Vec<usize>, selected: usize, cx: &mut Context<Self>) {
+        let Some(start) = self.lsp.completion.as_ref().filter(|m| Arc::ptr_eq(&m.items, items)).map(|m| m.start) else { return };
         if self.typed_from(start, cx).as_ref() != Some(&typed) {
             return;
         }
@@ -583,7 +585,7 @@ impl Editor {
         let items = menu.items.clone();
         self.stop_ranking();
         if let Some((matches, selected)) = rank_completions(&items, &typed, &AtomicBool::new(false)) {
-            self.show_ranking(typed, matches, selected, cx);
+            self.show_ranking(&items, typed, matches, selected, cx);
         }
     }
 
