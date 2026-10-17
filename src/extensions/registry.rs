@@ -272,14 +272,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A registry built locally (kuana-extensions' scripts/build.py, its
-    /// index signed): installs Dart from it, and refuses a package that
-    /// doesn't match its checksum. Points the config folder elsewhere, so
-    /// it runs alone:
-    /// `KUANA_REGISTRY=file:///…/dist/index.json cargo test installs_from_a_local_registry -- --ignored`.
+    /// The published registry (or one built locally, its index signed:
+    /// `KUANA_REGISTRY=file:///…/dist/index.json`): installs Dart from it,
+    /// and refuses a package that doesn't match its checksum. Points the
+    /// config folder elsewhere, so it runs alone:
+    /// `cargo test installs_from_the_registry -- --ignored`.
     #[test]
-    #[ignore = "needs a locally built, signed registry (KUANA_REGISTRY); changes XDG_CONFIG_HOME"]
-    fn installs_from_a_local_registry() {
+    #[ignore = "downloads from the registry; changes XDG_CONFIG_HOME"]
+    fn installs_from_the_registry() {
         let config = std::env::temp_dir().join(format!("kuana-registry-local-{}", std::process::id()));
         // SAFETY: this test runs on its own (it's ignored by default).
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &config) };
