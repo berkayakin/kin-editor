@@ -389,6 +389,12 @@ fn main() {
     let args: Vec<PathBuf> = raw.into_iter().map(PathBuf::from).collect();
     // A Kuana already running takes the paths; this launch is done.
     let Ok(instance) = instance::claim(&args) else { return };
+    // Git, language servers and debug adapters run with the login shell's
+    // PATH (`search_path`); ask the shell while the window opens, not when
+    // the first Git status waits for it.
+    std::thread::spawn(|| {
+        lsp::servers::search_path();
+    });
 
     #[cfg(target_os = "macos")]
     set_app_name();
