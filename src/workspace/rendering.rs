@@ -85,6 +85,10 @@ impl Workspace {
         let handle = div().id(id).absolute();
         let handle = match edge {
             Edge::Problems => handle.top(px(-GAP - 1.)).left_0().right_0().h(px(GAP)).cursor(CursorStyle::ResizeUpDown),
+            // In the gap between the sidebar and the editor, whichever side it's on.
+            Edge::Sidebar if self.sidebar_on_right(cx) => {
+                handle.top_0().bottom_0().left(px(-GAP - 1.)).w(px(GAP)).cursor(CursorStyle::ResizeLeftRight)
+            }
             Edge::Sidebar => handle.top_0().bottom_0().right(px(-GAP - 1.)).w(px(GAP)).cursor(CursorStyle::ResizeLeftRight),
             Edge::Pane(_) if self.pane_axis == PaneAxis::Row => {
                 handle.top_0().bottom_0().right(px(-GAP - 1.)).w(px(GAP)).cursor(CursorStyle::ResizeLeftRight)
@@ -195,9 +199,12 @@ impl Workspace {
                 self.problems_height = (resize.size + (resize.start - event.position.y)).clamp(px(90.), max);
             }
             Edge::Sidebar => {
-                // Leave the editor at least 320pt wide.
+                // Leave the editor at least 320pt wide. On the right, dragging
+                // left (toward the editor) widens it.
                 let max = (viewport.width - px(320.)).max(px(SIDEBAR_MIN_WIDTH));
-                self.sidebar_width = (resize.size + (event.position.x - resize.start)).clamp(px(SIDEBAR_MIN_WIDTH), max);
+                let delta = event.position.x - resize.start;
+                let delta = if self.sidebar_on_right(cx) { -delta } else { delta };
+                self.sidebar_width = (resize.size + delta).clamp(px(SIDEBAR_MIN_WIDTH), max);
             }
             Edge::Pane(ix) if ix + 1 < self.pane_sizes.len() => {
                 let bounds = self.panes_bounds.get();
@@ -285,6 +292,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::toggle_sidebar_position))
             .on_action(cx.listener(Self::toggle_problems))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::replace))
@@ -395,7 +403,9 @@ impl Render for Workspace {
                     .min_h_0()
                     .px(px(GAP))
                     .gap(px(GAP))
-                    .when(self.show_sidebar, |el| el.child(self.render_sidebar(window, cx)))
+                    // The sidebar keeps its full height on either side; the
+                    // bottom panels stay under the editor area.
+                    .when(self.show_sidebar && !self.sidebar_on_right(cx), |el| el.child(self.render_sidebar(window, cx)))
                     .child(
                         div()
                             .flex()
@@ -408,7 +418,8 @@ impl Render for Workspace {
                             .when(self.shows(BottomPanel::Terminal), |el| el.child(terminal_panel.unwrap()))
                             .when(self.shows(BottomPanel::GitLog), |el| el.child(self.render_git_log_panel(cx)))
                             .when(self.shows(BottomPanel::Debug), |el| el.children(self.render_debug_panel(cx))),
-                    ),
+                    )
+                    .when(self.show_sidebar && self.sidebar_on_right(cx), |el| el.child(self.render_sidebar(window, cx))),
             )
             .child(self.render_statusbar(cx)))
             .children(toasts)

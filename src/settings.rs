@@ -76,6 +76,8 @@ pub struct Settings {
     /// The switch `visual_effects` replaced: `true` reads as Minimal. Kept so
     /// a settings.json that has it still works; writing the level removes it.
     pub reduce_visual_effects: Option<bool>,
+    /// Which side of the editor the sidebar (Files, Commit) sits on.
+    pub sidebar_dock: Option<SidebarDock>,
     /// How Update Project (pull) combines incoming commits with local ones
     /// when both branches have new commits. Unset: as the Git config says,
     /// else asked the first time it happens.
@@ -181,6 +183,34 @@ impl VisualEffects {
     /// No shadows, glows or animations.
     pub fn minimal(self) -> bool {
         self == VisualEffects::Minimal
+    }
+}
+
+/// Which side of the editor area the sidebar (the file tree and the Git
+/// panel) sits on.
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarDock {
+    #[default]
+    Left,
+    Right,
+}
+
+impl SidebarDock {
+    pub const ALL: [SidebarDock; 2] = [SidebarDock::Left, SidebarDock::Right];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SidebarDock::Left => "left",
+            SidebarDock::Right => "right",
+        }
+    }
+
+    pub fn other(self) -> SidebarDock {
+        match self {
+            SidebarDock::Left => SidebarDock::Right,
+            SidebarDock::Right => SidebarDock::Left,
+        }
     }
 }
 
@@ -331,6 +361,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "icon_theme",
     "visual_effects",
     "reduce_visual_effects",
+    "sidebar_dock",
     "pull_strategy",
 ];
 
@@ -449,6 +480,20 @@ impl Settings {
         })
     }
 
+    /// The side the sidebar sits on (left unless set).
+    pub fn sidebar_dock(&self) -> SidebarDock {
+        self.sidebar_dock.unwrap_or_default()
+    }
+
+    /// Writes the sidebar's side; the default (left) removes the key.
+    pub fn set_sidebar_dock(dock: SidebarDock) -> std::io::Result<()> {
+        if dock == SidebarDock::default() {
+            Self::remove("sidebar_dock")
+        } else {
+            Self::set("sidebar_dock", dock.key().into())
+        }
+    }
+
     /// Saves a visual effects level (Full, the default, by removing the key)
     /// and drops the older `reduce_visual_effects` switch, which would
     /// otherwise speak for it once `visual_effects` is gone.
@@ -512,6 +557,7 @@ impl Settings {
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
             "visual_effects" => self.visual_effects.is_some() || self.reduce_visual_effects.is_some(),
+            "sidebar_dock" => self.sidebar_dock.is_some(),
             "terminal_shell" => self.terminal_shell.is_some(),
             "run_configurations" => !self.run_configurations.is_empty(),
             "auto_update" => self.auto_update.is_some(),
@@ -793,6 +839,9 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you
   // colors instead of gradients) or "minimal" (also no shadows, glows or
   // animations).
   // "visual_effects": "full",
+  // Which side of the editor the sidebar (Files, Commit) sits on: "left" or
+  // "right".
+  // "sidebar_dock": "left",
 
   // Per-language overrides, by the name shown in the status bar.
   // "languages": {
@@ -1171,6 +1220,16 @@ mod tests {
         assert_eq!(Settings::parse(r#"{"theme": "a // b /* c"}"#).unwrap().theme.as_deref(), Some("a // b /* c"));
         assert!(Settings::parse("{ \"tab_size\": ").is_err());
         assert!(Settings::parse(SETTINGS_TEMPLATE).unwrap() == Settings::default());
+    }
+
+    #[test]
+    fn reads_the_sidebar_dock() {
+        let dock = |json: &str| Settings::parse(json).unwrap().sidebar_dock();
+        assert_eq!(dock("{}"), SidebarDock::Left);
+        assert_eq!(dock(r#"{"sidebar_dock": "right"}"#), SidebarDock::Right);
+        assert_eq!(dock(r#"{"sidebar_dock": "left"}"#), SidebarDock::Left);
+        assert!(Settings::unknown_keys(r#"{"sidebar_dock": "right"}"#).is_empty());
+        assert_eq!(SidebarDock::Left.other(), SidebarDock::Right);
     }
 
     #[test]

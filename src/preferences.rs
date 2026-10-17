@@ -21,7 +21,7 @@ use crate::{
     format,
     git::PullStrategy,
     lsp::servers,
-    settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings, ShowWhitespace, VisualEffects},
+    settings::{self, AutoSave, BaseKeymap, RunConfiguration, Settings, ShowWhitespace, SidebarDock, VisualEffects},
     syntax::Language,
     theme::{self, Appearance, Theme, ThemeRegistry},
     workspace::Find,
@@ -124,6 +124,7 @@ enum Setting {
     Theme,
     IconTheme,
     VisualEffects,
+    SidebarDock,
     BaseKeymap,
     FontFamily,
     FontSize,
@@ -150,10 +151,11 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 26] = [
+    const ALL: [Setting; 27] = [
         Setting::Theme,
         Setting::IconTheme,
         Setting::VisualEffects,
+        Setting::SidebarDock,
         Setting::BaseKeymap,
         Setting::FontFamily,
         Setting::FontSize,
@@ -181,7 +183,7 @@ impl Setting {
 
     fn page(self) -> Page {
         match self {
-            Setting::Theme | Setting::IconTheme | Setting::VisualEffects => Page::Appearance,
+            Setting::Theme | Setting::IconTheme | Setting::VisualEffects | Setting::SidebarDock => Page::Appearance,
             Setting::BaseKeymap => Page::Keymap,
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
@@ -203,6 +205,7 @@ impl Setting {
             Setting::Theme => "Theme",
             Setting::IconTheme => "File icons",
             Setting::VisualEffects => "Effects",
+            Setting::SidebarDock => "Layout",
             Setting::BaseKeymap => "Keymap",
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => "Font",
             Setting::TabSize | Setting::HardTabs => "Indentation",
@@ -225,6 +228,7 @@ impl Setting {
             Setting::Theme => "Theme",
             Setting::IconTheme => "Icon theme",
             Setting::VisualEffects => "Visual effects",
+            Setting::SidebarDock => "Sidebar position",
             Setting::BaseKeymap => "Base keymap",
             Setting::FontFamily => "Family",
             Setting::FontSize => "Size",
@@ -256,6 +260,7 @@ impl Setting {
             Setting::Theme => "Add your own themes as .json files in the themes folder.",
             Setting::IconTheme => "File and folder icons. Extensions can add icon themes (Zed's work too).",
             Setting::VisualEffects => "Reduced uses solid colors instead of gradients; Minimal also drops shadows, glows and animations.",
+            Setting::SidebarDock => "Which side of the editor the Files and Commit views sit on.",
             Setting::BaseKeymap => "The shortcuts Kuana starts from. Your own changes below stay on top of any of them.",
             Setting::FontFamily => "Monospaced fonts installed on this computer.",
             Setting::FontSize => "Zoom (Increase / Decrease Font Size) adds to this until you reset it.",
@@ -288,6 +293,7 @@ impl Setting {
             Setting::Theme => "color scheme dark light appearance",
             Setting::IconTheme => "icons file icons folder icon theme",
             Setting::VisualEffects => "reduce simple simplify plain flat minimal gradient shadow glow animation transition motion effects decoration",
+            Setting::SidebarDock => "sidebar side dock left right position move layout file tree project panel git commit",
             Setting::BaseKeymap => "keymap shortcuts key bindings vscode vs code jetbrains intellij webstorm sublime zed",
             Setting::FontFamily => "typeface family monospace",
             Setting::FontSize => "font zoom text",
@@ -337,6 +343,7 @@ enum Menu {
     BaseKeymap,
     FontFamily,
     VisualEffects,
+    SidebarDock,
     PullStrategy,
     LanguageServer,
     Formatter,
@@ -1352,6 +1359,14 @@ impl Preferences {
                     this.write(Settings::set_visual_effects(VisualEffects::ALL[ix]), cx);
                 })
             }
+            Setting::SidebarDock => {
+                let current = settings.sidebar_dock();
+                let options = SidebarDock::ALL.iter().map(|d| (sidebar_dock_label(*d).into(), *d == current)).collect();
+                self.dropdown(Menu::SidebarDock, sidebar_dock_label(current).into(), px(200.), options, cx, move |this, ix, _, cx| {
+                    this.menu = None;
+                    this.write(Settings::set_sidebar_dock(SidebarDock::ALL[ix]), cx);
+                })
+            }
             Setting::FormatOnSave => self.bool_switch("pref-format", "format_on_save", settings.editor.format_on_save, cx),
             Setting::TrustAll => self.switch_with_default("pref-trust-all", "trust_all_projects", settings.trust_all_projects, false, cx),
             Setting::NativeGrammars => self.switch_with_default("pref-native-grammars", "native_grammars", settings.native_grammars, false, cx),
@@ -2310,6 +2325,7 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::HardTabs => "hard_tabs",
         Setting::IconTheme => "icon_theme",
         Setting::VisualEffects => "visual_effects",
+        Setting::SidebarDock => "sidebar_dock",
         Setting::SoftWrap => "soft_wrap",
         Setting::Rulers => "rulers",
         Setting::ShowWhitespace => "show_whitespace",
@@ -2326,6 +2342,13 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::NativeGrammars => "native_grammars",
         Setting::AutoUpdate => "auto_update",
         Setting::PullStrategy => "pull_strategy",
+    }
+}
+
+fn sidebar_dock_label(dock: SidebarDock) -> &'static str {
+    match dock {
+        SidebarDock::Left => "Left",
+        SidebarDock::Right => "Right",
     }
 }
 

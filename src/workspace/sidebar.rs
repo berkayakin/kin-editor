@@ -116,6 +116,31 @@ impl Workspace {
             .child(self.render_sidebar_tabs(window, cx))
     }
 
+    /// Whether the sidebar sits right of the editor area (`sidebar_dock`).
+    pub(super) fn sidebar_on_right(&self, cx: &App) -> bool {
+        Settings::get(cx).sidebar_dock() == crate::settings::SidebarDock::Right
+    }
+
+    /// Toggle Sidebar Position, and Move to Right / Left on the sidebar's tabs.
+    pub(super) fn toggle_sidebar_position(&mut self, _: &ToggleSidebarPosition, window: &mut Window, cx: &mut Context<Self>) {
+        let dock = Settings::get(cx).sidebar_dock().other();
+        if let Err(err) = Settings::set_sidebar_dock(dock) {
+            let _ = window.prompt(PromptLevel::Warning, "Couldn't save the sidebar's position", Some(&err.to_string()), &["OK"], cx);
+        }
+        let problems = settings::reload_now(cx);
+        self.report_config_problems(problems, cx);
+        cx.notify();
+    }
+
+    /// The sidebar tabs' right-click menu: move the sidebar to the other side.
+    fn open_sidebar_tab_menu(&mut self, position: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let label = if self.sidebar_on_right(cx) { "Move to Left" } else { "Move to Right" };
+        let icon = if self.sidebar_on_right(cx) { Icon::PanelLeft } else { Icon::PanelRight };
+        let entries = vec![MenuEntry::item(label, icon)];
+        let actions = vec![Some(MenuAction::Run(Box::new(ToggleSidebarPosition)))];
+        self.show_context_menu(entries, actions, position, None, window, cx);
+    }
+
     /// The sidebar's two views as tabs above its island, shaped like the
     /// editor's (`tab_shape`), without close buttons. In a narrow sidebar they
     /// give up their names: the other tab first, then the current one too
@@ -160,7 +185,9 @@ impl Workspace {
                 .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
                 .when(named, |el| el.child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label)))
         };
+        let on_right = self.sidebar_on_right(cx);
         div()
+            .id("sidebar-tabs")
             .absolute()
             .top_0()
             .left_0()
@@ -173,6 +200,13 @@ impl Workspace {
             .pl(px(TAB_STRIP_INSET))
             .pr(px(TAB_STRIP_INSET))
             .overflow_hidden()
+            .on_mouse_down(MouseButton::Right, cx.listener(|ws, e: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                ws.open_sidebar_tab_menu(e.position, window, cx);
+            }))
+            // On the right the strip mirrors: the tabs at the window's edge,
+            // the free space (which drags the window) toward the editor.
+            .when(on_right, |el| el.child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0()))
             .child(
                 tab("sidebar-files", Icon::Folder, "Files", files_on, false, files_named)
                     .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
@@ -196,6 +230,6 @@ impl Workspace {
                     })
                     .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
             )
-            .child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0())
+            .when(!on_right, |el| el.child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0()))
     }
 }

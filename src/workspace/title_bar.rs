@@ -213,7 +213,7 @@ impl Workspace {
             .items_center()
             .gap(px(2.))
             .child(
-                toggle("toggle-sidebar", Icon::PanelLeft, self.show_sidebar, cx, |ws, window, cx| ws.set_sidebar_visible(!ws.show_sidebar, window, cx))
+                toggle("toggle-sidebar", if self.sidebar_on_right(cx) { Icon::PanelRight } else { Icon::PanelLeft }, self.show_sidebar, cx, |ws, window, cx| ws.set_sidebar_visible(!ws.show_sidebar, window, cx))
                     .tooltip(|_, cx| tooltip_view("Toggle Sidebar", cx)),
             )
             .child(

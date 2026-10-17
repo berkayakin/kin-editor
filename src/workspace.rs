@@ -133,6 +133,7 @@ actions!(
         NextTab,
         PrevTab,
         ToggleSidebar,
+        ToggleSidebarPosition,
         ToggleProblems,
         ToggleTerminal,
         ToggleGitLog,
