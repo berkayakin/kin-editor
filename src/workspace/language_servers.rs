@@ -34,13 +34,29 @@ impl Workspace {
     }
 
     /// The open tab for `path`, comparing real paths (servers may report
-    /// `/tmp/…` for `/private/tmp/…`).
+    /// `/tmp/…` for `/private/tmp/…`): `path`'s is read once, the tabs' are
+    /// kept (`real_paths`), each read again only when its path changes.
     pub(super) fn tab_for(&self, path: &Path, cx: &App) -> Option<Entity<Editor>> {
-        let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path_of = |tab: &Entity<Editor>| tab.read(cx).doc.read(cx).path.clone();
+        if let Some(tab) = self.editors.iter().find(|t| path_of(t).as_deref() == Some(path)) {
+            return Some(tab.clone());
+        }
+        let wanted = path.canonicalize().ok()?;
+        let mut real_paths = self.real_paths.borrow_mut();
+        if real_paths.len() > 2 * self.editors.len() {
+            let open: HashSet<EntityId> = self.editors.iter().map(|t| t.entity_id()).collect();
+            real_paths.retain(|id, _| open.contains(id));
+        }
         self.editors
             .iter()
-            .find(|t| {
-                t.read(cx).doc.read(cx).path.as_deref().is_some_and(|p| p == path || p.canonicalize().is_ok_and(|p| p == wanted))
+            .find(|tab| {
+                let Some(path) = path_of(tab) else { return false };
+                let (known, real) = real_paths.entry(tab.entity_id()).or_insert_with(|| (PathBuf::new(), None));
+                if *known != path {
+                    *real = path.canonicalize().ok();
+                    *known = path;
+                }
+                real.as_deref() == Some(wanted.as_path())
             })
             .cloned()
     }
@@ -55,24 +71,46 @@ impl Workspace {
         }
     }
 
-    /// Lists usages (or several declarations) to pick from.
+    /// Lists usages (or several declarations) to pick from, each with its
+    /// line: from the tab's text where the file is open, else read in the
+    /// background, only as far as the last line wanted.
     pub(super) fn show_locations(&mut self, title: SharedString, locations: Vec<Location>, encoding: Encoding, window: &mut Window, cx: &mut Context<Self>) {
-        let mut files: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let mut tabs: HashMap<PathBuf, Option<Entity<Editor>>> = HashMap::new();
+        // Per file not open: the lines wanted, and the rows wanting them.
+        let mut unread: HashMap<PathBuf, Vec<(usize, usize)>> = HashMap::new();
         let mut rows = Vec::with_capacity(locations.len());
         for location in locations {
             let line = location.range.start.line as usize;
-            let lines = files.entry(location.path.clone()).or_insert_with(|| match self.tab_for(&location.path, cx) {
-                Some(editor) => editor.read(cx).doc.read(cx).rope().to_string().lines().map(str::to_string).collect(),
-                None => std::fs::read_to_string(&location.path).unwrap_or_default().lines().map(str::to_string).collect(),
-            });
-            let preview = lines.get(line).map(|l| l.trim().to_string()).unwrap_or_default();
+            let tab = tabs.entry(location.path.clone()).or_insert_with(|| self.tab_for(&location.path, cx));
+            let preview = match tab {
+                Some(editor) => editor.read(cx).doc.read(cx).rope().get_line(line).map(|l| l.to_string().trim().to_string()).unwrap_or_default(),
+                None => {
+                    unread.entry(location.path.clone()).or_default().push((line, rows.len()));
+                    String::new()
+                }
+            };
             rows.push(LocationRow { file: self.location_label(&location.path), line: line + 1, preview, location, encoding });
         }
-        self.close_modal(window, cx);
-        self.open_picker(PickerMode::Locations, window, cx);
-        if let Some(Modal::Picker(picker)) = &self.modals.current {
-            picker.update(cx, |p, cx| p.set_locations(Some(title), rows, cx));
-        }
+        let read = cx.background_executor().spawn(async move {
+            unread.into_iter().flat_map(|(path, wanted)| {
+                let lines = read_lines(&path, wanted.iter().map(|(line, _)| *line).max().unwrap_or(0));
+                wanted.into_iter().map(move |(line, row)| (row, lines.get(line).cloned().unwrap_or_default())).collect::<Vec<_>>()
+            }).collect::<Vec<_>>()
+        });
+        self.locations_task = Some(cx.spawn_in(window, async move |ws, cx| {
+            let previews = read.await;
+            ws.update_in(cx, |ws, window, cx| {
+                for (row, preview) in previews {
+                    rows[row].preview = preview;
+                }
+                ws.close_modal(window, cx);
+                ws.open_picker(PickerMode::Locations, window, cx);
+                if let Some(Modal::Picker(picker)) = &ws.modals.current {
+                    picker.update(cx, |p, cx| p.set_locations(Some(title), rows, cx));
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Applies a language server's edits: in a file's tab if it has one,
@@ -228,6 +266,22 @@ impl Workspace {
     }
 }
 
+/// A file's lines up to `last` (0-based), trimmed: read only that far.
+fn read_lines(path: &Path, last: usize) -> Vec<String> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else { return Vec::new() };
+    let mut reader = std::io::BufReader::new(file);
+    let (mut lines, mut line) = (Vec::new(), Vec::new());
+    while lines.len() <= last {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => lines.push(String::from_utf8_lossy(&line).trim().to_string()),
+        }
+    }
+    lines
+}
+
 /// A file's edits as byte ranges in the document's text today, or None when
 /// they were computed for a version that's no longer known.
 fn resolve_file_edits(doc: &Document, file: &protocol::FileEdits, encoding: Encoding) -> Option<Vec<(std::ops::Range<usize>, String)>> {
@@ -240,5 +294,23 @@ fn resolve_file_edits(doc: &Document, file: &protocol::FileEdits, encoding: Enco
                 .collect()
         }
         _ => Some(protocol::resolve_edits(doc.rope(), &file.edits, encoding)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A usage's line is read from the file, only that far; a file that
+    /// isn't UTF-8 still shows, a missing one shows nothing.
+    #[test]
+    fn reads_lines_only_as_far_as_wanted() {
+        let dir = std::env::temp_dir().join(format!("kuana-usages-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, b"fn a() {}\r\n    let x = caf\xe9;\nlast").unwrap();
+        assert_eq!(super::read_lines(&path, 1), ["fn a() {}", "let x = caf\u{fffd};"]);
+        assert_eq!(super::read_lines(&path, 9), ["fn a() {}", "let x = caf\u{fffd};", "last"]);
+        assert_eq!(super::read_lines(&path, 0).len(), 1);
+        assert!(super::read_lines(&dir.join("gone.rs"), 3).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

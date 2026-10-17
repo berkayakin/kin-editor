@@ -759,6 +759,11 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
+    /// Each tab's real path (symlinks resolved), with the path it's for:
+    /// worked out once, not per lookup (`tab_for`).
+    real_paths: std::cell::RefCell<HashMap<EntityId, (PathBuf, Option<PathBuf>)>>,
+    /// Usages being listed, while the files they're in are read.
+    locations_task: Option<Task<()>>,
     /// Debounced write of `state.json` (layout, the window's place on
     /// screen: see `save_state`).
     state_task: Option<Task<()>>,
@@ -1087,6 +1092,8 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
+            real_paths: Default::default(),
+            locations_task: None,
             state_task: None,
             onboarding: None,
             trust_waits: false,
