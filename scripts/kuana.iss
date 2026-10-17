@@ -1,9 +1,13 @@
 ; Windows installer (Inno Setup 6), built by .github/workflows/release.yml:
 ;   ISCC.exe /DVersion=<version> scripts\kuana.iss
 ; Installs per user (no admin prompt) so the updater can replace kuana.exe in place.
+; It takes the `dist` build; /DProfile=release takes `cargo build --release`'s.
 
 #ifndef Version
   #define Version "0.0.0"
+#endif
+#ifndef Profile
+  #define Profile "dist"
 #endif
 
 [Setup]
@@ -32,7 +36,7 @@ CloseApplications=yes
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\kuana.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\{#Profile}\kuana.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 

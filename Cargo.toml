@@ -95,6 +95,17 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# What releases are built with (`--profile dist`, see .github/workflows/release.yml), as Zed
+# builds its own: slower to build, a smaller binary (thin LTO, one codegen unit), and line tables
+# for backtraces. Those (~260 MB) go to a file beside the binary (kuana.dSYM, .dwp, .pdb) that
+# isn't shipped; on Linux they'd be in the binary. `cargo build --release` stays as quick as it was.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+debug = "limited"
+split-debuginfo = "packed"
+
 [lints.clippy]
 # Requests and prompts started for their effect, their answers not needed.
 let_underscore_future = "allow"

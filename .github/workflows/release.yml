@@ -6,6 +6,9 @@
 # (repository secret MINISIGN_SECRET_KEY) and publishes the release. Kuana's
 # updater (src/updater.rs) only installs what that signature vouches for.
 # A platform whose build fails is left out of the release; the rest ship.
+#
+# Builds use Cargo.toml's `dist` profile (thin LTO, one codegen unit; slower
+# to build than --release), so binaries are in target/[<triple>/]dist.
 
 name: Release
 
@@ -63,7 +66,7 @@ jobs:
     runs-on: macos-14
     env:
       VERSION: ${{ needs.create.outputs.version }}
-      APP: target/aarch64-apple-darwin/release/bundle/osx/Kuana.app
+      APP: target/aarch64-apple-darwin/dist/bundle/osx/Kuana.app
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -73,12 +76,12 @@ jobs:
       - run: cargo install cargo-bundle --locked
       - name: Build both architectures
         run: |
-          cargo bundle --release --target aarch64-apple-darwin
-          cargo build --release --locked --target x86_64-apple-darwin
+          cargo bundle --profile dist --target aarch64-apple-darwin
+          cargo build --profile dist --locked --target x86_64-apple-darwin
       - name: Make a universal Kuana.app
         run: |
           lipo -create -output "$APP/Contents/MacOS/kuana" \
-            target/aarch64-apple-darwin/release/kuana target/x86_64-apple-darwin/release/kuana
+            target/aarch64-apple-darwin/dist/kuana target/x86_64-apple-darwin/dist/kuana
 
       # Developer ID signing and notarization turn on once their repository
       # secrets exist (README: "Signing the macOS app"). Secrets are only given
@@ -178,11 +181,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
-      - run: cargo build --release --locked
+      - run: cargo build --profile dist --locked
       - name: Package
         run: |
           mkdir -p dist pkg
-          cp target/release/kuana.exe LICENSE-MIT LICENSE-APACHE pkg/
+          cp target/dist/kuana.exe LICENSE-MIT LICENSE-APACHE pkg/
           (cd pkg && 7z a -tzip "../dist/kuana-$VERSION-windows-x86_64.zip" .)
       - name: Installer
         shell: pwsh
@@ -209,11 +212,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
-      - run: cargo build --release --locked
+      - run: cargo build --profile dist --locked
       - name: Package
         run: |
           mkdir -p dist pkg
-          cp target/release/kuana LICENSE-MIT LICENSE-APACHE pkg/
+          cp target/dist/kuana LICENSE-MIT LICENSE-APACHE pkg/
           tar -czf "dist/kuana-$VERSION-linux-x86_64.tar.gz" -C pkg .
       - run: gh release upload "$TAG" dist/* --clobber
 
