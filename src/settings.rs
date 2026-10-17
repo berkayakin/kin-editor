@@ -82,6 +82,8 @@ pub struct Settings {
     /// when both branches have new commits. Unset: as the Git config says,
     /// else asked the first time it happens.
     pub pull_strategy: Option<PullStrategy>,
+    /// The minimap's width in pixels (`minimap_width()`).
+    pub minimap_width: Option<f32>,
 }
 
 /// One language server's settings (`lsp.<id>`).
@@ -301,6 +303,9 @@ pub struct EditorSettings {
     pub inlay_hints: Option<bool>,
     /// The language server's code lenses ("3 references", "▶ Run") above lines.
     pub code_lens: Option<bool>,
+    /// The document in miniature at the editor's right edge, in place of the
+    /// scrollbar (off by default).
+    pub minimap: Option<bool>,
 }
 
 impl EditorSettings {
@@ -317,6 +322,7 @@ impl EditorSettings {
             show_whitespace: self.show_whitespace.or(base.show_whitespace),
             inlay_hints: self.inlay_hints.or(base.inlay_hints),
             code_lens: self.code_lens.or(base.code_lens),
+            minimap: self.minimap.or(base.minimap),
         }
     }
 
@@ -339,6 +345,10 @@ impl EditorSettings {
         s
     }
 }
+
+pub const DEFAULT_MINIMAP_WIDTH: f32 = 100.;
+/// The narrowest and widest minimap.
+pub const MINIMAP_WIDTHS: (f32, f32) = (40., 240.);
 
 const TOP_LEVEL_KEYS: &[&str] = &[
     "theme",
@@ -363,6 +373,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "reduce_visual_effects",
     "sidebar_dock",
     "pull_strategy",
+    "minimap_width",
 ];
 
 const EDITOR_KEYS: &[&str] = &[
@@ -376,6 +387,7 @@ const EDITOR_KEYS: &[&str] = &[
     "show_whitespace",
     "inlay_hints",
     "code_lens",
+    "minimap",
 ];
 
 /// Editor options resolved for one file.
@@ -393,6 +405,7 @@ pub struct FileSettings {
     pub show_whitespace: ShowWhitespace,
     pub inlay_hints: bool,
     pub code_lens: bool,
+    pub minimap: bool,
 }
 
 impl Settings {
@@ -480,6 +493,11 @@ impl Settings {
         })
     }
 
+    /// The minimap's width in pixels (100 unless set).
+    pub fn minimap_width(&self) -> f32 {
+        self.minimap_width.unwrap_or(DEFAULT_MINIMAP_WIDTH).clamp(MINIMAP_WIDTHS.0, MINIMAP_WIDTHS.1)
+    }
+
     /// The side the sidebar sits on (left unless set).
     pub fn sidebar_dock(&self) -> SidebarDock {
         self.sidebar_dock.unwrap_or_default()
@@ -554,6 +572,8 @@ impl Settings {
             "show_whitespace" => self.editor.show_whitespace.is_some(),
             "inlay_hints" => self.editor.inlay_hints.is_some(),
             "code_lens" => self.editor.code_lens.is_some(),
+            "minimap" => self.editor.minimap.is_some(),
+            "minimap_width" => self.minimap_width.is_some(),
             "vim_mode" => self.vim_mode.is_some(),
             "icon_theme" => self.icon_theme.is_some(),
             "visual_effects" => self.visual_effects.is_some() || self.reduce_visual_effects.is_some(),
@@ -618,6 +638,7 @@ impl Settings {
             show_whitespace: None,
             inlay_hints: None,
             code_lens: None,
+            minimap: None,
         };
         let s = from_config
             .or(language_overrides)
@@ -636,6 +657,7 @@ impl Settings {
             show_whitespace: s.show_whitespace.unwrap_or_default(),
             inlay_hints: s.inlay_hints.unwrap_or(true),
             code_lens: s.code_lens.unwrap_or(true),
+            minimap: s.minimap.unwrap_or(false),
         }
     }
 }
@@ -830,6 +852,10 @@ pub const SETTINGS_TEMPLATE: &str = r#"// Kuana settings. Changes apply when you
   // "inlay_hints": true,
   // The language server's code lenses above lines ("3 references", "▶ Run").
   // "code_lens": true,
+  // The document in miniature at the editor's right edge, in place of the
+  // scrollbar, and its width in pixels.
+  // "minimap": false,
+  // "minimap_width": 100,
   // Vim keys (Normal, Insert and Visual modes).
   // "vim_mode": false,
 

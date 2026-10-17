@@ -6,6 +6,7 @@ mod format;
 mod conflict;
 pub(crate) mod derived;
 mod lsp;
+mod minimap;
 mod run;
 mod snippet;
 mod sticky;
@@ -265,6 +266,7 @@ pub struct Editor {
     scrollbar_hovered: bool,
     /// The thumb fades out when the text stops scrolling; the track's markers stay.
     scrollbar_fade: crate::ui::ScrollbarFade,
+    minimap_cache: minimap::MinimapCache,
     marked_range: Option<Range<usize>>,
     indent_unit: String,
     /// Display width of a tab character (and of an indent level with tabs).
@@ -401,6 +403,7 @@ impl Editor {
             scrollbar_drag: None,
             scrollbar_hovered: false,
             scrollbar_fade: Default::default(),
+            minimap_cache: Default::default(),
             marked_range: None,
             indent_unit: String::new(),
             tab_size: file_settings.tab_size,
@@ -2401,7 +2404,10 @@ impl Editor {
         self.sync_wrap(window, cx);
         let Some(layout) = self.layout.clone() else { return };
 
-        if let Some((track, thumb)) = self.scrollbar_geometry(cx)
+        if self.minimap_mouse_down(event.position, cx) {
+            return;
+        }
+        if let Some((track, thumb)) = self.scrollbar_geometry(cx).filter(|_| !self.shows_minimap(cx))
             && track.contains(&event.position)
         {
             if thumb.contains(&event.position) {
@@ -2638,6 +2644,12 @@ impl Editor {
     }
 
     fn drag_scrollbar_to(&mut self, y: Pixels, cx: &mut Context<Self>) {
+        if self.shows_minimap(cx) {
+            if let Some(grab) = self.scrollbar_drag {
+                self.drag_minimap_to(y, grab, cx);
+            }
+            return;
+        }
         let (Some(grab), Some((track, thumb)), Some(l)) = (self.scrollbar_drag, self.scrollbar_geometry(cx), self.layout.as_ref()) else {
             return;
         };
@@ -2666,7 +2678,10 @@ impl Editor {
             }
             // The pinned lines aren't the code under them, and block rows
             // (code lenses) aren't the line above.
-            if self.sticky_at(event.position).is_some() || self.on_block_row(event.position) {
+            if self.sticky_at(event.position).is_some()
+                || self.on_block_row(event.position)
+                || self.minimap_geometry(cx).is_some_and(|g| g.bounds.contains(&event.position))
+            {
                 self.pointer_left(window, cx);
             } else {
                 self.hover_at(event.position, window, cx);
@@ -2744,7 +2759,7 @@ impl Editor {
             self.scroll.x = px(0.);
             return;
         }
-        let text_width = l.bounds.right() - l.text_left - px(SCROLLBAR_WIDTH);
+        let text_width = l.bounds.right() - l.text_left - self.right_edge_width(cx);
         let max_x = (self.max_line_width + l.char_width * 4. - text_width).max(px(0.));
         self.scroll.x = self.scroll.x.clamp(px(0.), max_x);
     }
@@ -2782,7 +2797,7 @@ impl Editor {
         );
         let text_left = text_bounds.left() + if single { px(0.) } else { px(TEXT_PADDING) };
         let rows_per_page = ((bounds.size.height / line_height).floor() as usize).saturating_sub(2).max(1);
-        let wrap_width = (bounds.right() - text_left - if single { char_width } else { px(SCROLLBAR_WIDTH) + char_width })
+        let wrap_width = (bounds.right() - text_left - if single { char_width } else { self.right_edge_width(cx) + char_width })
             .max(char_width * 10.);
 
         self.layout = Some(LayoutSnapshot {
@@ -2832,7 +2847,7 @@ impl Editor {
             }
             if !wrapping {
                 let x = self.x_for_offset(head, window, cx);
-                let text_width = bounds.right() - text_left - if single { px(0.) } else { px(SCROLLBAR_WIDTH) };
+                let text_width = bounds.right() - text_left - if single { px(0.) } else { self.right_edge_width(cx) };
                 if x < self.scroll.x + char_width * 2. {
                     self.scroll.x = (x - char_width * 4.).max(px(0.));
                 } else if x > self.scroll.x + text_width - char_width * 3. {
@@ -3611,8 +3626,10 @@ impl Editor {
             self.layout_sticky(&mut frame, bounds, first_row, text_left, number_right, window, cx);
         }
 
-        // Scrollbar with diagnostic and search markers.
-        if let Some((track, thumb)) = self.scrollbar_geometry(cx).filter(|_| !single) {
+        // Scrollbar, or the minimap, with diagnostic and search markers.
+        let minimap = self.minimap_geometry(cx);
+        let scrollbar = if minimap.is_some() { None } else { self.scrollbar_geometry(cx).filter(|_| !single) };
+        if minimap.is_some() || scrollbar.is_some() {
             let active = self.scrollbar_drag.is_some() || self.scrollbar_hovered;
             let (fade, wake) = self.scrollbar_fade.step(self.scroll.y, active, theme.reduce_effects);
             match wake {
@@ -3625,11 +3642,21 @@ impl Editor {
                     .detach(),
                 crate::ui::FadeWake::None => {}
             }
-            if fade > 0. {
-                let alpha = if active { 0.28 } else { 0.16 } * fade;
-                frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(alpha)).corner_radii(px(3.)));
-            }
-            frame.scrollbar_track = Some(track);
+            let track = match (&minimap, scrollbar) {
+                (Some(g), _) => {
+                    frame.scrollbar_track = Some(g.bounds);
+                    self.layout_minimap(&mut frame, g, fade, active, cx)
+                }
+                (None, Some((track, thumb))) => {
+                    if fade > 0. {
+                        let alpha = if active { 0.28 } else { 0.16 } * fade;
+                        frame.scrollbar.push(fill(thumb, Hsla::from(theme.text).alpha(alpha)).corner_radii(px(3.)));
+                    }
+                    frame.scrollbar_track = Some(track);
+                    track
+                }
+                (None, None) => unreachable!(),
+            };
             let rows = display_rows.max(1) as f32;
             for d in &self.doc.read(cx).diagnostics {
                 let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
@@ -4499,7 +4526,7 @@ impl Render for Editor {
                 .id("markdown-preview-toggle")
                 .absolute()
                 .top(px(6.))
-                .right(px(SCROLLBAR_WIDTH + 6.))
+                .right(self.right_edge_width(cx) + px(6.))
                 .size(px(24.))
                 .flex()
                 .items_center()
@@ -4698,7 +4725,10 @@ pub struct FrameLayout {
     link_hitbox: Option<Hitbox>,
     inline_texts: Vec<(Point<Pixels>, ShapedLine)>,
     scrollbar: Vec<PaintQuad>,
-    /// The scrollbar's strip, for its cursor and hover.
+    /// The minimap's background, blocks and slider, painted inside its bounds.
+    minimap: Vec<PaintQuad>,
+    minimap_bounds: Option<Bounds<Pixels>>,
+    /// The scrollbar's (or minimap's) strip, for its cursor and hover.
     scrollbar_track: Option<Bounds<Pixels>>,
     scrollbar_hitbox: Option<Hitbox>,
     sticky_bgs: Vec<PaintQuad>,
@@ -4848,6 +4878,13 @@ impl Element for EditorElement {
         });
         for (origin, line) in &frame.sticky_numbers {
             line.paint(*origin, line_height, window, cx).ok();
+        }
+        if let Some(bounds) = frame.minimap_bounds {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for q in frame.minimap.drain(..) {
+                    window.paint_quad(q);
+                }
+            });
         }
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);

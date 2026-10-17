@@ -136,6 +136,8 @@ enum Setting {
     ShowWhitespace,
     InlayHints,
     CodeLens,
+    Minimap,
+    MinimapWidth,
     VimMode,
     AutoSave,
     AutoSaveDelay,
@@ -151,7 +153,7 @@ enum Setting {
 }
 
 impl Setting {
-    const ALL: [Setting; 27] = [
+    const ALL: [Setting; 29] = [
         Setting::Theme,
         Setting::IconTheme,
         Setting::VisualEffects,
@@ -167,6 +169,8 @@ impl Setting {
         Setting::ShowWhitespace,
         Setting::InlayHints,
         Setting::CodeLens,
+        Setting::Minimap,
+        Setting::MinimapWidth,
         Setting::VimMode,
         Setting::AutoSave,
         Setting::AutoSaveDelay,
@@ -188,6 +192,7 @@ impl Setting {
             Setting::FontFamily | Setting::FontSize | Setting::LineHeight => Page::Editor,
             Setting::TabSize | Setting::HardTabs | Setting::SoftWrap => Page::Editor,
             Setting::Rulers | Setting::ShowWhitespace | Setting::InlayHints | Setting::CodeLens | Setting::VimMode => Page::Editor,
+            Setting::Minimap | Setting::MinimapWidth => Page::Editor,
             Setting::AutoSave
             | Setting::AutoSaveDelay
             | Setting::FormatOnSave
@@ -212,6 +217,7 @@ impl Setting {
             Setting::SoftWrap => "Wrapping",
             Setting::Rulers | Setting::ShowWhitespace => "Guides",
             Setting::InlayHints | Setting::CodeLens => "Hints",
+            Setting::Minimap | Setting::MinimapWidth => "Minimap",
             Setting::VimMode => "Vim",
             Setting::AutoSave | Setting::AutoSaveDelay => "Auto-save",
             Setting::FormatOnSave | Setting::TrimWhitespace | Setting::FinalNewline => "On save",
@@ -240,6 +246,8 @@ impl Setting {
             Setting::ShowWhitespace => "Show whitespace",
             Setting::InlayHints => "Inlay hints",
             Setting::CodeLens => "Code lens",
+            Setting::Minimap => "Show minimap",
+            Setting::MinimapWidth => "Width",
             Setting::VimMode => "Vim mode",
             Setting::AutoSave => "Auto-save",
             Setting::AutoSaveDelay => "Delay",
@@ -272,6 +280,8 @@ impl Setting {
             Setting::ShowWhitespace => "Mark spaces with dots and tabs with lines.",
             Setting::InlayHints => "Types and parameter names from the language server, shown in the code.",
             Setting::CodeLens => "The language server's links above lines: references, implementations, Run and Debug.",
+            Setting::Minimap => "The file in miniature at the editor's right edge, in place of the scrollbar. Drag it or click to jump.",
+            Setting::MinimapWidth => "In pixels.",
             Setting::VimMode => "Vim's Normal, Insert and Visual modes. The status bar shows the mode.",
             Setting::AutoSave => "Every mode but Off also saves when Kuana quits or a tab closes.",
             Setting::AutoSaveDelay => "How long after you stop typing.",
@@ -305,6 +315,8 @@ impl Setting {
             Setting::ShowWhitespace => "whitespace spaces tabs invisible characters dots render",
             Setting::InlayHints => "inlay hints types parameters names language server",
             Setting::CodeLens => "code lens references implementations run debug language server",
+            Setting::Minimap => "minimap overview scrollbar outline map document preview scroll",
+            Setting::MinimapWidth => "minimap width size pixels",
             Setting::VimMode => "vim vi modal normal insert visual keys",
             Setting::AutoSave => "autosave save automatically",
             Setting::AutoSaveDelay => "autosave milliseconds idle",
@@ -1350,6 +1362,21 @@ impl Preferences {
             }
             Setting::InlayHints => self.switch_with_default("pref-inlay-hints", "inlay_hints", settings.editor.inlay_hints, true, cx),
             Setting::CodeLens => self.switch_with_default("pref-code-lens", "code_lens", settings.editor.code_lens, true, cx),
+            Setting::Minimap => self.bool_switch("pref-minimap", "minimap", settings.editor.minimap, cx),
+            Setting::MinimapWidth => {
+                let width = settings.minimap_width();
+                let (min, max) = settings::MINIMAP_WIDTHS;
+                let enabled = settings.editor.minimap.unwrap_or(false);
+                div()
+                    .when(!enabled, |el| el.opacity(0.45))
+                    .child(self.stepper("pref-minimap-width", format!("{width} px"), enabled && width > min, enabled && width < max, cx, move |this, step, cx| {
+                        let width = Settings::get(cx).minimap_width();
+                        // Snap to tens.
+                        let next = ((width / 10.).round() * 10. + step as f32 * 10.).clamp(min, max);
+                        this.set_or_default("minimap_width", json!(next as i64), json!(settings::DEFAULT_MINIMAP_WIDTH as i64), cx);
+                    }))
+                    .into_any_element()
+            }
             Setting::VimMode => self.bool_switch("pref-vim", "vim_mode", settings.vim_mode, cx),
             Setting::VisualEffects => {
                 let current = settings.visual_effects();
@@ -2331,6 +2358,8 @@ fn setting_key(setting: Setting) -> &'static str {
         Setting::ShowWhitespace => "show_whitespace",
         Setting::InlayHints => "inlay_hints",
         Setting::CodeLens => "code_lens",
+        Setting::Minimap => "minimap",
+        Setting::MinimapWidth => "minimap_width",
         Setting::VimMode => "vim_mode",
         Setting::AutoSave => "auto_save",
         Setting::AutoSaveDelay => "auto_save_delay",
