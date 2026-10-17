@@ -141,8 +141,14 @@ impl ProjectTree {
 
     /// Whether the tree has read `dir` (or is reading it): a change in it
     /// is for `paths_changed`.
-    pub fn has_read(&self, dir: &Path) -> bool {
+    fn has_read(&self, dir: &Path) -> bool {
         self.listings.contains_key(dir) || self.reading.contains(dir)
+    }
+
+    /// The folders the tree has read (or is reading), for sorting out
+    /// changes on disk elsewhere: a change in them is for `paths_changed`.
+    pub fn read_folders(&self) -> HashSet<PathBuf> {
+        self.listings.keys().chain(&self.reading).cloned().collect()
     }
 
     /// Makes the rows again from the folders read; open folders not read

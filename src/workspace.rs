@@ -758,7 +758,7 @@ pub struct Workspace {
     watcher: Option<Watcher>,
     watch_task: Option<Task<()>>,
     /// The project's .gitignore, to skip Git refreshes for ignored churn.
-    ignore: Option<ignore::gitignore::Gitignore>,
+    ignore: Option<Arc<ignore::gitignore::Gitignore>>,
     /// A Git refresh was asked for while one was running.
     git_refresh_again: bool,
     /// The running Go to Symbol request; replaced as the query changes.
