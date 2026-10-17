@@ -2589,7 +2589,9 @@ fn card(theme: &Theme) -> Div {
         .border_color(Hsla::from(theme.border).alpha(0.6))
 }
 
-/// Label and description on the left, the control on the right.
+/// Label and description on the left, the control on the right. In a narrow
+/// window the control goes under them instead of squeezing the text to a word
+/// per line (the label keeps `LABEL_MIN_WIDTH`).
 fn setting_row(
     label: impl Into<SharedString>,
     description: Option<SharedString>,
@@ -2597,10 +2599,13 @@ fn setting_row(
     reset: Option<AnyElement>,
     theme: &Theme,
 ) -> Div {
+    const LABEL_MIN_WIDTH: f32 = 220.;
     div()
         .flex()
+        .flex_wrap()
         .items_center()
-        .gap_4()
+        .gap_x_4()
+        .gap_y_2()
         .min_h(px(ROW_HEIGHT))
         .px_4()
         .py_2p5()
@@ -2610,14 +2615,14 @@ fn setting_row(
                 .flex_col()
                 .gap_0p5()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(LABEL_MIN_WIDTH))
                 // A changed option has a reset button right after its name.
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1()
-                        .h(px(20.))
+                        .min_h(px(20.))
                         .child(div().text_color(theme.text).child(label.into()))
                         .children(reset),
                 )
