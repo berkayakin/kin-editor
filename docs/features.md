@@ -28,6 +28,7 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
   (quick fixes and refactorings); see [Language servers](languages.md#language-servers)
 - Inlay hints from the language server (types, parameter names), rulers, visible whitespace,
+  control characters shown as dim symbols (␌ for a form feed, ␛, NEL, LS for U+2028),
   column (box) selection with Alt+drag, sort/reverse/de-duplicate lines and case conversions
   (upper, lower, title, snake, kebab, camel, Pascal) from Find Action
 - Vim mode (`vim_mode`): Normal, Insert, Visual and Visual Line; see [Vim mode](editing.md#vim-mode)

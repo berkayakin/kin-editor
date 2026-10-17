@@ -3110,6 +3110,9 @@ impl Editor {
             if !dl.inlays.is_empty() {
                 runs = inlay_runs(runs, &dl, editor_font.clone(), theme.text_dim.into());
             }
+            if !dl.controls.is_empty() {
+                runs = restyle_runs(runs, &dl.controls, |piece| piece.color = theme.text_dim.into());
+            }
             let is_cursor_row = head_rows.contains(&row);
             let indent = indents[row - first_row].unwrap_or_else(|| {
                 let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
@@ -3211,6 +3214,14 @@ impl Editor {
                     let bounds = Bounds::from_corners(
                         point(origin.x + x_of(span.label.start) - px(2.), y + px(2.)),
                         point(origin.x + x_of(span.label.end) + px(2.), y + line_height - px(2.)),
+                    );
+                    frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
+                }
+                // So do control characters' symbols, each on its own.
+                for symbol in dl.controls.iter().filter(|r| r.start >= seg_range.start && r.end <= seg_range.end) {
+                    let bounds = Bounds::from_corners(
+                        point(origin.x + x_of(symbol.start) + px(0.5), y + px(2.)),
+                        point(origin.x + x_of(symbol.end) - px(0.5), y + line_height - px(2.)),
                     );
                     frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
                 }
@@ -3954,9 +3965,21 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
     if total < dl.text.len() {
         runs.push(TextRun { len: dl.text.len() - total, font, color, background_color: None, underline: None, strikethrough: None });
     }
-    let in_hint = |at: usize| dl.inlays.iter().any(|s| s.whole.contains(&at));
-    let mut cuts: Vec<usize> = dl.inlays.iter().flat_map(|s| [s.whole.start, s.whole.end]).collect();
+    let hints: Vec<Range<usize>> = dl.inlays.iter().map(|s| s.whole.clone()).collect();
+    restyle_runs(runs, &hints, |piece| {
+        piece.color = color;
+        piece.underline = None;
+        piece.background_color = None;
+    })
+}
+
+/// `runs` cut where `ranges` (of the display text) start and end, with
+/// `restyle` applied to the pieces inside them.
+fn restyle_runs(runs: Vec<TextRun>, ranges: &[Range<usize>], restyle: impl Fn(&mut TextRun)) -> Vec<TextRun> {
+    let inside = |at: usize| ranges.iter().any(|r| r.contains(&at));
+    let mut cuts: Vec<usize> = ranges.iter().flat_map(|r| [r.start, r.end]).collect();
     cuts.sort_unstable();
+    cuts.dedup();
     let mut out = Vec::with_capacity(runs.len() + cuts.len());
     let mut pos = 0;
     for run in runs {
@@ -3964,10 +3987,8 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
         let mut start = pos;
         for &cut in cuts.iter().filter(|&&c| c > pos && c < end).chain(std::iter::once(&end)) {
             let mut piece = TextRun { len: cut - start, ..run.clone() };
-            if in_hint(start) {
-                piece.color = color;
-                piece.underline = None;
-                piece.background_color = None;
+            if inside(start) {
+                restyle(&mut piece);
             }
             out.push(piece);
             start = cut;
@@ -3977,14 +3998,54 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
     out
 }
 
-/// A buffer line prepared for display: tabs are expanded to spaces, with a
-/// mapping between buffer columns and display columns (both in bytes).
+/// A buffer line prepared for display: tabs are expanded to spaces and
+/// control characters shown as symbols (`control_symbol`), with a mapping
+/// between buffer columns and display columns (both in bytes).
 pub struct DisplayLine {
     pub text: String,
     map: Option<Vec<usize>>,
     /// Inlay hints shown in `text`: the inserted text (padding included), the
     /// label within it, and the buffer column they sit before.
     pub inlays: Vec<InlaySpan>,
+    /// Where `text` shows control characters' symbols (dim, on a chip).
+    pub controls: Vec<Range<usize>>,
+}
+
+/// How a control character shows, as it would otherwise draw as nothing (or
+/// as a box): C0 controls and DEL as their Control Pictures (a form feed is
+/// ␌), C1 controls and the Unicode line and paragraph separators by name.
+/// A tab isn't one: it shows as spaces.
+pub fn control_symbol(c: char) -> Option<&'static str> {
+    const C0: [&str; 32] = [
+        "␀", "␁", "␂", "␃", "␄", "␅", "␆", "␇", "␈", "␉", "␊", "␋", "␌", "␍", "␎", "␏", "␐", "␑", "␒", "␓", "␔", "␕", "␖", "␗",
+        "␘", "␙", "␚", "␛", "␜", "␝", "␞", "␟",
+    ];
+    const C1: [&str; 32] = [
+        "PAD", "HOP", "BPH", "NBH", "IND", "NEL", "SSA", "ESA", "HTS", "HTJ", "VTS", "PLD", "PLU", "RI", "SS2", "SS3", "DCS", "PU1",
+        "PU2", "STS", "CCH", "MW", "SPA", "EPA", "SOS", "SGC", "SCI", "CSI", "ST", "OSC", "PM", "APC",
+    ];
+    match c {
+        '\t' => None,
+        '\0'..='\u{1f}' => Some(C0[c as usize]),
+        '\u{7f}' => Some("␡"),
+        '\u{80}'..='\u{9f}' => Some(C1[c as usize - 0x80]),
+        '\u{2028}' => Some("LS"),
+        '\u{2029}' => Some("PS"),
+        _ => None,
+    }
+}
+
+/// Whether `line` has a tab or a control character, which show as something
+/// else (most lines have neither).
+fn has_tabs_or_controls(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        0..=0x1f | 0x7f => true,
+        // C1 controls are U+0080 to U+009F; LS and PS are E2 80 A8 / A9.
+        0xc2 => bytes.get(i + 1).is_some_and(|next| (0x80..=0x9f).contains(next)),
+        0xe2 => bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(0xa8 | 0xa9)),
+        _ => false,
+    })
 }
 
 pub struct InlaySpan {
@@ -4002,12 +4063,13 @@ impl DisplayLine {
     /// by column. A buffer column maps to the display column before its
     /// hints, so carets sit left of them.
     pub fn with_inlays(line: &str, tab_size: usize, inlays: &[(usize, &str, bool, bool)]) -> Self {
-        if !line.contains('\t') && inlays.is_empty() {
-            return Self { text: line.to_string(), map: None, inlays: Vec::new() };
+        if inlays.is_empty() && !has_tabs_or_controls(line) {
+            return Self { text: line.to_string(), map: None, inlays: Vec::new(), controls: Vec::new() };
         }
         let mut text = String::with_capacity(line.len() + 16);
         let mut map = Vec::with_capacity(line.len() + 1);
         let mut spans = Vec::new();
+        let mut controls = Vec::new();
         let mut next = 0;
         let mut insert = |at: usize, text: &mut String| {
             while let Some(&(column, label, pad_left, pad_right)) = inlays.get(next).filter(|i| i.0 <= at) {
@@ -4032,6 +4094,10 @@ impl DisplayLine {
                 let n = tab_size - col % tab_size;
                 text.extend(std::iter::repeat_n(' ', n));
                 col += n;
+            } else if let Some(symbol) = control_symbol(ch) {
+                controls.push(text.len()..text.len() + symbol.len());
+                text.push_str(symbol);
+                col += symbol.chars().count();
             } else {
                 text.push(ch);
                 col += 1;
@@ -4040,7 +4106,7 @@ impl DisplayLine {
         let before = text.len();
         insert(line.len(), &mut text);
         map.push(before);
-        Self { text, map: Some(map), inlays: spans }
+        Self { text, map: Some(map), inlays: spans, controls }
     }
 
     pub fn to_display(&self, col: usize) -> usize {
@@ -5167,5 +5233,42 @@ mod text_field_tests {
         // The code editor pairs them.
         let code = cx.new(|cx| Editor::new(Document::empty(), cx));
         assert_eq!(typed(&code, "f(", cx), "f()");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn control_characters_show_as_symbols() {
+        let symbols: Vec<Option<&str>> =
+            ['\0', '\x0b', '\x0c', '\r', '\x1b', '\x7f', '\u{85}', '\u{2028}', '\u{2029}'].into_iter().map(control_symbol).collect();
+        let expected = ["␀", "␋", "␌", "␍", "␛", "␡", "NEL", "LS", "PS"];
+        assert_eq!(symbols, expected.map(Some));
+        for plain in ['\t', ' ', 'a', '\u{a0}', 'é', '—', '\u{2027}', '\u{202a}'] {
+            assert_eq!(control_symbol(plain), None, "{plain:?}");
+        }
+        // The quick check agrees with the table, byte by byte.
+        for c in ('\0'..='\u{3000}').filter(|&c| c != '\t' && c != '\n') {
+            assert_eq!(has_tabs_or_controls(&format!("a{c}b")), control_symbol(c).is_some(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn symbols_map_to_their_one_character() {
+        // A form feed, a line separator and a tab: "a␌bLSc  d".
+        let line = "a\x0cb\u{2028}c\td";
+        let dl = DisplayLine::new(line, 4);
+        assert_eq!(dl.text, "a␌bLSc  d");
+        assert_eq!(dl.controls, [1..4, 5..7]);
+        let (ff, b, ls, c, tab, d) = (1, 2, 3, 6, 7, 8);
+        let shown: Vec<usize> = [ff, b, ls, c, tab, d, line.len()].map(|col| dl.to_display(col)).to_vec();
+        assert_eq!(shown, [1, 4, 5, 7, 8, 10, 11]);
+        // A click before or after a symbol is at its character or the next.
+        assert_eq!((dl.to_buffer(1), dl.to_buffer(4), dl.to_buffer(5), dl.to_buffer(7)), (ff, b, ls, c));
+        // Without tabs or control characters, the text is the line itself.
+        let plain = DisplayLine::new("a — b", 4);
+        assert!(plain.controls.is_empty() && plain.map.is_none());
     }
 }
