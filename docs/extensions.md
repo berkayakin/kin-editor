@@ -49,12 +49,13 @@ rev = "0123456789abcdef0123456789abcdef01234567"
 # path = "dialect"   # the grammar's folder inside the repository
 
 # A language server for this extension's languages, or for a built-in one
-# (it then runs beside Kuana's). Zed extensions find their server in code;
-# Kuana runs `command`, else a well-known server's command (zls, gleam lsp,
-# nil, lua-language-server, haskell-language-server…), else the server's id
-# as a program. With several servers for a language in one extension, the
-# first one installed runs. Settings' "language_servers" and "lsp" can
-# always override.
+# (it then runs beside Kuana's). Zed extensions find their server in code,
+# which Kuana runs for extension API 0.6 and 0.7 (see below). Otherwise, or
+# when that code fails, Kuana runs `command`, else a well-known server's
+# command (zls, gleam lsp, nil, lua-language-server, haskell-language-server…),
+# else the server's id as a program. With several servers for a language in
+# one extension, the first one installed (or that the code starts) runs.
+# Settings' "language_servers" and "lsp" can always override.
 [language_servers.mylang-ls]
 name = "MyLang LS"
 languages = ["MyLang"]
@@ -123,9 +124,17 @@ asks before downloading it once (about 180 MB, 170 MB on disk in `~/.config/kuan
 `WASI_SDK_PATH` uses one you have). Files of that language are highlighted when it's done.
 Fetching uses `git`. With `native_grammars` on, grammars of extensions in trusted folders are
 compiled with your C compiler instead (`cc`; on macOS `xcode-select --install`), which C++
-scanners need. Zed
-extensions' own WebAssembly code (downloading language servers, slash commands) isn't run yet, so
-a language server has to be installed (see `[language_servers]` above).
+scanners need.
+
+Zed extensions' own WebAssembly code (`extension.wasm`) runs for their language servers when it's
+built for extension API 0.6 or 0.7 (`[lib] version` in `extension.toml`): Kuana asks it for the
+command, which it may download first (into `~/.config/kuana/extensions/work/<id>/`, the only folder
+it can reach), the initialization options and the workspace configuration, and `lsp.<id>` settings
+go by Zed's server id. It runs sandboxed in the same runtime as grammars; it can reach the network
+only through Kuana (GitHub releases, HTTP, npm with Kuana's Node.js), and runs programs only for
+trusted projects. A built-in language's own server still comes first, so an extension's server
+for the same program (PHP's intelephense, HTML's) doesn't start beside it. Extensions' other code
+(slash commands, context servers, debug adapters, completion labels) isn't run.
 
 Icon themes are chosen with `icon_theme` (Settings → Appearance → Icon theme); without one, Kuana uses
 its built-in Charmed Icons.

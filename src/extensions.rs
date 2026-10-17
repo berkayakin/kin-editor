@@ -15,11 +15,13 @@
 //!   snippets/*.json              VS Code style snippets, `<language id>.json`
 //! ```
 //!
-//! What Zed extensions compute in WebAssembly (where a language server is)
-//! is plain configuration here: `command` and `args`, or `language_servers`
-//! in settings. A grammar is tree-sitter's generated C (`src/parser.c`, maybe
-//! a scanner), compiled once with the system compiler into a library beside
-//! it and loaded at run time.
+//! Where a language server is, Zed extensions compute in WebAssembly
+//! (`extension.wasm`), which Kuana runs for extension API 0.6 and 0.7
+//! (`wasm.rs`). For others it's plain configuration: `command` and `args`, a
+//! well-known server's command, or `language_servers` in settings. A grammar
+//! is tree-sitter's generated C (`src/parser.c`, maybe a scanner), compiled
+//! once with the system compiler into a library beside it and loaded at run
+//! time.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -47,6 +49,7 @@ use crate::{
 /// inserting: `line_comments` (the first) and `block_comment`, as
 /// `["/*", "*/"]` or Zed's newer `{ start = "/*", end = "*/" }`.
 pub mod check;
+pub mod wasm;
 
 pub(crate) fn comment_tokens(config: &Table) -> (Option<String>, Option<(String, String)>) {
     let line = match config.get("line_comments").or(config.get("line_comment")) {
@@ -662,7 +665,11 @@ fn read_extension(dir: &Path) -> Read {
     }
 
     // Per language, every server the extension lists for it: one spec with
-    // them all as candidates, so the first that's installed runs.
+    // them all as candidates, so the first that's installed runs. An
+    // extension whose code Kuana runs (`wasm`) starts them itself instead;
+    // the candidates are the guess when it can't.
+    let code: Option<&'static wasm::WasmExtension> =
+        wasm::supported(&manifest, dir).then(|| &*Box::leak(Box::new(wasm::WasmExtension { id: info.id.clone(), dir: dir.to_path_buf() })));
     type Candidate = (&'static str, &'static [&'static str]);
     type Json = Option<&'static serde_json::Value>;
     // (server ids, candidates, install hint, root markers, initialization options, settings)
@@ -682,7 +689,7 @@ fn read_extension(dir: &Path) -> Read {
                 None => (id.clone(), Vec::new()),
             },
         };
-        info.servers.push(format!("{name} ({command})"));
+        info.servers.push(if code.is_some() { format!("{name} (from its code)") } else { format!("{name} ({command})") });
         if let Some(table) = server.get("installer").and_then(Value::as_table) {
             match crate::lsp::install::Installer::from_manifest(leak(command.clone()), table) {
                 Ok(installer) => info.installers.push(Box::leak(Box::new(installer))),
@@ -714,6 +721,10 @@ fn read_extension(dir: &Path) -> Read {
         let install = install.unwrap_or_else(|| {
             leak(format!("Install {}, or set a command in language_servers (for the {} extension)", names.join(" or "), info.name))
         });
+        let wasm = code.map(|extension| {
+            let ids: Vec<&'static str> = ids.iter().map(|id| leak(id.clone())).collect();
+            &*Box::leak(Box::new(wasm::WasmServers { extension, ids: Box::leak(ids.into_boxed_slice()) }))
+        });
         let spec: &'static ServerSpec = Box::leak(Box::new(ServerSpec {
             // Languages listing the same servers share one process per root
             // (Tailwind for HTML, CSS and TSX).
@@ -723,6 +734,7 @@ fn read_extension(dir: &Path) -> Read {
             root_markers: Box::leak(markers.into_boxed_slice()),
             initialization_options,
             settings,
+            wasm,
         }));
         servers.insert(language, spec);
     }

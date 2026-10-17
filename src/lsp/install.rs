@@ -318,32 +318,47 @@ fn install_github(installer: &Installer, home: &Path, repo: &str, asset: &Asset)
 }
 
 fn install_npm(installer: &Installer, home: &Path, package: &str) -> Result<(), String> {
-    let (npm, node_bin) = npm()?;
-    let latest: Value = serde_json::from_slice(&crate::updater::fetch(&format!("https://registry.npmjs.org/{package}/latest"))?)
-        .map_err(|e| format!("npm's answer didn't parse: {e}"))?;
-    let version = latest["version"].as_str().ok_or_else(|| format!("npm knows no version of {package}"))?;
-    let folder = folder_name(version);
+    let version = npm_latest(package)?;
+    let folder = folder_name(&version);
     let dir = home.join(&folder);
     if servers::executable(&installer.binary(&dir)).is_some() {
         return set_current(home, &folder);
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let installed = npm_install(&dir, package, &version);
+    if installed.is_err() || servers::executable(&installer.binary(&dir)).is_none() {
+        std::fs::remove_dir_all(&dir).ok();
+        return Err(installed.err().unwrap_or_else(|| format!("{package} has no {}", installer.command)));
+    }
+    set_current(home, &folder)
+}
+
+/// The newest version of an npm package, from the registry.
+pub(crate) fn npm_latest(package: &str) -> Result<String, String> {
+    let latest: Value = serde_json::from_slice(&crate::updater::fetch(&format!("https://registry.npmjs.org/{package}/latest"))?)
+        .map_err(|e| format!("npm's answer didn't parse: {e}"))?;
+    latest["version"].as_str().map(str::to_string).ok_or_else(|| format!("npm knows no version of {package}"))
+}
+
+/// `npm install <package>@<version>` into `dir/node_modules` (with Kuana's
+/// Node.js when the user has none). Blocking.
+pub(crate) fn npm_install(dir: &Path, package: &str, version: &str) -> Result<(), String> {
+    let (npm, node_bin) = npm()?;
     let output = crate::process::command(&npm)
         .args(["install", "--no-audit", "--no-fund", "--loglevel=error", "--prefix"])
-        .arg(&dir)
+        .arg(dir)
         .arg(format!("{package}@{version}"))
-        .current_dir(&dir)
+        .current_dir(dir)
         .env("PATH", path_with(node_bin.as_deref()))
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("couldn't run npm: {e}"))?;
-    if !output.status.success() || servers::executable(&installer.binary(&dir)).is_none() {
-        std::fs::remove_dir_all(&dir).ok();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it gave no reason").trim().to_string();
-        return Err(format!("npm couldn't install {package}: {detail}"));
+    if output.status.success() {
+        return Ok(());
     }
-    set_current(home, &folder)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("it gave no reason").trim().to_string();
+    Err(format!("npm couldn't install {package}: {detail}"))
 }
 
 fn install_go(installer: &Installer, home: &Path, module: &str) -> Result<(), String> {
@@ -380,6 +395,16 @@ pub fn path_with(node_bin: Option<&Path>) -> std::ffi::OsString {
     let path = servers::search_path();
     let Some(bin) = node_bin else { return path.clone() };
     std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(path))).unwrap_or_else(|_| path.clone())
+}
+
+/// The `node` that runs npm servers: the user's, else Kuana's own
+/// (downloaded now if it has none yet). Blocking.
+pub(crate) fn node() -> Result<PathBuf, String> {
+    let bin = match npm()? {
+        (_, Some(bin)) => bin,
+        (_, None) => return servers::which("node").ok_or_else(|| "Node.js isn't installed".to_string()),
+    };
+    servers::executable(&bin.join("node")).ok_or_else(|| "the Node.js download has no node".to_string())
 }
 
 /// npm, and the folder Kuana's `node` is in when the user has none.
@@ -470,7 +495,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-fn make_executable(path: &Path) -> Result<(), String> {
+pub(crate) fn make_executable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

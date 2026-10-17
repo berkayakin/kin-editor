@@ -62,7 +62,18 @@ pub fn check(dir: &Path) -> Vec<Finding> {
             return out;
         }
     };
-    keys(&manifest, "extension.toml", MANIFEST_KEYS, ZED_MANIFEST_KEYS, &mut add);
+    // Its code runs for its language servers when it's for API 0.6 or 0.7.
+    let runs_code = super::wasm::supported(&manifest, dir);
+    let known: Vec<&str> = MANIFEST_KEYS.iter().copied().chain(runs_code.then_some("lib")).collect();
+    keys(&manifest, "extension.toml", &known, ZED_MANIFEST_KEYS, &mut add);
+    if let Some(version) = manifest.get("lib").and_then(|lib| lib.get("version")).and_then(Value::as_str).filter(|_| !runs_code) {
+        let why = if dir.join("extension.wasm").is_file() {
+            format!("its code is for extension API {version}, which Kuana doesn't run (0.6 and 0.7 only)")
+        } else {
+            "there's no extension.wasm (its compiled code)".to_string()
+        };
+        add(Level::Note, format!("extension.toml: {why}, so its language servers are guessed"));
+    }
     match manifest.get("schema_version") {
         Some(Value::Integer(n)) if *n > SCHEMA_VERSION => {
             add(Level::Warning, format!("extension.toml: schema_version {n} is newer than the {SCHEMA_VERSION} Kuana reads"))

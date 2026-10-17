@@ -11,7 +11,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::{settings::LspSettings, syntax::Language};
+use crate::{extensions::wasm::WasmServers, settings::LspSettings, syntax::Language};
 
 pub struct ServerSpec {
     /// Shared by languages one server handles (JS/TS/TSX).
@@ -25,11 +25,14 @@ pub struct ServerSpec {
     /// From an extension's manifest: what it passes the server.
     pub initialization_options: Option<&'static Value>,
     pub settings: Option<&'static Value>,
+    /// An extension's servers its own code starts (`candidates` are then
+    /// only the guess when the code fails).
+    pub wasm: Option<&'static WasmServers>,
 }
 
 /// The fields a spec usually leaves empty, for `..SPEC`.
 pub const SPEC: ServerSpec =
-    ServerSpec { id: "", candidates: &[], install: "", root_markers: &[], initialization_options: None, settings: None };
+    ServerSpec { id: "", candidates: &[], install: "", root_markers: &[], initialization_options: None, settings: None, wasm: None };
 
 /// For a language whose server is only a command in `language_servers`.
 pub static CUSTOM: ServerSpec = ServerSpec { id: "custom", install: "Check the command in language_servers (settings.json)", ..SPEC };
@@ -207,7 +210,7 @@ pub fn root_for(spec: &ServerSpec, file: &Path, workspace_root: Option<&Path>) -
 
 /// Zed's id for a server program where it isn't the program's name, so
 /// `lsp.<id>` settings written for Zed find it.
-fn zed_id(program: &str) -> &str {
+pub fn zed_id(program: &str) -> &str {
     match program {
         "basedpyright-langserver" => "basedpyright",
         "pyright-langserver" => "pyright",
@@ -243,14 +246,30 @@ pub struct ServerConfig {
     pub settings: Value,
 }
 
+/// What extensions' code said about a server: its own extension's, with
+/// what other extensions add to it (`WasmServers::additional`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FromCode {
+    /// Zed's id for the server, when its extension's code started it: its
+    /// `lsp.<id>` settings go by that.
+    pub server: Option<String>,
+    pub initialization_options: Value,
+    pub settings: Value,
+}
+
 /// A server's configuration: Kuana's defaults for its program, then its
-/// extension's, then the user's `lsp.<id>`, each merged over the one before.
-pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSettings>) -> ServerConfig {
+/// extension's manifest's, then what extensions' code said (taken as it is:
+/// no dotted keys expanded), then the user's `lsp.<id>`, each merged over the
+/// one before.
+pub fn config(spec: &ServerSpec, program: &Path, user: &HashMap<String, LspSettings>, code: &FromCode) -> ServerConfig {
     let name = program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (mut initialization_options, mut settings) = defaults(&name);
     merge(&mut initialization_options, spec.initialization_options.unwrap_or(&Value::Null));
     merge(&mut settings, &expand_dotted(spec.settings.unwrap_or(&Value::Null)));
-    if let Some(entry) = user_entry(spec, Some(&name), user) {
+    merge(&mut initialization_options, &code.initialization_options);
+    merge(&mut settings, &code.settings);
+    let entry = code.server.as_deref().and_then(|id| user.get(id)).or_else(|| user_entry(spec, Some(&name), user));
+    if let Some(entry) = entry {
         merge(&mut initialization_options, entry.initialization_options.as_ref().unwrap_or(&Value::Null));
         merge(&mut settings, &expand_dotted(entry.settings.as_ref().unwrap_or(&Value::Null)));
     }
@@ -344,17 +363,19 @@ pub fn configuration(settings: &Value, section: Option<&str>) -> Value {
     section.split('.').try_fold(settings, |value, key| value.get(key)).cloned().unwrap_or(Value::Null)
 }
 
-/// A server command: the executable and its arguments.
+/// A server command: the executable and its arguments (and environment, as
+/// an extension's code may set it).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Command {
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 /// Finds an installed server: the project's `node_modules/.bin` or Python
 /// venv first (a pinned version), then the search path.
 pub fn find(spec: &ServerSpec, file: &Path, venv: Option<&Path>) -> Option<Command> {
-    let command = |program: PathBuf, args: &[&str]| Command { program, args: args.iter().map(|a| a.to_string()).collect() };
+    let command = |program: PathBuf, args: &[&str]| Command { program, args: args.iter().map(|a| a.to_string()).collect(), env: Vec::new() };
     for (name, args) in spec.candidates {
         let local = file
             .ancestors()
@@ -388,7 +409,7 @@ pub fn custom(command: &[String]) -> Option<Command> {
     let (name, args) = command.split_first()?;
     let path = Path::new(name);
     let program = if path.components().count() > 1 { executable(path)? } else { which(name)? };
-    Some(Command { program, args: args.to_vec() })
+    Some(Command { program, args: args.to_vec(), env: Vec::new() })
 }
 
 pub fn which(name: &str) -> Option<PathBuf> {
@@ -523,9 +544,9 @@ mod tests {
         let typescript = builtin(Language::TypeScript).unwrap();
         // Kuana's defaults turn on inlay hints, by program.
         let none = HashMap::new();
-        let ts = config(typescript, Path::new("/bin/typescript-language-server"), &none);
+        let ts = config(typescript, Path::new("/bin/typescript-language-server"), &none, &FromCode::default());
         assert_eq!(ts.initialization_options["preferences"]["includeInlayParameterNameHints"], "all");
-        let vtsls = config(typescript, Path::new("/bin/vtsls"), &none);
+        let vtsls = config(typescript, Path::new("/bin/vtsls"), &none, &FromCode::default());
         assert_eq!(vtsls.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "all");
 
         // The user's entry by Kuana's id or Zed's, merged over the defaults.
@@ -534,13 +555,13 @@ mod tests {
             LspSettings { settings: Some(json!({ "typescript": { "inlayHints": { "parameterNames": { "enabled": "none" } } } })), ..Default::default() },
         )]
         .into();
-        let merged = config(typescript, Path::new("/bin/vtsls"), &user);
+        let merged = config(typescript, Path::new("/bin/vtsls"), &user, &FromCode::default());
         assert_eq!(merged.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "none");
         assert_eq!(merged.settings["typescript"]["inlayHints"]["variableTypes"]["enabled"], true);
         let python = builtin(Language::Python).unwrap();
         let user: HashMap<String, LspSettings> =
             [("basedpyright".to_string(), LspSettings { initialization_options: Some(json!({ "a": 1 })), ..Default::default() })].into();
-        assert_eq!(config(python, Path::new("/bin/basedpyright-langserver"), &user).initialization_options, json!({ "a": 1 }));
+        assert_eq!(config(python, Path::new("/bin/basedpyright-langserver"), &user, &FromCode::default()).initialization_options, json!({ "a": 1 }));
 
         // An extension's own values sit between the two.
         static EXT: ServerSpec = ServerSpec { id: "ext:x", ..SPEC };
@@ -548,7 +569,15 @@ mod tests {
         let ext = ServerSpec { settings: Some(ext_settings), ..SPEC };
         let user: HashMap<String, LspSettings> =
             [("ext:x".to_string(), LspSettings { settings: Some(json!({ "x": { "b": 3 } })), ..Default::default() })].into();
-        assert_eq!(config(&ServerSpec { id: EXT.id, ..ext }, Path::new("/bin/x"), &user).settings, json!({ "x": { "a": 1, "b": 3 } }));
+        assert_eq!(config(&ServerSpec { id: EXT.id, ..ext }, Path::new("/bin/x"), &user, &FromCode::default()).settings, json!({ "x": { "a": 1, "b": 3 } }));
+
+        // What an extension's code said comes before the user's entry, which
+        // goes by Zed's id for the server it started (the program is node).
+        let code = FromCode { server: Some("html".into()), initialization_options: json!({ "a": 1, "b": 1 }), settings: json!({ "x.y": 1 }) };
+        let user: HashMap<String, LspSettings> =
+            [("html".to_string(), LspSettings { initialization_options: Some(json!({ "b": 2 })), ..Default::default() })].into();
+        let from_code = config(&EXT, Path::new("/bin/node"), &user, &code);
+        assert_eq!((from_code.initialization_options, from_code.settings), (json!({ "a": 1, "b": 2 }), json!({ "x.y": 1 })));
 
         // Another program, by any of the server's names.
         if cfg!(windows) {
