@@ -272,6 +272,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A registry built locally (kuana-extensions' scripts/build.py, its
+    /// index signed): installs Dart from it, and refuses a package that
+    /// doesn't match its checksum. Points the config folder elsewhere, so
+    /// it runs alone:
+    /// `KUANA_REGISTRY=file:///…/dist/index.json cargo test installs_from_a_local_registry -- --ignored`.
+    #[test]
+    #[ignore = "needs a locally built, signed registry (KUANA_REGISTRY); changes XDG_CONFIG_HOME"]
+    fn installs_from_a_local_registry() {
+        let config = std::env::temp_dir().join(format!("kuana-registry-local-{}", std::process::id()));
+        // SAFETY: this test runs on its own (it's ignored by default).
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config) };
+        let listed = available().unwrap();
+        let dart = listed.iter().find(|e| e.id == "dart").expect("Dart in the registry");
+        assert_eq!(install(dart), Ok("Dart".to_string()));
+        let dir = extensions_dir().unwrap().join("dart");
+        for file in ["extension.toml", "extension.wasm", "grammars/dart.wasm", "LICENSE", MARKER] {
+            assert!(dir.join(file).is_file(), "{file}");
+        }
+        let mut tampered = dart.clone();
+        tampered.package.sha256 = "0".repeat(64);
+        assert!(install(&tampered).unwrap_err().contains("checksum"));
+        assert!(dir.join("extension.wasm").is_file(), "the installed one stays");
+        std::fs::remove_dir_all(&config).ok();
+    }
+
     #[test]
     fn updates_only_what_the_registry_installed() {
         let dir = std::env::temp_dir().join(format!("kuana-registry-{}", std::process::id()));
