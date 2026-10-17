@@ -119,16 +119,19 @@ impl Workspace {
         self.find_bar.update(cx, |f, cx| f.set_target(None, cx));
         self.editors.clear();
         self.tab_subscriptions.clear();
+        self.tab_looks.clear();
         self.panes = vec![Pane::new()];
         self.active_pane = 0;
         self.pane_sizes = vec![1.0];
         self.pinned.clear();
         self.session_task = None;
         self.terminals.update(cx, |p, cx| p.clear(cx));
+        self.running.clear();
         self.hide_bottom(BottomPanel::Terminal);
         if let Some((session, _)) = self.debug.take() {
             session.update(cx, |s, cx| s.stop(cx));
         }
+        self.debug_active = false;
         self.hide_bottom(BottomPanel::Debug);
         self.debug_location = None;
         self.breakpoints.clear();

@@ -16,16 +16,15 @@ impl Workspace {
         let pane = &self.panes[pane_ix];
         let focused_pane = pane_ix == self.active_pane;
         let accent: Hsla = theme.accent.into();
-        let names: Vec<String> = pane.tabs.iter().map(|t| t.tab_title(cx)).collect();
+        // What the tabs show, as kept: reading their items here would redraw
+        // the window whenever one changes, out of sight or not.
+        let looks: Vec<TabLook> = pane.tabs.iter().map(|t| self.tab_look(t, cx)).collect();
+        let names: Vec<String> = looks.iter().map(|l| l.title.clone()).collect();
         let name_widths = measure_tab_names(&names, window, &theme);
-        let naturals: Vec<f32> = pane
-            .tabs
+        let naturals: Vec<f32> = looks
             .iter()
             .zip(&name_widths)
-            .map(|(t, (w, _))| {
-                let errors = t.read(cx).has_errors(cx);
-                (TAB_CHROME + w + if errors { TAB_ERROR_DOT } else { 0. }).ceil()
-            })
+            .map(|(look, (w, _))| (TAB_CHROME + w + if look.errors { TAB_ERROR_DOT } else { 0. }).ceil())
             .collect();
         let slots = fit_tabs(&naturals, pane.active, available.unwrap_or(f32::INFINITY));
         let visible: Vec<usize> = (0..slots.len()).filter(|&i| slots[i] != TabSlot::Hidden).collect();
@@ -56,7 +55,7 @@ impl Workspace {
             .children(visible.iter().enumerate().map(|(pos, &ix)| {
                 let item = &pane.tabs[ix];
                 let slot = slots[ix];
-                let it = item.read(cx);
+                let look = &looks[ix];
                 let active = ix == pane.active;
                 let next = visible.get(pos + 1).copied();
                 // Separators only between two tabs that sit on the chrome.
@@ -65,11 +64,10 @@ impl Workspace {
                 let icon_only = matches!(slot, TabSlot::Icon(_));
                 let compact = matches!(slot, TabSlot::Compact(_));
                 let pinned = self.pinned.contains(&item.entity_id());
-                let dirty = it.is_dirty(cx);
-                let errors = it.has_errors(cx);
-                let icon = match it.tab_icon(cx) {
-                    TabIcon::File(path) => file_icon(&path, px(15.), &theme).into_any_element(),
-                    TabIcon::Ui(icon) => icon_el(icon, px(14.), theme.accent.into()).into_any_element(),
+                let (dirty, errors) = (look.dirty, look.errors);
+                let icon = match &look.icon {
+                    TabIcon::File(path) => file_icon(path, px(15.), &theme).into_any_element(),
+                    TabIcon::Ui(icon) => icon_el(*icon, px(14.), theme.accent.into()).into_any_element(),
                 };
                 let name = names[ix].clone();
                 let shown_name = tab_label(&name, slot, naturals[ix], name_widths[ix]);
