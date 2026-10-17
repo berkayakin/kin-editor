@@ -295,7 +295,7 @@ impl Workspace {
             self.focus_active(window, cx);
         }
         if visible && self.sidebar_mode == SidebarMode::Commit {
-            self.refresh_git(cx);
+            self.refresh_commit_view(cx);
         }
         self.save_state();
         cx.notify();
@@ -317,7 +317,7 @@ impl Workspace {
     pub(super) fn show_commit(&mut self, _: &ShowCommit, window: &mut Window, cx: &mut Context<Self>) {
         self.show_sidebar = true;
         self.sidebar_mode = SidebarMode::Commit;
-        self.refresh_git(cx);
+        self.refresh_commit_view(cx);
         self.git_panel.read(cx).focus_message(window, cx);
         self.save_state();
         cx.notify();

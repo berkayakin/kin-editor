@@ -316,6 +316,105 @@ pub fn status(root: &Path) -> Result<RepoStatus, String> {
     Ok(status)
 }
 
+/// The status of some paths only (relative to `root`; a folder with what's
+/// in it), for `RepoStatus::merge`: what changed in the work tree there,
+/// without reading the rest of the repository. Without the branch and
+/// merge state, which only change with `.git` (a full `status` reads them).
+pub fn status_of(root: &Path, rels: &[String]) -> Result<RepoStatus, String> {
+    // No paths would be every path.
+    if rels.is_empty() {
+        return Ok(RepoStatus::default());
+    }
+    let mut args = vec!["--no-optional-locks", "--literal-pathspecs", "status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=matching", "--"];
+    args.extend(rels.iter().map(String::as_str));
+    Ok(parse_status(root, &run(root, &args)?))
+}
+
+/// The pathspecs for `status_of` that cover `paths` (absolute; those
+/// outside `root` are left out): relative to the repository, none inside
+/// another. A path in a nested repository (a submodule) is its folder,
+/// which Git reports as one entry; the paths in it would read as nothing.
+/// Past a few dozen, the deepest go to their folders, until they're few
+/// enough (and a short command line). None when that comes to the whole
+/// repository: read all of it. Blocking (it looks for `.git` folders).
+pub fn pathspecs<'a>(root: &Path, paths: impl IntoIterator<Item = &'a Path>) -> Option<Vec<String>> {
+    const MAX_PATHSPECS: usize = 64;
+    // Windows takes a command line of 32K characters.
+    const MAX_LENGTH: usize = 16_000;
+    let mut nested: HashMap<PathBuf, bool> = HashMap::new();
+    let mut specs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for path in paths {
+        let Ok(rel) = path.strip_prefix(root) else { continue };
+        // The outermost repository it's in, below this one.
+        let mut folders: Vec<&Path> = rel.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).collect();
+        folders.reverse();
+        let repo = folders.into_iter().find(|folder| *nested.entry(folder.to_path_buf()).or_insert_with(|| root.join(folder).join(".git").exists()));
+        specs.insert(repo.unwrap_or(rel).to_path_buf());
+    }
+    loop {
+        // Sorted, a folder comes right before what's in it.
+        let mut kept: Vec<PathBuf> = Vec::new();
+        for spec in std::mem::take(&mut specs) {
+            if !kept.last().is_some_and(|folder| spec.starts_with(folder)) {
+                kept.push(spec);
+            }
+        }
+        if kept.iter().any(|spec| spec.as_os_str().is_empty()) {
+            return None;
+        }
+        let length: usize = kept.iter().map(|spec| spec.as_os_str().len() + 1).sum();
+        if kept.len() <= MAX_PATHSPECS && length <= MAX_LENGTH {
+            return Some(kept.iter().map(|spec| spec.to_string_lossy().replace('\\', "/")).collect());
+        }
+        let deepest = kept.iter().map(|spec| spec.components().count()).max().unwrap_or(0);
+        specs = kept
+            .into_iter()
+            .map(|spec| if spec.components().count() == deepest { spec.parent().map(Path::to_path_buf).unwrap_or_default() } else { spec })
+            .collect();
+    }
+}
+
+impl RepoStatus {
+    /// Takes in `scoped`, the status of `rels` alone (`status_of`): what was
+    /// known under those paths is replaced, the rest kept. Staged changes
+    /// stay as they were known: only `.git` changes (a full status) move
+    /// them, and a rename seen from one side reads as an addition or a
+    /// deletion. So a tracked file keeps its staged side and blob ids, and
+    /// a staged change not known before is left out. `root` is the
+    /// repository's.
+    pub fn merge(&mut self, root: &Path, rels: &[String], scoped: RepoStatus) {
+        let specs: Vec<PathBuf> = rels.iter().map(|rel| root.join(rel)).collect();
+        let covered = |path: &Path| specs.iter().any(|spec| path.starts_with(spec));
+        let mut before: HashMap<PathBuf, FileStatus> = HashMap::new();
+        self.files.retain(|f| {
+            let keep = !covered(&f.path);
+            if !keep {
+                before.insert(f.path.clone(), f.clone());
+            }
+            keep
+        });
+        for mut file in scoped.files {
+            match before.get(&file.path) {
+                Some(was) if was.blobs.is_some() && file.blobs.is_some() => {
+                    file.staged = was.staged;
+                    file.blobs = was.blobs.clone();
+                }
+                _ if file.staged.is_some() && file.unstaged.is_none() => continue,
+                _ => {}
+            }
+            self.files.push(file);
+        }
+        self.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+        // A path in an ignored folder reports the folder.
+        self.ignored.retain(|p| !covered(p));
+        for path in scoped.ignored {
+            if !self.ignored.contains(&path) {
+                self.ignored.push(path);
+            }
+        }
+    }
+}
+
 fn change_for(c: char) -> Option<Change> {
     match c {
         'M' | 'T' => Some(Change::Modified),
@@ -2204,6 +2303,89 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         drop_stash(&root, 0).unwrap();
         assert!(stashes(&root).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The status of the paths that changed, merged into the last full one,
+    /// is what a full status says now.
+    #[test]
+    fn a_status_of_changed_paths_merges_into_the_last_full_one() {
+        if !is_available() {
+            return;
+        }
+        let root = test_repo("scoped");
+        let write = |rel: &str, text: &str| {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), text).unwrap();
+        };
+        write(".gitignore", "dist/\n*.log\n");
+        for rel in ["src/a.rs", "src/b.rs", "keep.txt", "old.log"] {
+            write(rel, "one\n");
+        }
+        stage(&root, &[".gitignore".into(), "src".into(), "keep.txt".into()]).unwrap();
+        commit(&root, "first", false).unwrap();
+        run(&root, &["mv", "src/b.rs", "src/c.rs"]).unwrap();
+        write("src/a.rs", "staged\n");
+        stage(&root, &["src/a.rs".into()]).unwrap();
+        let mut known = status(&root).unwrap();
+        let check = |known: &RepoStatus| {
+            let full = status(&root).unwrap();
+            assert_eq!(known.files, full.files);
+            let sorted = |mut paths: Vec<PathBuf>| {
+                paths.sort();
+                paths
+            };
+            assert_eq!(sorted(known.ignored.clone()), sorted(full.ignored));
+        };
+
+        // The work tree changes: the renamed file and the staged one edited,
+        // a new file, a removed one, build output in an ignored folder, a log.
+        write("src/c.rs", "changed\n");
+        write("src/a.rs", "staged, then edited\n");
+        write("src/new.rs", "new\n");
+        std::fs::remove_file(root.join("keep.txt")).unwrap();
+        write("dist/x/out.js", "built\n");
+        write("debug.log", "log\n");
+        let rels: Vec<String> = ["src/c.rs", "src/a.rs", "src/new.rs", "keep.txt", "dist/x/out.js", "debug.log"].map(String::from).into();
+        known.merge(&root, &rels, status_of(&root, &rels).unwrap());
+        check(&known);
+        assert_eq!(known.files.iter().find(|f| f.rel == "src/c.rs").and_then(|f| f.staged), Some(Change::Renamed));
+        // A new file where the renamed one was: alone, its path also reads
+        // as the rename's deletion.
+        write("src/b.rs", "again\n");
+        let rels = vec!["src/b.rs".to_string()];
+        known.merge(&root, &rels, status_of(&root, &rels).unwrap());
+        check(&known);
+
+        // A folder at once: what went from it goes, what's ignored stays.
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        std::fs::remove_dir_all(root.join("dist")).unwrap();
+        std::fs::remove_file(root.join("old.log")).unwrap();
+        let rels = vec!["src".to_string(), "dist".to_string(), "old.log".to_string()];
+        known.merge(&root, &rels, status_of(&root, &rels).unwrap());
+        check(&known);
+        assert!(status_of(&root, &[]).unwrap().files.is_empty(), "no paths isn't every path");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pathspecs_cover_each_path_once() {
+        let root = std::env::temp_dir().join(format!("kuana-git-specs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub/.git")).unwrap();
+        let specs = |paths: &[PathBuf]| pathspecs(&root, paths.iter().map(PathBuf::as_path));
+        // A folder covers what's in it; a nested repository reads as its
+        // folder; what's outside the repository is left out.
+        let paths = ["src/a.rs", "src", "sub/x/y.txt", "notes.txt"].map(|p| root.join(p));
+        let outside = std::env::temp_dir().join("elsewhere.txt");
+        assert_eq!(specs(&[&paths[..], &[outside]].concat()), Some(["notes.txt", "src", "sub"].map(String::from).to_vec()));
+        // Too many: the deepest go to their folders.
+        let many: Vec<PathBuf> = (0..200).map(|i| root.join(format!("gen/d{}/f{i}.rs", i % 4))).collect();
+        assert_eq!(specs(&many), Some(["gen/d0", "gen/d1", "gen/d2", "gen/d3"].map(String::from).to_vec()));
+        // Up to the repository itself: read all of it.
+        let top: Vec<PathBuf> = (0..100).map(|i| root.join(format!("f{i}.rs"))).collect();
+        assert_eq!(specs(&top), None);
+        assert_eq!(specs(&[root.join(".gitignore").parent().unwrap().to_path_buf()]), None);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A repository in a fresh temp folder, with a committer and `main` checked out.

@@ -6,7 +6,7 @@
 
 use ignore::gitignore::Gitignore;
 
-use super::*;
+use super::{git_ops::StatusWork, *};
 use crate::lsp::{FileWatchers, ServerKey};
 
 impl Workspace {
@@ -94,9 +94,7 @@ impl Workspace {
         if !changed.lsp.is_empty() {
             self.lsp.read(cx).send_file_events(changed.lsp);
         }
-        if changed.git {
-            self.refresh_git(cx);
-        }
+        self.read_status(changed.git, cx);
         let paths = changed.open;
         if paths.is_empty() {
             return;
@@ -222,8 +220,8 @@ pub(super) struct Classified {
     structural: Vec<PathBuf>,
     /// The project's ignore rules, read again (a .gitignore changed).
     ignore: Option<Option<Arc<Gitignore>>>,
-    /// Git status needs reading again.
-    git: bool,
+    /// Git status to read again: all of it (`.git` changed), or paths'.
+    git: StatusWork,
     /// Open files that changed.
     open: HashSet<PathBuf>,
     /// Each language server's `didChangeWatchedFiles`, for what it watches.
@@ -231,9 +229,7 @@ pub(super) struct Classified {
 }
 
 /// Sorts out a batch of changes (blocking: in the background). Paths in
-/// `target` and `node_modules` matter to the tree only; churn in what Git
-/// ignores needs no status (a new ignored file or folder does: the tree
-/// dims it).
+/// `target` and `node_modules` matter to the tree only.
 pub(super) fn classify(changes: Vec<FsChange>, state: &WatchState) -> Classified {
     let root = &state.root;
     let mut out = Classified::default();
@@ -248,17 +244,21 @@ pub(super) fn classify(changes: Vec<FsChange>, state: &WatchState) -> Classified
         ignore = project_ignore(root).map(Arc::new);
         out.ignore = Some(ignore.clone());
     }
-    // By the project's rules, or inside what Git reported as ignored
-    // (nested .gitignore files and global excludes included).
-    let ignored = |path: &Path| {
-        ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(path, false).is_ignore())
-            || path.ancestors().skip(1).any(|p| state.git_ignored.contains(p))
+    // Each path's kind of change, found once, and only when needed.
+    let mut found: HashMap<PathBuf, Option<bool>> = HashMap::new();
+    let mut kind_of = |change: &FsChange| {
+        let is_dir = *found.entry(change.path.clone()).or_insert_with(|| std::fs::metadata(&change.path).ok().map(|m| m.is_dir()));
+        let kind = match (is_dir, change.structural) {
+            (None, _) => FileChange::Deleted,
+            (Some(_), true) => FileChange::Created,
+            (Some(_), false) => FileChange::Changed,
+        };
+        (kind, is_dir == Some(true))
     };
-    let mut exists: HashMap<PathBuf, bool> = HashMap::new();
     let mut file_changes = Vec::new();
     for change in changes {
         match watcher::git_path(&change.path) {
-            GitPath::Metadata => out.git = true,
+            GitPath::Metadata => out.git.add(StatusWork::all()),
             GitPath::Internal => {}
             GitPath::WorkTree => {
                 let tree_read = |path: &Path| state.tree_read.contains(path);
@@ -271,20 +271,11 @@ pub(super) fn classify(changes: Vec<FsChange>, state: &WatchState) -> Classified
                 if change.structural {
                     out.structural.push(change.path.clone());
                 }
-                let is_ignored = ignored(&change.path);
-                // The kind of change only matters to these.
-                let kind = (is_ignored || !state.watchers.is_empty()).then(|| {
-                    let there = *exists.entry(change.path.clone()).or_insert_with(|| change.path.exists());
-                    match (there, change.structural) {
-                        (false, _) => FileChange::Deleted,
-                        (true, true) => FileChange::Created,
-                        (true, false) => FileChange::Changed,
-                    }
-                });
-                let known = || change.path.ancestors().any(|p| state.git_ignored.contains(p));
-                out.git |= !is_ignored || (kind == Some(FileChange::Created) && !known());
-                if let Some(kind) = kind.filter(|_| !state.watchers.is_empty()) {
-                    file_changes.push((change.path.clone(), kind));
+                if let Some(path) = status_path(&change, state, ignore.as_deref(), &mut kind_of) {
+                    out.git.add_path(path);
+                }
+                if !state.watchers.is_empty() {
+                    file_changes.push((change.path.clone(), kind_of(&change).0));
                 }
                 if state.open.contains(&change.path) {
                     out.open.insert(change.path);
@@ -296,15 +287,56 @@ pub(super) fn classify(changes: Vec<FsChange>, state: &WatchState) -> Classified
     out
 }
 
+/// What of Git status a change in the work tree needs read again: its
+/// path's; nothing in a folder Git ignores (build output churning there),
+/// nor for an ignored file written to, unless it's open (it may be tracked
+/// all the same); for something new that the project's rules ignore, the
+/// outermost folder they ignore (a build's first output is read as its
+/// folder, not file by file: once Git says it's ignored, the tree dims
+/// it); for a .gitignore, its folder's.
+fn status_path(
+    change: &FsChange,
+    state: &WatchState,
+    ignore: Option<&Gitignore>,
+    kind_of: &mut impl FnMut(&FsChange) -> (FileChange, bool),
+) -> Option<PathBuf> {
+    let path = &change.path;
+    if path.ancestors().skip(1).any(|p| state.git_ignored.contains(p)) {
+        return None;
+    }
+    if state.git_ignored.contains(path) {
+        return (kind_of(change).0 == FileChange::Deleted).then(|| path.clone());
+    }
+    if path.file_name().is_some_and(|n| n == ".gitignore") {
+        return path.parent().map(Path::to_path_buf);
+    }
+    if state.open.contains(path) {
+        return Some(path.clone());
+    }
+    let Some(ignore) = ignore.filter(|i| i.matched_path_or_any_parents(path, false).is_ignore()) else {
+        return Some(path.clone());
+    };
+    match kind_of(change) {
+        (FileChange::Changed, _) => None,
+        (FileChange::Deleted, _) => Some(path.clone()),
+        (FileChange::Created, is_dir) => {
+            let mut folders: Vec<&Path> = path.ancestors().take_while(|a| *a != state.root.as_path()).collect();
+            folders.reverse();
+            let top = folders.into_iter().find(|a| ignore.matched(a, *a != path.as_path() || is_dir).is_ignore());
+            Some(top.unwrap_or(path).to_path_buf())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn state(root: &Path) -> WatchState {
+    fn watch_state(root: &Path) -> WatchState {
         WatchState {
             root: root.to_path_buf(),
             ignore: project_ignore(root).map(Arc::new),
-            git_ignored: Arc::new([root.join("dist")].into_iter().collect()),
+            git_ignored: Arc::new([root.join("dist"), root.join("old.log")].into_iter().collect()),
             tree_read: [root.to_path_buf(), root.join("src")].into_iter().collect(),
             open: [root.join("src/a.rs")].into_iter().collect(),
             watchers: FileWatchers::default(),
@@ -315,41 +347,52 @@ mod tests {
     fn a_batch_is_sorted_out_by_what_it_affects() {
         let root = std::env::temp_dir().join(format!("kuana-classify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in ["src", "dist/out", ".git", "node_modules/x"] {
+        for dir in ["src", "dist/out", ".git", "node_modules/x", "build/a"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
-        for file in ["src/a.rs", "src/new.rs", "dist/out/x.js", "debug.log"] {
+        std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        for file in ["src/a.rs", "src/new.rs", "dist/out/x.js", "debug.log", "build/a/b.js", "build/a/c.js"] {
             std::fs::write(root.join(file), "").unwrap();
         }
-        let state = state(&root);
+        let state = watch_state(&root);
         let change = |rel: &str, structural| FsChange { path: root.join(rel), structural };
+        let status_of = |c: &Classified| c.git.paths.iter().map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
 
-        // Build output in an ignored folder: only Go to File hears of it (it
-        // skips ignored folders itself).
+        // Build output in a folder Git ignores: only Go to File hears of it
+        // (it skips ignored folders itself).
         let c = classify(vec![change("dist/out/x.js", true), change("dist/out/y.js", true)], &state);
-        assert!(!c.git && c.tree.is_empty() && c.open.is_empty());
+        assert!(c.git.is_empty() && c.tree.is_empty() && c.open.is_empty());
         assert_eq!(c.structural.len(), 2);
-        // An open file written to: it's read again, and so is Git status.
+        // An open file written to: it's read again, and so is its status.
         let c = classify(vec![change("src/a.rs", false)], &state);
-        assert!(c.git && c.tree.is_empty() && c.structural.is_empty());
+        assert!(c.tree.is_empty() && c.structural.is_empty());
         assert!(c.open.contains(&root.join("src/a.rs")));
+        assert_eq!(status_of(&c), ["src/a.rs"]);
         // A new file where the tree has read: the tree hears of it.
         let c = classify(vec![change("src/new.rs", true)], &state);
         assert_eq!(c.tree, [root.join("src/new.rs")]);
-        // A log written to is ignored by the project's rules: no status. A
-        // new one needs one (the tree dims it once Git says it's ignored).
-        assert!(!classify(vec![change("debug.log", false)], &state).git);
-        assert!(classify(vec![change("debug.log", true)], &state).git);
+        assert_eq!(status_of(&c), ["src/new.rs"]);
+        // A log the project's rules ignore, written to: no status. A new
+        // one gets one (the tree dims it once Git says it's ignored), and
+        // so does one Git knew that went.
+        assert!(classify(vec![change("debug.log", false)], &state).git.is_empty());
+        assert_eq!(status_of(&classify(vec![change("debug.log", true)], &state)), ["debug.log"]);
+        assert_eq!(status_of(&classify(vec![change("old.log", true)], &state)), ["old.log"]);
+        let log_open = WatchState { open: [root.join("debug.log")].into_iter().collect(), ..watch_state(&root) };
+        assert_eq!(status_of(&classify(vec![change("debug.log", false)], &log_open)), ["debug.log"]);
+        // A new build folder the rules ignore: its status, not its files'.
+        let c = classify(vec![change("build", true), change("build/a/b.js", true), change("build/a/c.js", true)], &state);
+        assert_eq!(status_of(&c), ["build"]);
         // Dependencies: the tree only (where it has read).
         let c = classify(vec![change("node_modules/x/i.js", true)], &state);
-        assert!(!c.git && c.tree.is_empty() && c.structural.is_empty());
-        // Git's own: HEAD, the index, refs; not objects.
-        assert!(classify(vec![change(".git/index", false)], &state).git);
-        assert!(!classify(vec![change(".git/objects/ab/cdef", true)], &state).git);
-        // New ignore rules are read again.
+        assert!(c.git.is_empty() && c.tree.is_empty() && c.structural.is_empty());
+        // Git's own: HEAD, the index, refs, all of the status; not objects.
+        assert!(classify(vec![change(".git/index", false), change("src/a.rs", false)], &state).git.all);
+        assert!(classify(vec![change(".git/objects/ab/cdef", true)], &state).git.is_empty());
+        // New ignore rules: read again, and the status of their folder.
         let c = classify(vec![change(".gitignore", false)], &state);
-        assert!(c.ignore.is_some() && c.git);
+        assert!(c.ignore.is_some());
+        assert_eq!(c.git.paths.iter().collect::<Vec<_>>(), [&root]);
         // The watcher lost track: everything.
         assert!(classify(vec![FsChange { path: root.clone(), structural: true }], &state).everything);
         std::fs::remove_dir_all(&root).ok();

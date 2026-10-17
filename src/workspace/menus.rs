@@ -790,11 +790,11 @@ impl Workspace {
     }
 
     /// After a file operation on `changed` (created, removed or renamed):
-    /// the tree reads again the folders they're in. Go to File hears of it
-    /// from the watcher.
+    /// the tree reads again the folders they're in. Go to File and Git
+    /// status hear of it from the watcher.
     pub(super) fn after_fs_change(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
         self.tree.update(cx, |t, cx| t.paths_changed(changed.iter().map(PathBuf::as_path), cx));
-        self.refresh_git(cx);
+        self.files_written(changed.iter().cloned(), cx);
         cx.notify();
     }
 

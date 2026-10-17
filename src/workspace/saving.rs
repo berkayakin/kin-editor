@@ -53,7 +53,8 @@ impl Workspace {
         match editor.update(cx, |e, cx| e.save(cx)) {
             Ok(()) => {
                 self.auto_save_warned.remove(&id);
-                self.refresh_git(cx);
+                let saved = editor.read(cx).doc.read(cx).path.clone();
+                self.files_written(saved, cx);
                 self.check_config(cx);
                 // The session may hold the text as unsaved.
                 self.schedule_session_save(cx);
