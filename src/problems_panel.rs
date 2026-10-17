@@ -89,7 +89,8 @@ impl Render for ProblemsPanel {
         let theme = Theme::get(cx).clone();
         let doc = self.editor.as_ref().map(|e| e.read(cx).doc.read(cx));
         let run_count = self.run_shown(doc).len();
-        let diag_count = doc.map_or(0, |d| d.diagnostics.len());
+        // Hints aren't problems.
+        let diag_count = doc.map_or(0, |d| d.diagnostics.iter().filter(|d| d.severity.is_problem()).count());
 
         let header = crate::ui::panel_header(&theme)
             .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child("PROBLEMS"))
@@ -142,7 +143,7 @@ impl Render for ProblemsPanel {
                             ix -= 1;
                         }
                         let diagnostic = doc.and_then(|doc| {
-                            let d = doc.diagnostics.get(ix)?;
+                            let d = doc.diagnostics.iter().filter(|d| d.severity.is_problem()).nth(ix)?;
                             let row = doc.row_of(d.range.start);
                             let col = doc.slice(doc.line_start(row)..d.range.start).chars().count();
                             Some((d.clone(), row + 1, col + 1))
@@ -219,6 +220,7 @@ pub fn severity_icon(severity: Severity, theme: &Theme) -> (Icon, Hsla) {
         Severity::Error => (Icon::CircleX, theme.error.into()),
         Severity::Warning => (Icon::TriangleAlert, theme.warning.into()),
         Severity::Info => (Icon::CircleAlert, theme.info.into()),
+        Severity::Hint => (Icon::CircleAlert, theme.text_dim.into()),
     }
 }
 

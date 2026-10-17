@@ -1517,7 +1517,8 @@ impl Editor {
         let row = doc.row_of(self.primary_selection().head);
         let (start, end) = (doc.line_start(row), doc.line_end(row));
         let first = doc.diagnostics.partition_point(|d| d.range.start < start);
-        let problems: Vec<&lint::Diagnostic> = doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).collect();
+        let problems: Vec<&lint::Diagnostic> =
+            doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).filter(|d| d.severity.is_problem()).collect();
         let Some(only) = problems.first() else { return Vec::new() };
         let text = doc.line_text(row);
         let cols = (layout.wrap_width / layout.char_width).floor().max(20.) as usize;
@@ -3101,7 +3102,11 @@ impl Editor {
             });
             let breaks = self.line_breaks(row).to_vec();
             let row_first_drow = self.first_display_row(row);
-            let worst = row_diags.iter().filter(|d| self.doc.read(cx).row_of(d.range.start) == row).min_by_key(|d| d.severity);
+            // Hints get no dot or message at the line's end.
+            let worst = row_diags
+                .iter()
+                .filter(|d| d.severity.is_problem() && self.doc.read(cx).row_of(d.range.start) == row)
+                .min_by_key(|d| d.severity);
 
             // Each wrapped segment of the line is its own display row.
             for seg in 0..=breaks.len() {
@@ -3665,7 +3670,7 @@ impl Editor {
                 (None, None) => unreachable!(),
             };
             let rows = display_rows.max(1) as f32;
-            for d in &self.doc.read(cx).diagnostics {
+            for d in self.doc.read(cx).diagnostics.iter().filter(|d| d.severity.is_problem()) {
                 let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
@@ -3728,6 +3733,7 @@ fn severity_color(theme: &Theme, severity: Severity) -> Hsla {
         Severity::Error => theme.error,
         Severity::Warning => theme.warning,
         Severity::Info => theme.info,
+        Severity::Hint => theme.text_dim,
     }
     .into()
 }

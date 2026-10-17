@@ -60,6 +60,9 @@ impl std::fmt::Display for RpcError {
     }
 }
 
+/// JSON-RPC's error code for a request the receiver doesn't handle.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 /// The error for requests still waiting when the server exits.
 pub const STOPPED: &str = "The language server stopped";
 /// The error for a request still unanswered after `REQUEST_TIMEOUT`.
@@ -158,6 +161,13 @@ impl Client {
     /// Answers a request from the server.
     pub fn respond(&self, id: Value, result: Value) {
         self.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    }
+
+    /// Answers a request Kuana doesn't handle with JSON-RPC's MethodNotFound,
+    /// so the server knows it went unanswered (a `null` result reads as done).
+    pub fn respond_not_found(&self, id: Value, method: &str) {
+        let error = json!({ "code": METHOD_NOT_FOUND, "message": format!("Unhandled method {method}") });
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "error": error }));
     }
 
     fn send(&self, message: Value) {
@@ -317,7 +327,12 @@ fn read_loop(
     let _ = incoming.unbounded_send(Incoming::Closed { stderr_tail });
 }
 
-/// Reads one `Content-Length`-framed message; None at end of stream.
+/// The longest message read. A longer `Content-Length` means the stream (or
+/// the server) is broken, not a message to make room for.
+const MAX_MESSAGE: usize = 64 << 20;
+
+/// Reads one `Content-Length`-framed message; None at end of stream, or
+/// when it's broken (a length that isn't one, or past `MAX_MESSAGE`).
 pub(crate) fn read_message(reader: &mut impl BufRead) -> Option<Value> {
     loop {
         let mut length = None;
@@ -334,7 +349,7 @@ pub(crate) fn read_message(reader: &mut impl BufRead) -> Option<Value> {
             if let Some((name, value)) = header.split_once(':')
                 && name.eq_ignore_ascii_case("content-length")
             {
-                length = value.trim().parse::<usize>().ok();
+                length = Some(value.trim().parse::<usize>().ok().filter(|&n| n <= MAX_MESSAGE)?);
             }
         }
         let Some(length) = length else { continue };
@@ -468,6 +483,11 @@ mod tests {
         assert_eq!(read_message(&mut reader).unwrap()["result"]["ok"], true);
         assert_eq!(read_message(&mut reader).unwrap()["params"]["message"], "é");
         assert!(read_message(&mut reader).is_none());
+        // A length too big to be a message ends the stream; nothing is allocated for it.
+        for length in [format!("{}", MAX_MESSAGE + 1), "18446744073709551616".into(), "lots".into()] {
+            let stream = format!("Content-Length: {length}\r\n\r\n{a}");
+            assert!(read_message(&mut BufReader::new(stream.as_bytes())).is_none(), "{length}");
+        }
     }
 
     #[test]

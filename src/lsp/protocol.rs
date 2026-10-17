@@ -240,6 +240,7 @@ pub fn diagnostics(value: &Value, rope: &Rope, encoding: Encoding, server: &'sta
             let severity = match d.get("severity").and_then(Value::as_u64) {
                 Some(1) | None => Severity::Error,
                 Some(2) => Severity::Warning,
+                Some(4) => Severity::Hint,
                 _ => Severity::Info,
             };
             let code = match d.get("code") {
@@ -699,6 +700,24 @@ mod tests {
         assert_eq!(position_to_offset(&rope, Position { line: 9, character: 0 }, Encoding::Utf16), rope.len_bytes());
         // A UTF-8 column inside a character snaps back.
         assert_eq!(position_to_offset(&rope, Position { line: 0, character: 2 }, Encoding::Utf8), 1);
+    }
+
+    #[test]
+    fn reads_diagnostic_severities() {
+        let rope = Rope::from_str("let x = 1;\n");
+        let problem = |severity: Option<u64>| {
+            let range = json!({ "start": { "line": 0, "character": 4 }, "end": { "line": 0, "character": 5 } });
+            let mut problem = json!({ "range": range, "message": "m" });
+            if let Some(severity) = severity {
+                problem["severity"] = json!(severity);
+            }
+            problem
+        };
+        let params = json!({ "diagnostics": [problem(Some(1)), problem(Some(2)), problem(Some(3)), problem(Some(4)), problem(None)] });
+        let severities: Vec<Severity> = diagnostics(&params, &rope, Encoding::Utf16, "s").iter().map(|d| d.severity).collect();
+        assert_eq!(severities, [Severity::Error, Severity::Warning, Severity::Info, Severity::Hint, Severity::Error]);
+        // A hint is drawn, but isn't a problem.
+        assert!(Severity::Info.is_problem() && !Severity::Hint.is_problem());
     }
 
     #[test]
