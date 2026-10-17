@@ -22,8 +22,9 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Child, ChildStdout, Stdio},
     sync::{
-        Arc, LazyLock, Mutex,
+        LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     time::SystemTime,
 };
@@ -112,83 +113,104 @@ pub struct Asking {
 }
 
 impl Asking {
-    /// The server's workspace configuration from extensions' code. Blocking.
-    pub fn workspace_configuration(&self, lsp: &HashMap<String, LspSettings>) -> Value {
+    /// The server's workspace configuration from extensions' code, which
+    /// runs on their threads (see `WasmExtension::run`): this only waits.
+    pub async fn workspace_configuration(&self, lsp: &HashMap<String, LspSettings>) -> Value {
         let settings = CallSettings { lsp: lsp.clone(), tab_sizes: self.tab_sizes.clone() };
         let mut value = Value::Null;
         if let Some((extension, server)) = self.own {
-            let answer = extension.call(&self.root, &settings, &|e, store, project| e.call_language_server_workspace_configuration(store, server, project));
+            let (root, call) = (self.root.clone(), settings.clone());
+            let answer = extension
+                .run(move |extension, instance| {
+                    extension.call(instance, &root, &call, &|e, store, project| e.call_language_server_workspace_configuration(store, server, project))
+                })
+                .await;
             match answer.and_then(json_answer) {
                 Ok(own) => value = own.unwrap_or_default(),
                 Err(err) => eprintln!("kuana: {} extension, {server}: {err}", extension.id),
             }
         }
         for other in &self.others {
-            let more = other.additional(&self.target, &self.root, &settings, &|e, store, server, target, project| {
-                e.call_language_server_additional_workspace_configuration(store, server, target, project)
-            });
+            let more = other
+                .additional(&self.target, &self.root, &settings, |e, store, server, target, project| {
+                    e.call_language_server_additional_workspace_configuration(store, server, target, project)
+                })
+                .await;
             servers::merge(&mut value, &more.unwrap_or_default());
         }
         value
     }
 
-    /// What the other extensions add to its initialization options. Blocking.
-    pub fn additional_options(&self, lsp: &HashMap<String, LspSettings>) -> Value {
+    /// What the other extensions add to its initialization options (their
+    /// code runs on their threads: this only waits).
+    pub async fn additional_options(&self, lsp: &HashMap<String, LspSettings>) -> Value {
         let settings = CallSettings { lsp: lsp.clone(), tab_sizes: self.tab_sizes.clone() };
         let mut value = Value::Null;
         for other in &self.others {
-            let more = other.additional(&self.target, &self.root, &settings, &|e, store, server, target, project| {
-                e.call_language_server_additional_initialization_options(store, server, target, project)
-            });
+            let more = other
+                .additional(&self.target, &self.root, &settings, |e, store, server, target, project| {
+                    e.call_language_server_additional_initialization_options(store, server, target, project)
+                })
+                .await;
             servers::merge(&mut value, &more.unwrap_or_default());
         }
         value
     }
 }
 
-type Additional = dyn Fn(&Extension, &mut Store<State>, &str, &str, Resource<ProjectRoot>) -> wasmtime::Result<Result<Option<String>, String>>;
+type Additional = fn(&Extension, &mut Store<State>, &str, &str, Resource<ProjectRoot>) -> wasmtime::Result<Result<Option<String>, String>>;
 
 impl WasmServers {
     /// Asks the extension's code to start its first server it can, for the
-    /// project at `root`. Blocking: the code may download the server.
-    pub fn start(&self, root: &Path, settings: &CallSettings) -> Result<Started, String> {
-        let mut first_error = None;
-        for &server in self.ids {
-            match self.extension.start(server, root, settings) {
-                Ok(started) => return Ok(started),
-                Err(err) => {
-                    eprintln!("kuana: {} extension: {err}", self.extension.id);
-                    first_error.get_or_insert(err);
+    /// project at `root`. The code may download the server first, which can
+    /// take minutes: it runs on the extension's thread, and this only waits.
+    pub fn start(&'static self, root: &Path, settings: &CallSettings) -> impl Future<Output = Result<Started, String>> + Send + 'static {
+        let (root, settings, ids) = (root.to_path_buf(), settings.clone(), self.ids);
+        self.extension.run(move |extension, instance| {
+            let mut first_error = None;
+            for &server in ids {
+                match extension.start(instance, server, &root, &settings) {
+                    Ok(started) => return Ok(started),
+                    Err(err) => {
+                        eprintln!("kuana: {} extension: {err}", extension.id);
+                        first_error.get_or_insert(err);
+                    }
                 }
             }
-        }
-        Err(first_error.unwrap_or_else(|| format!("the {} extension has no language server", self.extension.id)))
+            Err(first_error.unwrap_or_else(|| format!("the {} extension has no language server", extension.id)))
+        })
     }
 
     /// What this extension's servers add (through `ask`: initialization
     /// options or workspace configuration) to another server's, `target` by
     /// Zed's id: Vue's TypeScript plugin for vtsls, say.
-    fn additional(&self, target: &str, root: &Path, settings: &CallSettings, ask: &Additional) -> Option<Value> {
-        let mut out = None;
-        for &server in self.ids.iter().filter(|id| **id != target) {
-            match self.extension.call(root, settings, &|e, store, project| ask(e, store, server, target, project)).and_then(json_answer) {
-                Ok(Some(value)) => servers::merge(out.get_or_insert(Value::Null), &value),
-                Ok(None) => {}
-                Err(err) => eprintln!("kuana: {} extension, {server} for {target}: {err}", self.extension.id),
+    fn additional(&'static self, target: &str, root: &Path, settings: &CallSettings, ask: Additional) -> impl Future<Output = Option<Value>> + Send + 'static {
+        let (target, root, settings, ids) = (target.to_string(), root.to_path_buf(), settings.clone(), self.ids);
+        let answer = self.extension.run(move |extension, instance| {
+            let mut out = None;
+            for &server in ids.iter().filter(|id| **id != target) {
+                match extension.call(instance, &root, &settings, &|e, store, project| ask(e, store, server, &target, project)).and_then(json_answer) {
+                    Ok(Some(value)) => servers::merge(out.get_or_insert(Value::Null), &value),
+                    Ok(None) => {}
+                    Err(err) => eprintln!("kuana: {} extension, {server} for {target}: {err}", extension.id),
+                }
             }
-        }
-        out
+            Ok(out)
+        });
+        async move { answer.await.ok().flatten() }
     }
 }
 
 impl WasmExtension {
-    fn start(&self, server: &'static str, root: &Path, settings: &CallSettings) -> Result<Started, String> {
+    fn start(&self, instance: &mut Option<Instance>, server: &'static str, root: &Path, settings: &CallSettings) -> Result<Started, String> {
         // The code's own errors go with the server's name.
         let own = |err: String| format!("{server}: {err}");
-        let command = self.call(root, settings, &|e, store, project| e.call_language_server_command(store, server, project))?.map_err(own)?;
-        let initialization_options =
-            json_answer(self.call(root, settings, &|e, store, project| e.call_language_server_initialization_options(store, server, project))?)
-                .map_err(own)?;
+        let command =
+            self.call(instance, root, settings, &|e, store, project| e.call_language_server_command(store, server, project))?.map_err(own)?;
+        let initialization_options = json_answer(
+            self.call(instance, root, settings, &|e, store, project| e.call_language_server_initialization_options(store, server, project))?,
+        )
+        .map_err(own)?;
         let work = work_dir(&self.id)?;
         Ok(Started {
             server,
@@ -197,17 +219,36 @@ impl WasmExtension {
         })
     }
 
+    /// Runs `job` on the extension's own thread with its instance (None
+    /// until a call makes one), after the jobs sent before it. The future
+    /// only waits for the answer: no thread is held while the code waits on
+    /// the network or npm.
+    fn run<T: Send + 'static>(
+        &'static self,
+        job: impl FnOnce(&'static WasmExtension, &mut Option<Instance>) -> Result<T, String> + Send + 'static,
+    ) -> impl Future<Output = Result<T, String>> + Send + 'static {
+        let (answer, answered) = futures::channel::oneshot::channel();
+        let job: Job = Box::new(move |instance| {
+            answer.send(job(self, instance)).ok();
+        });
+        // A job that isn't run (no thread) drops its sender: an error below.
+        if let Some(jobs) = worker(&self.id) {
+            jobs.send(job).ok();
+        }
+        async move { answered.await.unwrap_or_else(|_| Err(format!("the {} extension's code isn't running", self.id))) }
+    }
+
     /// Runs `f` on the extension's instance (made first if it has none, or
     /// its `extension.wasm` changed), with the project at `root` as its
     /// worktree. A trap ends the instance; the next call makes a new one.
+    /// On the extension's thread (`run`).
     fn call<T>(
         &self,
+        slot: &mut Option<Instance>,
         root: &Path,
         settings: &CallSettings,
         f: &dyn Fn(&Extension, &mut Store<State>, Resource<ProjectRoot>) -> wasmtime::Result<T>,
     ) -> Result<T, String> {
-        let slot = INSTANCES.lock().unwrap_or_else(|e| e.into_inner()).entry(self.id.clone()).or_default().clone();
-        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         let wasm = self.dir.join("extension.wasm");
         let modified = std::fs::metadata(&wasm).and_then(|m| m.modified()).ok();
         if slot.as_ref().is_none_or(|instance| instance.modified != modified || instance.wasm != wasm) {
@@ -282,9 +323,22 @@ fn work_dir_of(id: &str) -> Option<PathBuf> {
 /// An uninstalled extension: its instance ends and its work folder (the
 /// servers its code downloaded) goes.
 pub fn forget(id: &str) {
-    INSTANCES.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-    if let Some(dir) = work_dir_of(id) {
+    let jobs = WORKERS.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    let work = work_dir_of(id);
+    if let Some(dir) = &work {
         std::fs::remove_dir_all(dir).ok();
+    }
+    // Its thread ends, and its instance with it, after the jobs it has: what
+    // those download goes after them (unless it's in use again by then).
+    let id = id.to_string();
+    if let Some(jobs) = jobs {
+        jobs.send(Box::new(move |instance| {
+            *instance = None;
+            if let Some(dir) = work.filter(|_| !WORKERS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id)) {
+                std::fs::remove_dir_all(dir).ok();
+            }
+        }))
+        .ok();
     }
 }
 
@@ -311,9 +365,46 @@ static LINKER: LazyLock<Result<Linker<State>, String>> = LazyLock::new(|| {
     Ok(linker)
 });
 
-/// Each extension's instance, kept between calls (its code remembers things,
-/// such as where it put a server). One call at a time per extension.
-static INSTANCES: LazyLock<Mutex<HashMap<String, Arc<Mutex<Option<Instance>>>>>> = LazyLock::new(Default::default);
+/// Each extension's thread, by id, to send it jobs. The thread keeps the
+/// extension's instance between calls (its code remembers things, such as
+/// where it put a server) and runs one job at a time. A call can wait on the
+/// network for minutes (a download, npm): it does so on that thread, not on
+/// GPUI's shared ones (a thread per core on Linux), which parsing, linting
+/// and search need, and other calls for the extension wait in its queue
+/// instead of each holding a thread.
+static WORKERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<Job>>>> = LazyLock::new(Default::default);
+
+/// A job for an extension's thread, given its instance.
+type Job = Box<dyn FnOnce(&mut Option<Instance>) + Send>;
+
+/// The queue of extension `id`'s thread, started first if it has none; None
+/// when no thread could start.
+fn worker(id: &str) -> Option<mpsc::Sender<Job>> {
+    let mut workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(jobs) = workers.get(id) {
+        return Some(jobs.clone());
+    }
+    let (jobs, queue) = mpsc::channel::<Job>();
+    std::thread::Builder::new()
+        .name(format!("extension {id}"))
+        // wasmtime runs the code on this stack (up to its own 512 KiB limit)
+        // and compiles it here first.
+        .stack_size(8 << 20)
+        .spawn(move || {
+            let mut instance = None;
+            // Until the extension is forgotten and its last job is done.
+            for job in queue {
+                // A job that panicked loses its answer (its caller gets an
+                // error) and the instance, which may be half way through a call.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut instance))).is_err() {
+                    instance = None;
+                }
+            }
+        })
+        .ok()?;
+    workers.insert(id.to_string(), jobs.clone());
+    Some(jobs)
+}
 
 struct Instance {
     store: Store<State>,
@@ -898,6 +989,7 @@ mod tests {
     #[test]
     #[ignore = "needs Zed's dart, html and php extensions, the network, node and dart; changes XDG_CONFIG_HOME"]
     fn runs_zed_extensions() {
+        use futures::executor::block_on;
         let zed = super::super::zed_installed_dir().expect("Zed's extensions folder");
         let config = std::env::temp_dir().join(format!("kuana-wasm-zed-{}", std::process::id()));
         // SAFETY: this test runs on its own (it's ignored by default).
@@ -916,9 +1008,11 @@ mod tests {
             eprintln!("{id}: compiled in {:?}", start.elapsed());
             Box::leak(Box::new(WasmExtension { id: id.to_string(), dir }))
         };
-        let timed = |extension: &WasmExtension, server: &'static str| {
+        // On the extension's thread, as Kuana runs it.
+        let timed = |extension: &'static WasmExtension, server: &'static str| {
             let start = std::time::Instant::now();
-            let started = extension.start(server, &project, &settings);
+            let (project, settings) = (project.clone(), settings.clone());
+            let started = block_on(extension.run(move |e, instance| e.start(instance, server, &project, &settings)));
             eprintln!("{server}: {:?} in {:?}", started.as_ref().map(|s| &s.command), start.elapsed());
             started
         };
@@ -930,7 +1024,7 @@ mod tests {
         assert!(dart.command.program.ends_with("dart") && dart.command.args == ["language-server", "--protocol=lsp"], "{dart:?}");
         let asking = Asking { own: Some((dart_extension, "dart")), others: Vec::new(), target: "dart".into(), root: project.clone(), tab_sizes: Vec::new() };
         let lsp: HashMap<String, LspSettings> = [("dart".to_string(), LspSettings { settings: Some(json!({ "lineLength": 100 })), ..Default::default() })].into();
-        assert_eq!(asking.workspace_configuration(&lsp), json!({ "dart": { "lineLength": 100 } }));
+        assert_eq!(block_on(asking.workspace_configuration(&lsp)), json!({ "dart": { "lineLength": 100 } }));
 
         // HTML: npm into its work folder, run by node (an absolute path from
         // its current directory, which must be the work folder).
@@ -953,11 +1047,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert!(std::fs::metadata(program).unwrap().permissions().mode() & 0o111 != 0);
         }
-        let servers = WasmServers { extension: php, ids: &["intelephense", "phpactor"] };
-        let first = servers.start(&project, &settings).unwrap();
+        let servers: &'static WasmServers = Box::leak(Box::new(WasmServers { extension: php, ids: &["intelephense", "phpactor"] }));
+        let first = block_on(servers.start(&project, &settings)).unwrap();
         assert_eq!(first.server, "intelephense");
-        let asking = Asking { own: None, others: vec![Box::leak(Box::new(servers))], target: "vtsls".into(), root: project.clone(), tab_sizes: Vec::new() };
-        assert_eq!((asking.workspace_configuration(&settings.lsp), asking.additional_options(&settings.lsp)), (Value::Null, Value::Null));
+        let asking = Asking { own: None, others: vec![servers], target: "vtsls".into(), root: project.clone(), tab_sizes: Vec::new() };
+        let answers = (block_on(asking.workspace_configuration(&settings.lsp)), block_on(asking.additional_options(&settings.lsp)));
+        assert_eq!(answers, (Value::Null, Value::Null));
 
         // Uninstalled (`extensions::uninstall`, which also trashes the
         // extension), an extension's downloads go with it.

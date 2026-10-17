@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use futures::StreamExt;
@@ -119,7 +120,14 @@ struct Progress {
     title: String,
     message: Option<String>,
     percentage: Option<u64>,
+    /// When it was last shown (see `PROGRESS_THROTTLE`).
+    shown: Option<Instant>,
 }
+
+/// How often one piece of a server's work in progress is shown again at
+/// most: a server indexing reports hundreds of times a second, and each
+/// showing redraws the workspace. Reports in between wait (`progress_redraw`).
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(100);
 
 impl Progress {
     fn label(&self) -> String {
@@ -218,6 +226,8 @@ pub struct LspStore {
     diagnostics: HashMap<(PathBuf, ServerKey), Value>,
     /// Work-done progress per server, by token.
     progress: HashMap<ServerKey, HashMap<String, Progress>>,
+    /// Shows the progress reports `PROGRESS_THROTTLE` held back.
+    progress_redraw: Option<Task<()>>,
     /// Which start of each server is current: a server replaced by a
     /// restart may still answer, start late or exit, and mustn't touch its
     /// successor's state.
@@ -263,6 +273,7 @@ impl LspStore {
             documents: HashMap::new(),
             diagnostics: HashMap::new(),
             progress: HashMap::new(),
+            progress_redraw: None,
             configs: HashMap::new(),
             generations: HashMap::new(),
             next_generation: 0,
@@ -451,7 +462,9 @@ impl LspStore {
             servers::specs(language).into_iter().filter(|s| !std::ptr::eq(*s, spec)).filter_map(|s| s.wasm).collect();
         let task = cx.spawn(async move |this, cx| {
             // Finding the executable (and the login shell's PATH) touches the
-            // disk; an extension's code may download its server.
+            // disk. An extension's code may download its server: it runs on
+            // the extension's own thread, which this waits for without
+            // holding one of the executor's.
             let root = key.root.clone();
             let user_for_find = user.clone();
             let (spawned, code) = cx
@@ -466,7 +479,7 @@ impl LspStore {
                         Some(command) => Ok(servers::custom(command)),
                         None => match (servers::user_binary(spec, &user_for_find), spec.wasm) {
                             (Some(command), _) => Ok(Some(command)),
-                            (None, Some(wasm)) => match wasm.start(&root, &call_settings) {
+                            (None, Some(wasm)) => match wasm.start(&root, &call_settings).await {
                                 Ok(started) => {
                                     code.server = Some(started.server.to_string());
                                     code.initialization_options = started.initialization_options.unwrap_or_default();
@@ -485,8 +498,8 @@ impl LspStore {
                         let program = command.program.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         let target = code.server.clone().unwrap_or_else(|| servers::zed_id(&program).to_string());
                         let asking = Asking { own, others, target, root: root.clone(), tab_sizes: call_settings.tab_sizes };
-                        servers::merge(&mut code.initialization_options, &asking.additional_options(&user_for_find));
-                        code.settings = asking.workspace_configuration(&user_for_find);
+                        servers::merge(&mut code.initialization_options, &asking.additional_options(&user_for_find).await);
+                        code.settings = asking.workspace_configuration(&user_for_find).await;
                         code.asking = Some(asking);
                     }
                     // Kuana's own Node.js runs the npm servers it installed.
@@ -664,9 +677,12 @@ impl LspStore {
                     };
                     let value = params.get("value").unwrap_or(&Value::Null);
                     let entries = self.progress.entry(key.clone()).or_default();
-                    match value.get("kind").and_then(Value::as_str) {
+                    // Whether to show it now: work starting or ending shows at
+                    // once, a report once `PROGRESS_THROTTLE` passed since the last.
+                    let now = match value.get("kind").and_then(Value::as_str) {
                         Some("end") => {
                             entries.remove(&token);
+                            true
                         }
                         Some(kind) => {
                             let entry = entries.entry(token).or_default();
@@ -679,10 +695,28 @@ impl LspStore {
                             if let Some(pct) = value.get("percentage").and_then(Value::as_u64) {
                                 entry.percentage = Some(pct);
                             }
+                            let due = kind == "begin" || entry.shown.is_none_or(|at| at.elapsed() >= PROGRESS_THROTTLE);
+                            if due {
+                                entry.shown = Some(Instant::now());
+                            }
+                            due
                         }
-                        None => {}
+                        None => return,
+                    };
+                    if now {
+                        cx.notify();
+                    } else if self.progress_redraw.is_none() {
+                        self.progress_redraw = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(PROGRESS_THROTTLE).await;
+                            this.update(cx, |s, cx| {
+                                s.progress_redraw = None;
+                                let shown = Instant::now();
+                                s.progress.values_mut().flat_map(HashMap::values_mut).for_each(|p| p.shown = Some(shown));
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
                     }
-                    cx.notify();
                 }
                 "window/showMessage" => {
                     // 1 = error; warnings and info are mostly chatter.
@@ -740,6 +774,24 @@ impl LspStore {
                     // Progress shows through `$/progress` (Kuana says it does: `workDoneProgress`);
                     // a message's choices aren't offered, so none was picked.
                     "window/workDoneProgress/create" | "window/showMessageRequest" => client.respond(id, Value::Null),
+                    // Its hints or lenses changed (it finished loading the
+                    // project, another file changed): its documents' are due
+                    // again, asked for by the editors that show them.
+                    "workspace/inlayHint/refresh" | "workspace/codeLens/refresh" => {
+                        client.respond(id, Value::Null);
+                        let hints = method == "workspace/inlayHint/refresh";
+                        let docs: Vec<Entity<Document>> = self.documents.values().filter(|d| d.opened(key)).filter_map(|d| d.doc.upgrade()).collect();
+                        for doc in docs {
+                            doc.update(cx, |d, cx| {
+                                if hints {
+                                    d.hints_changed();
+                                } else {
+                                    d.lenses_changed();
+                                }
+                                cx.notify();
+                            });
+                        }
+                    }
                     _ => client.respond_not_found(id, &method),
                 }
             }
@@ -876,7 +928,12 @@ impl LspStore {
             } }),
         );
         doc.set_opened(key, true);
+        let editor = doc.editor.as_ref().and_then(WeakEntity::upgrade);
         self.apply_diagnostics(path, key, cx);
+        // What else it knows of the file can be asked for now.
+        if let Some(editor) = editor {
+            editor.update(cx, |e, cx| e.lsp_opened(cx));
+        }
     }
 
     /// The running server for an open document.
@@ -1045,8 +1102,8 @@ impl LspStore {
             let generation = self.generations.get(&key).copied();
             let user = user.clone();
             cx.spawn(async move |this, cx| {
-                let lsp = user.clone();
-                let settings = cx.background_executor().spawn(async move { asking.workspace_configuration(&lsp) }).await;
+                // The code runs on its extension's thread; this only waits.
+                let settings = asking.workspace_configuration(&user).await;
                 this.update(cx, |s, _| {
                     if s.generations.get(&key).copied() == generation {
                         s.update_settings(&key, Some(settings), &user);
@@ -1182,6 +1239,9 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
                 "configuration": true,
                 "workspaceFolders": true,
                 "didChangeWatchedFiles": { "dynamicRegistration": true, "relativePatternSupport": true },
+                // Hints and lenses are asked for again when it says they changed.
+                "inlayHint": { "refreshSupport": true },
+                "codeLens": { "refreshSupport": true },
             },
             "window": { "workDoneProgress": true },
             "textDocument": {
@@ -1326,15 +1386,19 @@ impl FileWatcher {
 /// by its initialization option `greeting` and the `mode` in its `fake`
 /// settings section when it has them), completes with "<name>-item", offers "<name> fix
 /// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
-/// Named "hints", it also gives an inlay hint at the end of the first line, and on a
-/// save checks the file as rust-analyzer does: "hints checked <first line>".
+/// Named "hints", it also gives inlay hints (": hint <how many it was asked for>") at the
+/// end of the lines asked for whose number divides by 100, and on a save checks the file as
+/// rust-analyzer does ("hints checked <first line>") and says its hints changed.
+/// Named "lenses", its code lenses are on every 100th line.
 /// Named "respell", it names the file in its answers as other servers may.
 /// Named "goodbye", it notes being told to shut down: a `<file>.shutdown` beside its file.
 /// Named "asks", it sends a request Kuana doesn't handle and a progress token's, and
 /// adds the first's error code and whether the second was accepted to its problem.
+/// Named "resolve", it completes with "foo", whose import (`use foo;` on the first
+/// line) comes only on `completionItem/resolve`, which it answers after a pause.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
-import sys, json
+import sys, json, time
 from urllib.parse import unquote, urlparse
 name = sys.argv[1]
 triggers = [t for t in sys.argv[2].split(",") if t] if len(sys.argv) > 2 else []
@@ -1363,11 +1427,20 @@ def send(msg):
     body = json.dumps(msg).encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
+# What came while it waited for an answer, handled after.
+held = []
+def answer_to(ids):
+    while True:
+        m = read()
+        if m.get("id") in ids and "method" not in m:
+            return m
+        held.append(m)
 init = {}
 last_uri = None
 text = ""
+hint_requests = 0
 while True:
-    m = read()
+    m = held.pop(0) if held else read()
     method, id = m.get("method"), m.get("id")
     if method is None:
         continue
@@ -1385,15 +1458,23 @@ while True:
         if name == "hints":
             caps["inlayHintProvider"] = True
             caps["textDocumentSync"] = {"openClose": True, "change": 1, "save": True}
+        if name == "resolve":
+            caps["completionProvider"]["resolveProvider"] = True
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didChange":
         text = m["params"]["contentChanges"][-1]["text"]
     elif method == "textDocument/didSave" and last_uri:
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "message": name + " checked " + text.split("\n", 1)[0]}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
+        if name == "hints":
+            send({"jsonrpc": "2.0", "id": "refresh", "method": "workspace/inlayHint/refresh", "params": None})
     elif method == "textDocument/inlayHint":
-        first = text.split("\n", 1)[0]
-        send({"jsonrpc": "2.0", "id": id, "result": [{"position": {"line": 0, "character": len(first)}, "label": ": hint"}]})
+        hint_requests += 1
+        lines = text.split("\n")
+        asked = m["params"]["range"]
+        rows = range(asked["start"]["line"], min(asked["end"]["line"] + 1, len(lines)))
+        hints = [{"position": {"line": n, "character": len(lines[n])}, "label": ": hint %d" % hint_requests} for n in rows if n % 100 == 0]
+        send({"jsonrpc": "2.0", "id": id, "result": hints})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
         last_uri = uri
@@ -1401,10 +1482,7 @@ while True:
         # Asks for its whole section and reads `mode` in it, as basedpyright
         # asks for "basedpyright" and reads its "analysis".
         send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})
-        answer = read()
-        while answer.get("id") != "cfg":
-            answer = read()
-        section = answer["result"][0] or {}
+        section = answer_to(["cfg"])["result"][0] or {}
         extra = [str(v) for v in (init.get("greeting"), section.get("mode")) if v is not None]
         if name == "asks":
             # A request Kuana doesn't handle, and one it says it does.
@@ -1412,17 +1490,17 @@ while True:
             send({"jsonrpc": "2.0", "id": "wdp", "method": "window/workDoneProgress/create", "params": {"token": "t"}})
             answers = {}
             while len(answers) < 2:
-                answer = read()
-                if answer.get("id") in ("odd", "wdp"):
-                    answers[answer["id"]] = answer
+                answer = answer_to(["odd", "wdp"])
+                answers[answer["id"]] = answer
             extra += [str(answers["odd"].get("error", {}).get("code")), "progress " + ("refused" if "error" in answers["wdp"] else "ok")]
         message = " ".join([name + " problem"] + extra)
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": spelled(uri), "diagnostics": [problem]}})
     elif method == "textDocument/codeLens":
         # Unresolved: the title comes with codeLens/resolve.
-        lens_range = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
-        send({"jsonrpc": "2.0", "id": id, "result": [{"range": lens_range, "data": 1}]})
+        lines = range(0, len(text.split("\n")) - 1, 100) if name == "lenses" else [0]
+        lenses = [{"range": {"start": {"line": n, "character": 0}, "end": {"line": n, "character": 1}}, "data": n} for n in lines]
+        send({"jsonrpc": "2.0", "id": id, "result": lenses})
     elif method == "codeLens/resolve":
         lens = m["params"]
         uri = last_uri or ""
@@ -1441,7 +1519,14 @@ while True:
         at = lambda line, ch: {"uri": uri, "range": {"start": {"line": line, "character": ch}, "end": {"line": line, "character": ch + 1}}}
         send({"jsonrpc": "2.0", "id": id, "result": [at(0, 3), at(1, 9)]})
     elif method == "textDocument/completion":
-        send({"jsonrpc": "2.0", "id": id, "result": [{"label": name + "-item"}]})
+        items = [{"label": "foo", "data": 1}] if name == "resolve" else [{"label": name + "-item"}]
+        send({"jsonrpc": "2.0", "id": id, "result": items})
+    elif method == "completionItem/resolve" and name == "resolve":
+        time.sleep(0.4)
+        item = m["params"]
+        start = {"line": 0, "character": 0}
+        item["additionalTextEdits"] = [{"range": {"start": start, "end": start}, "newText": "use foo;\n"}]
+        send({"jsonrpc": "2.0", "id": id, "result": item})
     elif method == "textDocument/codeAction":
         sent = len(m["params"]["context"]["diagnostics"])
         send({"jsonrpc": "2.0", "id": id, "result": [{"title": "%s fix (%d)" % (name, sent)}]})
@@ -1622,6 +1707,42 @@ mod tests {
         let message = editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics[0].message.to_string());
         assert_eq!(message, format!("asks problem {} progress ok", rpc::METHOD_NOT_FOUND));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A server indexing reports progress many times a second; each showing
+    /// redraws the workspace, so reports in quick succession show together.
+    #[gpui::test]
+    fn progress_shows_at_most_every_so_often(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let store = cx.new(|_| LspStore::new());
+        let shown = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = shown.clone();
+        let _observer = cx.update(|cx| cx.observe(&store, move |_, _| count.set(count.get() + 1)));
+        let key = ServerKey { id: "s".into(), root: PathBuf::from("/w") };
+        let send = |kind: &str, percentage: u64, cx: &mut gpui::TestAppContext| {
+            let params = json!({ "token": "t", "value": { "kind": kind, "title": "Indexing", "percentage": percentage } });
+            store.update(cx, |s, cx| s.handle(&key, Incoming::Notification { method: "$/progress".into(), params }, cx));
+        };
+        // Starting shows at once; the reports right after it wait.
+        send("begin", 0, cx);
+        assert_eq!(shown.get(), 1);
+        let started = Instant::now();
+        for percentage in 1..=50 {
+            send("report", percentage, cx);
+        }
+        if started.elapsed() < PROGRESS_THROTTLE {
+            assert_eq!(shown.get(), 1);
+        }
+        // The last one shows once the pause is over.
+        cx.executor().advance_clock(PROGRESS_THROTTLE);
+        cx.run_until_parked();
+        let after_pause = shown.get();
+        assert!((2..=3).contains(&after_pause), "{after_pause}");
+        assert_eq!(store.read_with(cx, |s, _| s.progress[&key]["t"].percentage), Some(50));
+        // Ending shows at once.
+        send("end", 0, cx);
+        assert_eq!(shown.get(), after_pause + 1);
+        assert!(store.read_with(cx, |s, _| s.progress[&key].is_empty()));
     }
 
     #[test]

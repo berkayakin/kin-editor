@@ -55,11 +55,13 @@ goes to the first that offers it. The status bar names the ones running.
 
 **Code lenses** sit above lines, as the server offers them: rust-analyzer's ▶ Run / Debug (run in a
 Run tab or the debugger, like the gutter ▶), implementations and references (which open the
-usages list), and other servers' commands. Turn them off with `code_lens`.
+usages list), and other servers' commands. A lens's title, which can cost the server a search, is
+asked for as it comes into view; its row is there meanwhile. Turn them off with `code_lens`.
 
 **Inlay hints** show what the server infers inside the code, on a soft chip: variable types,
 parameter names at call sites and the like. Kuana turns them on in typescript-language-server, vtsls
-and gopls, which leave them off unless asked (change that through `lsp`). Turn them off with
+and gopls, which leave them off unless asked (change that through `lsp`). They're asked for the
+lines in view and around them, so a long file costs no more than a short one. Turn them off with
 `inlay_hints` or, for one editor, **Toggle Inlay Hints**.
 
 ## Formatting

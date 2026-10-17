@@ -71,15 +71,17 @@ pub fn offset_to_position(rope: &Rope, offset: usize, encoding: Encoding) -> Pos
 }
 
 /// The byte offset of an LSP position, clamped to the document and to the
-/// end of its line.
+/// end of its line. O(log n) however long the line (a minified file's).
 pub fn position_to_offset(rope: &Rope, position: Position, encoding: Encoding) -> usize {
     let line = position.line as usize;
     if line >= rope.len_lines() {
         return rope.len_bytes();
     }
     let line_start = rope.line_to_byte(line);
-    let line_slice = rope.line(line);
-    let content_len = line_slice.len_bytes() - if line_slice.chars().last() == Some('\n') { 1 } else { 0 };
+    // The line's last byte, not its last char: ropey's `Chars::last` walks
+    // the whole line.
+    let line_end = rope.line_to_byte(line + 1);
+    let content_len = line_end - line_start - usize::from(line_end > line_start && rope.byte(line_end - 1) == b'\n');
     let col = match encoding {
         Encoding::Utf8 => (position.character as usize).min(content_len),
         Encoding::Utf16 => {
@@ -268,6 +270,9 @@ pub fn diagnostics(value: &Value, rope: &Rope, encoding: Encoding, server: &'sta
 #[derive(Clone, Debug)]
 pub struct CompletionItem {
     pub label: String,
+    /// The label in lowercase, which orders items that match alike: made
+    /// once with the item, not again on every key.
+    pub sort_label: String,
     pub kind: Option<&'static str>,
     pub detail: Option<String>,
     pub filter_text: String,
@@ -297,22 +302,10 @@ impl CompletionItem {
             insert_text: str_of("insertText"),
             is_snippet: raw.get("insertTextFormat").and_then(Value::as_u64) == Some(2),
             additional_edits: text_edits(raw.get("additionalTextEdits")),
+            sort_label: label.to_lowercase(),
             label,
             raw,
         })
-    }
-
-    /// Updates the parts `completionItem/resolve` can fill in.
-    pub fn merge_resolved(&mut self, resolved: &Value) {
-        if let Some(edits) = resolved.get("additionalTextEdits") {
-            self.additional_edits = text_edits(Some(edits));
-        }
-        if let Some(edit) = resolved.get("textEdit").and_then(TextEdit::from_json) {
-            self.edit = Some(edit);
-        }
-        if let Some(detail) = resolved.get("detail").and_then(Value::as_str) {
-            self.detail = Some(detail.to_string());
-        }
     }
 
     /// The text to insert, as written (still in snippet syntax when `is_snippet`).
@@ -700,6 +693,10 @@ mod tests {
         assert_eq!(position_to_offset(&rope, Position { line: 9, character: 0 }, Encoding::Utf16), rope.len_bytes());
         // A UTF-8 column inside a character snaps back.
         assert_eq!(position_to_offset(&rope, Position { line: 0, character: 2 }, Encoding::Utf8), 1);
+        // The last line, with no line break or no text.
+        let rope = Rope::from_str("ab\ncd");
+        assert_eq!(position_to_offset(&rope, Position { line: 1, character: 9 }, Encoding::Utf16), 5);
+        assert_eq!(position_to_offset(&Rope::from_str("ab\n"), Position { line: 1, character: 9 }, Encoding::Utf8), 3);
     }
 
     #[test]
