@@ -255,6 +255,18 @@ fn program_path(work: &Path, command: &str) -> PathBuf {
     inside
 }
 
+/// Whether an extension's code loads (`kuana extension check`): it compiles,
+/// links against this host and sets itself up, in a work folder of its own
+/// that goes afterwards. None of its servers is started.
+pub fn check(dir: &Path, id: &str) -> Result<(), String> {
+    let work = std::env::temp_dir().join(format!("kuana-check-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let extension = WasmExtension { id: id.to_string(), dir: dir.to_path_buf() };
+    let loaded = Instance::in_folder(&extension, dir.join("extension.wasm"), None, work.clone()).map(|_| ());
+    std::fs::remove_dir_all(&work).ok();
+    loaded
+}
+
 /// Where an extension's code keeps its files (and runs).
 pub fn work_dir(id: &str) -> Result<PathBuf, String> {
     let dir = work_dir_of(id).ok_or_else(|| format!("\"{id}\" isn't a usable extension id"))?;
@@ -314,8 +326,11 @@ impl Instance {
     /// Compiles and instantiates the extension's code, then lets it set up
     /// (`init-extension`).
     fn new(extension: &WasmExtension, wasm: PathBuf, modified: Option<SystemTime>) -> Result<Self, String> {
+        Self::in_folder(extension, wasm, modified, work_dir(&extension.id)?)
+    }
+
+    fn in_folder(extension: &WasmExtension, wasm: PathBuf, modified: Option<SystemTime>, work: PathBuf) -> Result<Self, String> {
         let failed = |e: wasmtime::Error| format!("couldn't run the {} extension's code: {e:#}", extension.id);
-        let work = work_dir(&extension.id)?;
         let component = WasmComponent::from_file(&ENGINE, &wasm).map_err(failed)?;
         let linker = LINKER.as_ref().map_err(|e| format!("couldn't set up extensions' code: {e}"))?;
         // Its current directory is the work folder (the API reads PWD), which

@@ -89,6 +89,12 @@ pub fn check(dir: &Path) -> Vec<Finding> {
         let level = if problem.ends_with("it needs a command") { Level::Warning } else { Level::Error };
         add(level, problem);
     }
+    if runs_code {
+        match super::wasm::check(dir, &info.id) {
+            Ok(()) => add(Level::Note, "extension.wasm: its code loads".into()),
+            Err(err) => add(Level::Error, format!("extension.wasm: {err}")),
+        }
+    }
     let mut names: Vec<&String> = grammars.keys().collect();
     names.sort();
     for name in names {
