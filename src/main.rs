@@ -399,7 +399,7 @@ fn main() {
     // open-file events; they're handled once the app is running.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let app = Application::new().with_assets(assets::Assets);
-    // Later launches' paths come the same way (none: just come to the front).
+    // Later launches' paths come the same way (none: see below).
     if let Some(instance) = instance {
         let open_tx = open_tx.clone();
         instance.serve(move |paths| {
@@ -416,8 +416,17 @@ fn main() {
             while let Some(urls) = open_rx.next().await {
                 let paths = cli::paths_from_urls(&urls);
                 let opened = match (urls.is_empty(), paths.is_empty()) {
-                    // A launch without paths: show the running Kuana.
-                    (true, _) => cx.update(|cx| cx.activate(true)),
+                    // A launch without paths on macOS: the running Kuana comes
+                    // to the front, as a click on its Dock icon does.
+                    (true, _) if cfg!(target_os = "macos") => cx.update(|cx| cx.activate(true)),
+                    // Elsewhere a new window, as VS Code opens: what the Start
+                    // menu and the taskbar's Shift+click / middle click mean.
+                    (true, _) => cx.update(|cx| {
+                        let front = cx.active_window().or_else(|| cx.windows().into_iter().next());
+                        let near = front.and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok());
+                        workspace::open_window(near, cx, |_, _, _| {});
+                        cx.activate(true);
+                    }),
                     (false, true) => Ok(()),
                     (false, false) => cx.update(|cx| open_external(paths, cx)),
                 };
