@@ -458,8 +458,7 @@ impl BlobText {
     pub fn new(bytes: &[u8], hint: Option<TextEncoding>) -> Self {
         let (text, encoding) = crate::encoding::decode(bytes, hint);
         let crlf = text.contains("\r\n");
-        let text = if crlf { text.replace("\r\n", "\n") } else { text };
-        BlobText { text, encoding, crlf }
+        BlobText { text: crate::encoding::to_lf(text), encoding, crlf }
     }
 
     /// `text` (with LF line ends) in this blob's line ends and encoding.
@@ -1272,7 +1271,7 @@ pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) ->
     // Compared with LF line ends, as editors hold text; written back in the
     // index's own line ends and encoding, so only the picked lines change.
     let index = index_blob_text(root, rel);
-    let staged = apply_hunks(&index.text, &current.replace("\r\n", "\n"), |h| rows_touch(&h.new_rows, &rows));
+    let staged = apply_hunks(&index.text, &crate::encoding::to_lf(current.to_string()), |h| rows_touch(&h.new_rows, &rows));
     write_index(root, rel, &index.encode(&staged)?)
 }
 
@@ -1281,7 +1280,7 @@ pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) ->
 pub fn unstage_lines(root: &Path, rel: &str, current: Option<&str>, rows: Range<usize>) -> Result<(), String> {
     let index = index_blob_text(root, rel);
     let rows = match current {
-        Some(current) => map_rows_to_base(&index.text, &current.replace("\r\n", "\n"), rows),
+        Some(current) => map_rows_to_base(&index.text, &crate::encoding::to_lf(current.to_string()), rows),
         None => rows,
     };
     let Some(head) = head_blob(root, rel) else {

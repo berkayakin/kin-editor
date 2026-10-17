@@ -2319,7 +2319,7 @@ impl Editor {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let mut text = text.replace("\r\n", "\n");
+        let mut text = crate::encoding::to_lf(text);
         if self.is_single_line() {
             text = text.trim_end_matches('\n').replace('\n', " ");
         }

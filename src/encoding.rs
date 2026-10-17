@@ -104,6 +104,18 @@ pub fn decode_as(bytes: &[u8], encoding: TextEncoding) -> String {
     encoding.encoding.decode_without_bom_handling(body).0.into_owned()
 }
 
+/// Text with LF line ends, as editors hold it: CRLF and a lone CR (old Mac
+/// files, redrawn progress lines) both become LF. Lines then end where
+/// language servers end them too (LSP counts a lone CR as a line end, the
+/// rope and tree-sitter don't). A save writes LF, or CRLF for a file that had
+/// any (`Document::uses_crlf`).
+pub fn to_lf(text: String) -> String {
+    if !text.contains('\r') {
+        return text;
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Encodes for saving. Fails when the text has characters the encoding
 /// can't represent, rather than writing something else in their place.
 pub fn encode(text: &str, encoding: TextEncoding) -> Result<Vec<u8>, String> {

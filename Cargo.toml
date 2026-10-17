@@ -38,7 +38,10 @@ oxc_semantic = "0.139.0"
 oxc_span = "0.139.0"
 oxc_syntax = "0.139.0"
 regex = "1.13.1"
-ropey = "1.6"
+# Lines end only at LF, as tree-sitter, Git and folds count them (the default
+# `unicode_lines` also ends them at U+2028, NEL, VT, FF and CR; a lone CR is
+# read as LF, see `encoding::to_lf`).
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rumdl = { version = "0.2.79", default-features = false }
 # JSON schemas of settings.json (and so on) for the JSON language server.
 schemars = "1"
