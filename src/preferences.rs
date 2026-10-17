@@ -1,9 +1,12 @@
-//! Preferences (JetBrains' Settings dialog): every option in `settings.json`
+//! Preferences (JetBrains' Settings, in a window of its own: `window.rs`): every option in `settings.json`
 //! and the key bindings in `keymap.json`, on pages with a search across all of
 //! them. It looks the same on every platform. Changes apply and save right
 //! away; the files stay the source of truth and keep their comments.
 
 mod keymap_page;
+mod window;
+
+pub use window::{Shown, open};
 
 use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
@@ -27,7 +30,7 @@ use crate::{
     workspace::Find,
     ui::{
         Button, HoverFill,
-        GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, switch, text_button,
+        GAP, focus_glow, icon_button, icon_el, input_box, island, popover, switch, text_button,
         tooltip_view,
     },
 };
@@ -968,10 +971,6 @@ impl Focusable for Preferences {
 impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let viewport = window.viewport_size();
-        // Matches the modal layer's top offset, so the dialog fits below it.
-        let top = (viewport.height * 0.12).max(px(50.));
-        let height = (viewport.height - top - px(24.)).min(px(640.)).max(px(320.));
         let words = self.query_words(cx);
         self.overlay = None;
 
@@ -991,8 +990,10 @@ impl Render for Preferences {
             .child(content)
             .when(self.body_shown.get(), |el| el.child(crate::ui::scrollbar("pref-body-scrollbar", &self.scroll, cx)));
 
-        let panel = modal_panel(cx)
+        // Fills its window (see `window.rs`), on the window's chrome.
+        let panel = div()
             .id("preferences")
+            .flex()
             .key_context("Preferences")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_cancel))
@@ -1003,9 +1004,7 @@ impl Render for Preferences {
                 this.search.update(cx, |e, cx| e.select_all_text(cx));
             }))
             .flex_row()
-            .w(px(940.))
-            .max_w(viewport.width - px(48.))
-            .h(height)
+            .size_full()
             .text_size(px(13.))
             .font_family(theme.ui_font.clone())
             // Like the main window: the nav on the chrome, the page on an island.
@@ -1021,10 +1020,9 @@ impl Render for Preferences {
                     .when_some(self.file_error.clone(), |el, error| el.child(self.render_file_error(error, cx)))
                     .child(content),
             );
-        // An open dropdown list goes beside the panel, not in it: the panel
-        // clips its content to its rounded shape, which would cut the list off
-        // at its edge.
-        div().relative().child(panel).children(self.overlay.take())
+        // An open dropdown list goes after the panel, so it paints over every
+        // part of it (the island clips its content to its rounded shape).
+        div().relative().size_full().child(panel).children(self.overlay.take())
     }
 }
 
@@ -1086,7 +1084,7 @@ impl Preferences {
             .flex_shrink_0()
             .w(px(212.))
             .h_full()
-            .child(div().p_2().pt_3().child(input_box(&self.search, Some(Icon::Search), window, cx)))
+            .child(div().flex().p_2().pt_3().child(input_box(&self.search, Some(Icon::Search), window, cx)))
             .child(div().flex().flex_col().gap_0p5().px_2().pt_1().flex_1().children(items))
             .child(
                 div()
@@ -1132,10 +1130,6 @@ impl Preferences {
                         .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::OpenKeymapFile))),
                 )
             })
-            .child(
-                icon_button("pref-close", Icon::X, theme.text_muted.into(), cx)
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::Dismissed))),
-            )
     }
 
     fn render_file_error(&self, error: String, cx: &mut Context<Self>) -> impl IntoElement {

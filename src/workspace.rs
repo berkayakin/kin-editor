@@ -66,7 +66,7 @@ use crate::{
     run::{self, DebugSpec, RunTarget},
     terminal::{RunState, TerminalEvent, TerminalView},
     theme::{self, Theme},
-    preferences::{self, Preferences, PreferencesEvent},
+    preferences,
     theme_picker::{ThemePicker, ThemePickerEvent},
     transition::{self, TransitionExt},
     ui::{Button, DragLabel, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
@@ -112,7 +112,8 @@ use self::{
 };
 pub use self::{
     sessions::update_recent_projects,
-    windows::{modal_max_height, open_window, quit},
+    title_bar::{window_controls, window_drag_area},
+    windows::{modal_max_height, open_window, placement_bounds, placement_of, quit},
 };
 
 actions!(
@@ -533,7 +534,6 @@ enum Modal {
     Branches(Entity<BranchPicker>),
     Input(Entity<InputDialog>),
     Clone(Entity<CloneDialog>),
-    Preferences(Entity<Preferences>),
     Push(Entity<PushDialog>),
     Remotes(Entity<RemotesDialog>),
     Trust(Entity<crate::trust_dialog::TrustDialog>),
@@ -740,8 +740,6 @@ pub struct Workspace {
     /// This window's documents by path, with a tab or without (edited by a
     /// workspace edit or Replace in Files, and not saved yet).
     documents: Entity<DocumentStore>,
-    /// The Preferences page shown last, to reopen there.
-    preferences_page: preferences::Page,
     _subscriptions: Vec<Subscription>,
     /// Each tab's subscriptions, dropped with the tab (they'd pile up).
     tab_subscriptions: HashMap<gpui::EntityId, Vec<Subscription>>,
@@ -913,6 +911,9 @@ impl Workspace {
         });
         // An update finished downloading: show Restart to Update.
         let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
+        // The Preferences window opened, closed or changed page: the title
+        // bar's Settings and Extensions buttons light up for it.
+        let preferences_observer = cx.observe_global::<preferences::Shown>(|_, cx| cx.notify());
         // Extensions reloaded, or a grammar finished building.
         let extensions_observer =
             cx.observe_global_in::<extensions::ExtensionsChanged>(window, |ws, window, cx| ws.extensions_changed(window, cx));
@@ -1045,7 +1046,6 @@ impl Workspace {
             symbol_task: None,
             lsp,
             documents,
-            preferences_page: preferences::Page::Appearance,
             tab_subscriptions: HashMap::new(),
             _subscriptions: vec![
                 find_subscription,
@@ -1058,6 +1058,7 @@ impl Workspace {
                 quit,
                 settings_observer,
                 updater_observer,
+                preferences_observer,
                 extensions_observer,
                 trust_observer,
                 lsp_subscription,

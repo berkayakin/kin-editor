@@ -1,6 +1,6 @@
 # Settings and project trust
 
-## The Settings dialog
+## The Settings window
 
 The first time Kuana starts, **Welcome Setup** asks for the basics: a theme (applied as you click),
 the keymap to start from (each shown with a few of its shortcuts) and editor basics such as font
@@ -8,14 +8,16 @@ size, auto-save, reformat on save and soft wrap. Its choices go to `settings.jso
 Open it again any time from the Kuana menu or Find Action (**Welcome Setup**).
 
 **Settings…** (⌘, / Ctrl+Alt+S, or the gear at the top right) opens the Settings
-dialog, the same on every platform. Its pages are Appearance (themes), Editor (font, indentation,
+window, the same on every platform. There's one for all your project windows, so it can stay
+open beside the code while changes apply; opening it again brings it forward, and it reopens
+where you left it, on the page you were on. Escape or ⌘W / Ctrl+W closes it. Its pages are Appearance (themes), Editor (font, indentation,
 wrapping), Saving, Languages (per-language options, language server and formatter),
 [Extensions](extensions.md), Keymap, Terminal & Run, Git, Trust and Updates. The search field looks through all of them; with it focused, ↑/↓ switch
 pages. Changes apply right away. An option you changed has an undo button next to its name,
 which puts the default back.
 
-Everything is stored in `settings.json`. **Open settings.json** (at the bottom of the dialog and
-in Find Action) opens it, created with every option commented out. Edits to the file apply when
+Everything is stored in `settings.json`. **Open settings.json** (at the bottom of the window and
+in Find Action) opens it in the project window you used last, created with every option commented out. Edits to the file apply when
 you save (or when you come back to Kuana after editing it elsewhere). Comments and trailing commas
 are fine, and Kuana keeps them when it changes a value itself. With the JSON language server
 installed (`vscode-langservers-extracted`), `settings.json`, `keymap.json` and your themes get

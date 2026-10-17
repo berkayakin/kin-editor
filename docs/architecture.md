@@ -34,7 +34,7 @@ bindings, colors, icons) are in the [contributing guide](../CONTRIBUTING.md).
 - `src/preview.rs`, `src/image_view.rs` — image files and their tab
 - `src/markdown_preview.rs`, `src/markdown_preview/view.rs` — the Markdown preview and its tab
 - `src/settings.rs`, `src/editorconfig.rs`, `src/preferences.rs`, `src/preferences/` —
-  `settings.json`, `.editorconfig` and the Settings dialog
+  `settings.json`, `.editorconfig` and the Settings window
 - `src/state.rs` — remembered UI state and per-project sessions
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
 - `src/updater.rs`, `.github/workflows/release.yml` — auto-update and the release build

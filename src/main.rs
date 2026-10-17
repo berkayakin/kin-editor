@@ -453,6 +453,9 @@ fn main() {
         // Quitting asks each window with unsaved edits in turn.
         cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
         cx.on_action(|_: &about::About, cx| about::open(cx));
+        // Also from the Preferences window, which has no workspace to handle them.
+        cx.on_action(|_: &OpenSettings, cx| preferences::open(None, cx));
+        cx.on_action(|_: &OpenExtensions, cx| preferences::open(Some(preferences::Page::Extensions), cx));
         cx.on_action(|_: &NewWindow, cx| {
             workspace::open_window(None, cx, |_, _, _| {});
         });

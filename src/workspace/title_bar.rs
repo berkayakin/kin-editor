@@ -11,7 +11,7 @@ use gpui::svg;
 /// handles, so it's occluded (the workspace root's focus-on-click would
 /// count), which hides it from whatever is behind: drops that should land
 /// there go on it too. macOS: a press hands the window to the window server.
-pub(super) fn window_drag_area(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
+pub fn window_drag_area(id: impl Into<gpui::ElementId>) -> Stateful<Div> {
     div()
         .id(id)
         .h_full()
@@ -266,10 +266,8 @@ impl Workspace {
 
     /// Whether Settings is open, and if so whether on its Extensions page.
     fn preferences_shown(&self, cx: &App) -> Option<bool> {
-        match &self.modals.current {
-            Some(Modal::Preferences(p)) => Some(matches!(p.read(cx).page(), preferences::Page::Extensions)),
-            _ => None,
-        }
+        let page = cx.try_global::<preferences::Shown>().and_then(|shown| shown.0)?;
+        Some(page == preferences::Page::Extensions)
     }
 
     /// Windows and Linux have no app menu, so Settings needs a way in.
@@ -487,31 +485,7 @@ impl Workspace {
     }
 
     pub(super) fn render_window_controls(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::get(cx);
-        let font = crate::theme::caption_font(cx);
-        let button = |id: &'static str, glyph: &'static str, area: WindowControlArea, hover: Hsla| {
-            div()
-                .id(id)
-                .w(px(46.))
-                .h_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(10.))
-                .text_color(theme.text_muted)
-                .font_family(font)
-                .hover(move |s| s.bg(hover))
-                .window_control_area(area)
-                .child(glyph)
-        };
-        // Maximized, the middle one restores (and shows it).
-        let max = if window.is_maximized() { "\u{E923}" } else { "\u{E922}" };
-        div()
-            .flex()
-            .h_full()
-            .child(button("min", "\u{E921}", WindowControlArea::Min, theme.hover.into()))
-            .child(button("max", max, WindowControlArea::Max, theme.hover.into()))
-            .child(button("close", "\u{E8BB}", WindowControlArea::Close, rgb(0xc42b1c).into()))
+        window_controls(window, cx)
     }
 
     pub(super) fn update_window_title(&mut self, window: &mut Window, cx: &App) {
@@ -587,6 +561,36 @@ pub(super) fn monogram_color(name: &str, theme: &Theme) -> Hsla {
     let palette = [theme.accent, theme.success, theme.info, theme.warning, theme.syntax.function, theme.syntax.keyword, theme.git_added, theme.git_modified];
     let hash = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     palette[hash as usize % palette.len()].into()
+}
+
+/// Windows' minimize, maximize and close buttons, for windows drawing their
+/// own title bar (the workspace's, Preferences').
+pub fn window_controls(window: &Window, cx: &App) -> impl IntoElement + use<> {
+    let theme = Theme::get(cx);
+    let font = crate::theme::caption_font(cx);
+    let button = |id: &'static str, glyph: &'static str, area: WindowControlArea, hover: Hsla| {
+        div()
+            .id(id)
+            .w(px(46.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.))
+            .text_color(theme.text_muted)
+            .font_family(font)
+            .hover(move |s| s.bg(hover))
+            .window_control_area(area)
+            .child(glyph)
+    };
+    // Maximized, the middle one restores (and shows it).
+    let max = if window.is_maximized() { "\u{E923}" } else { "\u{E922}" };
+    div()
+        .flex()
+        .h_full()
+        .child(button("min", "\u{E921}", WindowControlArea::Min, theme.hover.into()))
+        .child(button("max", max, WindowControlArea::Max, theme.hover.into()))
+        .child(button("close", "\u{E8BB}", WindowControlArea::Close, rgb(0xc42b1c).into()))
 }
 
 #[cfg(test)]

@@ -50,12 +50,6 @@ impl Workspace {
     }
 
     pub(super) fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Text typed into Preferences a moment ago still gets saved.
-        if let Some(Modal::Preferences(preferences)) = &self.modals.current {
-            let preferences = preferences.clone();
-            self.preferences_page = preferences.read(cx).page();
-            preferences.update(cx, |p, cx| p.flush(cx));
-        }
         // Leaving the theme picker without confirming undoes the preview.
         if let Some(Modal::Theme(picker)) = &self.modals.current {
             let picker = picker.read(cx);
