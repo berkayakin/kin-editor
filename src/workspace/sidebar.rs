@@ -185,7 +185,6 @@ impl Workspace {
                 .child(icon_el(icon, px(14.), if on { theme.accent.into() } else { theme.text_dim.into() }))
                 .when(named, |el| el.child(div().when(!on, |el| el.group_hover(id, |s| s.text_color(theme.text))).child(label)))
         };
-        let on_right = self.sidebar_on_right(cx);
         div()
             .id("sidebar-tabs")
             .absolute()
@@ -204,9 +203,6 @@ impl Workspace {
                 cx.stop_propagation();
                 ws.open_sidebar_tab_menu(e.position, window, cx);
             }))
-            // On the right the strip mirrors: the tabs at the window's edge,
-            // the free space (which drags the window) toward the editor.
-            .when(on_right, |el| el.child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0()))
             .child(
                 tab("sidebar-files", Icon::Folder, "Files", files_on, false, files_named)
                     .tooltip(|window, cx| status_tooltip("Files", &ToggleSidebar, window, cx))
@@ -230,6 +226,8 @@ impl Workspace {
                     })
                     .on_click(cx.listener(|ws, _, window, cx| ws.show_commit(&ShowCommit, window, cx))),
             )
-            .when(!on_right, |el| el.child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0()))
+            // Left-aligned on either side, like the editor's tabs; the free
+            // space after them drags the window.
+            .child(super::title_bar::window_drag_area("sidebar-tabs-free").flex_1().min_w_0())
     }
 }
