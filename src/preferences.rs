@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 
 use crate::{
     assets::Icon,
+    busy::Busy,
     editor::{Cancel, Editor, EditorEvent, MoveDown, MoveUp},
-    extensions::{self, ExtensionInfo, ExtensionsChanged},
+    extensions::{self, ExtensionInfo, ExtensionsChanged, registry},
     format,
     git::PullStrategy,
     lsp::servers,
@@ -536,6 +537,14 @@ pub struct Preferences {
     extension_url: Entity<Editor>,
     extension_status: Option<(bool, String)>,
     installing: bool,
+    /// The registry's extensions: the search over them, the list (or why
+    /// there's none) once fetched, the fetch running, and the extensions
+    /// being installed from it.
+    registry_query: Entity<Editor>,
+    registry: Option<Result<Arc<Vec<registry::Listed>>, String>>,
+    registry_busy: Busy,
+    registry_fetch: Option<Task<()>>,
+    registry_installing: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -553,6 +562,7 @@ impl Preferences {
         let formatter_command = cx.new(|cx| Editor::single_line("Command and arguments ({file} is the file's path)", cx));
         let keymap = cx.new(|cx| KeymapPage::new(window, cx));
         let extension_url = cx.new(|cx| Editor::single_line("Git URL of an extension (Zed extensions work too)", cx));
+        let registry_query = cx.new(|cx| Editor::single_line("Search available extensions", cx));
         let mut subscriptions = vec![
             // A grammar finished building, an extension came or went.
             cx.observe_global::<ExtensionsChanged>(|this, cx| {
@@ -566,6 +576,7 @@ impl Preferences {
                 cx.notify();
             }),
             cx.subscribe(&font_filter, |_, _, _: &EditorEvent, cx| cx.notify()),
+            cx.subscribe(&registry_query, |_, _, _: &EditorEvent, cx| cx.notify()),
             cx.subscribe(&keymap, |_, _, event: &PreferencesEvent, cx| cx.emit(clone_event(event))),
         ];
         for field in [&shell, &rulers, &server_command, &formatter_command] {
@@ -601,8 +612,16 @@ impl Preferences {
             extension_url,
             extension_status: None,
             installing: false,
+            registry_query,
+            registry: None,
+            registry_busy: Busy::default(),
+            registry_fetch: None,
+            registry_installing: Vec::new(),
             _subscriptions: subscriptions,
         };
+        if page == Page::Extensions {
+            this.fetch_registry(cx);
+        }
         for run in &settings.run_configurations {
             this.add_run_row(run, cx);
         }
@@ -627,6 +646,9 @@ impl Preferences {
         }
         if page == Page::Keymap {
             self.keymap.update(cx, |k, cx| k.focus_filter(window, cx));
+        }
+        if page == Page::Extensions {
+            self.fetch_registry(cx);
         }
         cx.notify();
     }
@@ -1904,6 +1926,49 @@ impl Preferences {
         cx.notify();
     }
 
+    /// Gets the registry's list of extensions, unless it's here or coming.
+    fn fetch_registry(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.registry, Some(Ok(_))) || self.registry_fetch.is_some() {
+            return;
+        }
+        self.registry = None;
+        self.registry_busy.set(Some("Loading the list of extensions…".into()), |this: &mut Self| &mut this.registry_busy, cx);
+        self.registry_fetch = Some(cx.spawn(async move |this, cx| {
+            let fetched = cx.background_executor().spawn(async move { registry::available() }).await;
+            this.update(cx, |this, cx| {
+                this.registry = Some(fetched);
+                this.registry_fetch = None;
+                this.registry_busy.set(None, |this: &mut Self| &mut this.registry_busy, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn install_from_registry(&mut self, listed: registry::Listed, cx: &mut Context<Self>) {
+        if self.registry_installing.contains(&listed.id) {
+            return;
+        }
+        self.registry_installing.push(listed.id.clone());
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let package = listed.clone();
+            let result = cx.background_executor().spawn(async move { registry::install(&package) }).await;
+            this.update(cx, |this, cx| {
+                this.registry_installing.retain(|id| *id != listed.id);
+                this.extension_status = Some(match result {
+                    Ok(name) => {
+                        extensions::reload(cx);
+                        (false, format!("Installed {name} {}", listed.version))
+                    }
+                    Err(err) => (true, err),
+                });
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+    }
+
     fn uninstall(&mut self, extension: ExtensionInfo, window: &mut Window, cx: &mut Context<Self>) {
         let linked = extension.path.is_symlink();
         let detail = if linked { "Its folder stays where it is." } else { "Its folder goes to the Trash." };
@@ -1954,6 +2019,34 @@ impl Preferences {
             });
 
         let installed = extensions::installed();
+        // The registry's extensions: built from their authors' repositories,
+        // grammars and code compiled.
+        let mut available = vec![div().px_3().py_2p5().child(input_box(&self.registry_query, Some(Icon::Search), window, cx)).into_any_element()];
+        let note = |text: String, color: Hsla| div().px_3().pb_2p5().text_size(px(12.5)).text_color(color).child(text).into_any_element();
+        if let Some(label) = self.registry_busy.label() {
+            available.push(note(label.to_string(), theme.text_dim.into()));
+        }
+        match &self.registry {
+            Some(Ok(listed)) => {
+                let found = registry::search(listed, &self.registry_query.read(cx).text(cx));
+                if found.is_empty() {
+                    available.push(note("No extensions match".into(), theme.text_dim.into()));
+                }
+                available.extend(found.iter().enumerate().map(|(ix, listed)| self.render_listed(ix, listed, &installed, &theme, cx)));
+            }
+            Some(Err(err)) => available.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pb_2p5()
+                    .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(theme.error).child(err.clone()))
+                    .child(text_button("ext-registry-retry", "Try Again", false, cx).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.fetch_registry(cx))))
+                    .into_any_element(),
+            ),
+            None => {}
+        }
         let rows: Vec<AnyElement> = if installed.is_empty() {
             vec![
                 div()
@@ -1996,6 +2089,7 @@ impl Preferences {
         let folder = extensions::extensions_dir().map(|d| theme::display_path(&d)).unwrap_or_default();
         self.body()
             .child(section("Install", vec![install.into_any_element()], &theme))
+            .child(section("Available", available, &theme))
             .child(section("Installed", rows, &theme))
             .when(!zed.is_empty(), |el| el.child(section("Installed in Zed", zed, &theme)))
             .child(
@@ -2058,6 +2152,52 @@ impl Preferences {
         self.body()
             .child(section(Setting::TrustAll.section(), switch_rows, &theme))
             .child(section("Trusted folders", rows, &theme))
+    }
+
+    /// One of the registry's extensions: what it has, its license, and
+    /// Install (Update) unless it's here already.
+    fn render_listed(&self, ix: usize, listed: &registry::Listed, installed: &[ExtensionInfo], theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let state = registry::installed(listed, installed);
+        let mut details: Vec<String> = Vec::new();
+        if !listed.provides.is_empty() {
+            details.push(listed.provides.iter().map(|p| p.replace('-', " ")).collect::<Vec<_>>().join(", "));
+        }
+        if !listed.license.is_empty() {
+            details.push(listed.license.clone());
+        }
+        let action = if self.registry_installing.contains(&listed.id) {
+            text_button(("ext-registry", ix), "Installing…", false, cx).into_any_element()
+        } else if matches!(state, registry::Installed::No | registry::Installed::Outdated) {
+            let label = if state == registry::Installed::No { "Install" } else { "Update" };
+            let listed = listed.clone();
+            text_button(("ext-registry", ix), label, true, cx)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.install_from_registry(listed.clone(), cx)))
+                .into_any_element()
+        } else {
+            div().text_size(px(12.)).text_color(theme.text_dim).child("Installed").into_any_element()
+        };
+        div()
+            .flex()
+            .items_start()
+            .gap_2p5()
+            .px_3()
+            .py_2p5()
+            .child(div().pt(px(2.)).child(icon_el(Icon::Puzzle, px(15.), theme.text_muted.into())))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(format!("{}  {}", listed.name, listed.version)))
+                    .when(!listed.description.is_empty(), |el| {
+                        el.child(div().text_size(px(12.5)).text_color(theme.text_muted).child(listed.description.clone()))
+                    })
+                    .child(div().text_size(px(12.)).text_color(theme.text_dim).child(details.join(" · "))),
+            )
+            .child(action)
+            .into_any_element()
     }
 
     fn render_extension(&self, ix: usize, extension: ExtensionInfo, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {

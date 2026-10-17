@@ -13,6 +13,15 @@ grammars prebuilt, so nothing needs compiling. Extensions live
 in `~/.config/kuana/extensions/<id>/`; copying a folder there and choosing **Reload Extensions** works
 too.
 
+**Available** lists the extensions in Kuana's registry
+([kuana-extensions](https://github.com/berkayakin/kuana-extensions)): popular languages that Kuana
+doesn't have built in, such as Java, C#, Dart, Ruby, Elixir, Zig and Vue. Each is built there from its
+author's repository, with its grammars and its own code compiled, so nothing needs compiling here. Type
+to search, then click **Install**. **Update** appears when the registry has a newer version; only
+extensions installed from it get one, never one from Git or a folder. Kuana checks the list's
+signature and each download's checksum. Every extension keeps its own license (shown on its row),
+which comes with it.
+
 An extension is a folder like this (Zed's layout; every part is optional):
 
 ```text

@@ -49,6 +49,7 @@ use crate::{
 /// inserting: `line_comments` (the first) and `block_comment`, as
 /// `["/*", "*/"]` or Zed's newer `{ start = "/*", end = "*/" }`.
 pub mod check;
+pub mod registry;
 pub mod wasm;
 
 pub(crate) fn comment_tokens(config: &Table) -> (Option<String>, Option<(String, String)>) {
