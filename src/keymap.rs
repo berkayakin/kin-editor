@@ -23,7 +23,7 @@ use crate::{
     workspace::{
         CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine, OpenSettingsFile,
         CloseWindow, MinimizeWindow, ZoomWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
-        PrevTab, Quit, RecentFiles, RecentProjects, Replace,
+        PrevTab, Quit, RecentFiles, RecentProjects, RecentTab, RecentTabBack, Replace,
         GitBranches, GitStash, ManageRemotes, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
@@ -92,8 +92,9 @@ fn common(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-f", FindInFiles, None),
         KeyBinding::new("f3", FindNext, None),
         KeyBinding::new("shift-f3", FindPrevious, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // The last used tab, as every editor's Ctrl+Tab switcher starts.
+        KeyBinding::new("ctrl-tab", RecentTab, None),
+        KeyBinding::new("ctrl-shift-tab", RecentTabBack, None),
         KeyBinding::new("secondary-\\", SplitRight, None),
         KeyBinding::new("ctrl-space", ShowCompletions, e),
         // Dialogs and panels.
@@ -733,6 +734,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Close Tab", CloseTab),
         a("Next Tab", NextTab),
         a("Previous Tab", PrevTab),
+        a("Switch to Recent Tab", RecentTab),
+        a("Switch to Recent Tab (Backward)", RecentTabBack),
         a("Toggle Project Sidebar", ToggleSidebar),
         a("Toggle Sidebar Position", ToggleSidebarPosition),
         a("Toggle Problems", ToggleProblems),
@@ -861,6 +864,8 @@ fn terminal_passthrough(defaults: &[KeyBinding]) -> Vec<KeyBinding> {
         "workspace::ToggleGitLog",
         "workspace::NextTab",
         "workspace::PrevTab",
+        "workspace::RecentTab",
+        "workspace::RecentTabBack",
         "workspace::FindAction",
         "workspace::ToggleSidebar",
         "workspace::ToggleProblems",

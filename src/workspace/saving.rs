@@ -446,4 +446,41 @@ impl Workspace {
             self.activate_in(self.active_pane, ix, window, cx);
         }
     }
+
+    /// Ctrl+Tab: the pane's tab used before this one; pressed again with
+    /// Ctrl still down, the one used before that, and so on.
+    pub(super) fn recent_tab(&mut self, _: &RecentTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_recent_tab(true, window, cx);
+    }
+
+    /// Ctrl+Shift+Tab: the same order from its other end.
+    pub(super) fn recent_tab_back(&mut self, _: &RecentTabBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_recent_tab(false, window, cx);
+    }
+
+    fn step_recent_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.active_pane;
+        let Some(tabs) = self.panes.get(pane).map(|p| &p.tabs) else { return };
+        let mut switch = match self.tab_switch.take() {
+            Some(switch) if switch.pane == pane => switch,
+            _ => {
+                let paths: Vec<Option<PathBuf>> = tabs.iter().map(|t| t.path(cx)).collect();
+                let order = tabs_by_use(&paths, self.panes[pane].active, &self.recent);
+                TabSwitch { pane, order: order.into_iter().map(|ix| tabs[ix].clone()).collect(), at: 0, recent: self.recent.clone() }
+            }
+        };
+        let len = switch.order.len();
+        if len < 2 {
+            return;
+        }
+        switch.at = if forward { (switch.at + 1) % len } else { (switch.at + len - 1) % len };
+        let Some(ix) = tabs.iter().position(|t| *t == switch.order[switch.at]) else { return };
+        // The tabs passed on the way keep their places in `recent`.
+        self.recent = switch.recent.clone();
+        self.activate_in(pane, ix, window, cx);
+        // Let go of the keys and the next press starts from the tab it ended on.
+        if window.modifiers().modified() {
+            self.tab_switch = Some(switch);
+        }
+    }
 }

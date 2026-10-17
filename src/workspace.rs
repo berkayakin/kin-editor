@@ -132,6 +132,10 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        /// Ctrl+Tab: the tab used before this one (see `TabSwitch`).
+        RecentTab,
+        /// Ctrl+Shift+Tab: the same order, the other way.
+        RecentTabBack,
         ToggleSidebar,
         ToggleSidebarPosition,
         ToggleProblems,
@@ -382,6 +386,34 @@ impl Pane {
     fn new() -> Self {
         Self { tabs: Vec::new(), active: 0 }
     }
+}
+
+/// Ctrl+Tab going through a pane's tabs in the order they were last used,
+/// while Ctrl (any modifier of the shortcut) is held: each press takes the
+/// next one in the order the first press found.
+struct TabSwitch {
+    pane: usize,
+    order: Vec<PaneItem>,
+    at: usize,
+    /// `recent` when it started: only the tab it ends on counts as used.
+    recent: Vec<PathBuf>,
+}
+
+/// A pane's tabs, by index, in the order they were last used: the current
+/// one, then the others by their files' places in `recent` (newest first),
+/// then those it doesn't list (not shown yet, untitled) in pane order.
+fn tabs_by_use(paths: &[Option<PathBuf>], active: usize, recent: &[PathBuf]) -> Vec<usize> {
+    let rank = |ix: usize| {
+        let used = paths[ix].as_ref().and_then(|path| recent.iter().position(|r| r == path));
+        match used {
+            _ if ix == active => (0, 0),
+            Some(at) => (1, at),
+            None => (2, ix),
+        }
+    };
+    let mut order: Vec<usize> = (0..paths.len()).collect();
+    order.sort_by_key(|&ix| rank(ix));
+    order
 }
 
 /// Terminal tabs shown together in the bottom panel; splitting the terminal
@@ -668,6 +700,8 @@ pub struct Workspace {
     project_changes: Vec<PathBuf>,
     /// Most recently used files, newest first.
     recent: Vec<PathBuf>,
+    /// Ctrl+Tab held down, going through the tabs.
+    tab_switch: Option<TabSwitch>,
     actions: Arc<Vec<ActionEntry>>,
     shift_down: bool,
     last_shift_tap: Option<Instant>,
@@ -1002,6 +1036,7 @@ impl Workspace {
             project_task: None,
             project_changes: Vec::new(),
             recent: Vec::new(),
+            tab_switch: None,
             actions: Arc::new(keymap::action_entries()),
             shift_down: false,
             last_shift_tap: None,
@@ -1482,6 +1517,19 @@ fn ellipsize(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::ellipsize;
+
+    #[test]
+    fn tabs_go_in_the_order_they_were_used() {
+        use std::path::PathBuf;
+        let path = |name: &str| Some(PathBuf::from(format!("/p/{name}")));
+        let paths = [path("a"), path("b"), path("c"), None, path("d")];
+        let recent: Vec<PathBuf> = ["c", "a", "x", "b"].iter().map(|n| PathBuf::from(format!("/p/{n}"))).collect();
+        // The current tab, then the last used before it; the untitled and
+        // the never shown come last.
+        assert_eq!(super::tabs_by_use(&paths, 2, &recent), [2, 0, 1, 3, 4]);
+        assert_eq!(super::tabs_by_use(&paths, 3, &recent), [3, 2, 0, 1, 4]);
+        assert_eq!(super::tabs_by_use(&[], 0, &recent), Vec::<usize>::new());
+    }
 
     #[cfg(unix)]
     #[test]

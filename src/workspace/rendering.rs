@@ -291,6 +291,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
+            .on_action(cx.listener(Self::recent_tab))
+            .on_action(cx.listener(Self::recent_tab_back))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_sidebar_position))
             .on_action(cx.listener(Self::toggle_problems))
