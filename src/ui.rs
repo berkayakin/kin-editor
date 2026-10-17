@@ -350,9 +350,11 @@ pub fn island(theme: &Theme) -> Div {
 /// a corner moves both of its edges. Two gradient quads per edge (GPUI's
 /// gradients have two stops).
 fn edge_sheen(theme: &Theme) -> impl IntoElement {
+    // A light island can't get brighter than its edge (white would vanish
+    // into it), so there the glint is a darker touch of the text color.
     let lit = match theme.appearance {
         Appearance::Dark => Hsla::from(theme.text).alpha(0.55),
-        Appearance::Light => gpui::white().alpha(0.85),
+        Appearance::Light => Hsla::from(theme.text).alpha(0.3),
     };
     gpui::canvas(
         |_, _, _| {},
@@ -404,7 +406,7 @@ fn edge_sheen(theme: &Theme) -> impl IntoElement {
 }
 
 /// How near the pointer has to come to an edge to draw its sheen.
-const SHEEN_REACH: f32 = 160.;
+const SHEEN_REACH: f32 = 96.;
 /// Sheens follow the pointer at up to 30 frames a second: smooth enough for a
 /// soft glow, at a fraction of the display's rate.
 const SHEEN_FRAME: Duration = Duration::from_millis(33);
