@@ -169,7 +169,10 @@ impl Workspace {
         for image in self.images() {
             image.update(cx, |i, cx| i.reload_if_changed(cx));
         }
-        self.tree.update(cx, |t, cx| t.rebuild(cx));
+        // The watcher tells the tree what changed, if there's one.
+        if self.watcher.is_none() {
+            self.tree.update(cx, |t, cx| t.relist_all(cx));
+        }
     }
 
     pub(super) fn run_git(&mut self, op: GitOp, window: &mut Window, cx: &mut Context<Self>) {

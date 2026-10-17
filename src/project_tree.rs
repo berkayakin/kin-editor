@@ -2,7 +2,10 @@
 //! open, the rows they make, drag & drop between them and from Finder. File
 //! operations are the workspace's: the tree reports what was asked
 //! (`TreeEvent`) and the workspace tells it what changed (expand, remap,
-//! reveal) and how rows look (Git changes, the open file, a menu's target).
+//! reveal, paths created or removed) and how rows look (Git changes, the
+//! open file, a menu's target). Folders are read in the background and
+//! kept: rows are made from what was read, and a change reads again only
+//! the folders it touched.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,7 +15,7 @@ use std::{
 
 use gpui::{
     Context, DragMoveEvent, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, MouseButton, MouseDownEvent, Pixels, Point, Render,
-    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    SharedString, Task, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
 use crate::{
@@ -32,6 +35,15 @@ struct TreeEntry {
     name: SharedString,
     depth: usize,
     is_dir: bool,
+}
+
+/// An entry of a folder, as read.
+struct Child {
+    path: PathBuf,
+    name: SharedString,
+    is_dir: bool,
+    /// A link to a folder it's in: it would expand forever, so it doesn't.
+    cycle: bool,
 }
 
 /// A tree row being dragged.
@@ -64,6 +76,16 @@ impl EventEmitter<TreeEvent> for ProjectTree {}
 pub struct ProjectTree {
     root: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
+    /// The folders read so far, their entries in order (folders first).
+    /// A closed one is kept too, until something in it changes.
+    listings: HashMap<PathBuf, Arc<[Child]>>,
+    /// Folders to read (again) once the running read is done.
+    unread: HashSet<PathBuf>,
+    /// Folders the running read is reading.
+    reading: HashSet<PathBuf>,
+    read_task: Option<Task<()>>,
+    /// A row to scroll to once it's listed (`reveal_and_scroll`).
+    scroll_to: Option<PathBuf>,
     entries: Vec<TreeEntry>,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
@@ -84,6 +106,11 @@ impl ProjectTree {
         Self {
             root: None,
             expanded: HashSet::new(),
+            listings: HashMap::new(),
+            unread: HashSet::new(),
+            reading: HashSet::new(),
+            read_task: None,
+            scroll_to: None,
             entries: Vec::new(),
             scroll: UniformListScrollHandle::new(),
             focus: cx.focus_handle(),
@@ -99,6 +126,11 @@ impl ProjectTree {
     pub fn set_root(&mut self, root: Option<PathBuf>, expanded: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
         self.expanded = root.iter().cloned().chain(expanded).collect();
         self.root = root;
+        self.listings.clear();
+        self.unread.clear();
+        self.reading.clear();
+        self.read_task = None;
+        self.scroll_to = None;
         self.rebuild(cx);
     }
 
@@ -107,25 +139,109 @@ impl ProjectTree {
         &self.expanded
     }
 
-    pub fn is_expanded(&self, dir: &Path) -> bool {
-        self.expanded.contains(dir)
+    /// Whether the tree has read `dir` (or is reading it): a change in it
+    /// is for `paths_changed`.
+    pub fn has_read(&self, dir: &Path) -> bool {
+        self.listings.contains_key(dir) || self.reading.contains(dir)
     }
 
-    /// Lists the open folders again (the disk changed).
+    /// Makes the rows again from the folders read; open folders not read
+    /// yet are read in the background, their rows coming then.
     pub fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.entries.clear();
         if let Some(root) = self.root.clone() {
             self.push_children(&root, 0);
         }
+        if let Some(target) = self.scroll_to.clone() {
+            if let Some(ix) = self.entries.iter().position(|e| e.path == target) {
+                self.scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+                self.scroll_to = None;
+            } else if self.unread.is_empty() && self.read_task.is_none() {
+                // Everything open is listed, and it isn't there.
+                self.scroll_to = None;
+            }
+        }
+        self.read_unread(cx);
         cx.notify();
     }
 
     fn push_children(&mut self, dir: &Path, depth: usize) {
-        for (path, is_dir, cycle, name) in children(dir) {
-            let expanded = is_dir && !cycle && self.expanded.contains(&path);
-            self.entries.push(TreeEntry { path: path.clone(), name: name.into(), depth, is_dir });
-            if expanded {
-                self.push_children(&path, depth + 1);
+        let Some(listing) = self.listings.get(dir).cloned() else {
+            if !self.reading.contains(dir) {
+                self.unread.insert(dir.to_path_buf());
+            }
+            return;
+        };
+        for child in listing.iter() {
+            self.entries.push(TreeEntry { path: child.path.clone(), name: child.name.clone(), depth, is_dir: child.is_dir });
+            if child.is_dir && !child.cycle && self.expanded.contains(&child.path) {
+                self.push_children(&child.path, depth + 1);
+            }
+        }
+    }
+
+    /// Reads the folders waiting for it in the background, then makes the
+    /// rows again. One read at a time: folders asked for meanwhile wait.
+    fn read_unread(&mut self, cx: &mut Context<Self>) {
+        if self.read_task.is_some() || self.unread.is_empty() {
+            return;
+        }
+        let dirs: Vec<PathBuf> = self.unread.drain().collect();
+        self.reading = dirs.iter().cloned().collect();
+        self.read_task = Some(cx.spawn(async move |tree, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { dirs.into_iter().map(|dir| (read_listing(&dir), dir)).collect::<Vec<_>>() })
+                .await;
+            tree.update(cx, |tree, cx| {
+                // This task is running; let it finish instead of dropping it.
+                if let Some(task) = tree.read_task.take() {
+                    task.detach();
+                }
+                tree.reading.clear();
+                // One that changed while it was read is in `unread` again.
+                tree.listings.extend(read.into_iter().map(|(listing, dir)| (dir, listing)));
+                tree.rebuild(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Paths created, removed or renamed (on disk, or by a file operation):
+    /// the folders they're in are read again, in the background, if they're
+    /// open, else forgotten until they are; so is a folder that went or
+    /// came back, with the folders in it. The rows are made again (folders
+    /// opened or forgotten meanwhile), and again when the reads are done.
+    pub fn paths_changed<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>, cx: &mut Context<Self>) {
+        let mut touched = HashSet::new();
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                touched.insert(parent.to_path_buf());
+            }
+            if self.has_read(path) {
+                touched.extend(self.listings.keys().chain(&self.reading).filter(|d| d.starts_with(path)).cloned());
+            }
+        }
+        self.relist(touched);
+        self.rebuild(cx);
+    }
+
+    /// Anything may have changed (the watcher lost track of the disk, or
+    /// there's none): every folder read is read again or forgotten.
+    pub fn relist_all(&mut self, cx: &mut Context<Self>) {
+        let all: Vec<PathBuf> = self.listings.keys().chain(&self.reading).cloned().collect();
+        self.relist(all);
+        self.rebuild(cx);
+    }
+
+    /// Has `dirs` read again if they're open, forgets them if not; a folder
+    /// being read is read once more (what it found may be from before).
+    fn relist(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
+        for dir in dirs {
+            if self.reading.contains(&dir) || (self.listings.contains_key(&dir) && self.expanded.contains(&dir)) {
+                self.unread.insert(dir);
+            } else {
+                self.listings.remove(&dir);
             }
         }
     }
@@ -145,11 +261,13 @@ impl ProjectTree {
     /// `path` is gone: so are its open folders.
     pub fn forget(&mut self, path: &Path) {
         self.expanded.retain(|p| !p.starts_with(path));
+        self.listings.retain(|p, _| !p.starts_with(path));
     }
 
-    /// Open folders follow a move or rename.
+    /// Open folders follow a move or rename (read again at their new place).
     pub fn remap(&mut self, remap: impl Fn(&Path) -> Option<PathBuf>) {
         self.expanded = self.expanded.iter().map(|p| remap(p).unwrap_or_else(|| p.clone())).collect();
+        self.listings.retain(|p, _| remap(p).is_none());
     }
 
     /// Opens the folders down to `path` (listed on the next `rebuild`).
@@ -163,13 +281,12 @@ impl ProjectTree {
         }
     }
 
-    /// Opens the folders down to `path` and scrolls its row into the middle.
+    /// Opens the folders down to `path` and scrolls its row into the middle
+    /// (once its folder is read).
     pub fn reveal_and_scroll(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.reveal(path);
+        self.scroll_to = Some(path.to_path_buf());
         self.rebuild(cx);
-        if let Some(ix) = self.entries.iter().position(|e| e.path == path) {
-            self.scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
-        }
     }
 
     pub fn has_drop_target(&self) -> bool {
@@ -408,6 +525,12 @@ impl Render for ProjectTree {
     }
 }
 
+/// A folder's entries as the tree lists them (blocking: in the background).
+/// One that can't be read lists nothing.
+fn read_listing(dir: &Path) -> Arc<[Child]> {
+    children(dir).into_iter().map(|(path, is_dir, cycle, name)| Child { path, name: name.into(), is_dir, cycle }).collect()
+}
+
 /// A folder's entries, folders first: (path, is a folder, is a link back to
 /// a folder it's in, name).
 pub fn children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
@@ -435,7 +558,8 @@ pub fn children(dir: &Path) -> Vec<(PathBuf, bool, bool, String)> {
             Some((path, is_dir, cycle, name))
         })
         .collect();
-    children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.to_lowercase().cmp(&b.3.to_lowercase())));
+    // Each name lowercased once, not at every comparison.
+    children.sort_by_cached_key(|(_, is_dir, _, name)| (!is_dir, name.to_lowercase()));
     children
 }
 
@@ -444,6 +568,64 @@ mod tests {
     use gpui::{AppContext, TestAppContext};
 
     use super::*;
+
+    #[gpui::test]
+    fn folders_are_read_in_the_background_and_again_only_where_changed(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("kuana-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("B")).unwrap();
+        for file in ["a/x.txt", "B/y.txt", "Readme.md", "build.rs"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        let tree = cx.new(ProjectTree::new);
+        let rows = |cx: &mut TestAppContext| {
+            tree.read_with(cx, |t, _| t.entries.iter().map(|e| format!("{}{}", "  ".repeat(e.depth), e.name)).collect::<Vec<_>>())
+        };
+        tree.update(cx, |t, cx| t.set_root(Some(dir.clone()), [dir.join("a")], cx));
+        assert!(rows(cx).is_empty(), "read in the background");
+        cx.run_until_parked();
+        // Folders first, then by name whatever its case.
+        assert_eq!(rows(cx), ["a", "  x.txt", "B", "build.rs", "Readme.md"]);
+
+        // A file created in `a`: only `a` is read again.
+        let top = tree.read_with(cx, |t, _| t.listings[&dir].clone());
+        std::fs::write(dir.join("a/new.txt"), "").unwrap();
+        tree.update(cx, |t, cx| t.paths_changed([dir.join("a/new.txt").as_path()], cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["a", "  new.txt", "  x.txt", "B", "build.rs", "Readme.md"]);
+        tree.read_with(cx, |t, _| assert!(Arc::ptr_eq(&t.listings[&dir], &top), "the project folder wasn't read again"));
+
+        // A closed folder keeps its entries, until something in it changes.
+        tree.update(cx, |t, cx| t.click(3, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx)[3..5], ["B", "  y.txt"]);
+        tree.update(cx, |t, cx| t.click(3, cx));
+        std::fs::write(dir.join("B/z.txt"), "").unwrap();
+        tree.update(cx, |t, cx| t.paths_changed([dir.join("B/z.txt").as_path()], cx));
+        tree.read_with(cx, |t, _| assert!(!t.listings.contains_key(&dir.join("B"))));
+        tree.update(cx, |t, cx| t.click(3, cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx)[3..6], ["B", "  y.txt", "  z.txt"]);
+
+        // A folder that went goes with what's in it; a row to reveal is
+        // scrolled to once its folder is read.
+        std::fs::remove_dir_all(dir.join("a")).unwrap();
+        tree.update(cx, |t, cx| t.paths_changed([dir.join("a").as_path()], cx));
+        cx.run_until_parked();
+        assert_eq!(rows(cx), ["B", "  y.txt", "  z.txt", "build.rs", "Readme.md"]);
+        std::fs::create_dir_all(dir.join("c/d")).unwrap();
+        std::fs::write(dir.join("c/d/deep.txt"), "").unwrap();
+        tree.update(cx, |t, cx| {
+            t.paths_changed([dir.join("c").as_path()], cx);
+            t.reveal_and_scroll(&dir.join("c/d/deep.txt"), cx);
+        });
+        tree.read_with(cx, |t, _| assert!(t.scroll_to.is_some()));
+        cx.run_until_parked();
+        assert_eq!(rows(cx)[3..6], ["c", "  d", "    deep.txt"]);
+        tree.read_with(cx, |t, _| assert!(t.scroll_to.is_none(), "scrolled to it"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[gpui::test]
     fn what_git_ignores_is_dimmed_with_everything_in_it(cx: &mut TestAppContext) {

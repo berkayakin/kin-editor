@@ -479,9 +479,9 @@ impl Workspace {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
-                self.file_history.record(format!("New File “{name}”"), crate::file_history::Change::Created(created));
+                self.file_history.record(format!("New File “{name}”"), crate::file_history::Change::Created(created.clone()));
                 self.reveal_in_tree(&path, cx);
-                self.after_fs_change(cx);
+                self.after_fs_change(&[created], cx);
                 self.open_path(path, window, cx);
             }
             PendingInput::NewFolder(dir) => {
@@ -491,10 +491,10 @@ impl Workspace {
                 }
                 let created = crate::file_history::topmost_new(&path);
                 std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-                self.file_history.record(format!("New Folder “{name}”"), crate::file_history::Change::Created(created));
+                self.file_history.record(format!("New Folder “{name}”"), crate::file_history::Change::Created(created.clone()));
                 self.reveal_in_tree(&path, cx);
                 self.tree.update(cx, |t, _| t.expand(path));
-                self.after_fs_change(cx);
+                self.after_fs_change(&[created], cx);
             }
             PendingInput::Rename(old) => {
                 let old = old.clone();
@@ -513,14 +513,18 @@ impl Workspace {
                 std::fs::rename(&old, &new).map_err(|e| e.to_string())?;
                 let old_name = old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let renamed = crate::file_history::Change::Renamed { from: old.clone(), to: new.clone() };
+                let mut changed = vec![old.clone(), new.clone()];
                 let change = match new_dirs {
-                    Some(dirs) => crate::file_history::Change::Batch(vec![crate::file_history::Change::Created(dirs), renamed]),
+                    Some(dirs) => {
+                        changed.push(dirs.clone());
+                        crate::file_history::Change::Batch(vec![crate::file_history::Change::Created(dirs), renamed])
+                    }
                     None => renamed,
                 };
                 self.file_history.record(format!("Rename “{old_name}”"), change);
                 self.moved(&old, &new, cx);
                 self.reveal_in_tree(&new, cx);
-                self.after_fs_change(cx);
+                self.after_fs_change(&changed, cx);
             }
             // Handled before the name checks above.
             PendingInput::RenameSymbol { .. } | PendingInput::VimCommand | PendingInput::Git(_) => {}
@@ -564,19 +568,25 @@ impl Workspace {
     pub(super) fn apply_file_history(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
         use crate::file_history::Change;
         let Some((label, result)) = self.file_history.step(redo) else { return };
+        let mut changed = Vec::new();
         match result {
             Ok(done) => done.visit(&mut |change| match change {
                 Change::Renamed { from, to } => {
                     self.moved(from, to, cx);
                     self.reveal_in_tree(to, cx);
+                    changed.extend([from.clone(), to.clone()]);
                 }
                 Change::Trashed(trashed) => {
                     let path = &trashed.original;
                     self.close_tabs_under(path, window, cx);
                     self.tree.update(cx, |t, _| t.forget(path));
                     self.recent.retain(|p| !p.starts_with(path));
+                    changed.push(path.clone());
                 }
-                Change::Created(path) | Change::Restored(path) => self.reveal_in_tree(path, cx),
+                Change::Created(path) | Change::Restored(path) => {
+                    self.reveal_in_tree(path, cx);
+                    changed.push(path.clone());
+                }
                 Change::Batch(_) => {}
             }),
             Err(err) => {
@@ -585,7 +595,7 @@ impl Workspace {
             }
         }
         window.focus(&self.tree.focus_handle(cx));
-        self.after_fs_change(cx);
+        self.after_fs_change(&changed, cx);
         self.schedule_session_save(cx);
     }
 
@@ -653,7 +663,7 @@ impl Workspace {
         self.moved(&from, &to, cx);
         self.tree.update(cx, |t, _| t.expand(dir));
         self.reveal_in_tree(&to, cx);
-        self.after_fs_change(cx);
+        self.after_fs_change(&[from, to], cx);
         self.schedule_session_save(cx);
     }
 
@@ -689,7 +699,7 @@ impl Workspace {
         window.focus(&self.tree.focus_handle(cx));
         self.tree.update(cx, |t, _| t.expand(dir.clone()));
         self.reveal_in_tree(&first, cx);
-        self.after_fs_change(cx);
+        self.after_fs_change(&added, cx);
         self.schedule_session_save(cx);
         let Some(repo) = self.repo.clone().filter(|r| added.iter().all(|p| p.starts_with(r))) else { return };
         let ignored: Vec<bool> = added.iter().map(|p| self.ignore.as_ref().is_some_and(|i| i.matched_path_or_any_parents(p, p.is_dir()).is_ignore())).collect();
@@ -779,9 +789,11 @@ impl Workspace {
         self.tree.update(cx, |t, _| t.reveal(path));
     }
 
-    pub(super) fn after_fs_change(&mut self, cx: &mut Context<Self>) {
-        // Go to File hears of the change from the watcher.
-        self.tree.update(cx, |t, cx| t.rebuild(cx));
+    /// After a file operation on `changed` (created, removed or renamed):
+    /// the tree reads again the folders they're in. Go to File hears of it
+    /// from the watcher.
+    pub(super) fn after_fs_change(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
+        self.tree.update(cx, |t, cx| t.paths_changed(changed.iter().map(PathBuf::as_path), cx));
         self.refresh_git(cx);
         cx.notify();
     }
@@ -798,7 +810,7 @@ impl Workspace {
         match std::fs::copy(&path, &target) {
             Ok(_) => {
                 self.file_history.record(format!("Duplicate “{stem}{ext}”"), crate::file_history::Change::Created(target.clone()));
-                self.after_fs_change(cx);
+                self.after_fs_change(std::slice::from_ref(&target), cx);
                 // Offer to name the copy right away.
                 self.ask_for_name(PendingInput::Rename(target), window, cx);
             }
@@ -868,7 +880,7 @@ impl Workspace {
         self.close_tabs_under(path, window, cx);
         self.tree.update(cx, |t, _| t.forget(path));
         self.recent.retain(|p| !p.starts_with(path));
-        self.after_fs_change(cx);
+        self.after_fs_change(&[path.to_path_buf()], cx);
         let message = format!("Moved “{name}” to the {}", trash_name());
         self.toast_with_button(ToastKind::Success, message, None, Some(ToastButton::UndoFile(id)), cx);
     }
@@ -911,7 +923,7 @@ impl Workspace {
             Ok(()) => {
                 self.toast(ToastKind::Success, format!("Added {entry} to .gitignore"), None, cx);
                 self.reload_changed_files(cx);
-                self.after_fs_change(cx);
+                self.after_fs_change(&[file], cx);
             }
             Err(err) => self.toast(ToastKind::Error, "Couldn't update .gitignore", Some(err.to_string()), cx),
         }

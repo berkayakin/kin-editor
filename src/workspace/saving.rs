@@ -273,6 +273,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 this.update_in(cx, |ws, window, cx| {
+                    let saved = path.clone();
                     let result = match &item {
                         PaneItem::Editor(editor) => {
                             let result = editor.update(cx, |e, cx| {
@@ -302,7 +303,7 @@ impl Workspace {
                     if let Err(err) = result {
                         let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
                     }
-                    ws.tree.update(cx, |t, cx| t.rebuild(cx));
+                    ws.tree.update(cx, |t, cx| t.paths_changed([saved.as_path()], cx));
                     ws.schedule_session_save(cx);
                     cx.notify();
                 })

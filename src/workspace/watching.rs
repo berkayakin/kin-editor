@@ -40,14 +40,17 @@ impl Workspace {
         let Some(root) = self.root.clone() else { return };
         // A venv may have been created or removed.
         self.venv_shown.take();
-        let (mut tree, mut git) = (false, false);
+        let mut git = false;
         let mut structural = Vec::new();
         // For language servers watching files.
         let mut file_changes = Vec::new();
         let mut paths = HashSet::new();
+        // Created, removed or renamed: the tree reads again the folders it
+        // has read that they're in.
+        let mut tree = Vec::new();
         // The watcher lost events: everything may have changed.
         if changes.iter().any(|c| c.path == root) {
-            self.tree.update(cx, |t, cx| t.rebuild(cx));
+            self.tree.update(cx, |t, cx| t.relist_all(cx));
             self.refresh_file_index(cx);
             self.refresh_git(cx);
             self.reload_documents(|_| true, cx);
@@ -59,8 +62,9 @@ impl Workspace {
                 GitPath::Metadata => git = true,
                 GitPath::Internal => {}
                 GitPath::WorkTree => {
-                    if change.structural && change.path.parent().is_some_and(|p| self.tree.read(cx).is_expanded(p)) {
-                        tree = true;
+                    let tree_read = |path: &Path| self.tree.read(cx).has_read(path);
+                    if change.structural && (change.path.parent().is_some_and(tree_read) || tree_read(&change.path)) {
+                        tree.push(change.path.clone());
                     }
                     if watcher::in_heavy_folder(&root, &change.path) || !change.path.starts_with(&root) {
                         continue;
@@ -93,9 +97,8 @@ impl Workspace {
                 }
             }
         }
-        if tree {
-            self.tree.update(cx, |t, cx| t.rebuild(cx));
-            cx.notify();
+        if !tree.is_empty() {
+            self.tree.update(cx, |t, cx| t.paths_changed(tree.iter().map(PathBuf::as_path), cx));
         }
         if !structural.is_empty() {
             self.update_project(structural, cx);
