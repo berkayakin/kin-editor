@@ -98,7 +98,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
   follow changes made outside Kuana (a checkout, a generator, another editor) as they happen. In
   an open file, carets, the view, breakpoints, folds, problems and inlay hints stay with the lines
-  they were on, and language servers check the file again as after a save
+  they were on, Undo brings back the text from before, and language servers check the file again
+  as after a save
 - File tree with new file/folder, rename, duplicate, copy/paste, Move to Trash, Find in Folder and
   Reveal in Finder; drag entries onto a folder to move them (open tabs follow); **Select Opened File**
   (⌥F1 / Alt+F1, or a tab's menu) shows the current file in the tree; ⌘Z / ⇧⌘Z (Ctrl+Z / Ctrl+Shift+Z)
