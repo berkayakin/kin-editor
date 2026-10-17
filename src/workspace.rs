@@ -1122,6 +1122,11 @@ impl Workspace {
     }
 
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path_as(path, false, window, cx);
+    }
+
+    /// `binary`: a file that looks binary opens as text too (Open Anyway).
+    fn open_path_as(&mut self, path: PathBuf, binary: bool, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
         if path.is_dir() {
             self.set_root(path, window, cx);
@@ -1144,7 +1149,8 @@ impl Workspace {
         let opened = if crate::preview::is_image(&path) {
             std::fs::metadata(&path).map(|_| PaneItem::from(cx.new(|cx| ImageView::new(path.clone(), cx))))
         } else {
-            match Document::open(&path) {
+            let read = if binary { Document::open_anyway(&path) } else { Document::open(&path) };
+            match read {
                 Err(err) if BinaryFile::is(&err) => return self.ask_to_open_binary(path, window, cx),
                 read => read.map(|doc| {
                     large = doc.large;
@@ -1160,13 +1166,12 @@ impl Workspace {
                 }
                 self.add_tab(item, window, cx);
             }
-            Err(err) => Self::cant_open(&path, err, window, cx),
+            Err(err) => {
+                let message = format!("Couldn't open {}", path.display());
+                let detail = err.to_string();
+                let _ = window.prompt(PromptLevel::Critical, &message, Some(&detail), &["OK"], cx);
+            }
         }
-    }
-
-    fn cant_open(path: &Path, err: std::io::Error, window: &mut Window, cx: &mut Context<Self>) {
-        let message = format!("Couldn't open {}", path.display());
-        let _ = window.prompt(PromptLevel::Critical, &message, Some(&err.to_string()), &["OK"], cx);
     }
 
     /// A file that looks binary opens as text only when asked to (Open
@@ -1177,17 +1182,9 @@ impl Workspace {
         let detail = "As text it may not show correctly, and saving it can damage it.";
         let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Open Anyway", "Cancel"], cx);
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
+            if answer.await == Ok(0) {
+                this.update_in(cx, |ws, window, cx| ws.open_path_as(path, true, window, cx)).ok();
             }
-            this.update_in(cx, |ws, window, cx| match Document::open_anyway(&path) {
-                Ok(doc) => {
-                    let editor = cx.new(|cx| Editor::new(doc, cx));
-                    ws.add_tab(PaneItem::from(editor), window, cx);
-                }
-                Err(err) => Self::cant_open(&path, err, window, cx),
-            })
-            .ok();
         })
         .detach();
     }
