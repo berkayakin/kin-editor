@@ -21,7 +21,7 @@ actions!(kuana, [About]);
 
 /// "0.1.0 (987a960)": the commit comes from `build.rs` and is left out when
 /// Kuana wasn't built from a git checkout.
-fn version() -> String {
+pub(crate) fn version() -> String {
     match option_env!("KUANA_COMMIT") {
         Some(commit) => format!("{} ({commit})", env!("CARGO_PKG_VERSION")),
         None => env!("CARGO_PKG_VERSION").to_string(),

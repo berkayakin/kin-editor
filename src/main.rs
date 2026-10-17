@@ -39,6 +39,7 @@ mod lsp;
 mod markdown_preview;
 mod onboarding;
 mod pane_item;
+mod panic_log;
 mod picker;
 mod preview;
 mod problems_panel;
@@ -386,6 +387,9 @@ fn limit_window_zoom() {
 
 fn main() {
     theme::move_legacy_config();
+    if let Some(config) = theme::config_dir() {
+        panic_log::install(config.join("logs"));
+    }
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "extension") {
         std::process::exit(cli::extension_command(&raw[1..]));
