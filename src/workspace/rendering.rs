@@ -46,7 +46,9 @@ impl Workspace {
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
-                                .flex_1()
+                                // Auto basis: a zero one (`flex_1`) can leave the text
+                                // wrapped as if it had no room, a letter per line.
+                                .flex_auto()
                                 .min_w_0()
                                 .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(t.message.clone()))
                                 .when_some(t.detail.clone(), |el, d| {

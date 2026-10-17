@@ -394,14 +394,18 @@ impl Render for Onboarding {
             .gap_3()
             .pt_2()
             .child(
+                // Wraps in a narrow window instead of pushing the buttons out
+                // of view (GPUI measures text's minimum as one line, so it
+                // shrinks only with `min_w_0`).
                 div()
-                    .flex_1()
+                    .flex_auto()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .text_size(px(12.))
                     .text_color(theme.text_dim)
-                    .child("Everything else is in Settings")
+                    .child(div().min_w_0().child("Everything else is in Settings"))
                     .when_some(settings_keys, |el, keys| el.child(kbd(keys, cx))),
             )
             .child(
@@ -525,12 +529,14 @@ fn option_rows(rows: Vec<(&str, &str, AnyElement)>, theme: &Theme) -> AnyElement
                     div()
                         .flex()
                         .flex_col()
-                        .flex_1()
+                        // Measured at its own width, then shrunk: with a zero
+                        // basis (`flex_1`) GPUI can wrap it a letter per line.
+                        .flex_auto()
                         .min_w_0()
                         .child(div().text_color(theme.text).child(label.to_string()))
                         .child(div().text_size(px(12.)).text_color(theme.text_dim).child(detail.to_string())),
                 )
-                .child(control)
+                .child(div().flex_shrink_0().child(control))
         }))
         .into_any_element()
 }

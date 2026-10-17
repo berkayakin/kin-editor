@@ -196,7 +196,9 @@ impl Render for PreferencesWindow {
                         div()
                             .flex()
                             .flex_col()
-                            .flex_1()
+                            // Sized by its text: a zero basis (`flex_1`) in this
+                            // shrink-wrapped popover wraps it a letter per line.
+                            .flex_auto()
                             .min_w_0()
                             .gap_0p5()
                             .text_size(px(12.5))

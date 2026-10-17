@@ -726,7 +726,8 @@ fn render_block(block: &Block, ix: usize, d: Draw, cx: &App) -> AnyElement {
                     .child(div().min_w(px(18.)).flex().justify_end().child(marker))
                     .child(
                         div()
-                            .flex_1()
+                            // Auto basis: a zero one (`flex_1`) can wrap the item a letter per line.
+                            .flex_auto()
                             .min_w_0()
                             .flex()
                             .flex_col()
