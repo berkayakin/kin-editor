@@ -234,51 +234,46 @@ impl Workspace {
         self.recent_projects = update_recent_projects(f, cx);
     }
 
-    /// Remembers layout and the open folder for the next launch.
-    pub(super) fn save_state(&self) {
-        let saved = SessionState::load();
-        let state = SessionState {
-            // Opening a lone file shouldn't forget the remembered project.
-            last_root: self.root.clone().or(saved.last_root),
-            sidebar_width: Some(self.sidebar_width.into()),
-            problems_height: Some(self.problems_height.into()),
-            // The sidebar's visibility is remembered for projects only; it's
-            // always closed without one.
-            show_sidebar: if self.root.is_some() { Some(self.show_sidebar) } else { saved.show_sidebar },
-            show_problems: Some(self.shows(BottomPanel::Problems)),
-            show_terminal: Some(self.shows(BottomPanel::Terminal)),
-            sidebar_mode: Some(match self.sidebar_mode {
-                SidebarMode::Files => "files".into(),
-                SidebarMode::Commit => "commit".into(),
-            }),
-            show_git_log: Some(self.shows(BottomPanel::GitLog)),
-            // Shared with other windows, so keep what's on disk.
-            font_zoom: saved.font_zoom,
-            diff_side_by_side: saved.diff_side_by_side,
-            recent_projects: saved.recent_projects,
-            trusted_folders: saved.trusted_folders,
-            window: saved.window,
-            preferences_window: saved.preferences_window,
-            welcome_done: saved.welcome_done,
-            other: saved.other,
+    /// Remembers layout and the open folder for the next launch: at once
+    /// for what reads it (`SessionState::load`), on disk a moment later, in
+    /// the background (panel toggles, pane changes and resizes come in
+    /// bursts, and a write waits for the disk), and when Kuana quits.
+    pub(super) fn save_state(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let (sidebar_width, problems_height) = (f32::from(self.sidebar_width), f32::from(self.problems_height));
+        let show_sidebar = self.show_sidebar;
+        let (show_problems, show_terminal, show_git_log) =
+            (self.shows(BottomPanel::Problems), self.shows(BottomPanel::Terminal), self.shows(BottomPanel::GitLog));
+        let sidebar_mode = match self.sidebar_mode {
+            SidebarMode::Files => "files",
+            SidebarMode::Commit => "commit",
         };
-        if let Err(err) = state.save() {
-            eprintln!("couldn't save window state: {err}");
-        }
+        // What this window shows; what's shared with other windows (zoom,
+        // recent projects, placement) stays as the others left it.
+        SessionState::change_soon("layout", cx.entity_id().as_u64(), move |state| {
+            // Opening a lone file shouldn't forget the remembered project,
+            // and the sidebar's visibility is remembered for projects only
+            // (it's always closed without one).
+            if let Some(root) = &root {
+                state.last_root = Some(root.clone());
+                state.show_sidebar = Some(show_sidebar);
+            }
+            state.sidebar_width = Some(sidebar_width);
+            state.problems_height = Some(problems_height);
+            state.show_problems = Some(show_problems);
+            state.show_terminal = Some(show_terminal);
+            state.sidebar_mode = Some(sidebar_mode.into());
+            state.show_git_log = Some(show_git_log);
+        });
+        self.state_task = Some(crate::state::write_soon(cx));
     }
 
     /// Saves where the window is (after moves and resizes settle), so the
     /// next launch opens it there.
     pub(super) fn remember_placement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let placement = placement_of(window, cx);
-        self.placement_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor().timer(Duration::from_millis(400)).await;
-            let mut state = SessionState::load();
-            state.window = Some(placement);
-            if let Err(err) = state.save() {
-                eprintln!("couldn't save window state: {err}");
-            }
-        }));
+        SessionState::change_soon("window", 0, move |state| state.window = Some(placement.clone()));
+        self.state_task = Some(crate::state::write_soon(cx));
     }
 
     /// Shows Welcome Setup (theme, keymap, editor basics) over the window.
@@ -322,19 +317,19 @@ impl Workspace {
 /// entries, and shown where the system lists recent items (the Dock, the
 /// jump list: `cli::show_recent_projects`).
 pub fn update_recent_projects(f: impl FnOnce(&mut Vec<PathBuf>), cx: &mut App) -> Vec<PathBuf> {
-    let mut state = SessionState::load();
-    let before = state.recent_projects.clone();
-    f(&mut state.recent_projects);
-    state.recent_projects.truncate(MAX_RECENT_PROJECTS);
+    let before = SessionState::load().recent_projects;
+    let mut projects = before.clone();
+    f(&mut projects);
+    projects.truncate(MAX_RECENT_PROJECTS);
     // What the user removed from the jump list goes from here too.
-    let removed = crate::cli::show_recent_projects(&state.recent_projects, cx);
-    state.recent_projects.retain(|p| !removed.contains(p));
-    if state.recent_projects != before
-        && let Err(err) = state.save()
-    {
-        eprintln!("couldn't save recent projects: {err}");
+    let removed = crate::cli::show_recent_projects(&projects, cx);
+    projects.retain(|p| !removed.contains(p));
+    if projects != before {
+        let list = projects.clone();
+        SessionState::change_soon("recent_projects", 0, move |state| state.recent_projects = list.clone());
+        crate::state::write_soon(cx).detach();
     }
-    state.recent_projects
+    projects
 }
 
 

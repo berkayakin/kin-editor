@@ -49,7 +49,7 @@ impl Workspace {
         if let Some(root) = self.root.clone() {
             self.detect_repo(root, cx);
         }
-        self.save_state();
+        self.save_state(cx);
         let root = self.root.clone();
         self.lsp.update(cx, |s, _| s.set_root(root));
         if self.items().next().is_none() {
@@ -217,7 +217,7 @@ impl Workspace {
                     }
                     Some(MenuAction::TerminalTab(action, terminal)) => ws.run_terminal_tab_action(action, terminal, window, cx),
                     Some(MenuAction::OpenFile(path)) => ws.open_path(path, window, cx),
-                    Some(MenuAction::SaveBackground) => ws.save_background(false, cx),
+                    Some(MenuAction::SaveBackground) => ws.save_background(false, false, cx),
                     None => {}
                 }
             }

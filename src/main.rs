@@ -461,6 +461,13 @@ fn main() {
         extensions::reload(cx);
         theme::init(cx);
         updater::init(cx);
+        state::init(cx);
+        // Quitting doesn't leave a file being saved half written.
+        cx.on_app_quit(|_| {
+            document::wait_for_saves();
+            async {}
+        })
+        .detach();
         cx.on_action(|_: &IncreaseFontSize, cx| theme::zoom(Some(1.), cx));
         cx.on_action(|_: &DecreaseFontSize, cx| theme::zoom(Some(-1.), cx));
         cx.on_action(|_: &ResetFontSize, cx| theme::zoom(None, cx));

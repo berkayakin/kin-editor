@@ -167,6 +167,61 @@ pub struct GitFile {
     pub rel: String,
     /// The repository's `user.name`, shown as "You" in blame.
     pub user_name: Option<String>,
+    /// HEAD's commit when the file's diff base was read: blame is read once
+    /// per file and HEAD.
+    pub head: Option<String>,
+}
+
+/// A whole file's blame, read for one version of its text; a row of a
+/// later version is followed back to it through the document's line edits.
+struct Blame {
+    git_file: GitFile,
+    doc: u64,
+    version: u64,
+    text: ropey::Rope,
+    lines: git::FileBlame,
+}
+
+impl Blame {
+    /// The commit row `row` of the text as it is now came from: a line
+    /// edited since, unless its text is the same again, isn't committed.
+    /// Some(None): nothing to show; None: the edits since aren't kept (the
+    /// file is blamed again).
+    fn line(&self, row: usize, doc: &Document) -> Option<Option<BlameLine>> {
+        let edits: Vec<crate::document::LineEdit> = doc.line_edits_since(self.version)?.copied().collect();
+        let (mut old, mut edited) = (row, false);
+        for edit in edits.iter().rev() {
+            if old < edit.row {
+                continue;
+            }
+            if old >= edit.row + edit.new_rows {
+                old = old - edit.new_rows + edit.old_rows;
+                continue;
+            }
+            // Among the lines an edit changed: the one as far from their
+            // start (a line break added at the end), or from their end.
+            edited = true;
+            let (from_start, from_end) = (old - edit.row, edit.row + edit.new_rows - 1 - old);
+            if from_start < edit.old_rows {
+                old = edit.row + from_start;
+            } else if from_end < edit.old_rows {
+                old = edit.row + edit.old_rows - 1 - from_end;
+            } else {
+                return Some(Some(BlameLine::uncommitted()));
+            }
+        }
+        // The same text, line break or not (a last line that got one).
+        fn text(line: ropey::RopeSlice<'_>) -> ropey::RopeSlice<'_> {
+            match line.len_chars() {
+                n if n > 0 && line.char(n - 1) == '\n' => line.slice(..n - 1),
+                _ => line,
+            }
+        }
+        if edited && (old >= self.text.len_lines() || text(doc.rope().line(row)) != text(self.text.line(old))) {
+            return Some(Some(BlameLine::uncommitted()));
+        }
+        Some(self.lines.line(old).cloned())
+    }
 }
 
 /// A Git operation started from the editor (staging a change).
@@ -318,9 +373,14 @@ pub struct Editor {
     hunk_staged: Arc<Vec<bool>>,
     /// Index into `hunks` of the change popover that is open.
     open_hunk: Option<usize>,
+    /// Blame shown for the caret's line: its row, the version, the commit.
     blame: Option<(usize, u64, BlameLine)>,
     blame_request: Option<(usize, u64)>,
-    blame_task: Option<Task<()>>,
+    /// The whole file's blame, for its file and HEAD.
+    file_blame: Option<Blame>,
+    /// The whole-file blame being read, for which file and HEAD and
+    /// document; dropping it kills git.
+    blame_task: Option<((GitFile, u64), Task<()>, git::KillOnDrop)>,
     soft_wrap: bool,
     /// Line breaks for soft wrap, recomputed lazily (see `sync_wrap`).
     wrap: Option<WrapMap>,
@@ -465,6 +525,7 @@ impl Editor {
             open_hunk: None,
             blame: None,
             blame_request: None,
+            file_blame: None,
             blame_task: None,
             soft_wrap: false,
             wrap: None,
@@ -828,6 +889,8 @@ impl Editor {
         if self.git_file != git_file {
             self.blame = None;
             self.blame_request = None;
+            self.file_blame = None;
+            self.blame_task = None;
         }
         self.git_file = git_file;
         self.has_diff_base = diff.has_base();
@@ -997,17 +1060,65 @@ impl Editor {
         }
     }
 
+    /// Saves here and now: closing a tab or window, and runs, decide on
+    /// what's saved afterwards.
     pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
+        let job = self.save_job(cx)?;
+        self.doc.as_mut(cx).saved(job.write())?;
+        self.after_save(cx);
+        Ok(())
+    }
+
+    /// Saves in the background (Save, auto-save): the text is taken now,
+    /// written off the UI thread, and once it's written the document counts
+    /// as saved, servers hear of it and linters run. The save goes on if the
+    /// future (its result) is dropped, or the tab closed meanwhile.
+    pub fn save_in_background(&mut self, cx: &mut Context<Self>) -> impl Future<Output = std::io::Result<()>> + use<> {
+        let (done, result) = futures::channel::oneshot::channel();
+        match self.save_job(cx) {
+            Err(err) => drop(done.send(Err(err))),
+            Ok(job) => {
+                let write = cx.background_executor().spawn(async move { job.write() });
+                let doc = self.doc.downgrade();
+                cx.spawn(async move |this, cx| {
+                    let written = write.await;
+                    // The document takes it in even with this tab gone (a split
+                    // or the document store may still show it).
+                    let saved = doc.update(cx, |doc, cx| {
+                        let saved = doc.saved(written);
+                        cx.notify();
+                        saved
+                    });
+                    let saved = saved.unwrap_or(Ok(()));
+                    if saved.is_ok() {
+                        this.update(cx, |editor, cx| editor.after_save(cx)).ok();
+                    }
+                    drop(done.send(saved));
+                })
+                .detach();
+            }
+        }
+        async move { result.await.unwrap_or_else(|_| Err(std::io::Error::other("the save was dropped"))) }
+    }
+
+    /// What a save writes, taken now (after the save actions), and the end
+    /// of the undo step being typed.
+    fn save_job(&mut self, cx: &mut Context<Self>) -> std::io::Result<crate::document::SaveJob> {
         // A restored tab saved before it was shown (Save All).
         self.load(cx)?;
         self.apply_save_actions(cx);
-        self.doc.as_mut(cx).save()?;
-        self.lsp_did_save(cx);
+        let job = self.doc.as_mut(cx).save_job()?;
         self.doc.as_mut(cx).finalize_transaction();
+        Ok(job)
+    }
+
+    /// The file has the text now: servers hear of it, linters that read
+    /// the file run.
+    fn after_save(&mut self, cx: &mut Context<Self>) {
+        self.lsp_did_save(cx);
         self.schedule_lint(Duration::ZERO, cx);
         self.run_external_linter(cx);
         cx.notify();
-        Ok(())
     }
 
     /// Extensions changed: the file may have a language now, or a grammar
@@ -1242,35 +1353,50 @@ impl Editor {
     }
 
     fn schedule_lint(&mut self, delay: Duration, cx: &mut Context<Self>) {
-        if !self.doc.read(cx).language.is_lintable() {
+        let language = self.doc.read(cx).language;
+        if !language.is_lintable() {
             self.doc.as_mut(cx).set_builtin_diagnostics(Vec::new());
             return;
         }
-        let syntax_only = self.external.is_some() && self.external_error.is_none();
         let version = self.doc.read(cx).version();
         if self.linted_version == Some(version) {
             return;
         }
-        let rope = self.doc.read(cx).rope().clone();
-        let language = self.doc.read(cx).language;
+        // Where the built-in lint is only syntax errors and they aren't
+        // wanted, there's nothing to run.
+        if lint::syntax_only(language) && !self.wants_syntax_errors(cx) {
+            self.lint_task = None;
+            self.doc.as_mut(cx).set_builtin_diagnostics(Vec::new());
+            self.linted_version = Some(version);
+            return;
+        }
+        let syntax_only = self.external.is_some() && self.external_error.is_none();
         let path = self.doc.read(cx).path.clone();
         self.lint_task = Some(cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
             }
+            // The text as it is after the pause, with its syntax tree (the
+            // document's: parsed already, it's no work to read).
+            let Ok((version, rope, tree)) = this.update(cx, |editor, cx| {
+                let doc = editor.doc.read(cx);
+                (doc.version(), doc.rope().clone(), lint::syntax_only(language).then(|| doc.tree_job()))
+            }) else {
+                return;
+            };
             let diagnostics = cx
                 .background_executor()
-                .spawn(async move { lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only) })
+                .spawn(async move {
+                    match tree {
+                        Some(tree) => tree().map_or_else(Vec::new, |tree| lint::syntax_errors(&tree, &rope)),
+                        None => lint::lint(language, &rope.to_string(), path.as_deref(), syntax_only),
+                    }
+                })
                 .await;
             this.update(cx, |editor, cx| {
                 if editor.doc.read(cx).version() == version {
                     let mut diagnostics = diagnostics;
-                    // A language server reports syntax errors itself. Asked
-                    // of the document's servers, not this editor: a split
-                    // showing the file never gets the diagnostics itself.
-                    // `syntax_errors: false` (extension languages' default)
-                    // drops them too.
-                    if editor.lsp.active || !editor.lsp_servers(cx).is_empty() || !editor.file_settings.syntax_errors {
+                    if !editor.wants_syntax_errors(cx) {
                         diagnostics.retain(|d| d.rule != "syntax");
                     }
                     editor.doc.as_mut(cx).set_builtin_diagnostics(diagnostics);
@@ -1280,6 +1406,14 @@ impl Editor {
             })
             .ok();
         }));
+    }
+
+    /// Whether the built-in lint reports syntax errors: not where a
+    /// language server does (asked of the document's servers, not this
+    /// editor: a split showing the file never gets the diagnostics itself),
+    /// nor with `syntax_errors: false` (extension languages' default).
+    fn wants_syntax_errors(&self, cx: &App) -> bool {
+        !self.lsp.active && self.lsp_servers(cx).is_empty() && self.file_settings.syntax_errors
     }
 
     /// Blinks the caret while the editor has the keyboard in the active
@@ -4555,7 +4689,9 @@ impl Editor {
         cx.refresh_windows();
     }
 
-    /// Fetches blame for the cursor line after it settles for a moment.
+    /// Shows blame for the caret's line, from the whole file's blame: read
+    /// once per file and HEAD in the background (`blame_file`), its rows
+    /// followed through edits since.
     fn request_blame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let enabled = cx.try_global::<InlineBlame>().is_none_or(|b| b.0);
         let Some(git_file) = self.git_file.clone().filter(|_| enabled) else {
@@ -4564,27 +4700,55 @@ impl Editor {
         if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || !self.has_diff_base {
             return;
         }
-        let row = self.doc.read(cx).row_of(self.primary_selection().head);
-        let version = self.doc.read(cx).version();
+        let doc = self.doc.read(cx);
+        let (row, version, id) = (doc.row_of(self.primary_selection().head), doc.version(), doc.id());
         if self.blame_request == Some((row, version)) {
             return;
         }
         self.blame_request = Some((row, version));
-        let rope = self.doc.read(cx).rope().clone();
-        self.blame_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(350)).await;
-            let blame = cx
+        match self.file_blame.as_ref().filter(|b| b.git_file == git_file && b.doc == id).and_then(|b| b.line(row, doc)) {
+            Some(line) => self.blame = line.map(|line| (row, version, line)),
+            None => {
+                self.blame = None;
+                self.blame_file(git_file, cx);
+            }
+        }
+    }
+
+    /// Reads the whole file's blame (as it is now, unsaved edits too) in
+    /// the background, unless that's under way; one for another file, HEAD
+    /// or document stops (git is killed).
+    fn blame_file(&mut self, git_file: GitFile, cx: &mut Context<Self>) {
+        let doc = self.doc.read(cx);
+        let key = (git_file.clone(), doc.id());
+        if self.blame_task.as_ref().is_some_and(|(running, ..)| *running == key) {
+            return;
+        }
+        let (id, version, text) = (doc.id(), doc.version(), doc.rope().clone());
+        let git = git::KillOnDrop::default();
+        let stop = git.token();
+        let task = cx.spawn(async move |this, cx| {
+            let (root, rel, contents) = (git_file.root.clone(), git_file.rel.clone(), text.clone());
+            let lines = cx
                 .background_executor()
-                .spawn(async move { git::blame_line(&git_file.root, &git_file.rel, row, &rope.to_string()) })
+                .spawn(async move { git::blame_file(&root, &rel, contents.to_string().as_bytes(), &stop) })
                 .await;
             this.update(cx, |editor, cx| {
-                if editor.blame_request == Some((row, version)) {
-                    editor.blame = blame.map(|b| (row, version, b));
-                    cx.notify();
+                // This task is running; let it finish instead of dropping it.
+                if let Some((_, task, _)) = editor.blame_task.take() {
+                    task.detach();
                 }
+                // Failed (not committed yet, say): nothing to show, and
+                // nothing asked again until HEAD moves.
+                let lines = lines.unwrap_or_default();
+                editor.file_blame = Some(Blame { git_file, doc: id, version, text, lines });
+                // Shown for the caret's line on the next frame.
+                editor.blame_request = None;
+                cx.notify();
             })
             .ok();
-        }));
+        });
+        self.blame_task = Some((key, task, git));
     }
 
     fn render_hunk_popover(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -5479,6 +5643,131 @@ impl Element for EditorElement {
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);
         }
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Save writes in the background: the tab is unsaved until the file has
+    /// the text, the save goes on if nothing waits for it, and a save made
+    /// here and now (closing) overtakes one still being written.
+    #[gpui::test]
+    fn saves_in_the_background(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("kuana-editor-saves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let editor = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "zero ".into())], cx));
+        let saving = editor.update(cx, |e, cx| e.save_in_background(cx));
+        editor.read_with(cx, |e, cx| assert!(e.doc.read(cx).is_dirty() && e.doc.read(cx).is_being_saved()));
+        cx.run_until_parked();
+        assert!(futures::FutureExt::now_or_never(saving).is_some_and(|saved| saved.is_ok()));
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).is_being_saved()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "zero one\n");
+
+        // Nothing waits for it: written all the same.
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "a ".into())], cx));
+        drop(editor.update(cx, |e, cx| e.save_in_background(cx)));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a zero one\n");
+
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "b ".into())], cx));
+        drop(editor.update(cx, |e, cx| e.save_in_background(cx)));
+        editor.update(cx, |e, cx| e.save(cx)).unwrap();
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty()));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b a zero one\n");
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).changed_on_disk()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::*;
+
+    /// A row is followed back to the blamed text through the edits since:
+    /// lines above and below keep their commit, a line edited isn't
+    /// committed until its text is the same again, and a line break added
+    /// at either end of a line leaves the line its commit.
+    #[test]
+    fn blamed_rows_follow_edits() {
+        let mut doc = Document::from_text("a\nb\nc\n".into(), None);
+        let commit = |summary: &str| BlameLine { author: "A".into(), time: 0, summary: summary.into(), sha: summary.into(), uncommitted: false };
+        let git_file = GitFile { root: "/r".into(), rel: "f".into(), user_name: None, head: None };
+        let lines = git::FileBlame::of(vec![commit("a"), commit("b"), commit("c")], vec![0, 1, 2]);
+        let blame = Blame { git_file, doc: doc.id(), version: doc.version(), text: doc.rope().clone(), lines };
+        let shown = |doc: &Document| -> Vec<String> {
+            (0..doc.line_count() - 1)
+                .map(|row| match blame.line(row, doc).expect("followed") {
+                    Some(line) if line.uncommitted => "new".to_string(),
+                    Some(line) => line.summary,
+                    None => "-".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(shown(&doc), ["a", "b", "c"]);
+        doc.edit(vec![(1..1, "x".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["new", "b", "c"]);
+        doc.undo();
+        assert_eq!(shown(&doc), ["a", "b", "c"]);
+        // Enter at the end of `a`, then at the start of `c`.
+        doc.edit(vec![(1..1, "\n".into())], &[], EditKind::Other);
+        let c = doc.line_start(3);
+        doc.edit(vec![(c..c, "\n".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["a", "new", "b", "new", "c"]);
+        // Lines added above move the rest down.
+        doc.edit(vec![(0..0, "x\ny\n".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["new", "new", "a", "new", "b", "new", "c"]);
+
+        // A last line without a line break keeps its commit when it gets one.
+        let mut doc = Document::from_text("a\nb".into(), None);
+        let lines = git::FileBlame::of(vec![commit("a"), commit("b")], vec![0, 1]);
+        let blame = Blame { git_file: blame.git_file.clone(), doc: doc.id(), version: doc.version(), text: doc.rope().clone(), lines };
+        doc.edit(vec![(3..3, "\n".into())], &[], EditKind::Other);
+        let summary = |row| blame.line(row, &doc).flatten().map(|l| if l.uncommitted { "new".to_string() } else { l.summary });
+        assert_eq!((summary(0), summary(1)), (Some("a".into()), Some("b".into())));
+    }
+}
+
+#[cfg(test)]
+mod lint_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Syntax errors come from the document's tree, and where a language
+    /// server reports them (or they're turned off) nothing runs at all.
+    #[gpui::test]
+    fn syntax_errors_unless_a_server_reports_them(cx: &mut TestAppContext) {
+        let doc = Document::from_text("fn main() {\n    let x = ;\n}\n".into(), Some("a.rs".into()));
+        let editor = cx.new(|cx| Editor::new(doc, cx));
+        cx.run_until_parked();
+        let syntax_errors = |editor: &Entity<Editor>, cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().filter(|d| d.rule == "syntax").count())
+        };
+        assert_eq!(syntax_errors(&editor, cx), 1);
+        editor.update(cx, |e, cx| {
+            e.lsp.active = true;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+            assert!(e.lint_task.is_none(), "nothing to run");
+        });
+        assert_eq!(syntax_errors(&editor, cx), 0);
+        editor.update(cx, |e, cx| {
+            e.lsp.active = false;
+            e.file_settings.syntax_errors = false;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+            assert!(e.lint_task.is_none());
+            e.file_settings.syntax_errors = true;
+            e.replace_ranges(vec![(0..0, " ".into())], cx);
+        });
+        // After the pause after typing.
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(syntax_errors(&editor, cx), 1);
     }
 }
 

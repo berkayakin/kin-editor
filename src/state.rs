@@ -4,7 +4,8 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, LazyLock, Mutex, PoisonError},
+    time::Duration,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
@@ -166,10 +167,6 @@ pub struct WindowPlacement {
 }
 
 impl SessionState {
-    fn path() -> Option<PathBuf> {
-        config_dir().map(|d| d.join("state.json"))
-    }
-
     /// Whether Welcome Setup should show: until it's been finished once, on
     /// any platform and whatever else is in the config folder.
     pub fn needs_onboarding() -> bool {
@@ -177,28 +174,137 @@ impl SessionState {
     }
 
     pub fn set_onboarded() {
-        let mut state = Self::load();
-        state.welcome_done = Some(true);
-        if let Err(err) = state.save() {
+        if let Err(err) = Self::change(|state| state.welcome_done = Some(true)) {
             eprintln!("couldn't save window state: {err}");
         }
     }
 
-    /// The saved state; a value that doesn't read costs only its key, and a
-    /// file that isn't JSON at all is kept aside (and reported) rather than
-    /// overwritten with defaults.
+    /// The saved state, with the changes not written yet (`change_soon`); a
+    /// value that doesn't read costs only its key, and a file that isn't
+    /// JSON at all is kept aside (and reported) rather than overwritten
+    /// with defaults.
     pub fn load() -> Self {
-        let Some(path) = Self::path() else { return Self::default() };
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
+        STATE.load()
+    }
+
+    /// Reads the file, makes `change` (after the changes waiting) and writes
+    /// it, here and now.
+    pub fn change(change: impl FnOnce(&mut Self)) -> std::io::Result<()> {
+        STATE.change(change)
+    }
+
+    /// Makes `change` at once for whoever loads the state and writes it with
+    /// the next write (`write_soon`, or quitting): panel toggles and resizes
+    /// don't wait for the disk. It replaces the change waiting for the same
+    /// `what` and `owner` (a window), so it must set values, not step them.
+    pub fn change_soon(what: &'static str, owner: u64, change: impl Fn(&mut Self) + Send + Sync + 'static) {
+        STATE.change_soon((what, owner), change);
+    }
+
+    /// Writes the changes waiting, here and now (quitting); a write under
+    /// way finishes first.
+    pub fn write_pending() -> std::io::Result<()> {
+        STATE.write_pending()
+    }
+}
+
+/// How long changes wait (`SessionState::change_soon`) before they're
+/// written, so a burst (panels toggled, a window dragged) is one write.
+const WRITE_DELAY: Duration = Duration::from_millis(500);
+
+/// Writes the changes waiting a moment from now, in the background (with
+/// `write_atomic`'s flush to disk). Keep the task to put the write off again
+/// with the next change, or detach it.
+pub fn write_soon(cx: &gpui::App) -> gpui::Task<()> {
+    let executor = cx.background_executor().clone();
+    cx.background_executor().spawn(async move {
+        executor.timer(WRITE_DELAY).await;
+        if let Err(err) = SessionState::write_pending() {
+            eprintln!("couldn't save window state: {err}");
+        }
+    })
+}
+
+/// Writes the changes still waiting when Kuana quits.
+pub fn init(cx: &mut gpui::App) {
+    cx.on_app_quit(|_| {
+        if let Err(err) = SessionState::write_pending() {
+            eprintln!("couldn't save window state: {err}");
+        }
+        async {}
+    })
+    .detach();
+}
+
+/// A change to `state.json` waiting to be written.
+type StateChange = Arc<dyn Fn(&mut SessionState) + Send + Sync>;
+
+static STATE: LazyLock<StateFile> = LazyLock::new(|| StateFile::at(config_dir().map(|d| d.join("state.json"))));
+
+/// `state.json`, changed from any window or thread. Every write reads the
+/// file, makes the changes waiting and its own, and writes it, all while
+/// holding `writing`, so writers never drop each other's changes; reads see
+/// the changes waiting too.
+struct StateFile {
+    path: Option<PathBuf>,
+    /// The changes waiting, by what and whose, in the order they were made.
+    pending: Mutex<Vec<((&'static str, u64), StateChange)>>,
+    writing: Mutex<()>,
+}
+
+impl StateFile {
+    fn at(path: Option<PathBuf>) -> Self {
+        Self { path, pending: Mutex::new(Vec::new()), writing: Mutex::new(()) }
+    }
+
+    fn read(&self) -> SessionState {
+        let Some(path) = &self.path else { return SessionState::default() };
+        let Ok(text) = std::fs::read_to_string(path) else { return SessionState::default() };
         read_lenient(&text).unwrap_or_else(|err| {
-            set_aside(&path, "Kuana's window state (state.json)", err);
-            Self::default()
+            set_aside(path, "Kuana's window state (state.json)", err);
+            SessionState::default()
         })
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path().ok_or_else(|| std::io::Error::other("no config directory"))?;
-        write_atomic(&path, (serde_json::to_string_pretty(self)? + "\n").as_bytes())
+    fn waiting(&self) -> Vec<StateChange> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).iter().map(|(_, change)| change.clone()).collect()
+    }
+
+    fn load(&self) -> SessionState {
+        let mut state = self.read();
+        for change in self.waiting() {
+            change(&mut state);
+        }
+        state
+    }
+
+    fn change(&self, change: impl FnOnce(&mut SessionState)) -> std::io::Result<()> {
+        let path = self.path.as_ref().ok_or_else(|| std::io::Error::other("no config directory"))?;
+        let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+        let waiting = self.waiting();
+        let mut state = self.read();
+        for change in &waiting {
+            change(&mut state);
+        }
+        change(&mut state);
+        write_atomic(path, (serde_json::to_string_pretty(&state)? + "\n").as_bytes())?;
+        // Written; a change made meanwhile stays for the next write.
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).retain(|(_, change)| !waiting.iter().any(|w| Arc::ptr_eq(w, change)));
+        Ok(())
+    }
+
+    fn change_soon(&self, key: (&'static str, u64), change: impl Fn(&mut SessionState) + Send + Sync + 'static) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        pending.retain(|(k, _)| *k != key);
+        pending.push((key, Arc::new(change)));
+    }
+
+    fn write_pending(&self) -> std::io::Result<()> {
+        if self.pending.lock().unwrap_or_else(PoisonError::into_inner).is_empty() {
+            drop(self.writing.lock().unwrap_or_else(PoisonError::into_inner));
+            return Ok(());
+        }
+        self.change(|_| {})
     }
 }
 
@@ -508,6 +614,54 @@ mod tests {
         // State with one bad value keeps the rest.
         let state: SessionState = read_lenient(r#"{ "sidebar_width": "wide", "welcome_done": true }"#).unwrap();
         assert_eq!((state.sidebar_width, state.welcome_done), (None, Some(true)));
+    }
+
+    /// Changes made to be written later are seen by every read at once,
+    /// written together, and kept by writes made meanwhile; writers on
+    /// several threads don't drop each other's changes.
+    #[test]
+    fn changes_wait_to_be_written_and_writers_keep_each_others() {
+        let dir = std::env::temp_dir().join(format!("kuana-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = Arc::new(StateFile::at(Some(dir.join("state.json"))));
+        let on_disk = || serde_json::from_str::<SessionState>(&std::fs::read_to_string(dir.join("state.json")).unwrap_or_default()).unwrap_or_default();
+        file.change_soon(("layout", 1), |s| s.sidebar_width = Some(200.));
+        file.change_soon(("layout", 2), |s| s.problems_height = Some(100.));
+        // The later change of the same window replaces its earlier one.
+        file.change_soon(("layout", 1), |s| s.sidebar_width = Some(300.));
+        assert_eq!((file.load().sidebar_width, file.load().problems_height), (Some(300.), Some(100.)));
+        assert_eq!(on_disk(), SessionState::default(), "nothing written yet");
+        // A write made now writes what waits too, and nothing waits after.
+        file.change(|s| s.recent_projects = vec!["/p".into()]).unwrap();
+        assert_eq!((on_disk().sidebar_width, on_disk().problems_height, on_disk().recent_projects.len()), (Some(300.), Some(100.), 1));
+        assert!(file.pending.lock().unwrap().is_empty());
+        file.change_soon(("window", 0), |s| s.welcome_done = Some(true));
+        file.write_pending().unwrap();
+        assert_eq!((on_disk().welcome_done, on_disk().sidebar_width), (Some(true), Some(300.)));
+        file.write_pending().unwrap();
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let project = PathBuf::from(format!("/{i}/{j}"));
+                        if j % 2 == 0 {
+                            file.change(|s| s.recent_projects.push(project)).unwrap();
+                        } else {
+                            file.change_soon(("t", i * 100 + j), move |s| s.trusted_folders.push(project.clone()));
+                            file.write_pending().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let state = on_disk();
+        assert_eq!((state.recent_projects.len(), state.trusted_folders.len()), (1 + 40, 40));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

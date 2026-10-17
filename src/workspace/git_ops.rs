@@ -189,6 +189,7 @@ impl Workspace {
             return;
         }
         let user = self.git_user.clone();
+        let head = self.git_status.head_oid.clone();
         cx.spawn(async move |_, cx| {
             let specs: Vec<String> = wanted.iter().flat_map(|(_, rel, _)| [format!("HEAD:{rel}"), format!(":{rel}")]).collect();
             let repo2 = repo.clone();
@@ -197,7 +198,7 @@ impl Workspace {
             for (diff, rel, encoding) in wanted {
                 let text = |bytes: Option<Option<Vec<u8>>>| bytes.flatten().map(|b| git::BlobText::new(&b, Some(encoding)).text);
                 let (base, index) = (text(blobs.next()), text(blobs.next()));
-                let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone() };
+                let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone(), head: head.clone() };
                 diff.update(cx, |d, cx| d.set_base(Some(git_file), base, index, cx)).ok();
             }
         })
@@ -782,9 +783,9 @@ impl Workspace {
             }
             DiffViewEvent::Layout { side_by_side } => {
                 // App-wide, like the font zoom.
-                let mut state = SessionState::load();
-                state.diff_side_by_side = Some(*side_by_side);
-                state.save().ok();
+                let side_by_side = *side_by_side;
+                SessionState::change_soon("diff_side_by_side", 0, move |state| state.diff_side_by_side = Some(side_by_side));
+                ws.state_task = Some(crate::state::write_soon(cx));
             }
         });
         self.modals.open(Modal::Diff(view), subscription);
@@ -798,7 +799,7 @@ impl Workspace {
         if had_terminal && self.shows(BottomPanel::Problems) {
             self.focus_active(window, cx);
         }
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 }

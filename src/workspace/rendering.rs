@@ -242,7 +242,7 @@ impl Workspace {
             self.clear_drag_state(cx);
         }
         if self.resizing.take().is_some() {
-            self.save_state();
+            self.save_state(cx);
             self.schedule_session_save(cx);
             cx.notify();
         }

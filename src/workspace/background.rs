@@ -52,7 +52,7 @@ impl Workspace {
             });
         }
         if self.auto_save != AutoSave::Off {
-            self.save_background(true, cx);
+            self.save_background(true, false, cx);
         }
         let names: Vec<String> = docs.iter().map(|d| d.read(cx).file_name()).collect();
         let unsaved = docs.iter().filter(|d| d.read(cx).is_dirty()).count();
@@ -69,16 +69,44 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Saves the documents edited without a tab. `auto`: for auto-save,
-    /// which leaves files changed on disk meanwhile alone (Save All doesn't).
-    pub(super) fn save_background(&mut self, auto: bool, cx: &mut Context<Self>) {
-        let (mut failed, mut saved) = (Vec::new(), Vec::new());
+    /// Saves the documents edited without a tab: in the background, or here
+    /// and now (`now`: closing). `auto`: for auto-save, which leaves files
+    /// changed on disk meanwhile alone (Save All doesn't).
+    pub(super) fn save_background(&mut self, auto: bool, now: bool, cx: &mut Context<Self>) {
+        let mut jobs = Vec::new();
+        let mut failed = Vec::new();
         for doc in self.documents.read(cx).kept(cx) {
             if auto && doc.read(cx).changed_on_disk() {
                 continue;
             }
+            match doc.update(cx, |d, _| d.save_job()) {
+                Ok(job) => jobs.push((doc.downgrade(), job)),
+                Err(err) => failed.push(format!("{}: {err}", doc.read(cx).file_name())),
+            }
+        }
+        if now {
+            let written = jobs.into_iter().map(|(doc, job)| (doc, job.write())).collect();
+            self.background_saved(written, failed, cx);
+            return;
+        }
+        let writes: Vec<_> = jobs.into_iter().map(|(doc, job)| (doc, cx.background_executor().spawn(async move { job.write() }))).collect();
+        cx.spawn(async move |ws, cx| {
+            let mut written = Vec::with_capacity(writes.len());
+            for (doc, write) in writes {
+                written.push((doc, write.await));
+            }
+            ws.update(cx, |ws, cx| ws.background_saved(written, failed, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Takes in the saves of documents edited without a tab.
+    fn background_saved(&mut self, written: Vec<(gpui::WeakEntity<Document>, crate::document::Written)>, mut failed: Vec<String>, cx: &mut Context<Self>) {
+        let mut saved = Vec::new();
+        for (doc, written) in written {
+            let Some(doc) = doc.upgrade() else { continue };
             match doc.update(cx, |d, cx| {
-                let saved = d.save();
+                let saved = d.saved(written);
                 // The store lets go of it once it's saved.
                 cx.notify();
                 saved

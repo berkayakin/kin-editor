@@ -147,6 +147,38 @@ pub fn encode(text: &str, encoding: TextEncoding) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Writes text, given in pieces, to `path` in `encoding`: UTF-8 and UTF-16
+/// piece by piece as they come, since they can hold any text; other
+/// encodings encoded whole first, so a character one lacks fails the save
+/// before the file is touched (see `encode`).
+pub fn write_file<'a>(path: &std::path::Path, text: impl Iterator<Item = &'a str>, encoding: TextEncoding) -> std::io::Result<()> {
+    use std::io::Write;
+    if encoding.encoding != UTF_8 && !encoding.is_utf16() {
+        let text: String = text.collect();
+        return std::fs::write(path, encode(&text, encoding).map_err(std::io::Error::other)?);
+    }
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    if encoding.is_utf16() {
+        let big = encoding.encoding == UTF_16BE;
+        out.write_all(if big { &[0xFE, 0xFF] } else { &[0xFF, 0xFE] })?;
+        let mut units = Vec::new();
+        for piece in text {
+            units.clear();
+            units.extend(piece.encode_utf16().flat_map(|unit| if big { unit.to_be_bytes() } else { unit.to_le_bytes() }));
+            out.write_all(&units)?;
+        }
+    } else {
+        if encoding.bom {
+            out.write_all(&[0xEF, 0xBB, 0xBF])?;
+        }
+        for piece in text {
+            out.write_all(piece.as_bytes())?;
+        }
+    }
+    out.into_inner().map_err(std::io::IntoInnerError::into_error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

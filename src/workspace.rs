@@ -759,8 +759,14 @@ pub struct Workspace {
     close_confirmed: bool,
     /// Debounced write of the project session (see `save_session`).
     session_task: Option<Task<()>>,
-    /// Debounced write of the window's place on screen.
-    placement_task: Option<Task<()>>,
+    /// Each tab's real path (symlinks resolved), with the path it's for:
+    /// worked out once, not per lookup (`tab_for`).
+    real_paths: std::cell::RefCell<HashMap<EntityId, (PathBuf, Option<PathBuf>)>>,
+    /// Usages being listed, while the files they're in are read.
+    locations_task: Option<Task<()>>,
+    /// Debounced write of `state.json` (layout, the window's place on
+    /// screen: see `save_state`).
+    state_task: Option<Task<()>>,
     /// Watches the project folder; `watch_task` applies what it reports.
     watcher: Option<Watcher>,
     watch_task: Option<Task<()>>,
@@ -861,7 +867,7 @@ impl Workspace {
             TerminalPanelEvent::Hide => {
                 ws.hide_bottom(BottomPanel::Terminal);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.save_state(cx);
                 ws.schedule_session_save(cx);
                 cx.notify();
             }
@@ -879,7 +885,7 @@ impl Workspace {
             GitLogEvent::Close => {
                 ws.hide_bottom(BottomPanel::GitLog);
                 ws.focus_active(window, cx);
-                ws.save_state();
+                ws.save_state(cx);
                 cx.notify();
             }
         });
@@ -897,14 +903,14 @@ impl Workspace {
                 ws.recent_projects = SessionState::load().recent_projects;
                 cx.notify();
             } else if ws.auto_save != AutoSave::Off {
-                ws.auto_save_all(cx);
+                ws.auto_save_all(false, cx);
             }
         });
         // Last chance to write edits when the app quits some other way
         // (Dock menu, logout).
         let quit = cx.on_app_quit(|ws, cx| {
             if ws.auto_save != AutoSave::Off {
-                ws.auto_save_all(cx);
+                ws.auto_save_all(true, cx);
             }
             if let Err(err) = ws.save_session(cx) {
                 eprintln!("couldn't save the session: {err}");
@@ -1086,7 +1092,9 @@ impl Workspace {
             auto_save_warned: HashSet::new(),
             close_confirmed: false,
             session_task: None,
-            placement_task: None,
+            real_paths: Default::default(),
+            locations_task: None,
+            state_task: None,
             onboarding: None,
             trust_waits: false,
             watcher: None,

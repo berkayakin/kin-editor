@@ -24,18 +24,39 @@ impl Workspace {
         self.auto_save_tasks.insert(editor.entity_id(), task);
     }
 
-    /// Writes a tab's edits to disk if it has a file and unsaved changes.
-    /// Files changed or deleted by another program are left alone (and
-    /// reported once) so auto-save never clobbers them. Returns whether the
-    /// tab is saved afterwards.
-    pub(super) fn auto_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
+    /// Writes a tab's edits to disk, in the background, if it has a file
+    /// and unsaved changes (see `may_auto_save`).
+    pub(super) fn auto_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        if !self.may_auto_save(editor, cx) {
+            return;
+        }
+        let (id, path) = (editor.entity_id(), editor.read(cx).doc.read(cx).path.clone());
+        let saving = editor.update(cx, |e, cx| e.save_in_background(cx));
+        cx.spawn(async move |ws, cx| {
+            let saved = saving.await;
+            ws.update(cx, |ws, cx| ws.auto_saved(id, path, saved, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The same here and now (closing: what's still unsaved afterwards
+    /// decides what to ask).
+    pub(super) fn auto_save_now(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        if self.may_auto_save(editor, cx) {
+            let path = editor.read(cx).doc.read(cx).path.clone();
+            let saved = editor.update(cx, |e, cx| e.save(cx));
+            self.auto_saved(editor.entity_id(), path, saved, cx);
+        }
+    }
+
+    /// Whether auto-save writes a tab: unsaved, with a file. Files changed
+    /// or deleted by another program are left alone (and reported once) so
+    /// auto-save never clobbers them.
+    fn may_auto_save(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) -> bool {
         let id = editor.entity_id();
         self.auto_save_tasks.remove(&id);
         let doc = editor.read(cx).doc.read(cx);
-        if !doc.is_dirty() {
-            return true;
-        }
-        if doc.path.is_none() {
+        if !doc.is_dirty() || doc.path.is_none() {
             return false;
         }
         if doc.changed_on_disk() {
@@ -50,32 +71,48 @@ impl Workspace {
             }
             return false;
         }
-        match editor.update(cx, |e, cx| e.save(cx)) {
+        true
+    }
+
+    /// Tab `id` was auto-saved to `path` (or not: reported once).
+    fn auto_saved(&mut self, id: EntityId, path: Option<PathBuf>, saved: std::io::Result<()>, cx: &mut Context<Self>) {
+        match saved {
             Ok(()) => {
                 self.auto_save_warned.remove(&id);
-                let saved = editor.read(cx).doc.read(cx).path.clone();
-                self.files_written(saved, cx);
+                self.files_written(path, cx);
                 self.check_config(cx);
                 // The session may hold the text as unsaved.
                 self.schedule_session_save(cx);
-                true
             }
             Err(err) => {
-                let name = editor.read(cx).doc.read(cx).file_name();
+                let name = path.as_deref().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if self.auto_save_warned.insert(id) {
                     self.toast(ToastKind::Error, format!("Couldn't auto-save {name}"), Some(err.to_string()), cx);
                 }
-                false
             }
         }
     }
 
-    pub(super) fn auto_save_all(&mut self, cx: &mut Context<Self>) {
+    /// Auto-saves every tab and the documents edited without one: in the
+    /// background, or here and now (`now`: closing, quitting).
+    pub(super) fn auto_save_all(&mut self, now: bool, cx: &mut Context<Self>) {
         for editor in self.editors.clone() {
-            self.auto_save(&editor, cx);
+            if now {
+                self.auto_save_now(&editor, cx);
+            } else {
+                self.auto_save(&editor, cx);
+            }
         }
         if !self.documents.read(cx).kept(cx).is_empty() {
-            self.save_background(true, cx);
+            self.save_background(true, now, cx);
+        }
+    }
+
+    /// A save of the text as it is that's still being written finishes
+    /// here (written again, now), so closing doesn't ask about it.
+    pub(super) fn finish_saving(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        if editor.read(cx).doc.read(cx).is_being_saved() {
+            editor.update(cx, |e, cx| e.save(cx)).ok();
         }
     }
 
@@ -89,7 +126,7 @@ impl Workspace {
             self.auto_save_tasks.clear();
             self.toast(ToastKind::Success, "Auto-save off", None, cx);
         } else {
-            self.auto_save_all(cx);
+            self.auto_save_all(false, cx);
             self.toast(ToastKind::Success, "Auto-save on", None, cx);
         }
     }
@@ -165,7 +202,10 @@ impl Workspace {
     /// couldn't be saved, or any edits with auto-save off.
     pub(super) fn prepare_to_close(&mut self, intent: CloseIntent, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.auto_save != AutoSave::Off {
-            self.auto_save_all(cx);
+            self.auto_save_all(true, cx);
+        }
+        for editor in self.editors.clone() {
+            self.finish_saving(&editor, cx);
         }
         // A project keeps unsaved edits in its session and brings them back
         // next time ("hot exit"), so there's nothing to ask.
@@ -206,7 +246,7 @@ impl Workspace {
             let Ok(answer) = rx.await else { return };
             this.update_in(cx, |ws, window, cx| match answer {
                 0 => {
-                    ws.save_background(false, cx);
+                    ws.save_background(false, true, cx);
                     for editor in ws.editors.clone() {
                         if editor.read(cx).doc.read(cx).is_dirty()
                             && editor.read(cx).doc.read(cx).path.is_some()
@@ -332,8 +372,9 @@ impl Workspace {
     pub(super) fn close_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let editor = editor.clone();
         if self.auto_save != AutoSave::Off {
-            self.auto_save(&editor, cx);
+            self.auto_save_now(&editor, cx);
         }
+        self.finish_saving(&editor, cx);
         // Another tab still shows the document: nothing is lost.
         if editor.read(cx).doc.read(cx).is_dirty() && self.siblings(&editor, cx).is_empty() {
             let name = editor.read(cx).doc.read(cx).file_name();

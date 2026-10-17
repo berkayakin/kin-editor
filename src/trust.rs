@@ -108,10 +108,8 @@ fn save(folders: &[PathBuf]) -> std::io::Result<()> {
     let path = file_path().ok_or_else(|| std::io::Error::other("no config directory"))?;
     let json = serde_json::to_string_pretty(&TrustFile { folders: folders.to_vec() })? + "\n";
     crate::state::write_atomic(&path, json.as_bytes())?;
-    let mut state = SessionState::load();
-    if !state.trusted_folders.is_empty() {
-        state.trusted_folders.clear();
-        state.save()?;
+    if !SessionState::load().trusted_folders.is_empty() {
+        SessionState::change(|state| state.trusted_folders.clear())?;
     }
     Ok(())
 }

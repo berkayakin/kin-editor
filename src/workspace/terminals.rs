@@ -26,7 +26,7 @@ impl Workspace {
                 self.focus_terminal(window, cx);
             }
         }
-        self.save_state();
+        self.save_state(cx);
         self.schedule_session_save(cx);
         cx.notify();
     }
@@ -40,7 +40,7 @@ impl Workspace {
             self.git_log.update(cx, |l, cx| l.show_path(None, cx));
             self.open_git_log(window, cx);
         }
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -61,7 +61,7 @@ impl Workspace {
     pub(super) fn show_history_of(&mut self, rel: String, window: &mut Window, cx: &mut Context<Self>) {
         self.git_log.update(cx, |l, cx| l.show_path(Some(rel), cx));
         self.open_git_log(window, cx);
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -328,7 +328,7 @@ impl Workspace {
                 if focus {
                     self.focus_terminal(window, cx);
                 }
-                self.save_state();
+                self.save_state(cx);
                 self.schedule_session_save(cx);
             }
             Err(err) => {

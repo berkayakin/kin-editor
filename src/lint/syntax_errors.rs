@@ -1,7 +1,8 @@
 //! Syntax errors for any language with a tree-sitter grammar: reports the
 //! `ERROR` and `MISSING` nodes the parser produced while recovering.
 
-use tree_sitter::{Language, Node};
+use ropey::Rope;
+use tree_sitter::{Node, Tree};
 
 use super::{Diagnostic, Severity};
 
@@ -9,10 +10,8 @@ use super::{Diagnostic, Severity};
 /// the rest are noise.
 const MAX_ERRORS: usize = 100;
 
-pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
-    let Some(tree) = crate::syntax::with_parser(language, |parser| parser.parse(text, None)).flatten() else {
-        return Vec::new();
-    };
+/// The errors in `tree`, the syntax tree of `text`.
+pub fn lint(tree: &Tree, text: &Rope) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let mut cursor = tree.walk();
     loop {
@@ -47,24 +46,24 @@ pub fn lint(language: &Language, text: &str) -> Vec<Diagnostic> {
     out
 }
 
-fn unexpected(node: Node, text: &str) -> Diagnostic {
+fn unexpected(node: Node, text: &Rope) -> Diagnostic {
     let range = node.byte_range();
     // An error node can swallow many lines; underline only its first one.
-    let line_end = text[range.start..range.end]
-        .find('\n')
-        .map_or(range.end, |i| range.start + i);
+    let line = text.byte_to_line(range.start.min(text.len_bytes()));
+    let line_end = if line + 1 < text.len_lines() { text.line_to_byte(line + 1) - 1 } else { text.len_bytes() };
     // Name the token only when it is the whole error; in a larger error node
     // the first token is usually valid code the parser gave up on.
     let token = first_token(node)
-        .filter(|t| t.byte_range() == range)
-        .map(|t| text[t.byte_range()].trim())
+        .filter(|t| t.byte_range() == range && range.len() <= 200)
+        .and_then(|t| text.get_byte_slice(t.byte_range()))
+        .map(|t| t.to_string().trim().to_string())
         .filter(|t| !t.is_empty() && t.len() <= 40 && !t.contains('\n'));
     let message = match token {
         Some(token) => format!("Syntax error: unexpected `{token}`"),
         None => "Syntax error".to_string(),
     };
     Diagnostic {
-        range: range.start..line_end,
+        range: range.start..range.end.min(line_end).max(range.start),
         severity: Severity::Error,
         message: message.into(),
         rule: "syntax".into(),
@@ -98,10 +97,8 @@ mod tests {
     use crate::syntax::{Language, grammar};
 
     fn errors(language: Language, src: &str) -> Vec<(String, String)> {
-        super::lint(&grammar(language).unwrap(), src)
-            .into_iter()
-            .map(|d| (src[d.range].to_string(), d.message.to_string()))
-            .collect()
+        let tree = crate::syntax::with_parser(&grammar(language).unwrap(), |p| p.parse(src, None)).flatten().unwrap();
+        super::lint(&tree, &ropey::Rope::from_str(src)).into_iter().map(|d| (src[d.range].to_string(), d.message.to_string())).collect()
     }
 
     #[test]
