@@ -217,7 +217,7 @@ impl Workspace {
                     }
                     Some(MenuAction::TerminalTab(action, terminal)) => ws.run_terminal_tab_action(action, terminal, window, cx),
                     Some(MenuAction::OpenFile(path)) => ws.open_path(path, window, cx),
-                    Some(MenuAction::SaveBackground) => ws.save_background(false, cx),
+                    Some(MenuAction::SaveBackground) => ws.save_background(false, false, cx),
                     None => {}
                 }
             }

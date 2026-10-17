@@ -898,14 +898,14 @@ impl Workspace {
                 ws.recent_projects = SessionState::load().recent_projects;
                 cx.notify();
             } else if ws.auto_save != AutoSave::Off {
-                ws.auto_save_all(cx);
+                ws.auto_save_all(false, cx);
             }
         });
         // Last chance to write edits when the app quits some other way
         // (Dock menu, logout).
         let quit = cx.on_app_quit(|ws, cx| {
             if ws.auto_save != AutoSave::Off {
-                ws.auto_save_all(cx);
+                ws.auto_save_all(true, cx);
             }
             if let Err(err) = ws.save_session(cx) {
                 eprintln!("couldn't save the session: {err}");

@@ -5,7 +5,10 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -228,6 +231,12 @@ pub struct Document {
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
+    /// The saves taken (`save_job`) and being written, shared with them.
+    writes: Arc<Writes>,
+    /// The last save taken (its ticket), and the newest taken back in.
+    tickets: (u64, u64),
+    /// What the last save taken writes: the version, encoding and line ends.
+    last_save: Option<(u64, TextEncoding, bool)>,
 }
 
 impl Document {
@@ -356,6 +365,9 @@ impl Document {
             last_lens: 0,
             code_lens_generation: 0,
             disk_mtime: None,
+            writes: Arc::default(),
+            tickets: (0, 0),
+            last_save: None,
         }
     }
 
@@ -434,7 +446,8 @@ impl Document {
     /// read). The lines that changed are one edit, undone like any other,
     /// and the text counts as saved after it. True when the text changed.
     pub fn apply_reload(&mut self, reload: Reload, selections: &[Selection]) -> bool {
-        if (reload.id, reload.version, reload.known) != (self.id, self.version, self.disk_mtime) || self.is_dirty() {
+        // A save being written may be what the reload read, half done.
+        if (reload.id, reload.version, reload.known) != (self.id, self.version, self.disk_mtime) || self.is_dirty() || self.writes.unsettled() {
             return false;
         }
         self.encoding = reload.encoding;
@@ -516,28 +529,66 @@ impl Document {
         self.saved_version = u64::MAX;
     }
 
+    /// Saves here and now.
+    #[cfg(test)]
     pub fn save(&mut self) -> std::io::Result<()> {
-        let path = self
-            .path
-            .clone()
-            .ok_or_else(|| std::io::Error::other("document has no path"))?;
-        let mut text = self.rope.to_string();
-        if self.uses_crlf {
-            text = text.replace('\n', "\r\n");
+        let job = self.save_job()?;
+        self.saved(job.write())
+    }
+
+    /// What a save writes, taken now: the text as it is (a rope clone), to
+    /// write anywhere (`SaveJob::write`, off the UI thread), then take back
+    /// in with `saved`. Until then the document is unsaved, as before.
+    pub fn save_job(&mut self) -> std::io::Result<SaveJob> {
+        let path = self.path.clone().ok_or_else(|| std::io::Error::other("document has no path"))?;
+        self.tickets.0 += 1;
+        self.last_save = Some((self.version, self.encoding, self.uses_crlf));
+        Ok(SaveJob {
+            id: self.id,
+            ticket: self.tickets.0,
+            version: self.version,
+            path,
+            rope: self.rope.clone(),
+            encoding: self.encoding,
+            crlf: self.uses_crlf,
+            settles: Settles::new(&self.writes),
+            in_flight: InFlight::new(),
+        })
+    }
+
+    /// Takes a save's result back in: written, the document counts as saved
+    /// as of the version it wrote (so unsaved again if edited since, or if
+    /// its encoding or line ends changed) and knows the file's new
+    /// modification time. A save that a newer one overtook changes nothing.
+    pub fn saved(&mut self, written: Written) -> std::io::Result<()> {
+        let mtime = match written.outcome {
+            Outcome::Written(mtime) => mtime,
+            Outcome::Overtaken => return Ok(()),
+            Outcome::Failed(err) => return Err(err),
+        };
+        if written.id == self.id && written.ticket > self.tickets.1 {
+            self.tickets.1 = written.ticket;
+            self.disk_mtime = mtime;
+            if (written.encoding, written.crlf) == (self.encoding, self.uses_crlf) {
+                self.saved_version = written.version;
+            }
         }
-        let bytes = encoding::encode(&text, self.encoding).map_err(std::io::Error::other)?;
-        std::fs::write(&path, bytes)?;
-        self.disk_mtime = mtime(&path);
-        self.saved_version = self.version;
         Ok(())
+    }
+
+    /// Whether the text as it is now is being saved (written in the
+    /// background, not taken back in yet): closing waits for it.
+    pub fn is_being_saved(&self) -> bool {
+        self.writes.unsettled() && self.last_save == Some((self.version, self.encoding, self.uses_crlf))
     }
 
     /// Whether the file was modified or removed by another program since it
     /// was last read or written. Auto-save skips such files so it never
-    /// overwrites someone else's changes or recreates a deleted file.
+    /// overwrites someone else's changes or recreates a deleted file. While
+    /// a save is being written, the change is that save.
     pub fn changed_on_disk(&self) -> bool {
         let Some(path) = &self.path else { return false };
-        self.disk_mtime.is_some() && mtime(path) != self.disk_mtime
+        self.disk_mtime.is_some() && !self.writes.unsettled() && mtime(path) != self.disk_mtime
     }
 
     // ---- Coordinate helpers -------------------------------------------------
@@ -1430,6 +1481,133 @@ impl LspChanges {
 
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// What a save writes, taken from a document (`Document::save_job`): its
+/// text then, a rope clone, written anywhere with `write`; the result goes
+/// back to `Document::saved`.
+pub struct SaveJob {
+    id: u64,
+    ticket: u64,
+    version: u64,
+    path: PathBuf,
+    rope: Rope,
+    encoding: TextEncoding,
+    crlf: bool,
+    settles: Settles,
+    in_flight: InFlight,
+}
+
+impl SaveJob {
+    /// Writes the text: line ends turned into CRLF if the file has them and
+    /// encoded chunk by chunk as they're written (see `encoding::write_file`).
+    /// A document's saves write one at a time, and one that a newer save
+    /// overtook writes nothing, so the file ends with the newest text.
+    pub fn write(self) -> Written {
+        let SaveJob { id, ticket, version, path, rope, encoding, crlf, settles, in_flight } = self;
+        let outcome = {
+            let mut newest = settles.0.written.lock().unwrap_or_else(PoisonError::into_inner);
+            if *newest > ticket {
+                Outcome::Overtaken
+            } else {
+                let line_end = if crlf { "\r\n" } else { "\n" };
+                let pieces = rope.chunks().flat_map(|chunk| {
+                    chunk.split_inclusive('\n').flat_map(move |part| match part.strip_suffix('\n') {
+                        Some(line) => [line, line_end],
+                        None => [part, ""],
+                    })
+                });
+                match encoding::write_file(&path, pieces, encoding) {
+                    Ok(()) => {
+                        *newest = ticket;
+                        Outcome::Written(mtime(&path))
+                    }
+                    Err(err) => Outcome::Failed(err),
+                }
+            }
+        };
+        drop(in_flight);
+        Written { id, ticket, version, encoding, crlf, outcome, _settles: settles }
+    }
+}
+
+/// A save written (or not), for `Document::saved`.
+pub struct Written {
+    id: u64,
+    ticket: u64,
+    version: u64,
+    encoding: TextEncoding,
+    crlf: bool,
+    outcome: Outcome,
+    _settles: Settles,
+}
+
+enum Outcome {
+    /// With the file's modification time after it.
+    Written(Option<SystemTime>),
+    /// A newer save was written first.
+    Overtaken,
+    Failed(std::io::Error),
+}
+
+/// A document's saves: written one at a time (holding `written`, the
+/// newest one written), and how many were taken and aren't back in yet.
+#[derive(Default)]
+struct Writes {
+    written: Mutex<u64>,
+    unsettled: AtomicUsize,
+}
+
+impl Writes {
+    fn unsettled(&self) -> bool {
+        self.unsettled.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// Counts a save as unsettled until its result is taken back in, or
+/// dropped on the way.
+struct Settles(Arc<Writes>);
+
+impl Settles {
+    fn new(writes: &Arc<Writes>) -> Self {
+        writes.unsettled.fetch_add(1, Ordering::SeqCst);
+        Self(writes.clone())
+    }
+}
+
+impl Drop for Settles {
+    fn drop(&mut self) {
+        self.0.unsettled.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Saves of any document being written, which quitting waits for.
+static IN_FLIGHT: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Counts a save in `IN_FLIGHT` until it's written, or dropped unwritten.
+struct InFlight;
+
+impl InFlight {
+    fn new() -> Self {
+        *IN_FLIGHT.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        *IN_FLIGHT.0.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        IN_FLIGHT.1.notify_all();
+    }
+}
+
+/// Waits for the saves being written (quitting: a file must not be left
+/// half written).
+pub fn wait_for_saves() {
+    let mut count = IN_FLIGHT.0.lock().unwrap_or_else(PoisonError::into_inner);
+    while *count > 0 {
+        count = IN_FLIGHT.1.wait(count).unwrap_or_else(PoisonError::into_inner);
+    }
 }
 
 /// How long a reload may diff the old text with the new (in the
@@ -2550,6 +2728,69 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert!(doc.changed_on_disk(), "a deleted file counts as changed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A save taken now and written later (the background): the file gets
+    /// the text as it was taken, the document counts as saved as of that
+    /// version once it's taken back in, and its own write isn't a change
+    /// made by another program. A newer save overtakes an older one.
+    #[test]
+    fn saves_written_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("kuana-doc-saves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        doc.edit(vec![(3..3, " two".into())], &[], EditKind::Other);
+        let job = doc.save_job().unwrap();
+        // Typed while it's written: still unsaved after, and the write isn't
+        // taken for another program's.
+        doc.edit(vec![(0..0, "zero ".into())], &[], EditKind::Typing);
+        assert!(doc.is_dirty() && !doc.is_being_saved());
+        let written = std::thread::spawn(move || job.write()).join().unwrap();
+        assert!(!doc.changed_on_disk(), "its own write, not taken in yet");
+        let read = doc.reload_job().unwrap()().unwrap().unwrap();
+        assert!(!doc.apply_reload(read, &[]), "not while a save is being written");
+        doc.saved(written).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one two\n");
+        assert!(doc.is_dirty() && !doc.changed_on_disk());
+        assert!(reload(&mut doc).is_ok_and(|changed| !changed), "the file's time is known");
+
+        // Two saves at once: the newer one's text stays, whichever is written first.
+        let older = doc.save_job().unwrap();
+        doc.edit(vec![(0..0, "<".into())], &[], EditKind::Other);
+        let newer = doc.save_job().unwrap();
+        assert!(doc.is_being_saved());
+        let newer = newer.write();
+        let older = older.write();
+        doc.saved(newer).unwrap();
+        doc.saved(older).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "<zero one two\n");
+        assert!(!doc.is_dirty() && !doc.is_being_saved());
+
+        // Line ends and encoding as the file has them, chunk by chunk; one
+        // changed while a save is written still needs a save.
+        doc.set_crlf(true);
+        doc.convert_to(TextEncoding::from_key("UTF-16LE").unwrap());
+        let job = doc.save_job().unwrap();
+        doc.set_crlf(false);
+        doc.saved(job.write()).unwrap();
+        assert!(doc.is_dirty());
+        let bytes = std::fs::read(&path).unwrap();
+        let units: Vec<u16> = bytes[2..].chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        assert_eq!((&bytes[..2], String::from_utf16(&units).unwrap()), (&[0xFF, 0xFE][..], "<zero one two\r\n".to_string()));
+        let mut big = Document::from_text("line\n".repeat(50_000), Some(dir.join("big.txt")));
+        big.set_crlf(true);
+        big.save().unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("big.txt")).unwrap(), "line\r\n".repeat(50_000));
+        // A character the encoding lacks fails before the file is touched.
+        let mut latin = Document::from_text("ok\n".into(), Some(dir.join("latin.txt")));
+        latin.save().unwrap();
+        latin.convert_to(TextEncoding::from_key("windows-1252").unwrap());
+        latin.edit(vec![(0..0, "🦀".into())], &[], EditKind::Other);
+        assert!(latin.save().is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("latin.txt")).unwrap(), "ok\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

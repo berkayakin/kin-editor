@@ -900,7 +900,7 @@ impl Workspace {
         }
         match button {
             ToastButton::UndoFile(_) => self.step_file_history(false, window, cx),
-            ToastButton::SaveBackground => self.save_background(false, cx),
+            ToastButton::SaveBackground => self.save_background(false, false, cx),
         }
     }
 

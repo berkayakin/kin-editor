@@ -193,20 +193,30 @@ impl Workspace {
         self.save_editor(&editor, window, cx);
     }
 
+    /// Saves a tab, in the background: its text is taken now and written
+    /// off the UI thread (see `Editor::save_in_background`).
     pub(super) fn save_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
-        match editor.update(cx, |e, cx| e.save(cx)) {
-            Ok(()) => {
-                self.auto_save_warned.remove(&editor.entity_id());
-                self.check_config(cx);
-                // The session may hold the text as unsaved.
-                self.schedule_session_save(cx);
-            }
-            Err(err) => {
-                let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
-            }
-        }
-        let saved = editor.read(cx).doc.read(cx).path.clone();
-        self.files_written(saved, cx);
+        let (id, path) = (editor.entity_id(), editor.read(cx).doc.read(cx).path.clone());
+        let saving = editor.update(cx, |e, cx| e.save_in_background(cx));
+        cx.spawn_in(window, async move |ws, cx| {
+            let saved = saving.await;
+            ws.update_in(cx, |ws, window, cx| {
+                match saved {
+                    Ok(()) => {
+                        ws.auto_save_warned.remove(&id);
+                        ws.check_config(cx);
+                        // The session may hold the text as unsaved.
+                        ws.schedule_session_save(cx);
+                    }
+                    Err(err) => {
+                        let _ = window.prompt(PromptLevel::Critical, "Couldn't save file", Some(&err.to_string()), &["OK"], cx);
+                    }
+                }
+                ws.files_written(path, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 

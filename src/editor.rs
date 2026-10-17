@@ -997,17 +997,65 @@ impl Editor {
         }
     }
 
+    /// Saves here and now: closing a tab or window, and runs, decide on
+    /// what's saved afterwards.
     pub fn save(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
+        let job = self.save_job(cx)?;
+        self.doc.as_mut(cx).saved(job.write())?;
+        self.after_save(cx);
+        Ok(())
+    }
+
+    /// Saves in the background (Save, auto-save): the text is taken now,
+    /// written off the UI thread, and once it's written the document counts
+    /// as saved, servers hear of it and linters run. The save goes on if the
+    /// future (its result) is dropped, or the tab closed meanwhile.
+    pub fn save_in_background(&mut self, cx: &mut Context<Self>) -> impl Future<Output = std::io::Result<()>> + use<> {
+        let (done, result) = futures::channel::oneshot::channel();
+        match self.save_job(cx) {
+            Err(err) => drop(done.send(Err(err))),
+            Ok(job) => {
+                let write = cx.background_executor().spawn(async move { job.write() });
+                let doc = self.doc.downgrade();
+                cx.spawn(async move |this, cx| {
+                    let written = write.await;
+                    // The document takes it in even with this tab gone (a split
+                    // or the document store may still show it).
+                    let saved = doc.update(cx, |doc, cx| {
+                        let saved = doc.saved(written);
+                        cx.notify();
+                        saved
+                    });
+                    let saved = saved.unwrap_or(Ok(()));
+                    if saved.is_ok() {
+                        this.update(cx, |editor, cx| editor.after_save(cx)).ok();
+                    }
+                    drop(done.send(saved));
+                })
+                .detach();
+            }
+        }
+        async move { result.await.unwrap_or_else(|_| Err(std::io::Error::other("the save was dropped"))) }
+    }
+
+    /// What a save writes, taken now (after the save actions), and the end
+    /// of the undo step being typed.
+    fn save_job(&mut self, cx: &mut Context<Self>) -> std::io::Result<crate::document::SaveJob> {
         // A restored tab saved before it was shown (Save All).
         self.load(cx)?;
         self.apply_save_actions(cx);
-        self.doc.as_mut(cx).save()?;
-        self.lsp_did_save(cx);
+        let job = self.doc.as_mut(cx).save_job()?;
         self.doc.as_mut(cx).finalize_transaction();
+        Ok(job)
+    }
+
+    /// The file has the text now: servers hear of it, linters that read
+    /// the file run.
+    fn after_save(&mut self, cx: &mut Context<Self>) {
+        self.lsp_did_save(cx);
         self.schedule_lint(Duration::ZERO, cx);
         self.run_external_linter(cx);
         cx.notify();
-        Ok(())
     }
 
     /// Extensions changed: the file may have a language now, or a grammar
@@ -5479,6 +5527,46 @@ impl Element for EditorElement {
         for q in frame.scrollbar.drain(..) {
             window.paint_quad(q);
         }
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// Save writes in the background: the tab is unsaved until the file has
+    /// the text, the save goes on if nothing waits for it, and a save made
+    /// here and now (closing) overtakes one still being written.
+    #[gpui::test]
+    fn saves_in_the_background(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("kuana-editor-saves-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let editor = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "zero ".into())], cx));
+        let saving = editor.update(cx, |e, cx| e.save_in_background(cx));
+        editor.read_with(cx, |e, cx| assert!(e.doc.read(cx).is_dirty() && e.doc.read(cx).is_being_saved()));
+        cx.run_until_parked();
+        assert!(futures::FutureExt::now_or_never(saving).is_some_and(|saved| saved.is_ok()));
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).is_being_saved()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "zero one\n");
+
+        // Nothing waits for it: written all the same.
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "a ".into())], cx));
+        drop(editor.update(cx, |e, cx| e.save_in_background(cx)));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a zero one\n");
+
+        editor.update(cx, |e, cx| e.replace_ranges(vec![(0..0, "b ".into())], cx));
+        drop(editor.update(cx, |e, cx| e.save_in_background(cx)));
+        editor.update(cx, |e, cx| e.save(cx)).unwrap();
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty()));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b a zero one\n");
+        editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).changed_on_disk()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
