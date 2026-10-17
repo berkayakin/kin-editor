@@ -91,7 +91,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   JetBrains). A lone CR (old Mac files) reads as a line end and is saved as the file's line ending,
   as in Zed. Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
   encoding can't hold is never saved in it. Files over 20 MB open as plain text without language
-  features; over 500 MB they don't open
+  features; over 500 MB they don't open. A file that looks binary (a NUL byte near its start, as Git
+  tells) asks first, and opens as text only with Open Anyway
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
   follow changes made outside Kuana (a checkout, a generator, another editor) as they happen. In
   an open file, carets, the view, breakpoints, folds, problems and inlay hints stay with the lines

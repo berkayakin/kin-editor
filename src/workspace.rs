@@ -20,7 +20,7 @@ use gpui::{
 use crate::{
     assets::{self, Icon},
     busy::Busy,
-    document::{Breakpoint, Document},
+    document::{BinaryFile, Breakpoint, Document},
     document_store::{DocumentStore, DocumentStoreEvent},
     branch_picker::{BranchPicker, BranchPickerEvent},
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
@@ -1144,10 +1144,13 @@ impl Workspace {
         let opened = if crate::preview::is_image(&path) {
             std::fs::metadata(&path).map(|_| PaneItem::from(cx.new(|cx| ImageView::new(path.clone(), cx))))
         } else {
-            Document::open(&path).map(|doc| {
-                large = doc.large;
-                PaneItem::from(cx.new(|cx| Editor::new(doc, cx)))
-            })
+            match Document::open(&path) {
+                Err(err) if BinaryFile::is(&err) => return self.ask_to_open_binary(path, window, cx),
+                read => read.map(|doc| {
+                    large = doc.large;
+                    PaneItem::from(cx.new(|cx| Editor::new(doc, cx)))
+                }),
+            }
         };
         match opened {
             Ok(item) => {
@@ -1157,12 +1160,36 @@ impl Workspace {
                 }
                 self.add_tab(item, window, cx);
             }
-            Err(err) => {
-                let message = format!("Couldn't open {}", path.display());
-                let detail = err.to_string();
-                let _ = window.prompt(PromptLevel::Critical, &message, Some(&detail), &["OK"], cx);
-            }
+            Err(err) => Self::cant_open(&path, err, window, cx),
         }
+    }
+
+    fn cant_open(path: &Path, err: std::io::Error, window: &mut Window, cx: &mut Context<Self>) {
+        let message = format!("Couldn't open {}", path.display());
+        let _ = window.prompt(PromptLevel::Critical, &message, Some(&err.to_string()), &["OK"], cx);
+    }
+
+    /// A file that looks binary opens as text only when asked to (Open
+    /// Anyway), as in VS Code.
+    fn ask_to_open_binary(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let message = format!("“{name}” looks like a binary file");
+        let detail = "As text it may not show correctly, and saving it can damage it.";
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Open Anyway", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            this.update_in(cx, |ws, window, cx| match Document::open_anyway(&path) {
+                Ok(doc) => {
+                    let editor = cx.new(|cx| Editor::new(doc, cx));
+                    ws.add_tab(PaneItem::from(editor), window, cx);
+                }
+                Err(err) => Self::cant_open(&path, err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Opens a file at a 1-based line and column (from terminal output).

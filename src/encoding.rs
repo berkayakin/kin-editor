@@ -104,6 +104,13 @@ pub fn decode_as(bytes: &[u8], encoding: TextEncoding) -> String {
     encoding.encoding.decode_without_bom_handling(body).0.into_owned()
 }
 
+/// Whether a file's `bytes` look binary rather than like text: a NUL byte
+/// in the first 8000 (as Git and Find in Files tell), without a byte order
+/// mark (UTF-16 text has NULs all over).
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    Encoding::for_bom(bytes).is_none() && bytes[..bytes.len().min(8000)].contains(&0)
+}
+
 /// Text with LF line ends, as editors hold it: CRLF and a lone CR (old Mac
 /// files, redrawn progress lines) both become LF. Lines then end where
 /// language servers end them too (LSP counts a lone CR as a line end, the
