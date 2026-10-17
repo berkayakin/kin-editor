@@ -332,6 +332,87 @@ pub fn island(theme: &Theme) -> Div {
         .border_1()
         .border_color(island_edge(theme))
         .shadow(soft_shadow(theme, 1))
+        .when(theme.gradients, |el| el.child(edge_sheen(theme)))
+}
+
+/// Light catching islands' edges: a 1px line over the outline that brightens
+/// and fades back, like a glossy rim, on the sides and the bottom (the top is
+/// where the tabs join the island). One light for the window, above and to the
+/// left: a diagonal band from low on the left to high on the right sets where a
+/// side edge shines, so islands side by side shine at different heights; the
+/// farther right, the weaker, and edges facing away from the light (right,
+/// bottom) weaker still. Each sheen's length and shape vary from edge to edge
+/// (`wobble`) as a share of the edge's straight part between the rounded
+/// corners, so it scales with the island and has faded out before its corners.
+/// Two gradient quads per edge (GPUI's gradients have two stops).
+fn edge_sheen(theme: &Theme) -> impl IntoElement {
+    let lit = match theme.appearance {
+        Appearance::Dark => Hsla::from(theme.text).alpha(0.55),
+        Appearance::Light => gpui::white().alpha(0.85),
+    };
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let view = window.viewport_size();
+            let (width, height) = (f32::from(view.width).max(1.), f32::from(view.height));
+            let radius = px(ISLAND_RADIUS);
+            let (top, bottom) = (bounds.top() + radius, bounds.bottom() - radius);
+            let (left, right) = (bounds.left() + radius, bounds.right() - radius);
+            let mut paint = |rise: gpui::Bounds<Pixels>, fall: gpui::Bounds<Pixels>, angle: f32, at: f32, facing: f32| {
+                let color = lit.alpha(lit.a * facing * (1. - 0.4 * (at / width).clamp(0., 1.)));
+                let off = color.alpha(0.);
+                let toward = |from: Hsla, to: Hsla| gpui::linear_gradient(angle, gpui::linear_color_stop(from, 0.), gpui::linear_color_stop(to, 1.));
+                window.paint_quad(gpui::fill(rise, toward(off, color)));
+                window.paint_quad(gpui::fill(fall, toward(color, off)));
+            };
+            if bottom > top {
+                for (x, facing, salt) in [(bounds.left(), 1., 0.), (bounds.right() - px(1.), 0.55, 5.)] {
+                    // Seeded by the edge's place across the window, which a
+                    // change of height leaves alone: a taller island's sheen
+                    // only stretches.
+                    let seed = f32::from(x);
+                    let band = px(height * (0.62 - 0.5 * (seed / width).clamp(0., 1.)));
+                    let along = 0.7 * ((band - top) / (bottom - top)).clamp(0., 1.) + 0.3 * wobble(seed, salt);
+                    let (from, peak, to) = sheen_span(top, bottom, along, seed, salt);
+                    let span = |a: Pixels, b: Pixels| gpui::Bounds::from_corners(gpui::point(x, a), gpui::point(x + px(1.), b));
+                    paint(span(from, peak), span(peak, to), 180., seed, facing);
+                }
+            }
+            if right > left {
+                let y = bounds.bottom() - px(1.);
+                let seed = f32::from(bounds.left());
+                let (from, peak, to) = sheen_span(left, right, 0.1 + 0.6 * wobble(seed, 9.), seed, 9.);
+                let span = |a: Pixels, b: Pixels| gpui::Bounds::from_corners(gpui::point(a, y), gpui::point(b, y + px(1.)));
+                paint(span(from, peak), span(peak, to), 90., f32::from(peak), 0.6);
+            }
+        },
+    )
+    .absolute()
+    // Insets count from inside the border, so -1px covers it.
+    .top(px(-1.))
+    .bottom(px(-1.))
+    .left(px(-1.))
+    .right(px(-1.))
+}
+
+/// Where a sheen lies on an edge's straight part from `start` to `end`: from,
+/// brightest, to. Its length (45–85% of the part) and how soon it peaks vary
+/// with `seed`; `along` (0–1) slides it from one end to the other.
+fn sheen_span(start: Pixels, end: Pixels, along: f32, seed: f32, salt: f32) -> (Pixels, Pixels, Pixels) {
+    let length = end - start;
+    let size = length * (0.45 + 0.4 * wobble(seed, salt + 1.));
+    // Rising quicker than it falls, as a reflection does under a light above.
+    let rise = size * (0.28 + 0.22 * wobble(seed, salt + 2.));
+    let from = start + (length - size) * along.clamp(0., 1.);
+    (from, from + rise, from + size)
+}
+
+/// A smooth stand-in for randomness, 0–1: varies over a few hundred pixels of
+/// `seed` (a position in the window), so a moved edge changes gradually rather
+/// than jumping, and differs per `salt`.
+fn wobble(seed: f32, salt: f32) -> f32 {
+    let t = seed / 480.;
+    0.5 + 0.3 * (t * 1.7 + salt * 2.1).sin() + 0.2 * (t * 3.1 - salt * 1.3 + 0.7).sin()
 }
 
 /// A card floating above the window: menus, completion, hover, toasts.
