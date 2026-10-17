@@ -563,7 +563,7 @@ mod tests {
         for (language, program) in
             [(Language::Json, "vscode-json-language-server"), (Language::Css, "vscode-css-language-server"), (Language::Html, "vscode-html-language-server")]
         {
-            let config = config(builtin(language).unwrap(), &Path::new("/bin").join(program), &none);
+            let config = config(builtin(language).unwrap(), &Path::new("/bin").join(program), &none, &FromCode::default());
             assert_eq!(config.initialization_options["provideFormatter"], true, "{program}");
         }
 
