@@ -5,7 +5,8 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Rope-backed buffer (`ropey`) with undo/redo; only visible lines are shaped and painted
 - Tree-sitter syntax highlighting for JavaScript/JSX, TypeScript/TSX, HTML (including `<script>` blocks),
   CSS, Rust, Go, Python, PHP, shell scripts, JSON, YAML, TOML and Markdown; any other language
-  through [extensions](extensions.md), which use Zed's format (Zed's language and theme extensions work)
+  through [extensions](extensions.md), which use Zed's format (Zed's language and theme extensions work);
+  popular ones install from **Settings → Extensions → Available**
 - Linting off the main thread:
   - **JavaScript** — syntax errors plus `no-unused-vars`, `no-undef`, `no-const-assign`,
     `no-dupe-keys`, `eqeqeq`, `use-isnan`, `no-cond-assign`, `no-debugger`, `no-var` (built on oxc)

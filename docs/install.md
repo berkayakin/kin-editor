@@ -22,7 +22,7 @@ cargo run --release -- path/to/folder path/to/file.js
 Each folder on the command line opens in its own window; files open in the first one.
 
 GPUI's `runtime_shaders` feature is enabled, so no separate Metal toolchain is needed on macOS.
-Building needs `cmake` (for wasmtime, which runs extensions' WebAssembly grammars):
+Building needs `cmake` (for wasmtime, which runs extensions' WebAssembly grammars and code):
 `brew install cmake` on macOS.
 
 ### App icon

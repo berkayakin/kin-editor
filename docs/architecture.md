@@ -19,6 +19,10 @@ bindings, colors, icons) are in the [contributing guide](../CONTRIBUTING.md).
 - `src/syntax.rs` — tree-sitter parsing, highlighting, bracket matching and file outlines
 - `src/lsp/` — language server client: JSON-RPC transport, protocol types, server discovery
 - `src/editor/lsp.rs` — completion, hover, signature help and LSP requests in the editor
+- `src/extensions.rs` — extensions in Zed's format: languages, grammars, themes, snippets, servers
+- `src/extensions/wasm.rs` — runs extensions' own code (`extension.wasm`, Zed's extension API
+  0.6/0.7) for their language servers, sandboxed; `src/extensions/wit/` is that API's interface
+- `src/extensions/registry.rs` — Kuana's extension registry: the signed list, install and update
 - `src/format.rs`, `src/editor/format.rs` — Reformat Code and format on save
 - `src/lint/` — built-in JS/HTML/Markdown linters, tree-sitter syntax errors and the ESLint bridge
 - `src/search.rs`, `src/find_bar.rs`, `src/project_search.rs` — in-file and project search

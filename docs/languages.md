@@ -7,6 +7,10 @@ project, and shows it in the status bar (with indexing progress). It uses the se
 project's `node_modules/.bin` or venv, else one on your PATH (also the login shell's PATH,
 `~/.cargo/bin`, `~/go/bin`, Homebrew and nvm, so it works when Kuana is opened from the Dock).
 
+A language Kuana doesn't have built in comes with an [extension](extensions.md): install one from
+**Settings → Extensions → Available**. Most bring their own code for their server, which uses the
+server you have installed or downloads one itself (into `~/.config/kuana/extensions/work/<id>/`).
+
 If none is installed, the status bar offers **Install <server>**: one click puts it in Kuana's own
 folder (`~/.config/kuana/servers/`) and starts it. While Kuana downloads anything (a server, Node.js,
 wasi-sdk, an update), the status bar shows its progress; the tooltip lists each download's size,

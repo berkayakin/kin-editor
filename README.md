@@ -33,8 +33,11 @@ each previewed live as you pick it. Prefer something plainer? One setting tones 
 shadows and animations.
 
 **🧩 Zed extensions.** Kuana reads [Zed's extension format](docs/extensions.md), so Zed's language,
-theme and icon-theme extensions work as they are. Gleam, Elixir, Zig, Lua, Nix, Kotlin, Haskell
-and Catppuccin are all tested. Grammars run sandboxed as WebAssembly.
+theme and icon-theme extensions work as they are. Install popular languages (Java, C#, Dart, Ruby,
+Zig, Vue and more) from **Settings → Extensions → Available**, built ready to use by
+[Kuana's extension registry](https://github.com/berkayakin/kuana-extensions). An extension's
+grammars and its own code (which finds or downloads its language server) run sandboxed as
+WebAssembly.
 
 **⌨️ Feels like home.** Search Everywhere on double Shift, Find Action, ⌥↩ for context
 actions: Kuana behaves like a JetBrains IDE. One click switches to the **VS Code**, **Sublime
@@ -102,8 +105,8 @@ support, features. Good places to start:
 - **Make a theme or an extension.** Neither needs any Rust: see [Themes](docs/themes.md) and
   [Extensions](docs/extensions.md).
 - **Pick an open [issue](https://github.com/berkayakin/kuana-editor/issues)**, or take something
-  from the roadmap: a three-way merge editor, Vim registers and macros, semantic tokens, an
-  extension registry.
+  from the roadmap: a three-way merge editor, Vim registers and macros, semantic tokens, debug
+  adapters from extensions.
 
 The [contributing guide](CONTRIBUTING.md) covers building, the checks a change has to pass and
 the conventions the code follows; [Architecture](docs/architecture.md) maps the code.
