@@ -167,6 +167,54 @@ pub struct GitFile {
     pub rel: String,
     /// The repository's `user.name`, shown as "You" in blame.
     pub user_name: Option<String>,
+    /// HEAD's commit when the file's diff base was read: blame is read once
+    /// per file and HEAD.
+    pub head: Option<String>,
+}
+
+/// A whole file's blame, read for one version of its text; a row of a
+/// later version is followed back to it through the document's line edits.
+struct Blame {
+    git_file: GitFile,
+    doc: u64,
+    version: u64,
+    text: ropey::Rope,
+    lines: git::FileBlame,
+}
+
+impl Blame {
+    /// The commit row `row` of the text as it is now came from: a line
+    /// edited since, unless its text is the same again, isn't committed.
+    /// Some(None): nothing to show; None: the edits since aren't kept (the
+    /// file is blamed again).
+    fn line(&self, row: usize, doc: &Document) -> Option<Option<BlameLine>> {
+        let edits: Vec<crate::document::LineEdit> = doc.line_edits_since(self.version)?.copied().collect();
+        let (mut old, mut edited) = (row, false);
+        for edit in edits.iter().rev() {
+            if old < edit.row {
+                continue;
+            }
+            if old >= edit.row + edit.new_rows {
+                old = old - edit.new_rows + edit.old_rows;
+                continue;
+            }
+            // Among the lines an edit changed: the one as far from their
+            // start (a line break added at the end), or from their end.
+            edited = true;
+            let (from_start, from_end) = (old - edit.row, edit.row + edit.new_rows - 1 - old);
+            if from_start < edit.old_rows {
+                old = edit.row + from_start;
+            } else if from_end < edit.old_rows {
+                old = edit.row + edit.old_rows - 1 - from_end;
+            } else {
+                return Some(Some(BlameLine::uncommitted()));
+            }
+        }
+        if edited && (old >= self.text.len_lines() || doc.rope().line(row) != self.text.line(old)) {
+            return Some(Some(BlameLine::uncommitted()));
+        }
+        Some(self.lines.line(old).cloned())
+    }
 }
 
 /// A Git operation started from the editor (staging a change).
@@ -318,9 +366,14 @@ pub struct Editor {
     hunk_staged: Arc<Vec<bool>>,
     /// Index into `hunks` of the change popover that is open.
     open_hunk: Option<usize>,
+    /// Blame shown for the caret's line: its row, the version, the commit.
     blame: Option<(usize, u64, BlameLine)>,
     blame_request: Option<(usize, u64)>,
-    blame_task: Option<Task<()>>,
+    /// The whole file's blame, for its file and HEAD.
+    file_blame: Option<Blame>,
+    /// The whole-file blame being read, for which file and HEAD and
+    /// document; dropping it kills git.
+    blame_task: Option<((GitFile, u64), Task<()>, git::KillOnDrop)>,
     soft_wrap: bool,
     /// Line breaks for soft wrap, recomputed lazily (see `sync_wrap`).
     wrap: Option<WrapMap>,
@@ -465,6 +518,7 @@ impl Editor {
             open_hunk: None,
             blame: None,
             blame_request: None,
+            file_blame: None,
             blame_task: None,
             soft_wrap: false,
             wrap: None,
@@ -828,6 +882,8 @@ impl Editor {
         if self.git_file != git_file {
             self.blame = None;
             self.blame_request = None;
+            self.file_blame = None;
+            self.blame_task = None;
         }
         self.git_file = git_file;
         self.has_diff_base = diff.has_base();
@@ -4626,7 +4682,9 @@ impl Editor {
         cx.refresh_windows();
     }
 
-    /// Fetches blame for the cursor line after it settles for a moment.
+    /// Shows blame for the caret's line, from the whole file's blame: read
+    /// once per file and HEAD in the background (`blame_file`), its rows
+    /// followed through edits since.
     fn request_blame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let enabled = cx.try_global::<InlineBlame>().is_none_or(|b| b.0);
         let Some(git_file) = self.git_file.clone().filter(|_| enabled) else {
@@ -4635,27 +4693,55 @@ impl Editor {
         if !self.focus_handle.is_focused(window) || self.selections.len() != 1 || !self.has_diff_base {
             return;
         }
-        let row = self.doc.read(cx).row_of(self.primary_selection().head);
-        let version = self.doc.read(cx).version();
+        let doc = self.doc.read(cx);
+        let (row, version, id) = (doc.row_of(self.primary_selection().head), doc.version(), doc.id());
         if self.blame_request == Some((row, version)) {
             return;
         }
         self.blame_request = Some((row, version));
-        let rope = self.doc.read(cx).rope().clone();
-        self.blame_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(350)).await;
-            let blame = cx
+        match self.file_blame.as_ref().filter(|b| b.git_file == git_file && b.doc == id).and_then(|b| b.line(row, doc)) {
+            Some(line) => self.blame = line.map(|line| (row, version, line)),
+            None => {
+                self.blame = None;
+                self.blame_file(git_file, cx);
+            }
+        }
+    }
+
+    /// Reads the whole file's blame (as it is now, unsaved edits too) in
+    /// the background, unless that's under way; one for another file, HEAD
+    /// or document stops (git is killed).
+    fn blame_file(&mut self, git_file: GitFile, cx: &mut Context<Self>) {
+        let doc = self.doc.read(cx);
+        let key = (git_file.clone(), doc.id());
+        if self.blame_task.as_ref().is_some_and(|(running, ..)| *running == key) {
+            return;
+        }
+        let (id, version, text) = (doc.id(), doc.version(), doc.rope().clone());
+        let git = git::KillOnDrop::default();
+        let stop = git.token();
+        let task = cx.spawn(async move |this, cx| {
+            let (root, rel, contents) = (git_file.root.clone(), git_file.rel.clone(), text.clone());
+            let lines = cx
                 .background_executor()
-                .spawn(async move { git::blame_line(&git_file.root, &git_file.rel, row, &rope.to_string()) })
+                .spawn(async move { git::blame_file(&root, &rel, contents.to_string().as_bytes(), &stop) })
                 .await;
             this.update(cx, |editor, cx| {
-                if editor.blame_request == Some((row, version)) {
-                    editor.blame = blame.map(|b| (row, version, b));
-                    cx.notify();
+                // This task is running; let it finish instead of dropping it.
+                if let Some((_, task, _)) = editor.blame_task.take() {
+                    task.detach();
                 }
+                // Failed (not committed yet, say): nothing to show, and
+                // nothing asked again until HEAD moves.
+                let lines = lines.unwrap_or_default();
+                editor.file_blame = Some(Blame { git_file, doc: id, version, text, lines });
+                // Shown for the caret's line on the next frame.
+                editor.blame_request = None;
+                cx.notify();
             })
             .ok();
-        }));
+        });
+        self.blame_task = Some((key, task, git));
     }
 
     fn render_hunk_popover(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -5590,6 +5676,46 @@ mod save_tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "b a zero one\n");
         editor.read_with(cx, |e, cx| assert!(!e.doc.read(cx).is_dirty() && !e.doc.read(cx).changed_on_disk()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::*;
+
+    /// A row is followed back to the blamed text through the edits since:
+    /// lines above and below keep their commit, a line edited isn't
+    /// committed until its text is the same again, and a line break added
+    /// at either end of a line leaves the line its commit.
+    #[test]
+    fn blamed_rows_follow_edits() {
+        let mut doc = Document::from_text("a\nb\nc\n".into(), None);
+        let commit = |summary: &str| BlameLine { author: "A".into(), time: 0, summary: summary.into(), sha: summary.into(), uncommitted: false };
+        let git_file = GitFile { root: "/r".into(), rel: "f".into(), user_name: None, head: None };
+        let lines = git::FileBlame::of(vec![commit("a"), commit("b"), commit("c")], vec![0, 1, 2]);
+        let blame = Blame { git_file, doc: doc.id(), version: doc.version(), text: doc.rope().clone(), lines };
+        let shown = |doc: &Document| -> Vec<String> {
+            (0..doc.line_count() - 1)
+                .map(|row| match blame.line(row, doc).expect("followed") {
+                    Some(line) if line.uncommitted => "new".to_string(),
+                    Some(line) => line.summary,
+                    None => "-".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(shown(&doc), ["a", "b", "c"]);
+        doc.edit(vec![(1..1, "x".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["new", "b", "c"]);
+        doc.undo();
+        assert_eq!(shown(&doc), ["a", "b", "c"]);
+        // Enter at the end of `a`, then at the start of `c`.
+        doc.edit(vec![(1..1, "\n".into())], &[], EditKind::Other);
+        let c = doc.line_start(3);
+        doc.edit(vec![(c..c, "\n".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["a", "new", "b", "new", "c"]);
+        // Lines added above move the rest down.
+        doc.edit(vec![(0..0, "x\ny\n".into())], &[], EditKind::Other);
+        assert_eq!(shown(&doc), ["new", "new", "a", "new", "b", "new", "c"]);
     }
 }
 

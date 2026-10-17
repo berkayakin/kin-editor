@@ -4,10 +4,11 @@
 
 use std::{
     collections::HashMap,
-    io::Write,
+    io::{Read, Write},
     ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -942,7 +943,6 @@ pub fn start_clone(parent: &Path, url: &str, name: &str, shallow: bool) -> Resul
 impl CloneJob {
     /// Blocks until git exits, updating `progress` along the way.
     pub fn wait(&self) -> Result<PathBuf, String> {
-        use std::io::Read;
         let mut all = Vec::new();
         if let Some(mut stderr) = self.stderr.lock().unwrap().take() {
             let mut buf = [0u8; 4096];
@@ -989,35 +989,151 @@ pub struct BlameLine {
     pub uncommitted: bool,
 }
 
-/// Blame for one (0-based) line, computed against the given buffer text so
-/// unsaved edits are accounted for.
-pub fn blame_line(root: &Path, rel: &str, line: usize, contents: &str) -> Option<BlameLine> {
-    let range = format!("{},{}", line + 1, line + 1);
-    let out = run_with_stdin(
-        root,
-        &["blame", "--porcelain", "-L", &range, "--contents", "-", "--", rel],
-        contents.as_bytes(),
-    )
-    .ok()?;
-    let mut lines = out.lines();
-    let sha = lines.next()?.split_whitespace().next()?.to_string();
-    let mut blame = BlameLine {
-        uncommitted: sha.chars().all(|c| c == '0'),
-        sha: sha.chars().take(8).collect(),
-        author: String::new(),
-        time: 0,
-        summary: String::new(),
-    };
-    for l in lines {
-        if let Some(v) = l.strip_prefix("author ") {
-            blame.author = v.to_string();
-        } else if let Some(v) = l.strip_prefix("author-time ") {
-            blame.time = v.parse().unwrap_or(0);
-        } else if let Some(v) = l.strip_prefix("summary ") {
-            blame.summary = v.to_string();
+impl BlameLine {
+    /// A line not committed yet.
+    pub fn uncommitted() -> Self {
+        BlameLine { author: String::new(), time: 0, summary: String::new(), sha: String::new(), uncommitted: true }
+    }
+}
+
+/// A whole file's blame (`blame_file`): which commit each row came from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileBlame {
+    /// Per row of the text blamed: its commit in `commits` (`u32::MAX`: git
+    /// didn't say).
+    rows: Vec<u32>,
+    commits: Vec<BlameLine>,
+}
+
+impl FileBlame {
+    /// The commit that row `row` (0-based) of the text blamed came from.
+    pub fn line(&self, row: usize) -> Option<&BlameLine> {
+        self.commits.get(*self.rows.get(row)? as usize)
+    }
+
+    /// A blame of rows from these commits (tests).
+    #[cfg(test)]
+    pub fn of(commits: Vec<BlameLine>, rows: Vec<u32>) -> Self {
+        FileBlame { rows, commits }
+    }
+
+    /// Reads `git blame --incremental`: per run of rows, the commit (with
+    /// its author, time and summary the first time it's named) and where
+    /// the rows are, ending with its `filename` line.
+    fn parse(out: &str) -> Self {
+        let mut blame = FileBlame::default();
+        let mut by_sha: HashMap<&str, u32> = HashMap::new();
+        let mut lines = out.lines();
+        while let Some(header) = lines.next() {
+            let mut fields = header.split_whitespace();
+            let (Some(sha), Some(_), Some(row), Some(count)) = (fields.next(), fields.next(), fields.next(), fields.next()) else { continue };
+            let (Ok(row), Ok(count)) = (row.parse::<usize>(), count.parse::<usize>()) else { continue };
+            let ix = *by_sha.entry(sha).or_insert_with(|| {
+                blame.commits.push(BlameLine {
+                    author: String::new(),
+                    time: 0,
+                    summary: String::new(),
+                    sha: sha.chars().take(8).collect(),
+                    uncommitted: sha.chars().all(|c| c == '0'),
+                });
+                (blame.commits.len() - 1) as u32
+            });
+            let commit = &mut blame.commits[ix as usize];
+            for line in lines.by_ref() {
+                if let Some(author) = line.strip_prefix("author ") {
+                    commit.author = author.to_string();
+                } else if let Some(time) = line.strip_prefix("author-time ") {
+                    commit.time = time.parse().unwrap_or(0);
+                } else if let Some(summary) = line.strip_prefix("summary ") {
+                    commit.summary = summary.to_string();
+                } else if line.starts_with("filename ") {
+                    break;
+                }
+            }
+            // 1-based in git's output.
+            let rows = row.saturating_sub(1)..row.saturating_sub(1) + count;
+            if blame.rows.len() < rows.end {
+                blame.rows.resize(rows.end, u32::MAX);
+            }
+            blame.rows[rows].fill(ix);
+        }
+        blame
+    }
+}
+
+/// Blame for every line of `rel`, computed against the given buffer text
+/// so unsaved edits are accounted for (as not committed). The `stop`'s
+/// owner dropping it kills git.
+pub fn blame_file(root: &Path, rel: &str, contents: &[u8], stop: &StopToken) -> Result<FileBlame, String> {
+    let out = run_stoppable(root, &["blame", "--incremental", "--contents", "-", "--", rel], contents, stop)?;
+    Ok(FileBlame::parse(&out))
+}
+
+/// Kills the git command run with one of its tokens (`token`) when dropped:
+/// work that newer work replaced doesn't keep git running.
+#[derive(Default)]
+pub struct KillOnDrop(Arc<Mutex<Running>>);
+
+/// What a git command run with a `KillOnDrop`'s token is: once the owner
+/// went, it's killed, or not started.
+pub struct StopToken(Arc<Mutex<Running>>);
+
+#[derive(Default)]
+struct Running {
+    dropped: bool,
+    child: Option<Child>,
+}
+
+impl KillOnDrop {
+    pub fn token(&self) -> StopToken {
+        StopToken(self.0.clone())
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let mut running = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        running.dropped = true;
+        if let Some(child) = &mut running.child {
+            child.kill().ok();
         }
     }
-    Some(blame)
+}
+
+/// `run_with_stdin`, killed when `stop`'s owner is dropped.
+fn run_stoppable(root: &Path, args: &[&str], input: &[u8], stop: &StopToken) -> Result<String, String> {
+    let mut child = command(root, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run git: {e}"))?;
+    let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    {
+        let mut running = stop.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if running.dropped {
+            child.kill().ok();
+            child.wait().ok();
+            return Err("stopped".into());
+        }
+        running.child = Some(child);
+    }
+    // The input first (blame reads it all before it answers), then what it says.
+    let written = stdin.map_or(Ok(()), |mut stdin| stdin.write_all(input));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    if let Some(mut stdout) = stdout {
+        stdout.read_to_end(&mut out).ok();
+    }
+    if let Some(mut stderr) = stderr {
+        stderr.read_to_end(&mut err).ok();
+    }
+    let child = stop.0.lock().unwrap_or_else(PoisonError::into_inner).child.take();
+    let status = child.map(|mut child| child.wait()).transpose().map_err(|e| e.to_string())?;
+    match status {
+        Some(status) if status.success() && written.is_ok() => Ok(String::from_utf8_lossy(&out).into_owned()),
+        Some(status) if !status.success() && !err.is_empty() => Err(error_text(&err, &out)),
+        _ => Err("stopped".into()),
+    }
 }
 
 pub fn user_name(root: &Path) -> Option<String> {
@@ -2564,9 +2680,16 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         std::fs::write(dir.join("a.txt"), "one\n2\n").unwrap();
         let s = status(&root).unwrap();
         assert_eq!(s.files[0].unstaged, Some(Change::Modified));
-        let blame = blame_line(&root, "a.txt", 0, "one\n2\n").unwrap();
-        assert_eq!(blame.summary, "first");
-        assert!(blame_line(&root, "a.txt", 1, "one\n2\n").unwrap().uncommitted);
+        let blame = blame_file(&root, "a.txt", b"one\n2\nthree\n", &KillOnDrop::default().token());
+        let blame = blame.unwrap_or_else(|_| panic!("blamed"));
+        assert_eq!(blame.line(0).map(|l| (l.summary.as_str(), l.author.as_str(), l.uncommitted)), Some(("first", "Test", false)));
+        assert!(blame.line(1).is_some_and(|l| l.uncommitted) && blame.line(2).is_some_and(|l| l.uncommitted));
+        assert_eq!(blame.line(3), None);
+        // A blame whose owner went is stopped, not run.
+        let owner = KillOnDrop::default();
+        let token = owner.token();
+        drop(owner);
+        assert!(blame_file(&root, "a.txt", b"one\n", &token).is_err());
         discard(&root, &s.files).unwrap();
         assert!(status(&root).unwrap().files.is_empty());
         create_branch(&root, "feature").unwrap();

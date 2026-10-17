@@ -189,6 +189,7 @@ impl Workspace {
             return;
         }
         let user = self.git_user.clone();
+        let head = self.git_status.head_oid.clone();
         cx.spawn(async move |_, cx| {
             let specs: Vec<String> = wanted.iter().flat_map(|(_, rel, _)| [format!("HEAD:{rel}"), format!(":{rel}")]).collect();
             let repo2 = repo.clone();
@@ -197,7 +198,7 @@ impl Workspace {
             for (diff, rel, encoding) in wanted {
                 let text = |bytes: Option<Option<Vec<u8>>>| bytes.flatten().map(|b| git::BlobText::new(&b, Some(encoding)).text);
                 let (base, index) = (text(blobs.next()), text(blobs.next()));
-                let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone() };
+                let git_file = GitFile { root: repo.clone(), rel, user_name: user.clone(), head: head.clone() };
                 diff.update(cx, |d, cx| d.set_base(Some(git_file), base, index, cx)).ok();
             }
         })
