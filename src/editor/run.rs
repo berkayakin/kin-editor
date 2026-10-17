@@ -103,12 +103,8 @@ impl Editor {
 
     /// Breakpoints only go where a debugger can stop.
     pub fn can_break(&self, cx: &App) -> bool {
-        self.mode == EditorMode::Full
-            && self.doc.read(cx).path.is_some()
-            && matches!(
-                self.doc.read(cx).language,
-                Language::Rust | Language::Go | Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx
-            )
+        let doc = self.doc.read(cx);
+        self.mode == EditorMode::Full && doc.path.as_deref().is_some_and(|path| crate::debugger::launch::can_stop_in(doc.language, path))
     }
 
     pub fn toggle_breakpoint_at(&mut self, row: usize, cx: &mut Context<Self>) {
@@ -120,7 +116,7 @@ impl Editor {
     /// Toggle Line Breakpoint (⌘F8 / F9) on the caret's line.
     pub(super) fn toggle_breakpoint(&mut self, _: &super::ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
         if !self.can_break(cx) {
-            cx.emit(EditorLspEvent::Message("Breakpoints work in Rust, Go, Python, JavaScript and TypeScript files".into()));
+            cx.emit(EditorLspEvent::Message(crate::debugger::launch::NO_DEBUGGER.into()));
             return;
         }
         let mut rows: Vec<usize> = self.selections.iter().map(|s| self.doc.read(cx).row_of(s.head)).collect();

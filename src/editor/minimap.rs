@@ -167,6 +167,11 @@ impl Editor {
                 }
                 if ch == '\t' {
                     col += tab - col % tab;
+                } else if let Some(symbol) = super::control_symbol(ch) {
+                    // Its symbol, as wide as the editor shows it and as dim.
+                    let width = symbol.chars().count();
+                    runs.push((col, width, theme.text_dim.into()));
+                    col += width;
                 } else if ch.is_whitespace() {
                     col += 1;
                 } else {
@@ -215,7 +220,10 @@ impl Editor {
     fn minimap_column(&self, from: usize, offset: usize, indent: usize, cx: &App) -> usize {
         let tab = self.tab_size.max(1);
         let rope = self.doc.read(cx).rope();
-        rope.byte_slice(from..offset.max(from)).chars().fold(indent, |col, ch| if ch == '\t' { col + tab - col % tab } else { col + 1 })
+        rope.byte_slice(from..offset.max(from)).chars().fold(indent, |col, ch| match ch {
+            '\t' => col + tab - col % tab,
+            ch => col + super::control_symbol(ch).map_or(1, |symbol| symbol.chars().count()),
+        })
     }
 
     /// The highlights of the chunk of lines holding `line`.

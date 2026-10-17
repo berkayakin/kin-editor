@@ -111,6 +111,26 @@ const LARGE_FILE_SIZE: u64 = 20_000_000;
 /// Above this, it doesn't open at all (it would take that much memory twice over).
 const MAX_FILE_SIZE: u64 = 500_000_000;
 
+/// What [`Document::open`] fails with for a file that looks binary
+/// (`encoding::looks_binary`).
+#[derive(Debug)]
+pub struct BinaryFile;
+
+impl BinaryFile {
+    /// Whether opening failed because the file looks binary.
+    pub fn is(err: &std::io::Error) -> bool {
+        err.get_ref().is_some_and(|e| e.is::<BinaryFile>())
+    }
+}
+
+impl std::fmt::Display for BinaryFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it looks like a binary file")
+    }
+}
+
+impl std::error::Error for BinaryFile {}
+
 pub struct Document {
     /// Unique per document: an editor showing it notices when it's replaced
     /// as a whole (an unloaded tab read its file).
@@ -205,12 +225,31 @@ impl Document {
         doc
     }
 
+    /// Reads a file as text. One that looks binary fails with [`BinaryFile`]:
+    /// as text it shows as garbage, and a save would damage it.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::read(path, false)
+    }
+
+    /// Reads a file as text even when it looks binary (Open Anyway).
+    pub fn open_anyway(path: &Path) -> std::io::Result<Self> {
+        Self::read(path, true)
+    }
+
+    fn read(path: &Path, binary: bool) -> std::io::Result<Self> {
+        use std::io::Read;
         let size = std::fs::metadata(path)?.len();
         if size > MAX_FILE_SIZE {
             return Err(std::io::Error::other(format!("{} MB is too large to open", size / 1_000_000)));
         }
-        let bytes = std::fs::read(path)?;
+        // The start first: a binary file isn't read further.
+        let mut file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        (&mut file).take(8000).read_to_end(&mut bytes)?;
+        if !binary && encoding::looks_binary(&bytes) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, BinaryFile));
+        }
+        file.read_to_end(&mut bytes)?;
         let (text, encoding) = encoding::decode(&bytes, None);
         // A large file is shown as plain text: no parsing, linting or language
         // server. Decided before building the syntax tree, which would parse it.
@@ -228,7 +267,7 @@ impl Document {
             Some(encoding) => encoding::decode_as(&bytes, encoding),
             None => encoding::decode(&bytes, None).0,
         };
-        read.replace("\r\n", "\n") == text
+        encoding::to_lf(read) == text
     }
 
     pub(crate) fn from_text(text: String, path: Option<PathBuf>) -> Self {
@@ -239,11 +278,7 @@ impl Document {
     fn with_text(text: String, path: Option<PathBuf>, large: bool, budget: Option<Duration>) -> Self {
         // Normalize to LF internally; remember the style for saving.
         let uses_crlf = text.contains("\r\n");
-        let text = if uses_crlf {
-            text.replace("\r\n", "\n")
-        } else {
-            text
-        };
+        let text = encoding::to_lf(text);
         let rope = Rope::from_str(&text);
         let language = match path.as_deref() {
             Some(path) if !large => Language::from_path(path),
@@ -354,7 +389,7 @@ impl Document {
         let (text, encoding) = encoding::decode(&bytes, Some(self.encoding));
         self.encoding = encoding;
         self.disk_mtime = mtime(&path);
-        Ok(self.replace_all(text.replace("\r\n", "\n")))
+        Ok(self.replace_all(encoding::to_lf(text)))
     }
 
     /// Reads the file again as `encoding` (when it was guessed wrong).
@@ -364,7 +399,7 @@ impl Document {
         let bytes = std::fs::read(&path)?;
         self.encoding = encoding;
         self.disk_mtime = mtime(&path);
-        self.replace_all(encoding::decode_as(&bytes, encoding).replace("\r\n", "\n"));
+        self.replace_all(encoding::to_lf(encoding::decode_as(&bytes, encoding)));
         self.saved_version = self.version;
         Ok(())
     }
@@ -1843,6 +1878,72 @@ mod tests {
         std::fs::write(&path, [0xEF, 0xF2]).unwrap();
         assert!(Document::file_has(&path, "пт", TextEncoding::from_key("windows-1251")));
         assert!(!Document::file_has(&dir.join("gone.txt"), "", None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_files_open_as_text_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("kuana-doc-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.zip");
+        std::fs::write(&path, b"PK\x03\x04\x00\x00zipped").unwrap();
+        let Err(err) = Document::open(&path) else { panic!("opened a binary file as text") };
+        assert!(BinaryFile::is(&err));
+        assert_eq!(Document::open_anyway(&path).unwrap().len(), 12);
+        // UTF-16 text has NULs, but its byte order mark says it's text.
+        std::fs::write(&path, b"\xff\xfeh\x00i\x00").unwrap();
+        assert_eq!(Document::open(&path).unwrap().rope().to_string(), "hi");
+        // As in Git, only the start counts.
+        let mut late = vec![b'a'; 9000];
+        late.push(0);
+        std::fs::write(&path, &late).unwrap();
+        assert_eq!(Document::open(&path).unwrap().len(), 9001);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lines_end_only_at_line_feeds() {
+        use crate::lsp::protocol::{Encoding, Position, offset_to_position, position_to_offset};
+        let dir = std::env::temp_dir().join(format!("kuana-doc-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        // A line separator and a form feed are text inside their lines; a
+        // lone CR reads as a line end, as CRLF does.
+        std::fs::write(&path, "fn a() {\u{2028}}\nfn b() {\x0c}\nfn c() {}\rfn d() {}\n").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        let text = doc.rope().to_string();
+        assert_eq!(text, "fn a() {\u{2028}}\nfn b() {\x0c}\nfn c() {}\nfn d() {}\n");
+        assert!(!doc.uses_crlf);
+        assert_eq!(doc.line_count(), 5);
+        assert_eq!(doc.line_text(0), "fn a() {\u{2028}}");
+        assert_eq!(doc.line_end(1), text.find("}\nfn c").unwrap() + 1);
+        let (b, c, d) = (text.find("fn b").unwrap(), text.find("fn c").unwrap(), text.find("fn d").unwrap());
+        assert_eq!((doc.row_of(b), doc.row_of(c), doc.row_of(d)), (1, 2, 3));
+        // Git, folds and tree-sitter count the same rows.
+        assert_eq!(crate::git::split_lines(&text).len(), 4);
+        assert_eq!(text.split('\n').count(), doc.line_count());
+        let tree = doc.syntax().tree().unwrap();
+        let rows: Vec<usize> = [b, c, d]
+            .iter()
+            .map(|&at| tree.root_node().descendant_for_byte_range(at, at).unwrap().start_position().row)
+            .collect();
+        assert_eq!(rows, [1, 2, 3]);
+        // Language servers' positions: after the line separator (3 bytes, one
+        // UTF-16 unit) and the form feed, and on the lines below them.
+        let rope = doc.rope();
+        let brace_a = text.find('}').unwrap();
+        assert_eq!(offset_to_position(rope, brace_a, Encoding::Utf16), Position { line: 0, character: 9 });
+        assert_eq!(offset_to_position(rope, brace_a, Encoding::Utf8), Position { line: 0, character: 11 });
+        assert_eq!(position_to_offset(rope, Position { line: 0, character: 9 }, Encoding::Utf16), brace_a);
+        let brace_b = text.find("\x0c}").unwrap() + 1;
+        assert_eq!(offset_to_position(rope, brace_b, Encoding::Utf16), Position { line: 1, character: 9 });
+        for (at, line) in [(b, 1), (c, 2), (d, 3)] {
+            assert_eq!(offset_to_position(rope, at, Encoding::Utf16), Position { line, character: 0 });
+            assert_eq!(position_to_offset(rope, Position { line, character: 0 }, Encoding::Utf16), at);
+        }
+        // A save writes the lone CR as LF.
+        doc.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

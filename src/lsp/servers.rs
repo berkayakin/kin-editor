@@ -275,7 +275,8 @@ fn expand_dotted(value: &Value) -> Value {
 
 /// What Kuana passes a server program unless told otherwise:
 /// (initialization options, settings). Inlay hints are off in TypeScript's
-/// and Go's servers until asked for.
+/// and Go's servers until asked for, and formatting in the JSON, CSS and
+/// HTML servers (which VS Code's own extensions turn on).
 fn defaults(program: &str) -> (Value, Value) {
     match program {
         "typescript-language-server" => {
@@ -316,9 +317,10 @@ fn defaults(program: &str) -> (Value, Value) {
         }
         // Schemas for Kuana's own settings, keymap and theme files.
         "vscode-json-language-server" => match crate::schemas::json_schemas() {
-            Value::Null => (Value::Null, Value::Null),
-            schemas => (Value::Null, json!({ "json": { "schemas": schemas } })),
+            Value::Null => (json!({ "provideFormatter": true }), Value::Null),
+            schemas => (json!({ "provideFormatter": true }), json!({ "json": { "schemas": schemas } })),
         },
+        "vscode-css-language-server" | "vscode-html-language-server" => (json!({ "provideFormatter": true }), Value::Null),
         _ => (Value::Null, Value::Null),
     }
 }
@@ -527,6 +529,13 @@ mod tests {
         assert_eq!(ts.initialization_options["preferences"]["includeInlayParameterNameHints"], "all");
         let vtsls = config(typescript, Path::new("/bin/vtsls"), &none);
         assert_eq!(vtsls.settings["typescript"]["inlayHints"]["parameterNames"]["enabled"], "all");
+        // VS Code's JSON, CSS and HTML servers format only when told they may.
+        for (language, program) in
+            [(Language::Json, "vscode-json-language-server"), (Language::Css, "vscode-css-language-server"), (Language::Html, "vscode-html-language-server")]
+        {
+            let config = config(builtin(language).unwrap(), &Path::new("/bin").join(program), &none);
+            assert_eq!(config.initialization_options["provideFormatter"], true, "{program}");
+        }
 
         // The user's entry by Kuana's id or Zed's, merged over the defaults.
         let user: HashMap<String, LspSettings> = [(

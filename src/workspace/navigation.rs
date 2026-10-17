@@ -423,6 +423,10 @@ impl Workspace {
     /// editors about ⌘/Ctrl (links under the pointer): only the focused one
     /// hears it, and the pointer may rest on another.
     pub(super) fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Ctrl+Tab's keys let go: the tab it got to is the one in use.
+        if !event.modifiers.modified() {
+            self.tab_switch = None;
+        }
         let shown: Vec<Entity<Editor>> = self.panes.iter().filter_map(|p| p.tabs.get(p.active)?.editor().cloned()).collect();
         for editor in shown {
             editor.update(cx, |e, cx| e.secondary_modifier_changed(event.modifiers.secondary(), window, cx));

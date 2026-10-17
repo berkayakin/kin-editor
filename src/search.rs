@@ -171,8 +171,10 @@ pub fn search_project(
                 if bytes.iter().take(8000).any(|b| *b == 0) {
                     continue; // binary
                 }
+                // Line ends as an editor of the file has them, so a match's
+                // offsets select the same text there.
                 match String::from_utf8(bytes) {
-                    Ok(s) => s.into(),
+                    Ok(s) => crate::encoding::to_lf(s).into(),
                     Err(_) => continue,
                 }
             }

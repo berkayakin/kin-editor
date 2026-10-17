@@ -135,7 +135,7 @@ impl Formatter {
             return Err(format!("{}: {first}", self.name));
         }
         String::from_utf8(output.stdout)
-            .map(|s| s.replace("\r\n", "\n"))
+            .map(crate::encoding::to_lf)
             .map_err(|_| format!("{} returned text that isn't UTF-8", self.name))
     }
 }

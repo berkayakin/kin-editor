@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::{
     lsp::servers,
     run::{DebugSpec, RunTarget},
+    syntax::Language,
 };
 
 /// How to start an adapter.
@@ -125,6 +126,27 @@ impl DebugAdapter for ExtensionAdapter {
 }
 
 static EXTENSION_ADAPTERS: std::sync::RwLock<Vec<&'static ExtensionAdapter>> = std::sync::RwLock::new(Vec::new());
+
+/// Native code's file extensions. lldb-dap debugs C, C++, Objective-C, Swift
+/// and Zig (from a debug configuration, or through Attach to Process),
+/// whether or not an extension adds the language.
+const NATIVE_SOURCES: &[&str] = &["c", "h", "cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "inl", "ipp", "m", "mm", "swift", "zig"];
+
+/// What a breakpoint in a file no debugger stops in gets told.
+pub const NO_DEBUGGER: &str = "No debugger can stop in this kind of file";
+
+/// Whether a debugger can stop in `path` (written in `language`), so a
+/// breakpoint there means something: languages Kuana debugs itself, native
+/// code, and extension languages that come with a debugger.
+pub fn can_stop_in(language: Language, path: &Path) -> bool {
+    match language {
+        Language::Rust | Language::Go | Language::Python | Language::JavaScript | Language::TypeScript | Language::Tsx => return true,
+        Language::Extension(ix) if crate::extensions::language(ix).is_some_and(|def| def.debuggable) => return true,
+        _ => {}
+    }
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    NATIVE_SOURCES.iter().any(|native| native.eq_ignore_ascii_case(extension))
+}
 
 /// Replaces the adapters extensions declare (after they reload).
 pub fn set_extension_adapters(adapters: Vec<&'static ExtensionAdapter>) {
@@ -593,6 +615,18 @@ fn pick_executable(artifacts: &[Value], args: &[String]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breakpoints_go_where_a_debugger_stops() {
+        assert!(can_stop_in(Language::Rust, Path::new("src/main.rs")));
+        assert!(can_stop_in(Language::Tsx, Path::new("app.tsx")));
+        // lldb-dap debugs C and C++ with or without a language for them.
+        assert!(can_stop_in(Language::PlainText, Path::new("main.c")));
+        assert!(can_stop_in(Language::PlainText, Path::new("include/Thing.HPP")));
+        assert!(!can_stop_in(Language::Markdown, Path::new("README.md")));
+        assert!(!can_stop_in(Language::PlainText, Path::new("notes.txt")));
+        assert!(!can_stop_in(Language::Json, Path::new("package.json")));
+    }
 
     #[test]
     fn reads_vs_code_and_zed_debug_configurations() {

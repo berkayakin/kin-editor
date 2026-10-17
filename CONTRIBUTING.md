@@ -7,7 +7,9 @@ conventions the code follows.
 ## Ways to help
 
 - **Report bugs.** Open an [issue](https://github.com/berkayakin/kuana-editor/issues/new/choose) with
-  the version from **About Kuana → Copy Version**. Reports from Windows and Linux are especially
+  the version from **About Kuana → Copy Version**. If Kuana crashed, attach the newest
+  `panic-<time>.log` from the `logs` folder in its config folder (`~/.config/kuana`,
+  `%APPDATA%\kuana` on Windows). Reports from Windows and Linux are especially
   valuable: those builds have had the least testing.
 - **Make a theme.** A theme is a JSON file with only the colors it changes; see
   [Themes](docs/themes.md). Built-in themes live in [`assets/themes/`](assets/themes).

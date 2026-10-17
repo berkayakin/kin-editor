@@ -28,13 +28,15 @@ Everything Kuana does, in one list. Each area has its own page with the details.
   uses of the symbol at the caret, Go to Symbol across the project, Rename and context actions
   (quick fixes and refactorings); see [Language servers](languages.md#language-servers)
 - Inlay hints from the language server (types, parameter names), rulers, visible whitespace,
+  control characters shown as dim symbols (␌ for a form feed, ␛, NEL, LS for U+2028),
   column (box) selection with Alt+drag, sort/reverse/de-duplicate lines and case conversions
   (upper, lower, title, snake, kebab, camel, Pascal) from Find Action
 - Vim mode (`vim_mode`): Normal, Insert, Visual and Visual Line; see [Vim mode](editing.md#vim-mode)
 - Reformat Code (⌥⌘L / Ctrl+Alt+L) and optional format on save, with the project's formatter
   (e.g. its Prettier), the language server, or rustfmt/gofmt/ruff/black/taplo/shfmt on PATH
-- Inline diagnostics, gutter markers, scrollbar markers and a Problems panel
-- Multi-cursor (next/all occurrences, ⌥-click, add caret above/below), syntax-aware Extend Selection,
+- Inline diagnostics, gutter markers, scrollbar markers, a Problems panel and Next / Previous Problem
+- Multi-cursor (next/all occurrences, of the caret's word as a whole word with its case; ⌥-click,
+  add caret above/below), syntax-aware Extend Selection,
   auto-closing pairs, smart indent, line/block comments, move/duplicate/join/delete lines
 - Matching-bracket highlight (ignores brackets in strings and comments) and an editor right-click menu
 - Soft wrap that keeps indentation, on by default for Markdown and plain text (View → Soft-Wrap
@@ -88,9 +90,11 @@ Everything Kuana does, in one list. Each area has its own page with the details.
 - Encodings and line endings: files keep their encoding (UTF-8 with or without BOM, UTF-16,
   Windows-125x, ISO-8859-2, Shift JIS, EUC-KR, GBK, Big5) and line endings when saved; the status
   bar shows both, and clicking them reloads the file in another encoding or converts it (as in
-  JetBrains). Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
+  JetBrains). A lone CR (old Mac files) reads as a line end and is saved as the file's line ending,
+  as in Zed. Files that aren't UTF-8 are read as Windows-1252, so no byte is lost. Text an
   encoding can't hold is never saved in it. Files over 20 MB open as plain text without language
-  features; over 500 MB they don't open
+  features; over 500 MB they don't open. A file that looks binary (a NUL byte near its start, as Git
+  tells) asks first, and opens as text only with Open Anyway
 - Live file watching: the file tree, Go to File, Git status and branch, the Git log and open files
   follow changes made outside Kuana (a checkout, a generator, another editor) as they happen. In
   an open file, carets, the view, breakpoints, folds, problems and inlay hints stay with the lines

@@ -19,7 +19,7 @@ use ropey::Rope;
 
 use crate::{
     document::{InlayHint, LineEdit},
-    editor::DisplayLine,
+    editor::{DisplayLine, control_symbol},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,8 +165,10 @@ impl<'a> Measure<'a> {
             return Vec::new();
         }
         let hint_cols: usize = hints.iter().map(|h| display_columns(h.label.chars(), 1) + h.pad_left as usize + h.pad_right as usize).sum();
+        // No character takes more columns than a tab or a control character's name (NEL).
         if self.wrap
-            && ((hint_cols == 0 && line.len_chars() <= self.max_cols / self.tab_size) || display_columns(line.chars(), self.tab_size) + hint_cols <= self.max_cols)
+            && ((hint_cols == 0 && line.len_chars() <= self.max_cols / self.tab_size.max(3))
+                || display_columns(line.chars(), self.tab_size) + hint_cols <= self.max_cols)
         {
             return Vec::new();
         }
@@ -179,16 +181,20 @@ impl<'a> Measure<'a> {
         if !self.wrap {
             return dl.text.char_indices().map(|(ix, _)| ix).step_by(LONG_LINE_ROW).skip(1).map(|ix| at(ix, 0)).collect();
         }
-        // A hint is one piece: rows break before or after it, not inside.
-        let mut fragments = Vec::with_capacity(2 * dl.inlays.len() + 1);
+        // A hint is one piece: rows break before or after it, not inside; so
+        // is a control character's name (a Control Picture is one character).
+        let names = dl.controls.iter().filter(|r| dl.text[(*r).clone()].is_ascii());
+        let mut pieces: Vec<Range<usize>> = dl.inlays.iter().map(|s| s.whole.clone()).chain(names.cloned()).filter(|r| !r.is_empty()).collect();
+        pieces.sort_by_key(|r| r.start);
+        let mut fragments = Vec::with_capacity(2 * pieces.len() + 1);
         let mut from = 0;
-        for span in dl.inlays.iter().filter(|s| !s.whole.is_empty()) {
-            if span.whole.start > from {
-                fragments.push(LineFragment::text(&dl.text[from..span.whole.start]));
+        for piece in pieces {
+            if piece.start > from {
+                fragments.push(LineFragment::text(&dl.text[from..piece.start]));
             }
-            let width = self.char_width * display_columns(dl.text[span.whole.clone()].chars(), 1) as f32;
-            fragments.push(LineFragment::element(width, span.whole.len()));
-            from = span.whole.end;
+            let width = self.char_width * display_columns(dl.text[piece.clone()].chars(), 1) as f32;
+            fragments.push(LineFragment::element(width, piece.len()));
+            from = piece.end;
         }
         if from < dl.text.len() {
             fragments.push(LineFragment::text(&dl.text[from..]));
@@ -431,15 +437,19 @@ impl WrapMap {
 }
 
 /// Display columns of a line's characters (tabs expanded, wide characters
-/// as two), an upper bound for whether it can need wrapping.
+/// as two, control characters as their symbols), an upper bound for whether
+/// it can need wrapping.
 fn display_columns(chars: impl Iterator<Item = char>, tab_size: usize) -> usize {
     let mut col = 0;
     for c in chars {
         col += match c {
             '\t' => tab_size - col % tab_size,
             '\n' => 0,
-            c if (c as u32) >= 0x1100 => 2,
-            _ => 1,
+            c => match control_symbol(c) {
+                Some(symbol) => display_columns(symbol.chars(), 1),
+                None if (c as u32) >= 0x1100 => 2,
+                None => 1,
+            },
         };
     }
     col
@@ -531,6 +541,25 @@ mod tests {
                 let fresh = WrapMap::new(key(wrap), doc.version(), folds.ranges(), shown, doc.rope(), &text_system, font.clone(), gpui::px(7.));
                 assert_eq!((&map.breaks, &map.inlays, &map.row_starts), (&fresh.breaks, &fresh.inlays, &fresh.row_starts));
             }
+        }
+    }
+
+    /// A control character's name (NEL) takes its room, so a line of them
+    /// wraps, and stays whole on a row.
+    #[gpui::test]
+    fn control_symbols_take_room_and_wrap_whole(cx: &mut gpui::TestAppContext) {
+        let text_system = cx.update(|cx| cx.text_system().clone());
+        let key = WrapKey { width: gpui::px(300.), font_family: "Test".into(), font_size: gpui::px(14.), tab_size: 2, wrap: true };
+        // 20 characters, 60 columns shown.
+        let text = "\u{85}".repeat(20);
+        let rope = Rope::from_str(&text);
+        let map = WrapMap::new(key, 0, &[], Inlays::NONE, &rope, &text_system, gpui::font("Test"), gpui::px(7.));
+        let breaks = map.breaks(0);
+        assert!(!breaks.is_empty(), "wraps");
+        let dl = DisplayLine::new(&text, 2);
+        for b in breaks {
+            assert!(dl.controls.iter().all(|r| b.ix as usize <= r.start || b.ix as usize >= r.end), "not inside a name: {b:?}");
+            assert_eq!(dl.to_buffer(b.ix as usize), b.byte as usize);
         }
     }
 

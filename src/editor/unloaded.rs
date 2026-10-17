@@ -103,7 +103,8 @@ impl Editor {
     /// read and there's no unsaved text.
     pub fn load(&mut self, cx: &mut Context<Self>) -> std::io::Result<()> {
         let Some(unloaded) = self.unloaded.take() else { return Ok(()) };
-        let doc = match self.doc.read(cx).path.as_deref().map(Document::open) {
+        // As text even if it looks binary: it was open as text last time.
+        let doc = match self.doc.read(cx).path.as_deref().map(Document::open_anyway) {
             Some(Ok(mut doc)) => {
                 if let Some(encoding) = unloaded.encoding
                     && encoding != doc.encoding

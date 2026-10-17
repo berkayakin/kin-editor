@@ -131,6 +131,8 @@ actions!(
         AcceptBoth,
         NextChange,
         PreviousChange,
+        NextProblem,
+        PreviousProblem,
         ToggleInlineBlame,
         ToggleSoftWrap,
         ToggleInlayHints,
@@ -241,6 +243,10 @@ pub struct Editor {
     /// Selections before each ExtendSelection, for ShrinkSelection.
     expand_stack: Vec<Vec<Selection>>,
     expanding: bool,
+    /// The selections Add Selection for Next Occurrence made, when it
+    /// started from a caret: while they're still the selections, it adds
+    /// only whole words (case-sensitively, as VS Code and Zed do).
+    occurrence_words: Option<Vec<Selection>>,
     selections: Vec<Selection>,
     /// Index of the most recently added selection.
     primary: usize,
@@ -386,6 +392,7 @@ impl Editor {
             active_match: None,
             expand_stack: Vec::new(),
             expanding: false,
+            occurrence_words: None,
             selections: vec![Selection::cursor(0)],
             primary: 0,
             goal_x: None,
@@ -1517,7 +1524,8 @@ impl Editor {
         let row = doc.row_of(self.primary_selection().head);
         let (start, end) = (doc.line_start(row), doc.line_end(row));
         let first = doc.diagnostics.partition_point(|d| d.range.start < start);
-        let problems: Vec<&lint::Diagnostic> = doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).collect();
+        let problems: Vec<&lint::Diagnostic> =
+            doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).filter(|d| d.severity.is_problem()).collect();
         let Some(only) = problems.first() else { return Vec::new() };
         let text = doc.line_text(row);
         let cols = (layout.wrap_width / layout.char_width).floor().max(20.) as usize;
@@ -2198,6 +2206,12 @@ impl Editor {
     }
 
     fn select_next_occurrence(&mut self, _: &SelectNextOccurrence, _: &mut Window, cx: &mut Context<Self>) {
+        self.add_next_occurrence(cx);
+    }
+
+    /// From carets, the words at them; then the next occurrence of the
+    /// primary selection's text (around the end), as another selection.
+    fn add_next_occurrence(&mut self, cx: &mut Context<Self>) {
         let primary = self.primary_selection();
         if primary.is_empty() {
             let selections = self
@@ -2209,21 +2223,24 @@ impl Editor {
                 })
                 .collect();
             self.set_selections(selections, self.primary, cx);
+            self.occurrence_words = Some(self.selections.clone());
             return;
         }
-        let needle = self.doc.read(cx).slice(primary.range());
-        let haystack = self.doc.read(cx).rope().to_string();
+        let whole_words = self.occurrence_words.as_ref() == Some(&self.selections);
+        let doc = self.doc.read(cx);
+        let needle = doc.slice(primary.range());
         let from = self.selections.iter().map(|s| s.range().end).max().unwrap_or(0);
-        let found = haystack[from..]
-            .find(&needle)
-            .map(|i| i + from)
-            .or_else(|| haystack.find(&needle))
+        let found = find_occurrence(doc, &needle, from, doc.len(), whole_words)
+            .or_else(|| find_occurrence(doc, &needle, 0, from, whole_words))
             .filter(|&i| !self.selections.iter().any(|s| s.range().start == i));
         if let Some(start) = found {
             let mut selections = self.selections.clone();
             selections.push(Selection { anchor: start, head: start + needle.len() });
             let primary = selections.len() - 1;
             self.set_selections(selections, primary, cx);
+            if whole_words {
+                self.occurrence_words = Some(self.selections.clone());
+            }
         }
     }
 
@@ -2319,7 +2336,7 @@ impl Editor {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        let mut text = text.replace("\r\n", "\n");
+        let mut text = crate::encoding::to_lf(text);
         if self.is_single_line() {
             text = text.trim_end_matches('\n').replace('\n', " ");
         }
@@ -3093,6 +3110,9 @@ impl Editor {
             if !dl.inlays.is_empty() {
                 runs = inlay_runs(runs, &dl, editor_font.clone(), theme.text_dim.into());
             }
+            if !dl.controls.is_empty() {
+                runs = restyle_runs(runs, &dl.controls, |piece| piece.color = theme.text_dim.into());
+            }
             let is_cursor_row = head_rows.contains(&row);
             let indent = indents[row - first_row].unwrap_or_else(|| {
                 let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
@@ -3101,7 +3121,11 @@ impl Editor {
             });
             let breaks = self.line_breaks(row).to_vec();
             let row_first_drow = self.first_display_row(row);
-            let worst = row_diags.iter().filter(|d| self.doc.read(cx).row_of(d.range.start) == row).min_by_key(|d| d.severity);
+            // Hints get no dot or message at the line's end.
+            let worst = row_diags
+                .iter()
+                .filter(|d| d.severity.is_problem() && self.doc.read(cx).row_of(d.range.start) == row)
+                .min_by_key(|d| d.severity);
 
             // Each wrapped segment of the line is its own display row.
             for seg in 0..=breaks.len() {
@@ -3190,6 +3214,14 @@ impl Editor {
                     let bounds = Bounds::from_corners(
                         point(origin.x + x_of(span.label.start) - px(2.), y + px(2.)),
                         point(origin.x + x_of(span.label.end) + px(2.), y + line_height - px(2.)),
+                    );
+                    frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
+                }
+                // So do control characters' symbols, each on its own.
+                for symbol in dl.controls.iter().filter(|r| r.start >= seg_range.start && r.end <= seg_range.end) {
+                    let bounds = Bounds::from_corners(
+                        point(origin.x + x_of(symbol.start) + px(0.5), y + px(2.)),
+                        point(origin.x + x_of(symbol.end) - px(0.5), y + line_height - px(2.)),
                     );
                     frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
                 }
@@ -3665,7 +3697,7 @@ impl Editor {
                 (None, None) => unreachable!(),
             };
             let rows = display_rows.max(1) as f32;
-            for d in &self.doc.read(cx).diagnostics {
+            for d in self.doc.read(cx).diagnostics.iter().filter(|d| d.severity.is_problem()) {
                 let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
                 let y = track.top() + track.size.height * (row / rows);
                 frame.scrollbar.push(fill(
@@ -3728,6 +3760,7 @@ fn severity_color(theme: &Theme, severity: Severity) -> Hsla {
         Severity::Error => theme.error,
         Severity::Warning => theme.warning,
         Severity::Info => theme.info,
+        Severity::Hint => theme.text_dim,
     }
     .into()
 }
@@ -3825,6 +3858,62 @@ fn word_right(doc: &Document, mut o: usize) -> usize {
     o
 }
 
+/// Where `needle` first occurs in `doc` starting from `from` up to (not
+/// from) `to`, matching case; with `whole_words`, only where no word
+/// character goes on past either end of it. Reads the rope chunk by chunk
+/// rather than copying the text.
+fn find_occurrence(doc: &Document, needle: &str, from: usize, to: usize, whole_words: bool) -> Option<usize> {
+    let pattern = needle.as_bytes();
+    if pattern.is_empty() || from >= to || from >= doc.len() {
+        return None;
+    }
+    let is_word = |c: Option<char>| c.is_some_and(|c| char_kind(c) == CharKind::Word);
+    let (word_start, word_end) = (is_word(needle.chars().next()), is_word(needle.chars().next_back()));
+    let whole = |start: usize| {
+        let joined_before = word_start && is_word(doc.char_before(start));
+        let joined_after = word_end && is_word(doc.char_at(start + pattern.len()));
+        !whole_words || !(joined_before || joined_after)
+    };
+    // The bytes from `window_start` on: what's left of the chunks before
+    // (shorter than a match) and the current chunk.
+    let (chunks, mut chunk_start, _, _) = doc.rope().chunks_at_byte(from);
+    let (mut window, mut window_start) = (Vec::new(), from);
+    for chunk in chunks {
+        let bytes = chunk.as_bytes();
+        window.extend_from_slice(&bytes[from.saturating_sub(chunk_start).min(bytes.len())..]);
+        chunk_start += bytes.len();
+        let mut at = 0;
+        while let Some(i) = window[at..].windows(pattern.len()).position(|w| w == pattern) {
+            let start = window_start + at + i;
+            if start >= to {
+                return None;
+            }
+            if whole(start) {
+                return Some(start);
+            }
+            at += i + 1;
+        }
+        let keep = window.len().min(pattern.len() - 1);
+        window_start += window.len() - keep;
+        window.drain(..window.len() - keep);
+        if window_start >= to {
+            return None;
+        }
+    }
+    None
+}
+
+/// Where Next (`forward`) or Previous Problem goes from `head`: the nearest
+/// problem start after (before) it, else around the file, the first (last).
+/// `starts` is sorted.
+fn problem_from(starts: &[usize], head: usize, forward: bool) -> Option<usize> {
+    if forward {
+        starts.iter().copied().find(|&s| s > head).or(starts.first().copied())
+    } else {
+        starts.iter().rev().copied().find(|&s| s < head).or(starts.last().copied())
+    }
+}
+
 fn word_range(doc: &Document, offset: usize) -> Range<usize> {
     let kind = match (doc.char_at(offset), doc.char_before(offset)) {
         (Some(c), _) if char_kind(c) == CharKind::Word => CharKind::Word,
@@ -3876,9 +3965,21 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
     if total < dl.text.len() {
         runs.push(TextRun { len: dl.text.len() - total, font, color, background_color: None, underline: None, strikethrough: None });
     }
-    let in_hint = |at: usize| dl.inlays.iter().any(|s| s.whole.contains(&at));
-    let mut cuts: Vec<usize> = dl.inlays.iter().flat_map(|s| [s.whole.start, s.whole.end]).collect();
+    let hints: Vec<Range<usize>> = dl.inlays.iter().map(|s| s.whole.clone()).collect();
+    restyle_runs(runs, &hints, |piece| {
+        piece.color = color;
+        piece.underline = None;
+        piece.background_color = None;
+    })
+}
+
+/// `runs` cut where `ranges` (of the display text) start and end, with
+/// `restyle` applied to the pieces inside them.
+fn restyle_runs(runs: Vec<TextRun>, ranges: &[Range<usize>], restyle: impl Fn(&mut TextRun)) -> Vec<TextRun> {
+    let inside = |at: usize| ranges.iter().any(|r| r.contains(&at));
+    let mut cuts: Vec<usize> = ranges.iter().flat_map(|r| [r.start, r.end]).collect();
     cuts.sort_unstable();
+    cuts.dedup();
     let mut out = Vec::with_capacity(runs.len() + cuts.len());
     let mut pos = 0;
     for run in runs {
@@ -3886,10 +3987,8 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
         let mut start = pos;
         for &cut in cuts.iter().filter(|&&c| c > pos && c < end).chain(std::iter::once(&end)) {
             let mut piece = TextRun { len: cut - start, ..run.clone() };
-            if in_hint(start) {
-                piece.color = color;
-                piece.underline = None;
-                piece.background_color = None;
+            if inside(start) {
+                restyle(&mut piece);
             }
             out.push(piece);
             start = cut;
@@ -3899,14 +3998,54 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
     out
 }
 
-/// A buffer line prepared for display: tabs are expanded to spaces, with a
-/// mapping between buffer columns and display columns (both in bytes).
+/// A buffer line prepared for display: tabs are expanded to spaces and
+/// control characters shown as symbols (`control_symbol`), with a mapping
+/// between buffer columns and display columns (both in bytes).
 pub struct DisplayLine {
     pub text: String,
     map: Option<Vec<usize>>,
     /// Inlay hints shown in `text`: the inserted text (padding included), the
     /// label within it, and the buffer column they sit before.
     pub inlays: Vec<InlaySpan>,
+    /// Where `text` shows control characters' symbols (dim, on a chip).
+    pub controls: Vec<Range<usize>>,
+}
+
+/// How a control character shows, as it would otherwise draw as nothing (or
+/// as a box): C0 controls and DEL as their Control Pictures (a form feed is
+/// ␌), C1 controls and the Unicode line and paragraph separators by name.
+/// A tab isn't one: it shows as spaces.
+pub fn control_symbol(c: char) -> Option<&'static str> {
+    const C0: [&str; 32] = [
+        "␀", "␁", "␂", "␃", "␄", "␅", "␆", "␇", "␈", "␉", "␊", "␋", "␌", "␍", "␎", "␏", "␐", "␑", "␒", "␓", "␔", "␕", "␖", "␗",
+        "␘", "␙", "␚", "␛", "␜", "␝", "␞", "␟",
+    ];
+    const C1: [&str; 32] = [
+        "PAD", "HOP", "BPH", "NBH", "IND", "NEL", "SSA", "ESA", "HTS", "HTJ", "VTS", "PLD", "PLU", "RI", "SS2", "SS3", "DCS", "PU1",
+        "PU2", "STS", "CCH", "MW", "SPA", "EPA", "SOS", "SGC", "SCI", "CSI", "ST", "OSC", "PM", "APC",
+    ];
+    match c {
+        '\t' => None,
+        '\0'..='\u{1f}' => Some(C0[c as usize]),
+        '\u{7f}' => Some("␡"),
+        '\u{80}'..='\u{9f}' => Some(C1[c as usize - 0x80]),
+        '\u{2028}' => Some("LS"),
+        '\u{2029}' => Some("PS"),
+        _ => None,
+    }
+}
+
+/// Whether `line` has a tab or a control character, which show as something
+/// else (most lines have neither).
+fn has_tabs_or_controls(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        0..=0x1f | 0x7f => true,
+        // C1 controls are U+0080 to U+009F; LS and PS are E2 80 A8 / A9.
+        0xc2 => bytes.get(i + 1).is_some_and(|next| (0x80..=0x9f).contains(next)),
+        0xe2 => bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(0xa8 | 0xa9)),
+        _ => false,
+    })
 }
 
 pub struct InlaySpan {
@@ -3924,12 +4063,13 @@ impl DisplayLine {
     /// by column. A buffer column maps to the display column before its
     /// hints, so carets sit left of them.
     pub fn with_inlays(line: &str, tab_size: usize, inlays: &[(usize, &str, bool, bool)]) -> Self {
-        if !line.contains('\t') && inlays.is_empty() {
-            return Self { text: line.to_string(), map: None, inlays: Vec::new() };
+        if inlays.is_empty() && !has_tabs_or_controls(line) {
+            return Self { text: line.to_string(), map: None, inlays: Vec::new(), controls: Vec::new() };
         }
         let mut text = String::with_capacity(line.len() + 16);
         let mut map = Vec::with_capacity(line.len() + 1);
         let mut spans = Vec::new();
+        let mut controls = Vec::new();
         let mut next = 0;
         let mut insert = |at: usize, text: &mut String| {
             while let Some(&(column, label, pad_left, pad_right)) = inlays.get(next).filter(|i| i.0 <= at) {
@@ -3954,6 +4094,10 @@ impl DisplayLine {
                 let n = tab_size - col % tab_size;
                 text.extend(std::iter::repeat_n(' ', n));
                 col += n;
+            } else if let Some(symbol) = control_symbol(ch) {
+                controls.push(text.len()..text.len() + symbol.len());
+                text.push_str(symbol);
+                col += symbol.chars().count();
             } else {
                 text.push(ch);
                 col += 1;
@@ -3962,7 +4106,7 @@ impl DisplayLine {
         let before = text.len();
         insert(line.len(), &mut text);
         map.push(before);
-        Self { text, map: Some(map), inlays: spans }
+        Self { text, map: Some(map), inlays: spans, controls }
     }
 
     pub fn to_display(&self, col: usize) -> usize {
@@ -4074,6 +4218,26 @@ impl Editor {
 
     fn previous_change(&mut self, _: &PreviousChange, _: &mut Window, cx: &mut Context<Self>) {
         self.jump_to_change(false, cx);
+    }
+
+    /// Next / Previous Problem: the caret goes to where the next (previous)
+    /// problem in the file starts, built-in lint's and language servers'
+    /// alike, around the end; its message shows on that line.
+    fn jump_to_problem(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let doc = self.doc.read(cx);
+        let starts: Vec<usize> = doc.diagnostics.iter().filter(|d| d.severity.is_problem()).map(|d| d.range.start).collect();
+        match problem_from(&starts, self.primary_selection().head, forward) {
+            Some(at) => self.select_range(at..at, cx),
+            None => cx.emit(EditorLspEvent::Message("No problems in this file".into())),
+        }
+    }
+
+    fn next_problem(&mut self, _: &NextProblem, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_problem(true, cx);
+    }
+
+    fn previous_problem(&mut self, _: &PreviousProblem, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_problem(false, cx);
     }
 
     fn toggle_inline_blame(&mut self, _: &ToggleInlineBlame, _: &mut Window, cx: &mut Context<Self>) {
@@ -4273,26 +4437,45 @@ impl Editor {
         if self.selections.len() < 2 {
             return;
         }
+        let whole_words = self.occurrence_words.as_ref() == Some(&self.selections);
         let mut selections = self.selections.clone();
         selections.remove(self.primary);
         let primary = self.primary.saturating_sub(1).min(selections.len() - 1);
         self.set_selections(selections, primary, cx);
+        if whole_words {
+            self.occurrence_words = Some(self.selections.clone());
+        }
     }
 
     fn select_all_occurrences(&mut self, _: &SelectAllOccurrences, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_occurrences(cx);
+    }
+
+    fn select_occurrences(&mut self, cx: &mut Context<Self>) {
         let p = self.primary_selection();
-        let range = if p.is_empty() { word_range(self.doc.read(cx), p.head) } else { p.range() };
+        // From a caret, the word there wherever it's a whole word (as Add
+        // Selection for Next Occurrence goes on from one).
+        let whole_words = p.is_empty() || self.occurrence_words.as_ref() == Some(&self.selections);
+        let doc = self.doc.read(cx);
+        let range = if p.is_empty() { word_range(doc, p.head) } else { p.range() };
         if range.is_empty() {
             return;
         }
-        let needle = self.doc.read(cx).slice(range.clone());
-        let haystack = self.doc.read(cx).rope().to_string();
-        let selections: Vec<Selection> = haystack
-            .match_indices(&needle)
-            .map(|(i, _)| Selection { anchor: i, head: i + needle.len() })
-            .collect();
+        let needle = doc.slice(range.clone());
+        let mut selections = Vec::new();
+        let mut from = 0;
+        while let Some(start) = find_occurrence(doc, &needle, from, doc.len(), whole_words) {
+            selections.push(Selection { anchor: start, head: start + needle.len() });
+            from = start + needle.len();
+        }
+        if selections.is_empty() {
+            return;
+        }
         let primary = selections.iter().position(|s| s.anchor == range.start).unwrap_or(0);
         self.set_selections(selections, primary, cx);
+        if whole_words {
+            self.occurrence_words = Some(self.selections.clone());
+        }
     }
 
     fn toggle_case(&mut self, _: &ToggleCase, _: &mut Window, cx: &mut Context<Self>) {
@@ -4638,6 +4821,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::accept_both))
             .on_action(cx.listener(Self::next_change))
             .on_action(cx.listener(Self::previous_change))
+            .on_action(cx.listener(Self::next_problem))
+            .on_action(cx.listener(Self::previous_problem))
             .on_action(cx.listener(Self::toggle_inline_blame))
             .on_action(cx.listener(Self::toggle_soft_wrap))
             .on_action(cx.listener(Self::show_completions))
@@ -4953,6 +5138,74 @@ mod block_tests {
             assert!(e.caret_problem_rows(cx).is_empty());
         });
     }
+
+    #[gpui::test]
+    fn next_problem_steps_through_the_files_problems(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::new(Document::from_text("let a = 1;\nlet b = 2;\nlet c = 3;\n".into(), None), cx));
+        let at = |start: usize, severity: lint::Severity| lint::Diagnostic { range: start..start + 1, severity, message: "m".into(), rule: "r".into() };
+        editor.update(cx, |e, cx| {
+            // A language server's problem, a built-in one, and a hint, which isn't one.
+            e.doc.as_mut(cx).set_lsp_diagnostics(vec![at(15, lint::Severity::Warning), at(26, lint::Severity::Hint)]);
+            e.doc.as_mut(cx).set_builtin_diagnostics(vec![at(4, lint::Severity::Error)]);
+            let mut steps = Vec::new();
+            for forward in [true, true, true, false, false] {
+                e.jump_to_problem(forward, cx);
+                steps.push(e.primary_selection().head);
+            }
+            // In document order, around the end both ways.
+            assert_eq!(steps, [4, 15, 4, 15, 4]);
+        });
+    }
+
+    #[gpui::test]
+    fn occurrences_of_a_word_at_the_caret_are_whole_words(cx: &mut TestAppContext) {
+        let editor = cx.new(|cx| Editor::new(Document::from_text("foo foobar Foo foo_x foo\nfoo\n".into(), None), cx));
+        editor.update(cx, |e, cx| {
+            let selected = |e: &Editor| e.selections.iter().map(Selection::range).collect::<Vec<_>>();
+            // From a caret: its word, then the same word, matching case.
+            e.set_selections(vec![Selection::cursor(1)], 0, cx);
+            for _ in 0..4 {
+                e.add_next_occurrence(cx);
+            }
+            assert_eq!(selected(e), [0..3, 21..24, 25..28]);
+            // Selected by hand: any match, still matching case.
+            e.set_selections(vec![Selection { anchor: 0, head: 3 }], 0, cx);
+            e.add_next_occurrence(cx);
+            assert_eq!(selected(e), [0..3, 4..7]);
+            // Select All Occurrences from a caret: whole words too.
+            e.set_selections(vec![Selection::cursor(22)], 0, cx);
+            e.select_occurrences(cx);
+            assert_eq!(selected(e), [0..3, 21..24, 25..28]);
+        });
+    }
+
+    #[test]
+    fn occurrences_are_found_across_the_ropes_chunks() {
+        let needle = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let text: String = (0..200).map(|i| format!("{needle}-{i:04}|")).collect();
+        let doc = Document::from_text(text.clone(), None);
+        assert!(doc.rope().chunks().count() > 4);
+        for from in (0..text.len()).step_by(7) {
+            let expected = text[from..].find(needle).map(|i| i + from);
+            assert_eq!(find_occurrence(&doc, needle, from, text.len(), false), expected, "from {from}");
+        }
+        // Only matches starting before `to`; whole words with word characters around fail.
+        assert_eq!(find_occurrence(&doc, needle, 1, 46, false), None);
+        assert_eq!(find_occurrence(&doc, needle, 0, 1, false), Some(0));
+        assert_eq!(find_occurrence(&doc, "efgh", 0, text.len(), true), None);
+        assert_eq!(find_occurrence(&doc, "-0001|", 0, text.len(), true), Some(86));
+    }
+
+    #[test]
+    fn problems_are_found_around_the_file() {
+        let starts = [5, 5, 20, 40];
+        assert_eq!(problem_from(&starts, 0, true), Some(5));
+        assert_eq!(problem_from(&starts, 5, true), Some(20));
+        assert_eq!(problem_from(&starts, 40, true), Some(5));
+        assert_eq!(problem_from(&starts, 30, false), Some(20));
+        assert_eq!(problem_from(&starts, 5, false), Some(40));
+        assert_eq!(problem_from(&[], 3, true), None);
+    }
 }
 
 #[cfg(test)]
@@ -4980,5 +5233,42 @@ mod text_field_tests {
         // The code editor pairs them.
         let code = cx.new(|cx| Editor::new(Document::empty(), cx));
         assert_eq!(typed(&code, "f(", cx), "f()");
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn control_characters_show_as_symbols() {
+        let symbols: Vec<Option<&str>> =
+            ['\0', '\x0b', '\x0c', '\r', '\x1b', '\x7f', '\u{85}', '\u{2028}', '\u{2029}'].into_iter().map(control_symbol).collect();
+        let expected = ["␀", "␋", "␌", "␍", "␛", "␡", "NEL", "LS", "PS"];
+        assert_eq!(symbols, expected.map(Some));
+        for plain in ['\t', ' ', 'a', '\u{a0}', 'é', '—', '\u{2027}', '\u{202a}'] {
+            assert_eq!(control_symbol(plain), None, "{plain:?}");
+        }
+        // The quick check agrees with the table, byte by byte.
+        for c in ('\0'..='\u{3000}').filter(|&c| c != '\t' && c != '\n') {
+            assert_eq!(has_tabs_or_controls(&format!("a{c}b")), control_symbol(c).is_some(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn symbols_map_to_their_one_character() {
+        // A form feed, a line separator and a tab: "a␌bLSc  d".
+        let line = "a\x0cb\u{2028}c\td";
+        let dl = DisplayLine::new(line, 4);
+        assert_eq!(dl.text, "a␌bLSc  d");
+        assert_eq!(dl.controls, [1..4, 5..7]);
+        let (ff, b, ls, c, tab, d) = (1, 2, 3, 6, 7, 8);
+        let shown: Vec<usize> = [ff, b, ls, c, tab, d, line.len()].map(|col| dl.to_display(col)).to_vec();
+        assert_eq!(shown, [1, 4, 5, 7, 8, 10, 11]);
+        // A click before or after a symbol is at its character or the next.
+        assert_eq!((dl.to_buffer(1), dl.to_buffer(4), dl.to_buffer(5), dl.to_buffer(7)), (ff, b, ls, c));
+        // Without tabs or control characters, the text is the line itself.
+        let plain = DisplayLine::new("a — b", 4);
+        assert!(plain.controls.is_empty() && plain.map.is_none());
     }
 }

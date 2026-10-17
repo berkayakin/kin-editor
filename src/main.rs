@@ -39,6 +39,7 @@ mod lsp;
 mod markdown_preview;
 mod onboarding;
 mod pane_item;
+mod panic_log;
 mod picker;
 mod preview;
 mod problems_panel;
@@ -177,6 +178,10 @@ fn menus_for(mac: bool) -> Vec<Menu> {
                 MenuItem::action("Go to Implementation", GoToImplementation),
                 MenuItem::action("Go to Type Definition", GoToTypeDefinition),
                 MenuItem::action("Find Usages", FindUsages),
+                MenuItem::separator(),
+                MenuItem::action("Next Problem", NextProblem),
+                MenuItem::action("Previous Problem", PreviousProblem),
+                MenuItem::separator(),
                 MenuItem::action("Find Action…", FindAction),
             ],
         },
@@ -382,6 +387,9 @@ fn limit_window_zoom() {
 
 fn main() {
     theme::move_legacy_config();
+    if let Some(config) = theme::config_dir() {
+        panic_log::install(config.join("logs"));
+    }
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "extension") {
         std::process::exit(cli::extension_command(&raw[1..]));
@@ -389,6 +397,12 @@ fn main() {
     let args: Vec<PathBuf> = raw.into_iter().map(PathBuf::from).collect();
     // A Kuana already running takes the paths; this launch is done.
     let Ok(instance) = instance::claim(&args) else { return };
+    // Git, language servers and debug adapters run with the login shell's
+    // PATH (`search_path`); ask the shell while the window opens, not when
+    // the first Git status waits for it.
+    std::thread::spawn(|| {
+        lsp::servers::search_path();
+    });
 
     #[cfg(target_os = "macos")]
     set_app_name();

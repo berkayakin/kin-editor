@@ -23,7 +23,7 @@ use crate::{
     workspace::{
         CloseAllTabs, CloseOtherTabs, CloseTab, CloseTerminal, NextPane, Rerun, RunConfiguration, StopRun, SplitDown, SplitRight, TogglePinTab, DecreaseFontSize, NewTerminal, ToggleTerminal, FileStructure, Find, IncreaseFontSize, OpenKeymap, OpenSettings, ResetFontSize, RestartLanguageServer, FindAction, FindInFiles, FindNext, FindPrevious, GoToFile, GoToLine, OpenSettingsFile,
         CloseWindow, MinimizeWindow, ZoomWindow, NewFile, NewWindow, NextTab, OpenFile, OpenFolder, OpenFolderInThisWindow,
-        PrevTab, Quit, RecentFiles, RecentProjects, Replace,
+        PrevTab, Quit, RecentFiles, RecentProjects, RecentTab, RecentTabBack, Replace,
         GitBranches, GitStash, ManageRemotes, GitClone, GitFetch, GitInit, GitPull, GitPush, OpenRemote, OpenThemesFolder, OpenSnippetsFolder, ReloadThemes, ReplaceInFiles,
         Save, SaveAs, SearchEverywhere, SelectTheme, ShowCommit, ShowFileHistory, ToggleCommit, ToggleGitLog, ToggleProblems,
         DebugConfiguration, Resume, PauseProgram, StepOver, StepInto, StepOut, ToggleDebugPanel, AttachToProcess, AddConditionalBreakpoint,
@@ -92,8 +92,9 @@ fn common(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-f", FindInFiles, None),
         KeyBinding::new("f3", FindNext, None),
         KeyBinding::new("shift-f3", FindPrevious, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        // The last used tab, as every editor's Ctrl+Tab switcher starts.
+        KeyBinding::new("ctrl-tab", RecentTab, None),
+        KeyBinding::new("ctrl-shift-tab", RecentTabBack, None),
         KeyBinding::new("secondary-\\", SplitRight, None),
         KeyBinding::new("ctrl-space", ShowCompletions, e),
         // Dialogs and panels.
@@ -260,6 +261,9 @@ fn jetbrains(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-t", GitPull, None),
         KeyBinding::new("ctrl-alt-shift-down", NextChange, e),
         KeyBinding::new("ctrl-alt-shift-up", PreviousChange, e),
+        // Next / Previous Highlighted Error.
+        KeyBinding::new("f2", NextProblem, e),
+        KeyBinding::new("shift-f2", PreviousProblem, e),
         KeyBinding::new("shift-enter", NewlineBelow, e),
         KeyBinding::new("secondary-d", DuplicateLine, e),
         KeyBinding::new("secondary-shift-u", ToggleCase, e),
@@ -411,6 +415,9 @@ fn vscode(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("alt-z", ToggleSoftWrap, e),
         KeyBinding::new("alt-f5", NextChange, e),
         KeyBinding::new("shift-alt-f5", PreviousChange, e),
+        // Go to Next / Previous Problem.
+        KeyBinding::new("f8", NextProblem, e),
+        KeyBinding::new("shift-f8", PreviousProblem, e),
     ];
     if mac {
         b.extend([
@@ -485,6 +492,9 @@ fn sublime_text(mac: bool) -> Vec<KeyBinding> {
         // Next / previous modification.
         KeyBinding::new("ctrl-.", NextChange, e),
         KeyBinding::new("ctrl-,", PreviousChange, e),
+        // Next / previous result (build errors).
+        KeyBinding::new("f4", NextProblem, e),
+        KeyBinding::new("shift-f4", PreviousProblem, e),
     ];
     if mac {
         b.extend([
@@ -589,6 +599,9 @@ fn zed(mac: bool) -> Vec<KeyBinding> {
         KeyBinding::new("secondary-shift-l", SelectAllOccurrences, e),
         KeyBinding::new("secondary-u", UnselectOccurrence, e),
         KeyBinding::new("secondary-k z", ToggleSoftWrap, e),
+        // Go to (previous) diagnostic.
+        KeyBinding::new("f8", NextProblem, e),
+        KeyBinding::new("shift-f8", PreviousProblem, e),
     ];
     if mac {
         b.extend([
@@ -721,6 +734,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Close Tab", CloseTab),
         a("Next Tab", NextTab),
         a("Previous Tab", PrevTab),
+        a("Switch to Recent Tab", RecentTab),
+        a("Switch to Recent Tab (Backward)", RecentTabBack),
         a("Toggle Project Sidebar", ToggleSidebar),
         a("Toggle Sidebar Position", ToggleSidebarPosition),
         a("Toggle Problems", ToggleProblems),
@@ -778,6 +793,8 @@ pub fn action_entries() -> Vec<ActionEntry> {
         a("Rollback Lines", RollbackHunk),
         a("Next Change", NextChange),
         a("Previous Change", PreviousChange),
+        a("Next Problem", NextProblem),
+        a("Previous Problem", PreviousProblem),
         a("Toggle Inline Git Blame", ToggleInlineBlame),
         a("Soft-Wrap", ToggleSoftWrap),
         a("Toggle Inlay Hints", ToggleInlayHints),
@@ -847,6 +864,8 @@ fn terminal_passthrough(defaults: &[KeyBinding]) -> Vec<KeyBinding> {
         "workspace::ToggleGitLog",
         "workspace::NextTab",
         "workspace::PrevTab",
+        "workspace::RecentTab",
+        "workspace::RecentTabBack",
         "workspace::FindAction",
         "workspace::ToggleSidebar",
         "workspace::ToggleProblems",
@@ -1103,6 +1122,24 @@ mod tests {
         assert_eq!(resolve(BaseKeymap::JetBrains, "f7", &["Workspace", "DiffView"]), Some("editor::NextChange"));
         assert_eq!(resolve(BaseKeymap::JetBrains, "f7", &["Workspace", "Editor"]), Some("workspace::StepInto"));
     }
+    #[test]
+    fn problem_keys_follow_each_editor() {
+        let editor = &["Workspace", "Editor"];
+        for (base, next, previous) in [
+            (BaseKeymap::JetBrains, "f2", "shift-f2"),
+            (BaseKeymap::VSCode, "f8", "shift-f8"),
+            (BaseKeymap::Zed, "f8", "shift-f8"),
+            (BaseKeymap::SublimeText, "f4", "shift-f4"),
+        ] {
+            assert_eq!(resolve(base, next, editor), Some("editor::NextProblem"), "{base:?}");
+            assert_eq!(resolve(base, previous, editor), Some("editor::PreviousProblem"), "{base:?}");
+        }
+        // F8 stays JetBrains' Step Over, F2 VS Code's and Zed's Rename.
+        assert_eq!(resolve(BaseKeymap::JetBrains, "f8", editor), Some("workspace::StepOver"));
+        assert_eq!(resolve(BaseKeymap::VSCode, "f2", editor), Some("editor::RenameSymbol"));
+        assert_eq!(resolve(BaseKeymap::Zed, "f2", editor), Some("editor::RenameSymbol"));
+    }
+
     use serde_json::json;
 
     fn layers(base: BaseKeymap, mac: bool) -> Vec<KeyBinding> {

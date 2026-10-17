@@ -694,7 +694,10 @@ impl LspStore {
                         let edits = protocol::workspace_edit(params.get("edit").unwrap_or(&Value::Null));
                         cx.emit(LspEvent::ApplyEdit { key: key.clone(), request_id: id, encoding, edits });
                     }
-                    _ => client.respond(id, Value::Null),
+                    // Progress shows through `$/progress` (Kuana says it does: `workDoneProgress`);
+                    // a message's choices aren't offered, so none was picked.
+                    "window/workDoneProgress/create" | "window/showMessageRequest" => client.respond(id, Value::Null),
+                    _ => client.respond_not_found(id, &method),
                 }
             }
             Incoming::Closed { stderr_tail } => {
@@ -1224,6 +1227,8 @@ impl FileWatcher {
 /// save checks the file as rust-analyzer does: "hints checked <first line>".
 /// Named "respell", it names the file in its answers as other servers may.
 /// Named "goodbye", it notes being told to shut down: a `<file>.shutdown` beside its file.
+/// Named "asks", it sends a request Kuana doesn't handle and a progress token's, and
+/// adds the first's error code and whether the second was accepted to its problem.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
 import sys, json
@@ -1298,6 +1303,16 @@ while True:
             answer = read()
         section = answer["result"][0] or {}
         extra = [str(v) for v in (init.get("greeting"), section.get("mode")) if v is not None]
+        if name == "asks":
+            # A request Kuana doesn't handle, and one it says it does.
+            send({"jsonrpc": "2.0", "id": "odd", "method": "kuana/noSuchRequest", "params": {}})
+            send({"jsonrpc": "2.0", "id": "wdp", "method": "window/workDoneProgress/create", "params": {"token": "t"}})
+            answers = {}
+            while len(answers) < 2:
+                answer = read()
+                if answer.get("id") in ("odd", "wdp"):
+                    answers[answer["id"]] = answer
+            extra += [str(answers["odd"].get("error", {}).get("code")), "progress " + ("refused" if "error" in answers["wdp"] else "ok")]
         message = " ".join([name + " problem"] + extra)
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": spelled(uri), "diagnostics": [problem]}})
@@ -1469,6 +1484,40 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(10), "the server wasn't told to shut down");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A request Kuana doesn't handle gets MethodNotFound (a `null` result
+    /// would read as done), one it handles its answer.
+    #[gpui::test]
+    fn unknown_requests_are_answered_method_not_found(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+
+        use crate::document::Document;
+        if servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-asks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("asks", "")]);
+            store
+        });
+        let editor = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let started = std::time::Instant::now();
+        while !editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "timed out waiting for the server");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+        let message = editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics[0].message.to_string());
+        assert_eq!(message, format!("asks problem {} progress ok", rpc::METHOD_NOT_FOUND));
         std::fs::remove_dir_all(&dir).ok();
     }
 
