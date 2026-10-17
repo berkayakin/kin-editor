@@ -6,6 +6,7 @@ mod format;
 mod conflict;
 pub(crate) mod derived;
 mod lsp;
+mod markers;
 mod minimap;
 mod run;
 mod snippet;
@@ -37,6 +38,7 @@ use crate::{
     document_diff::DocumentDiff,
     git::{self, BlameLine, Hunk, HunkKind},
     lint::{self, Severity, external::ExternalLinter},
+    search::SearchMatches,
     settings::{FileSettings, Settings, ShowWhitespace},
     theme::Theme,
     ui::HoverFill,
@@ -238,7 +240,7 @@ pub struct Editor {
     pub doc: Entity<Document>,
     mode: EditorMode,
     placeholder: SharedString,
-    search_matches: Vec<Range<usize>>,
+    search_matches: SearchMatches,
     active_match: Option<usize>,
     /// Selections before each ExtendSelection, for ShrinkSelection.
     expand_stack: Vec<Vec<Selection>>,
@@ -247,7 +249,13 @@ pub struct Editor {
     /// started from a caret: while they're still the selections, it adds
     /// only whole words (case-sensitively, as VS Code and Zed do).
     occurrence_words: Option<Vec<Selection>>,
+    /// Sorted and apart (see `set_selections`), so a frame finds the ones on
+    /// screen by binary search.
     selections: Vec<Selection>,
+    /// Changes whenever `selections` do, for what's drawn from all of them.
+    selections_generation: u64,
+    /// `selected_chars` for (document, version, selections generation).
+    selected_chars: std::cell::Cell<Option<((u64, u64, u64), usize)>>,
     /// Index of the most recently added selection.
     primary: usize,
     goal_x: Option<Pixels>,
@@ -273,6 +281,16 @@ pub struct Editor {
     /// The thumb fades out when the text stops scrolling; the track's markers stay.
     scrollbar_fade: crate::ui::ScrollbarFade,
     minimap_cache: minimap::MinimapCache,
+    /// The scrollbar's markers, kept until what they show changes.
+    markers: markers::Markers,
+    /// Block rows for what they were built from (see `blocks`).
+    blocks_cache: Option<BlocksCache>,
+    /// Finds the diagnostics reaching into what's on screen.
+    reach: Reach,
+    /// Rows with a gutter ▶, for the run targets they're from.
+    run_rows: (Option<Arc<Vec<crate::run::RunTarget>>>, Arc<Vec<usize>>),
+    /// See `row_problems`, for a document state.
+    row_problems: (Option<(u64, u64, u64)>, Arc<Vec<(usize, Option<usize>, usize)>>),
     marked_range: Option<Range<usize>>,
     indent_unit: String,
     /// Display width of a tab character (and of an indent level with tabs).
@@ -333,6 +351,10 @@ pub struct Editor {
     previewed: bool,
     /// Pinned lines of sticky scroll, as last painted: bounds and where to go.
     sticky_rows: Vec<(Bounds<Pixels>, usize)>,
+    /// `breadcrumbs` for an outline and caret.
+    breadcrumbs: Option<(Arc<Vec<crate::syntax::Symbol>>, usize, Vec<(SharedString, usize)>)>,
+    /// The outline's rows for an outline and version (see `outline_rows`).
+    sticky_spans: (Option<(Arc<Vec<crate::syntax::Symbol>>, u64)>, Arc<Vec<(usize, usize, usize)>>),
     /// The pointer is over the gutter, so fold arrows show.
     gutter_hovered: bool,
     /// Runnable targets for a version and path (gutter ▶).
@@ -392,12 +414,14 @@ impl Editor {
             waiting_view: None,
             mode: EditorMode::Full,
             placeholder: SharedString::default(),
-            search_matches: Vec::new(),
+            search_matches: SearchMatches::default(),
             active_match: None,
             expand_stack: Vec::new(),
             expanding: false,
             occurrence_words: None,
             selections: vec![Selection::cursor(0)],
+            selections_generation: 0,
+            selected_chars: Default::default(),
             primary: 0,
             goal_x: None,
             focus_handle: cx.focus_handle(),
@@ -415,6 +439,11 @@ impl Editor {
             scrollbar_hovered: false,
             scrollbar_fade: Default::default(),
             minimap_cache: Default::default(),
+            markers: Default::default(),
+            blocks_cache: None,
+            reach: Reach::default(),
+            run_rows: (None, Arc::default()),
+            row_problems: (None, Arc::default()),
             marked_range: None,
             indent_unit: String::new(),
             tab_size: file_settings.tab_size,
@@ -452,6 +481,8 @@ impl Editor {
             outline: derived::Derived::new(),
             previewed: false,
             sticky_rows: Vec::new(),
+            breadcrumbs: None,
+            sticky_spans: (None, Arc::default()),
             gutter_hovered: false,
             run_targets: derived::Derived::new(),
             conflicts: derived::Derived::new(),
@@ -474,6 +505,7 @@ impl Editor {
         this.apply_settings(cx);
         this.detect_external_linter(cx);
         this.selections = selections;
+        this.selections_generation += 1;
         this.scroll = scroll;
         // It starts folded like the view it splits from, then folds apart.
         this.folds = folds;
@@ -551,6 +583,7 @@ impl Editor {
         }
         let selections = self.moved_since(self.seen.1, &self.selections, cx);
         self.selections = self.clamp_selections(selections, cx);
+        self.selections_generation += 1;
         self.follow_edits(self.seen.1, cx);
         self.seen = (id, version);
         cx.notify();
@@ -648,7 +681,7 @@ impl Editor {
         self.reveal_primary = true;
     }
 
-    pub fn set_search_highlights(&mut self, matches: Vec<Range<usize>>, active: Option<usize>, cx: &mut Context<Self>) {
+    pub fn set_search_highlights(&mut self, matches: SearchMatches, active: Option<usize>, cx: &mut Context<Self>) {
         self.search_matches = matches;
         self.active_match = active;
         cx.notify();
@@ -722,6 +755,15 @@ impl Editor {
         &self.selections
     }
 
+    /// The selections touching bytes `range` (an end on either of its ends
+    /// too), by binary search: they're sorted and apart, and there can be
+    /// thousands.
+    fn selections_touching(&self, range: std::ops::RangeInclusive<usize>) -> &[Selection] {
+        let first = self.selections.partition_point(|s| s.range().end < *range.start());
+        let len = self.selections[first..].partition_point(|s| s.range().start <= *range.end());
+        &self.selections[first..first + len]
+    }
+
     pub fn primary_selection(&self) -> Selection {
         self.selections[self.primary]
     }
@@ -735,14 +777,21 @@ impl Editor {
         (row + 1, col + 1)
     }
 
+    /// Characters selected, over all selections. Kept until the text or the
+    /// selections change: the status bar asks at every frame, and there can
+    /// be thousands of selections.
     pub fn selected_chars(&self, cx: &App) -> usize {
-        self.selections
-            .iter()
-            .map(|s| {
-                let r = self.doc.read(cx).rope();
-                r.byte_to_char(s.range().end) - r.byte_to_char(s.range().start)
-            })
-            .sum()
+        let doc = self.doc.read(cx);
+        let key = (doc.id(), doc.version(), self.selections_generation);
+        if let Some((k, chars)) = self.selected_chars.get()
+            && k == key
+        {
+            return chars;
+        }
+        let r = doc.rope();
+        let chars = self.selections.iter().map(|s| r.byte_to_char(s.range().end) - r.byte_to_char(s.range().start)).sum();
+        self.selected_chars.set(Some((key, chars)));
+        chars
     }
 
     pub fn indent_label(&self) -> String {
@@ -1030,6 +1079,7 @@ impl Editor {
             .position(|s| s.range().start <= primary_sel.range().start && primary_sel.range().end <= s.range().end)
             .unwrap_or(merged.len() - 1);
         self.selections = merged;
+        self.selections_generation += 1;
         if !std::mem::take(&mut self.expanding) {
             self.expand_stack.clear();
         }
@@ -1232,6 +1282,10 @@ impl Editor {
         }));
     }
 
+    /// Blinks the caret while the editor has the keyboard in the active
+    /// window. Otherwise the caret stays on and the timer stops: a frame drawn
+    /// with focus starts it again (focus and activation draw), so editors in
+    /// other tabs and panes don't wake up twice a second.
     fn restart_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let epoch = self.blink_epoch;
         self.blink_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -1245,11 +1299,17 @@ impl Editor {
                         if editor.focus_handle.is_focused(window) && window.is_window_active() {
                             editor.cursor_visible = !editor.cursor_visible;
                             cx.notify();
-                        } else if !editor.cursor_visible {
+                            return true;
+                        }
+                        if !editor.cursor_visible {
                             editor.cursor_visible = true;
                             cx.notify();
                         }
-                        true
+                        // This task is running; let it finish instead of dropping it.
+                        if let Some(task) = editor.blink_task.take() {
+                            task.detach();
+                        }
+                        false
                     })
                     .unwrap_or(false);
                 if !keep_going {
@@ -1294,26 +1354,62 @@ impl Editor {
         wrap::Inlays { hints: doc.inlay_hints(), generation: doc.inlay_generation() }
     }
 
-    /// `row` as displayed: tabs expanded, inlay hints in place (soft wrap
-    /// measures lines the same way).
-    fn display_line(&self, row: usize, cx: &App) -> DisplayLine {
-        let text = self.doc.read(cx).line_text(row);
-        let (start, hints) = self.inlays(cx).of_line(self.doc.read(cx).rope(), row);
-        if hints.is_empty() {
-            return DisplayLine::new(&text, self.tab_size);
+    /// Line `row` as displayed: tabs expanded, inlay hints in place (soft
+    /// wrap measures lines the same way), with its text. A line longer than
+    /// `wrap::LONG_LINE` is built only for its rows `segs` (its display
+    /// segments with those indices; see `DisplayLine::window`): a minified
+    /// file's line can be megabytes long, and drawing it is per frame.
+    fn display_part(&self, row: usize, segs: std::ops::RangeInclusive<usize>, cx: &App) -> (String, DisplayLine) {
+        let doc = self.doc.read(cx);
+        let start = doc.line_start(row);
+        let (from, to) = self.part_bounds(row, segs, cx);
+        let text = doc.slice(start + from.byte as usize..start + to);
+        let (_, hints) = self.inlays(cx).of_line(doc.rope(), row);
+        let shown = start + from.byte as usize..=start + to;
+        let inlays: Vec<(usize, &str, bool, bool)> =
+            hints.iter().filter(|h| shown.contains(&h.offset)).map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right)).collect();
+        let dl = DisplayLine::window(&text, from, self.tab_size, &inlays);
+        (text, dl)
+    }
+
+    /// Where `display_part` starts building line `row` for its rows `segs`
+    /// and the column it stops at: the whole line, unless it's long.
+    fn part_bounds(&self, row: usize, segs: std::ops::RangeInclusive<usize>, cx: &App) -> (wrap::Resume, usize) {
+        let doc = self.doc.read(cx);
+        let len = doc.line_end(row) - doc.line_start(row);
+        let breaks = self.line_breaks(row);
+        if len <= wrap::LONG_LINE || breaks.is_empty() {
+            return (wrap::Resume::default(), len);
         }
-        let inlays: Vec<(usize, &str, bool, bool)> = hints.iter().map(|h| (h.offset - start, h.label.as_str(), h.pad_left, h.pad_right)).collect();
-        DisplayLine::with_inlays(&text, self.tab_size, &inlays)
+        let (first, last) = ((*segs.start()).min(breaks.len()), (*segs.end()).min(breaks.len()));
+        let from = if first == 0 { wrap::Resume::default() } else { breaks[first - 1].from };
+        (from, breaks.get(last).map_or(len, |b| b.byte as usize).max(from.byte as usize))
+    }
+
+    /// The columns of line `row` laid out for display rows
+    /// `first_drow..last_drow` (see `display_part`).
+    fn shown_columns(&self, row: usize, first_drow: usize, last_drow: usize, cx: &App) -> Range<usize> {
+        let first = self.first_display_row(row);
+        let segs = first_drow.saturating_sub(first)..=last_drow.saturating_sub(1).saturating_sub(first);
+        let (from, to) = self.part_bounds(row, segs, cx);
+        from.byte as usize..to
+    }
+
+    /// Where buffer column `col` of line `row` shows (a display offset),
+    /// building only the rows around it of a long line.
+    fn display_column(&self, row: usize, col: usize, cx: &App) -> usize {
+        let seg = self.line_breaks(row).partition_point(|b| b.byte as usize <= col);
+        self.display_part(row, seg.saturating_sub(1)..=seg + 1, cx).1.to_display(col)
     }
 
     /// Shapes the part of `row` shown on display segment `seg`.
     fn shape_segment(&self, row: usize, seg: usize, window: &mut Window, cx: &App) -> RowShape {
         let theme = Theme::get(cx);
-        let dl = self.display_line(row, cx);
+        let (_, dl) = self.display_part(row, seg..=seg, cx);
         let breaks = self.line_breaks(row);
-        let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.text.len());
+        let (range, indent) = wrap::segment(breaks, seg.min(breaks.len()), dl.end());
         let last = seg >= breaks.len();
-        let text = &dl.text[range.clone()];
+        let text = dl.slice(range.clone());
         let run = TextRun {
             len: text.len(),
             font: self.editor_font(cx),
@@ -1337,7 +1433,7 @@ impl Editor {
     /// The x of `offset` within its display row (wrap indent included).
     fn x_for_offset(&self, offset: usize, window: &mut Window, cx: &App) -> Pixels {
         let row = self.doc.read(cx).row_of(offset);
-        let col = self.display_line(row, cx).to_display(offset - self.doc.read(cx).line_start(row));
+        let col = self.display_column(row, offset - self.doc.read(cx).line_start(row), cx);
         let seg = wrap::segment_of(self.line_breaks(row), col);
         let shape = self.shape_segment(row, seg, window, cx);
         shape.indent + shape.line.x_for_index(col - shape.range.start)
@@ -1349,7 +1445,7 @@ impl Editor {
         let mut col = shape.range.start + shape.line.closest_index_for_x((x - shape.indent).max(px(0.)));
         // The end of a wrapped row is the start of the next one; stay on this row.
         if !shape.last && col >= shape.range.end && shape.range.end > shape.range.start {
-            col = shape.dl.text[..shape.range.end].char_indices().last().map_or(col, |(i, _)| i);
+            col = shape.dl.slice(shape.range.clone()).char_indices().last().map_or(col, |(i, _)| shape.range.start + i);
         }
         self.doc.read(cx).line_start(row) + shape.dl.to_buffer(col)
     }
@@ -1500,10 +1596,47 @@ impl Editor {
         self.wrap = Some(map);
     }
 
+    /// The block rows (see `build_blocks`), built again only when what they
+    /// come from changes: they're asked for twice a frame, and a file can
+    /// have a code lens above every other line.
+    fn blocks(&mut self, cx: &App) -> Arc<Vec<Block>> {
+        self.cached_blocks(cx).blocks.clone()
+    }
+
+    /// The blocks as (line, rows), for the wrap map.
+    fn block_rows(&mut self, cx: &App) -> Arc<Vec<(usize, usize)>> {
+        self.cached_blocks(cx).rows.clone()
+    }
+
+    fn cached_blocks(&mut self, cx: &App) -> &BlocksCache {
+        let doc = self.doc.read(cx);
+        let key = BlocksKey {
+            mode: self.mode,
+            doc: (doc.id(), doc.version(), doc.diagnostics_generation(), doc.code_lens_generation()),
+            hunk: self.open_hunk.map(|ix| (ix, Same(self.hunks.clone()))),
+            caret: (self.selections.len() == 1).then(|| self.primary_selection().head),
+            layout: self.layout.as_ref().map(|l| (l.wrap_width, l.char_width)),
+            tab_size: self.tab_size,
+            code_lens: self.file_settings.code_lens,
+        };
+        let fresh = self.blocks_cache.as_ref().is_some_and(|c| c.key == key && c.folds == self.folds.ranges());
+        if !fresh {
+            let blocks = self.build_blocks(cx);
+            let rows = blocks.iter().map(|b| (b.line, b.rows())).collect();
+            let problems = blocks.iter().find_map(|b| match b.kind {
+                BlockKind::Problems { of, .. } => Some((b.line, of)),
+                _ => None,
+            });
+            let folds = self.folds.ranges().to_vec();
+            self.blocks_cache = Some(BlocksCache { key, folds, blocks: Arc::new(blocks), rows: Arc::new(rows), problems });
+        }
+        self.blocks_cache.as_ref().expect("built above")
+    }
+
     /// Rows between lines that aren't text (see `wrap`), in the order they
     /// sit above their line: a hunk opened from the gutter shows the lines it
     /// deleted, and code lenses sit right above their line.
-    fn blocks(&self, cx: &App) -> Vec<Block> {
+    fn build_blocks(&self, cx: &App) -> Vec<Block> {
         if self.is_single_line() {
             return Vec::new();
         }
@@ -1564,14 +1697,14 @@ impl Editor {
         let problems: Vec<&lint::Diagnostic> =
             doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).filter(|d| d.severity.is_problem()).collect();
         let Some(only) = problems.first() else { return Vec::new() };
-        let text = doc.line_text(row);
         let cols = (layout.wrap_width / layout.char_width).floor().max(20.) as usize;
-        let line_cols = DisplayLine::new(&text, self.tab_size).text.chars().count();
+        // Past the view's width it can't fit whatever the line's length.
+        let line_cols = self.display_chars(row, cols + 1, cx);
         let message = only.message.trim();
         if problems.len() == 1 && !message.contains('\n') && line_cols + 4 + message.chars().count() <= cols {
             return Vec::new();
         }
-        let indent = DisplayLine::new(&text[..text.len() - text.trim_start().len()], self.tab_size).text.len();
+        let indent = self.leading_whitespace(row, cx).0;
         let width = cols.saturating_sub(indent + 2).max(20);
         let mut rows = Vec::new();
         for problem in problems {
@@ -1583,15 +1716,80 @@ impl Editor {
         rows
     }
 
-    fn block_rows(&self, cx: &App) -> Vec<(usize, usize)> {
-        self.blocks(cx).iter().map(|b| (b.line, b.rows())).collect()
+    /// Display characters of line `row` (tabs expanded, control characters
+    /// as their symbols), counted no further than past `limit`: the line can
+    /// be megabytes long.
+    fn display_chars(&self, row: usize, limit: usize, cx: &App) -> usize {
+        let doc = self.doc.read(cx);
+        let mut col = 0;
+        for ch in doc.rope().byte_slice(doc.line_start(row)..doc.line_end(row)).chars() {
+            if col > limit {
+                break;
+            }
+            col += match ch {
+                '\t' => self.tab_size - col % self.tab_size,
+                ch => control_symbol(ch).map_or(1, |symbol| symbol.chars().count()),
+            };
+        }
+        col
     }
 
-    /// Both brackets of the pairs around carets (a few, so many cursors stay
-    /// cheap). Cached: in a big array or object finding a partner is a walk,
-    /// and a caret blink draws again.
-    fn bracket_pairs(&mut self, cx: &App) -> Arc<Vec<Range<usize>>> {
-        let heads: Vec<usize> = self.selections.iter().filter(|s| s.is_empty()).take(8).map(|s| s.head).collect();
+    /// Line `row`'s indentation as displayed (its length in display text,
+    /// tabs expanded), and whether the line is nothing else: read from the
+    /// rope, as the line can be megabytes long.
+    fn leading_whitespace(&self, row: usize, cx: &App) -> (usize, bool) {
+        let doc = self.doc.read(cx);
+        let mut indent = String::new();
+        for ch in doc.rope().byte_slice(doc.line_start(row)..doc.line_end(row)).chars() {
+            if !ch.is_whitespace() {
+                return (DisplayLine::new(&indent, self.tab_size).text.len(), false);
+            }
+            indent.push(ch);
+        }
+        (DisplayLine::new(&indent, self.tab_size).text.len(), true)
+    }
+
+    /// Where line `row`'s text starts and ends without the whitespace around
+    /// it (columns), read from the rope.
+    fn body_columns(&self, row: usize, cx: &App) -> (usize, usize) {
+        let doc = self.doc.read(cx);
+        let line = doc.rope().byte_slice(doc.line_start(row)..doc.line_end(row));
+        let start = line.chars().take_while(|c| c.is_whitespace()).map(char::len_utf8).sum();
+        let mut end = line.len_bytes();
+        let mut chars = line.chars_at(line.len_chars());
+        while let Some(c) = chars.prev().filter(|c| c.is_whitespace()) {
+            end -= c.len_utf8();
+        }
+        (start, end)
+    }
+
+    /// Per line where diagnostics start: (line, its worst problem's index in
+    /// `diagnostics`, how many start on it), kept for the document's state:
+    /// a line's gutter dot and hint mustn't walk them.
+    fn row_problems(&mut self, cx: &App) -> Arc<Vec<(usize, Option<usize>, usize)>> {
+        let doc = self.doc.read(cx);
+        let key = (doc.id(), doc.version(), doc.diagnostics_generation());
+        if self.row_problems.0 != Some(key) {
+            self.row_problems = (Some(key), Arc::new(markers::row_problems(doc)));
+        }
+        self.row_problems.1.clone()
+    }
+
+    /// Rows with a gutter ▶, sorted, for the run targets drawn.
+    fn shown_run_rows(&mut self, cx: &mut Context<Self>) -> Arc<Vec<usize>> {
+        let targets = self.shown_run_targets(cx);
+        if !self.run_rows.0.as_ref().is_some_and(|t| Arc::ptr_eq(t, &targets)) {
+            let mut rows: Vec<usize> = targets.iter().filter_map(|t| t.row).collect();
+            rows.sort_unstable();
+            self.run_rows = (Some(targets), Arc::new(rows));
+        }
+        self.run_rows.1.clone()
+    }
+
+    /// Both brackets of the pairs around carets at `heads` (a few, so many
+    /// cursors stay cheap). Cached: in a big array or object finding a
+    /// partner is a walk, and a caret blink draws again.
+    fn bracket_pairs(&mut self, heads: Vec<usize>, cx: &App) -> Arc<Vec<Range<usize>>> {
         let key = (self.doc.read(cx).tree_version(), heads);
         if let Some((k, pairs)) = &self.bracket_cache
             && *k == key
@@ -1619,7 +1817,8 @@ impl Editor {
         }
         let (row, seg) = self.line_of_display_row(first_drow, cx);
         if let (Some(r), Some(b)) = (ranges.first_mut(), seg.checked_sub(1).and_then(|s| self.line_breaks(row).get(s))) {
-            r.start = (self.doc.read(cx).line_start(row) + b.byte as usize).min(r.end);
+            // From the character the row's text starts in (see `display_part`).
+            r.start = (self.doc.read(cx).line_start(row) + b.from.byte as usize).min(r.end);
         }
         let (row, seg) = self.line_of_display_row(last_drow.saturating_sub(1), cx);
         if let (Some(r), Some(b)) = (ranges.last_mut(), self.line_breaks(row).get(seg)) {
@@ -1678,7 +1877,7 @@ impl Editor {
         if breaks.is_empty() {
             return self.first_display_row(row);
         }
-        let col = self.display_line(row, cx).to_display(offset - self.doc.read(cx).line_start(row));
+        let col = self.display_column(row, offset - self.doc.read(cx).line_start(row), cx);
         self.first_display_row(row) + wrap::segment_of(breaks, col)
     }
 
@@ -2926,8 +3125,13 @@ impl Editor {
         let first_drow = first_drow.min(last_drow);
         let first_row = self.line_of_display_row(first_drow, cx).0;
         let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1, cx).0 + 1).min(line_count) };
-        let range_start = self.doc.read(cx).line_start(first_row);
-        let range_end = if last_row == 0 { 0 } else { self.doc.read(cx).line_end(last_row - 1) };
+        // The bytes on screen: a long line's only on its rows on screen.
+        let range_start = self.doc.read(cx).line_start(first_row) + self.shown_columns(first_row, first_drow, last_drow, cx).start;
+        let range_end = if last_row == 0 {
+            0
+        } else {
+            self.doc.read(cx).line_start(last_row - 1) + self.shown_columns(last_row - 1, first_drow, last_drow, cx).end
+        };
         if !single {
             // Inlay hints and lens titles are asked for by what's in view.
             self.lsp_view(first_row..last_row, cx);
@@ -2936,30 +3140,25 @@ impl Editor {
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
         let fold_regions = (!single && (self.gutter_hovered || !self.folds.is_empty())).then(|| self.shown_fold_regions(cx));
-        let run_rows: Vec<usize> =
-            if single { Vec::new() } else { self.shown_run_targets(cx).iter().filter_map(|t| t.row).collect() };
+        let run_rows = if single { Arc::default() } else { self.shown_run_rows(cx) };
         let conflicts = if single { Arc::new(Vec::new()) } else { self.shown_conflicts(cx) };
         let debug_row = self.doc.read(cx).debug_row();
         self.conflict_hits.clear();
         let highlights = self.visible_highlights(first_drow, last_drow, first_row, last_row, cx);
-        // Bracket pairs around carets.
+        // Bracket pairs around carets: the first few, or with many, the first on screen.
         let brackets: Vec<Range<usize>> = if focused && !single {
-            self.bracket_pairs(cx).iter().filter(|r| (range_start..=range_end).contains(&r.start)).cloned().collect()
+            let pool = if self.selections.len() <= 8 { &self.selections[..] } else { self.selections_touching(range_start..=range_end) };
+            let heads = pool.iter().filter(|s| s.is_empty()).take(8).map(|s| s.head).collect();
+            self.bracket_pairs(heads, cx).iter().filter(|r| (range_start..=range_end).contains(&r.start)).cloned().collect()
         } else {
             Vec::new()
         };
-        // Sorted by start: none past the last visible line.
-        let below = self.doc.read(cx).diagnostics.partition_point(|d| d.range.start <= range_end);
-        let diagnostics: Vec<&lint::Diagnostic> =
-            self.doc.read(cx).diagnostics[..below].iter().filter(|d| d.range.end >= range_start).collect();
-
-        let breakpoints = if single { Vec::new() } else { self.doc.read(cx).breakpoints() };
-        let head_rows: Vec<usize> = self
-            .selections
-            .iter()
-            .filter(|s| s.is_empty())
-            .map(|s| self.doc.read(cx).row_of(s.head))
-            .collect();
+        // The diagnostics on screen (sorted by start), without walking the
+        // ones before them.
+        self.reach.update(self.doc.read(cx));
+        let diagnostics: Vec<&lint::Diagnostic> = self.reach.find(&self.doc.read(cx).diagnostics, range_start..=range_end);
+        // Per line with problems: its worst one and how many start on it.
+        let row_problems = if single { Arc::default() } else { self.row_problems(cx) };
 
         let mut frame = FrameLayout {
             text_bounds,
@@ -2982,15 +3181,11 @@ impl Editor {
         let tab_size = self.tab_size;
         // Guides at each indent level of the file's own style.
         let guide_step = if self.indent_unit == "\t" { tab_size } else { self.indent_unit.len().max(1) };
-        // Indentation (in columns) for indent guides.
+        // Indentation (in columns) for indent guides; None for blank lines.
         let indents: Vec<Option<usize>> = (first_row..last_row)
-            .map(|row| {
-                let t = self.doc.read(cx).line_text(row);
-                if t.trim().is_empty() {
-                    None
-                } else {
-                    Some(DisplayLine::new(&t[..t.len() - t.trim_start().len()], tab_size).text.len())
-                }
+            .map(|row| match self.leading_whitespace(row, cx) {
+                (_, true) => None,
+                (indent, false) => Some(indent),
             })
             .collect();
 
@@ -2998,11 +3193,17 @@ impl Editor {
         self.lens_hits.clear();
         // The line whose problems show in full under it (no hint at its end then).
         let mut problems_row = None;
+        let blocks = if self.wrap.is_some() { self.blocks(cx) } else { Arc::default() };
         if let Some(map) = self.wrap.as_ref() {
             let mut lens_hits = Vec::new();
             let mut used: HashMap<usize, usize> = HashMap::new();
             let run = |text: &str, font: Font, color: Hsla| TextRun { len: text.len(), font, color, background_color: None, underline: None, strikethrough: None };
-            for block in self.blocks(cx) {
+            // Only the blocks of lines on screen (blocks after the last line
+            // too, at the end): they're sorted by line.
+            let first_line = map.line_at(first_drow);
+            let last_line = if last_drow >= display_rows { usize::MAX } else { map.line_at(last_drow.saturating_sub(1)) };
+            let shown = blocks.partition_point(|b| b.line < first_line);
+            for block in blocks[shown..].iter().take_while(|b| b.line <= last_line) {
                 // A fold hides the blocks above the lines it hides (no rows
                 // for them in the map; drawn, they'd cover the lines below).
                 if block.line < line_count && map.hidden(block.line) {
@@ -3029,8 +3230,7 @@ impl Editor {
                     BlockKind::Lenses(lenses) if visible(start) => {
                         // Lined up with the line's text, smaller, like a caption.
                         let y = y_of(start);
-                        let line = self.doc.read(cx).line_text(block.line.min(line_count.saturating_sub(1)));
-                        let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
+                        let indent = self.leading_whitespace(block.line.min(line_count.saturating_sub(1)), cx).0;
                         let caption = font_size * 0.85;
                         let mut x = text_left - self.scroll.x + char_width * indent as f32;
                         // One still without its title keeps its row empty until it comes.
@@ -3052,8 +3252,7 @@ impl Editor {
                     BlockKind::Lenses(_) => {}
                     BlockKind::Problems { of, rows } => {
                         // Under the caret line, in the hint's colors, lined up with its text.
-                        let line = self.doc.read(cx).line_text(*of);
-                        let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
+                        let indent = self.leading_whitespace(*of, cx).0;
                         let msg_size = px(theme.ui_font_size - 0.5);
                         for (i, (severity, text)) in rows.iter().enumerate().filter(|(i, _)| visible(start + i)) {
                             let y = y_of(start + i);
@@ -3065,11 +3264,16 @@ impl Editor {
                             let shaped = text_system.shape_line(SharedString::from(text.clone()), msg_size, &[run(text, ui_font.clone(), color.alpha(0.9))], None);
                             frame.lines.push((point(text_left - self.scroll.x + char_width * indent as f32, y + (line_height - msg_size) / 4.), shaped));
                         }
-                        problems_row = Some(*of);
                     }
                 }
             }
             self.lens_hits = lens_hits;
+        }
+        // The caret line's problems show in full under it, on screen or not.
+        if let (Some(map), Some((line, of))) = (self.wrap.as_ref(), self.blocks_cache.as_ref().and_then(|c| c.problems))
+            && !(line < line_count && map.hidden(line))
+        {
+            problems_row = Some(of);
         }
 
         let mut hl_ix = 0;
@@ -3077,31 +3281,42 @@ impl Editor {
             if self.row_hidden(row) {
                 continue;
             }
-            let line_start = self.doc.read(cx).line_start(row);
-            let text = self.doc.read(cx).line_text(row);
-            let line_end = line_start + text.len();
-            let dl = self.display_line(row, cx);
+            let row_first_drow = self.first_display_row(row);
+            let (line_start, line_end) = (self.doc.read(cx).line_start(row), self.doc.read(cx).line_end(row));
+            // This line's rows on screen.
+            let breaks_count = self.line_breaks(row).len();
+            if row_first_drow + breaks_count < first_drow || row_first_drow >= last_drow {
+                continue;
+            }
+            let (seg_lo, seg_hi) = (first_drow.saturating_sub(row_first_drow), (last_drow - 1 - row_first_drow).min(breaks_count));
+            let segs = Segments::new(self.line_breaks(row), seg_lo..=seg_hi);
+            // The part of the line laid out: all of it, or a long line's rows
+            // on screen; its buffer text, from column `part.start`.
+            let (text, dl) = self.display_part(row, seg_lo..=seg_hi, cx);
+            let part = dl.columns();
+            let (part_start, part_end) = (line_start + part.start, line_start + part.end);
+            let col_of = |offset: usize| offset.saturating_sub(line_start).clamp(part.start, part.end);
 
             // Build styled runs from highlight spans and diagnostics.
-            while hl_ix < highlights.len() && highlights[hl_ix].0.end <= line_start {
+            while hl_ix < highlights.len() && highlights[hl_ix].0.end <= part_start {
                 hl_ix += 1;
             }
-            let mut cuts: Vec<usize> = vec![0, text.len()];
-            for (r, _) in highlights[hl_ix..].iter().take_while(|(r, _)| r.start < line_end) {
-                cuts.push(r.start.saturating_sub(line_start).min(text.len()));
-                cuts.push(r.end.saturating_sub(line_start).min(text.len()));
+            let mut cuts: Vec<usize> = vec![part.start, part.end];
+            for (r, _) in highlights[hl_ix..].iter().take_while(|(r, _)| r.start < part_end) {
+                cuts.push(col_of(r.start));
+                cuts.push(col_of(r.end));
             }
             let row_diags: Vec<&&lint::Diagnostic> = diagnostics
                 .iter()
-                .filter(|d| d.range.start <= line_end && d.range.end > line_start)
+                .filter(|d| d.range.start <= part_end && d.range.end > part_start)
                 .collect();
             for d in &row_diags {
-                cuts.push(d.range.start.saturating_sub(line_start).min(text.len()));
-                cuts.push(d.range.end.saturating_sub(line_start).min(text.len()));
+                cuts.push(col_of(d.range.start));
+                cuts.push(col_of(d.range.end));
             }
-            if let Some(link) = self.lsp.link.as_ref().filter(|l| l.start < line_end && l.end > line_start) {
-                cuts.push(link.start.saturating_sub(line_start).min(text.len()));
-                cuts.push(link.end.saturating_sub(line_start).min(text.len()));
+            if let Some(link) = self.lsp.link.as_ref().filter(|l| l.start < part_end && l.end > part_start) {
+                cuts.push(col_of(link.start));
+                cuts.push(col_of(link.end));
             }
             cuts.sort_unstable();
             cuts.dedup();
@@ -3153,34 +3368,41 @@ impl Editor {
                 runs = inlay_runs(runs, &dl, editor_font.clone(), theme.text_dim.into());
             }
             if !dl.controls.is_empty() {
-                runs = restyle_runs(runs, &dl.controls, |piece| piece.color = theme.text_dim.into());
+                let controls: Vec<Range<usize>> = dl.controls.iter().map(|r| dl.local(r.clone())).collect();
+                runs = restyle_runs(runs, &controls, |piece| piece.color = theme.text_dim.into());
             }
-            let is_cursor_row = head_rows.contains(&row);
+            // The selections on this part of the line (sorted and apart: found
+            // by binary search, however many there are).
+            let row_sels: Vec<Selection> = self.selections_touching(part_start..=part_end).to_vec();
+            let is_cursor_row = self.selections_touching(line_start..=line_end).iter().any(|s| s.is_empty());
             let indent = indents[row - first_row].unwrap_or_else(|| {
                 let prev = indents[..row - first_row].iter().rev().find_map(|i| *i).unwrap_or(0);
                 let next = indents[row - first_row..].iter().find_map(|i| *i).unwrap_or(0);
                 prev.min(next)
             });
-            let breaks = self.line_breaks(row).to_vec();
-            let row_first_drow = self.first_display_row(row);
             // Hints get no dot or message at the line's end.
-            let worst = row_diags
-                .iter()
-                .filter(|d| d.severity.is_problem() && self.doc.read(cx).row_of(d.range.start) == row)
-                .min_by_key(|d| d.severity);
+            let worst = row_problems
+                .binary_search_by_key(&row, |&(r, _, _)| r)
+                .ok()
+                .and_then(|i| {
+                    let (_, worst, count) = row_problems[i];
+                    Some((self.doc.read(cx).diagnostics.get(worst?)?, count))
+                });
+            // Where the line's text starts and ends after its whitespace, for `show_whitespace`.
+            let body = matches!(show_whitespace, ShowWhitespace::Boundary | ShowWhitespace::Trailing).then(|| self.body_columns(row, cx));
 
             // Each wrapped segment of the line is its own display row.
-            for seg in 0..=breaks.len() {
+            for seg in seg_lo..=seg_hi {
                 let drow = row_first_drow + seg;
                 if drow < first_drow || drow >= last_drow {
                     continue;
                 }
-                let (seg_range, wrap_indent) = wrap::segment(&breaks, seg, dl.text.len());
+                let (seg_range, wrap_indent) = segs.range(seg, dl.end());
                 let first_seg = seg == 0;
-                let last_seg = seg == breaks.len();
-                let seg_runs = if breaks.is_empty() { std::mem::take(&mut runs) } else { slice_runs(&runs, seg_range.clone()) };
+                let last_seg = seg == breaks_count;
+                let seg_runs = if breaks_count == 0 { std::mem::take(&mut runs) } else { slice_runs(&runs, dl.local(seg_range.clone())) };
                 let shaped = text_system.shape_line(
-                    SharedString::from(dl.text[seg_range.clone()].to_string()),
+                    SharedString::from(dl.slice(seg_range.clone()).to_string()),
                     font_size,
                     &seg_runs,
                     None,
@@ -3251,8 +3473,9 @@ impl Editor {
                     col += guide_step;
                 }
 
-                // Inlay hints sit on a soft chip.
-                for span in dl.inlays.iter().filter(|s| s.label.start >= seg_range.start && s.label.end <= seg_range.end) {
+                // Inlay hints sit on a soft chip (sorted: the row's by binary search).
+                let first_span = dl.inlays.partition_point(|s| s.label.start < seg_range.start);
+                for span in dl.inlays[first_span..].iter().take_while(|s| s.label.start <= seg_range.end).filter(|s| s.label.end <= seg_range.end) {
                     let bounds = Bounds::from_corners(
                         point(origin.x + x_of(span.label.start) - px(2.), y + px(2.)),
                         point(origin.x + x_of(span.label.end) + px(2.), y + line_height - px(2.)),
@@ -3260,7 +3483,8 @@ impl Editor {
                     frame.search.push(fill(bounds, Hsla::from(theme.text_dim).alpha(0.13)).corner_radii(px(3.)));
                 }
                 // So do control characters' symbols, each on its own.
-                for symbol in dl.controls.iter().filter(|r| r.start >= seg_range.start && r.end <= seg_range.end) {
+                let first_symbol = dl.controls.partition_point(|r| r.start < seg_range.start);
+                for symbol in dl.controls[first_symbol..].iter().take_while(|r| r.end <= seg_range.end) {
                     let bounds = Bounds::from_corners(
                         point(origin.x + x_of(symbol.start) + px(0.5), y + px(2.)),
                         point(origin.x + x_of(symbol.end) - px(0.5), y + line_height - px(2.)),
@@ -3270,17 +3494,12 @@ impl Editor {
 
                 // Spaces as dots and tabs as lines, where `show_whitespace` asks.
                 if show_whitespace != ShowWhitespace::None {
-                    let body_start = text.len() - text.trim_start().len();
-                    let body_end = text.trim_end().len();
-                    let selected: Vec<Range<usize>> = self
-                        .selections
-                        .iter()
-                        .map(|s| s.range())
-                        .filter(|r| !r.is_empty() && r.start <= line_end && r.end > line_start)
-                        .collect();
+                    let (body_start, body_end) = body.unwrap_or_default();
+                    let selected: Vec<Range<usize>> = row_sels.iter().map(|s| s.range()).filter(|r| !r.is_empty()).collect();
                     // Only this row's part of the line (a long line has many rows).
                     let seg_text = dl.to_buffer(seg_range.start)..dl.to_buffer(seg_range.end).max(dl.to_buffer(seg_range.start));
-                    let chars = text[seg_text.clone()].char_indices().map(|(i, c)| (seg_text.start + i, c));
+                    let local = seg_text.start.saturating_sub(part.start).min(text.len())..seg_text.end.saturating_sub(part.start).min(text.len());
+                    let chars = text[local].char_indices().map(|(i, c)| (seg_text.start + i, c));
                     for (i, c) in chars.filter(|(_, c)| *c == ' ' || *c == '\t') {
                         let shown = match show_whitespace {
                             ShowWhitespace::All => true,
@@ -3306,14 +3525,15 @@ impl Editor {
                     }
                 }
 
-                // Search matches.
-                let first_match = self.search_matches.partition_point(|m| m.end < line_start);
-                for (ix, m) in self.search_matches.iter().enumerate().skip(first_match) {
-                    if m.start > line_end {
+                // Search matches (found by binary search: there can be many).
+                let matches = &self.search_matches.ranges;
+                let first_match = matches.partition_point(|m| m.end < part_start);
+                for (ix, m) in matches.iter().enumerate().skip(first_match) {
+                    if m.start > part_end {
                         break;
                     }
                     let Some((s, e, continues)) =
-                        clip(m.start.max(line_start) - line_start, m.end.min(line_end) - line_start, m.end > line_end)
+                        clip(m.start.max(part_start) - line_start, m.end.min(part_end) - line_start, m.end > line_end)
                     else {
                         continue;
                     };
@@ -3333,11 +3553,11 @@ impl Editor {
 
                 // Other uses of the symbol at the caret (from the language server).
                 let symbols = self.current_symbol_highlights(cx);
-                for r in symbols.iter().skip(symbols.partition_point(|r| r.end < line_start)) {
-                    if r.start > line_end {
+                for r in symbols.iter().skip(symbols.partition_point(|r| r.end < part_start)) {
+                    if r.start > part_end {
                         break;
                     }
-                    let Some((s, e, _)) = clip(r.start.max(line_start) - line_start, r.end.min(line_end) - line_start, false) else {
+                    let Some((s, e, _)) = clip(r.start.max(part_start) - line_start, r.end.min(part_end) - line_start, false) else {
                         continue;
                     };
                     let bounds = Bounds::from_corners(point(origin.x + x_of(s), y + px(1.)), point(origin.x + x_of(e), y + line_height - px(1.)));
@@ -3345,9 +3565,9 @@ impl Editor {
                 }
 
                 // Matching brackets (painted with search highlights, under the text).
-                for b in brackets.iter().filter(|b| b.start >= line_start && b.start < line_end) {
+                for b in brackets.iter().filter(|b| b.start >= part_start && b.start < part_end) {
                     let col = dl.to_display(b.start - line_start);
-                    if wrap::segment_of(&breaks, col) != seg {
+                    if segs.of(col) != seg {
                         continue;
                     }
                     let (x0, x1) = (x_of(col), x_of(dl.to_display(b.end.min(line_end) - line_start)));
@@ -3361,16 +3581,16 @@ impl Editor {
                 }
 
                 // Selections.
-                for sel in &self.selections {
+                for sel in &row_sels {
                     let r = sel.range();
-                    if sel.is_empty() || r.end < line_start || r.start > line_end {
+                    if sel.is_empty() || r.end < part_start || r.start > part_end {
                         continue;
                     }
                     if r.end == line_start && r.start < line_start {
                         continue;
                     }
                     let Some((s, e, continues)) =
-                        clip(r.start.max(line_start) - line_start, r.end.min(line_end) - line_start, r.end > line_end)
+                        clip(r.start.max(part_start) - line_start, r.end.min(part_end) - line_start, r.end > line_end)
                     else {
                         continue;
                     };
@@ -3394,18 +3614,18 @@ impl Editor {
                 // Cursors (blocks in Vim's Normal and Visual modes).
                 let block = self.vim_block_cursor();
                 if focused && (self.cursor_visible || block) {
-                    for sel in &self.selections {
+                    for sel in &row_sels {
                         let head = self.vim_cursor_of(sel);
-                        if self.doc.read(cx).row_of(head) != row {
+                        if head < part_start || head > part_end {
                             continue;
                         }
                         let col = dl.to_display(head - line_start);
-                        if wrap::segment_of(&breaks, col) != seg {
+                        if segs.of(col) != seg {
                             continue;
                         }
                         let x = x_of(col);
                         let bounds = if block {
-                            let next = dl.to_display((head - line_start + self.doc.read(cx).char_at(head).filter(|c| *c != '\n').map_or(0, char::len_utf8)).min(text.len()));
+                            let next = dl.to_display((head - line_start + self.doc.read(cx).char_at(head).filter(|c| *c != '\n').map_or(0, char::len_utf8)).min(part.end));
                             let width = if next > col { x_of(next) - x } else { char_width };
                             Bounds::new(point(origin.x + x, y + px(1.)), size(width, line_height - px(2.)))
                         } else {
@@ -3461,7 +3681,7 @@ impl Editor {
                         None,
                     );
                     let nx = bounds.left() + gutter_width - px(FOLD_ZONE_RIGHT + 18.) - number_line.width;
-                    if let Some(breakpoint) = breakpoints.iter().find(|b| b.row == row) {
+                    if let Some(breakpoint) = self.doc.read(cx).breakpoint(row) {
                         // A breakpoint covers its line number, as in JetBrains:
                         // a dot, "=" in it with a condition, a diamond for a logpoint.
                         let d = (line_height * 0.62).min(px(13.));
@@ -3509,14 +3729,14 @@ impl Editor {
                         ));
                     }
 
-                    if run_rows.contains(&row) {
+                    if run_rows.binary_search(&row).is_ok() {
                         let icon_size = px(RUN_ICON);
                         frame.fold_icons.push((
                             Bounds::new(point(bounds.left() + px(5.), y + (line_height - icon_size) / 2.), size(icon_size, icon_size)),
                             Icon::Play.path(),
                             theme.success.into(),
                         ));
-                    } else if let Some(worst) = worst {
+                    } else if let Some((worst, _)) = worst {
                         let dot = px(6.);
                         frame.gutter_marks.push(
                             fill(
@@ -3620,7 +3840,7 @@ impl Editor {
                     self.fold_pills.push((pill, fold.start));
                     text_end = pill.right();
                 }
-                if let Some(worst) = worst.filter(|_| problems_row != Some(row)) {
+                if let Some((worst, count)) = worst.filter(|_| problems_row != Some(row)) {
                     let color = severity_color(&theme, worst.severity);
                     // Multi-line messages (rust-analyzer's) fit on one line here;
                     // hovering shows them in full.
@@ -3630,7 +3850,6 @@ impl Editor {
                         message.truncate(message.floor_char_boundary(160));
                         message.push('…');
                     }
-                    let count = row_diags.iter().filter(|d| self.doc.read(cx).row_of(d.range.start) == row).count();
                     if count > 1 {
                         message.push_str(&format!("  (+{})", count - 1));
                     }
@@ -3738,48 +3957,9 @@ impl Editor {
                 }
                 (None, None) => unreachable!(),
             };
-            let rows = display_rows.max(1) as f32;
-            for d in self.doc.read(cx).diagnostics.iter().filter(|d| d.severity.is_problem()) {
-                let row = self.first_display_row(self.doc.read(cx).row_of(d.range.start)) as f32;
-                let y = track.top() + track.size.height * (row / rows);
-                frame.scrollbar.push(fill(
-                    Bounds::new(point(track.right() - px(5.), y), size(px(4.), px(2.))),
-                    severity_color(&theme, d.severity),
-                ));
-            }
-            for hunk in self.hunks.iter() {
-                let color: Hsla = match hunk.kind {
-                    HunkKind::Added => theme.git_added,
-                    HunkKind::Modified => theme.git_modified,
-                    HunkKind::Deleted => theme.git_deleted,
-                }
-                .into();
-                let (d0, d1) = (self.first_display_row(hunk.new_rows.start), self.first_display_row(hunk.new_rows.end));
-                let y0 = track.top() + track.size.height * (d0 as f32 / rows);
-                let h = (track.size.height * (d1.saturating_sub(d0) as f32 / rows)).max(px(2.));
-                frame.scrollbar.push(fill(Bounds::new(point(track.left(), y0), size(px(2.), h)), color));
-            }
-            let mut last_y = None;
-            for m in &self.search_matches {
-                let row = self.first_display_row(self.doc.read(cx).row_of(m.start)) as f32;
-                let y = (track.top() + track.size.height * (row / rows)).round();
-                if last_y == Some(y) {
-                    continue;
-                }
-                last_y = Some(y);
-                frame.scrollbar.push(fill(
-                    Bounds::new(point(track.left() + px(3.), y), size(px(6.), px(2.))),
-                    Hsla::from(theme.search_active).alpha(0.8),
-                ));
-            }
-            for s in &self.selections {
-                let row = self.first_display_row(self.doc.read(cx).row_of(s.head)) as f32;
-                let y = track.top() + track.size.height * (row / rows);
-                frame.scrollbar.push(fill(
-                    Bounds::new(point(track.left() + px(1.), y), size(px(4.), px(2.))),
-                    theme.accent,
-                ));
-            }
+            // Problems, changes, matches and carets: laid out when they or
+            // the rows change, not per frame.
+            self.layout_markers(&mut frame, track, cx);
         }
 
         // The ⌘/Ctrl-hover link's word, for the pointing hand over it.
@@ -3790,7 +3970,8 @@ impl Editor {
             frame.link_bounds = Some(Bounds::from_corners(point(start, y), point(end, y + line_height)).intersect(&frame.text_bounds));
         }
 
-        if self.blink_task.is_none() {
+        // Only the focused editor blinks (see `restart_blink`).
+        if self.blink_task.is_none() && focused {
             self.restart_blink(window, cx);
         }
         frame
@@ -3985,6 +4166,39 @@ struct RowShape {
     last: bool,
 }
 
+/// A line's breaks around the rows laid out (a long line has thousands):
+/// `wrap::segment` and `wrap::segment_of` for those rows.
+struct Segments {
+    /// The line's breaks from `first` on, as far as the rows need.
+    breaks: Vec<Break>,
+    first: usize,
+    /// How many breaks the line has.
+    count: usize,
+}
+
+impl Segments {
+    fn new(all: &[Break], segs: std::ops::RangeInclusive<usize>) -> Self {
+        let first = segs.start().saturating_sub(1).min(all.len());
+        let end = (segs.end() + 1).clamp(first, all.len());
+        Segments { breaks: all[first..end].to_vec(), first, count: all.len() }
+    }
+
+    /// The display range and wrap indent of segment `seg` (one of the rows
+    /// given), the display text ending at `len`.
+    fn range(&self, seg: usize, len: usize) -> (Range<usize>, u32) {
+        let before = (seg > 0).then(|| self.breaks[seg - 1 - self.first]);
+        let start = before.map_or(0, |b| b.ix as usize);
+        let end = if seg >= self.count { len } else { self.breaks[seg - self.first].ix as usize };
+        (start.min(len)..end.min(len).max(start.min(len)), before.map_or(0, |b| b.indent))
+    }
+
+    /// The segment that shows display offset `col`: exact for the rows given;
+    /// one before or after them says it's not on them.
+    fn of(&self, col: usize) -> usize {
+        self.first + self.breaks.partition_point(|b| b.ix as usize <= col)
+    }
+}
+
 /// The part of `runs` (covering a whole line) that falls in `range`.
 fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
     let mut out = Vec::new();
@@ -3999,15 +4213,16 @@ fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
     out
 }
 
-/// Runs for a line with inlay hints: the hints' text in `color`, plain, and
-/// a run for hints after the last character (the text's runs end there).
+/// Runs for a line with inlay hints (covering `dl.text`): the hints' text in
+/// `color`, plain, and a run for hints after the last character (the text's
+/// runs end there).
 fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> Vec<TextRun> {
     let mut runs = runs;
     let total: usize = runs.iter().map(|r| r.len).sum();
     if total < dl.text.len() {
         runs.push(TextRun { len: dl.text.len() - total, font, color, background_color: None, underline: None, strikethrough: None });
     }
-    let hints: Vec<Range<usize>> = dl.inlays.iter().map(|s| s.whole.clone()).collect();
+    let hints: Vec<Range<usize>> = dl.inlays.iter().map(|s| dl.local(s.whole.clone())).collect();
     restyle_runs(runs, &hints, |piece| {
         piece.color = color;
         piece.underline = None;
@@ -4015,21 +4230,29 @@ fn inlay_runs(runs: Vec<TextRun>, dl: &DisplayLine, font: Font, color: Hsla) -> 
     })
 }
 
-/// `runs` cut where `ranges` (of the display text) start and end, with
-/// `restyle` applied to the pieces inside them.
+/// `runs` cut where `ranges` (of the display text; sorted and apart, as
+/// hints and symbols are) start and end, with `restyle` applied to the
+/// pieces inside them. One walk over both: a long line's rows on screen can
+/// hold thousands of each.
 fn restyle_runs(runs: Vec<TextRun>, ranges: &[Range<usize>], restyle: impl Fn(&mut TextRun)) -> Vec<TextRun> {
-    let inside = |at: usize| ranges.iter().any(|r| r.contains(&at));
-    let mut cuts: Vec<usize> = ranges.iter().flat_map(|r| [r.start, r.end]).collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    let mut out = Vec::with_capacity(runs.len() + cuts.len());
+    let mut out = Vec::with_capacity(runs.len() + 2 * ranges.len());
     let mut pos = 0;
+    // The first range that doesn't end at or before where the walk is.
+    let mut next = 0;
     for run in runs {
         let end = pos + run.len;
         let mut start = pos;
-        for &cut in cuts.iter().filter(|&&c| c > pos && c < end).chain(std::iter::once(&end)) {
+        while start < end {
+            while ranges.get(next).is_some_and(|r| r.end <= start) {
+                next += 1;
+            }
+            let (cut, inside) = match ranges.get(next) {
+                Some(r) if r.start <= start => (r.end.min(end), true),
+                Some(r) => (r.start.min(end), false),
+                None => (end, false),
+            };
             let mut piece = TextRun { len: cut - start, ..run.clone() };
-            if inside(start) {
+            if inside {
                 restyle(&mut piece);
             }
             out.push(piece);
@@ -4042,9 +4265,16 @@ fn restyle_runs(runs: Vec<TextRun>, ranges: &[Range<usize>], restyle: impl Fn(&m
 
 /// A buffer line prepared for display: tabs are expanded to spaces and
 /// control characters shown as symbols (`control_symbol`), with a mapping
-/// between buffer columns and display columns (both in bytes).
+/// between buffer columns and display columns (both in bytes). It can be a
+/// window of the line (see `window`): positions stay the whole line's.
 pub struct DisplayLine {
+    /// The display text from display offset `start.ix` on.
     pub text: String,
+    /// Where `text` starts: buffer column, display offset, tab column (zero
+    /// for a whole line).
+    start: wrap::Resume,
+    /// Display offsets of buffer columns `start.byte..`; None when they're
+    /// the same (no tabs, control characters or hints).
     map: Option<Vec<usize>>,
     /// Inlay hints shown in `text`: the inserted text (padding included), the
     /// label within it, and the buffer column they sit before.
@@ -4105,56 +4335,92 @@ impl DisplayLine {
     /// by column. A buffer column maps to the display column before its
     /// hints, so carets sit left of them.
     pub fn with_inlays(line: &str, tab_size: usize, inlays: &[(usize, &str, bool, bool)]) -> Self {
-        if inlays.is_empty() && !has_tabs_or_controls(line) {
-            return Self { text: line.to_string(), map: None, inlays: Vec::new(), controls: Vec::new() };
+        Self::window(line, wrap::Resume::default(), tab_size, inlays)
+    }
+
+    /// Part of a line: `text` is its buffer text from `from` (see
+    /// `wrap::Resume`) on, `inlays` its hints there (columns the line's, up
+    /// to the end of `text` included). Positions in and out are the whole
+    /// line's; ones outside the part are clamped to it.
+    pub fn window(text: &str, from: wrap::Resume, tab_size: usize, inlays: &[(usize, &str, bool, bool)]) -> Self {
+        let first = from.byte as usize;
+        let inlays = &inlays[inlays.partition_point(|i| i.0 < first)..];
+        if inlays.is_empty() && !has_tabs_or_controls(text) {
+            return Self { text: text.to_string(), start: from, map: None, inlays: Vec::new(), controls: Vec::new() };
         }
-        let mut text = String::with_capacity(line.len() + 16);
-        let mut map = Vec::with_capacity(line.len() + 1);
+        let base = from.ix as usize;
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut map = Vec::with_capacity(text.len() + 1);
         let mut spans = Vec::new();
         let mut controls = Vec::new();
         let mut next = 0;
-        let mut insert = |at: usize, text: &mut String| {
+        let mut insert = |at: usize, out: &mut String| {
             while let Some(&(column, label, pad_left, pad_right)) = inlays.get(next).filter(|i| i.0 <= at) {
-                let start = text.len();
-                text.push_str(if pad_left { " " } else { "" });
-                let label_start = text.len();
-                text.push_str(label);
-                let label_end = text.len();
-                text.push_str(if pad_right { " " } else { "" });
-                spans.push(InlaySpan { whole: start..text.len(), label: label_start..label_end, column });
+                let start = base + out.len();
+                out.push_str(if pad_left { " " } else { "" });
+                let label_start = base + out.len();
+                out.push_str(label);
+                let label_end = base + out.len();
+                out.push_str(if pad_right { " " } else { "" });
+                spans.push(InlaySpan { whole: start..base + out.len(), label: label_start..label_end, column });
                 next += 1;
             }
         };
-        let mut col = 0;
-        for (i, ch) in line.char_indices() {
-            let before = text.len();
-            insert(i, &mut text);
+        let mut col = from.col as usize;
+        for (i, ch) in text.char_indices() {
+            let before = base + out.len();
+            insert(first + i, &mut out);
             for _ in 0..ch.len_utf8() {
                 map.push(before);
             }
             if ch == '\t' {
                 let n = tab_size - col % tab_size;
-                text.extend(std::iter::repeat_n(' ', n));
+                out.extend(std::iter::repeat_n(' ', n));
                 col += n;
             } else if let Some(symbol) = control_symbol(ch) {
-                controls.push(text.len()..text.len() + symbol.len());
-                text.push_str(symbol);
+                controls.push(base + out.len()..base + out.len() + symbol.len());
+                out.push_str(symbol);
                 col += symbol.chars().count();
             } else {
-                text.push(ch);
+                out.push(ch);
                 col += 1;
             }
         }
-        let before = text.len();
-        insert(line.len(), &mut text);
+        let before = base + out.len();
+        insert(first + text.len(), &mut out);
         map.push(before);
-        Self { text, map: Some(map), inlays: spans, controls }
+        Self { text: out, start: from, map: Some(map), inlays: spans, controls }
+    }
+
+    /// The buffer columns it shows: the line's, or a window's.
+    pub fn columns(&self) -> Range<usize> {
+        let first = self.start.byte as usize;
+        first..first + self.map.as_ref().map_or(self.text.len(), |m| m.len() - 1)
+    }
+
+    /// Where the text ends (the display offset after it).
+    pub fn end(&self) -> usize {
+        self.start.ix as usize + self.text.len()
+    }
+
+    /// The display text in `range` (display offsets of the line).
+    pub fn slice(&self, range: Range<usize>) -> &str {
+        let range = self.local(range);
+        &self.text[range]
+    }
+
+    /// `range` (display offsets of the line) as offsets into `text`.
+    pub fn local(&self, range: Range<usize>) -> Range<usize> {
+        let base = self.start.ix as usize;
+        let start = range.start.saturating_sub(base).min(self.text.len());
+        start..range.end.saturating_sub(base).clamp(start, self.text.len())
     }
 
     pub fn to_display(&self, col: usize) -> usize {
+        let first = self.start.byte as usize;
         match &self.map {
-            None => col.min(self.text.len()),
-            Some(m) => m[col.min(m.len() - 1)],
+            None => self.start.ix as usize + col.saturating_sub(first).min(self.text.len()),
+            Some(m) => m[col.saturating_sub(first).min(m.len() - 1)],
         }
     }
 
@@ -4163,9 +4429,10 @@ impl DisplayLine {
         if let Some(span) = self.inlays.iter().find(|s| s.whole.start < display && display <= s.whole.end) {
             return span.column;
         }
+        let first = self.start.byte as usize;
         match &self.map {
-            None => display.min(self.text.len()),
-            Some(m) => m.partition_point(|&d| d < display).min(m.len() - 1),
+            None => first + display.saturating_sub(self.start.ix as usize).min(self.text.len()),
+            Some(m) => first + m.partition_point(|&d| d < display).min(m.len() - 1),
         }
     }
 }
@@ -4934,6 +5201,95 @@ impl Block {
     }
 }
 
+/// An `Arc` compared by address, for what a cache was built from: holding it
+/// keeps the address from going to another value.
+#[derive(Clone)]
+struct Same<T>(Arc<T>);
+
+impl<T> PartialEq for Same<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// What blocks are built from (see `Editor::cached_blocks`), folds aside.
+#[derive(Clone, PartialEq)]
+struct BlocksKey {
+    mode: EditorMode,
+    /// The document's id, version, diagnostics and code lens generations.
+    doc: (u64, u64, u64, u64),
+    /// The open hunk and the list it's in.
+    hunk: Option<(usize, Same<Vec<Hunk>>)>,
+    /// The caret, when it's the only one (its line's problems can show).
+    caret: Option<usize>,
+    /// Wrap width and character width, which problems wrap to.
+    layout: Option<(Pixels, Pixels)>,
+    tab_size: usize,
+    code_lens: bool,
+}
+
+struct BlocksCache {
+    key: BlocksKey,
+    folds: Vec<Range<usize>>,
+    blocks: Arc<Vec<Block>>,
+    rows: Arc<Vec<(usize, usize)>>,
+    /// The caret line's problems block: (its line, the caret's).
+    problems: Option<(usize, usize)>,
+}
+
+/// Finds the diagnostics that reach into a byte range without walking the
+/// ones before it: they're sorted by start, and a tree of the farthest end
+/// under each node skips those that end sooner. Built per document state.
+#[derive(Default)]
+struct Reach {
+    /// Document id, version and diagnostics generation it's for.
+    key: Option<(u64, u64, u64)>,
+    /// The farthest end under each node of a complete binary tree whose
+    /// leaves, from `leaves` on, are the diagnostics.
+    tree: Vec<usize>,
+    leaves: usize,
+}
+
+impl Reach {
+    fn update(&mut self, doc: &Document) {
+        let key = (doc.id(), doc.version(), doc.diagnostics_generation());
+        if self.key == Some(key) {
+            return;
+        }
+        self.key = Some(key);
+        self.leaves = doc.diagnostics.len().next_power_of_two();
+        self.tree = vec![0; 2 * self.leaves];
+        for (i, d) in doc.diagnostics.iter().enumerate() {
+            self.tree[self.leaves + i] = d.range.end;
+        }
+        for node in (1..self.leaves).rev() {
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+    }
+
+    /// The diagnostics (of the document it was updated for) that start by
+    /// `range.end` and end at `range.start` or later, in order.
+    fn find<'a>(&self, diagnostics: &'a [lint::Diagnostic], range: std::ops::RangeInclusive<usize>) -> Vec<&'a lint::Diagnostic> {
+        let below = diagnostics.partition_point(|d| d.range.start <= *range.end());
+        let mut found = Vec::new();
+        // (node, first leaf under it, leaves under it)
+        let mut stack = vec![(1, 0, self.leaves)];
+        while let Some((node, first, len)) = stack.pop() {
+            if first >= below || self.tree.get(node).is_none_or(|&end| end < *range.start()) {
+                continue;
+            }
+            if len == 1 {
+                found.push(&diagnostics[first]);
+            } else {
+                // The left half after the right, so it's taken first.
+                stack.push((2 * node + 1, first + len / 2, len / 2));
+                stack.push((2 * node, first, len / 2));
+            }
+        }
+        found
+    }
+}
+
 #[derive(Default)]
 pub struct FrameLayout {
     text_bounds: Bounds<Pixels>,
@@ -5165,10 +5521,10 @@ mod block_tests {
             e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(4, "mismatched types\nexpected `i32`")]);
             let rows: Vec<String> = e.caret_problem_rows(cx).into_iter().map(|(_, t)| t).collect();
             assert_eq!(rows, ["mismatched types", "expected `i32`"]);
-            assert_eq!(e.block_rows(cx), [(1, 2)]);
+            assert_eq!(*e.block_rows(cx), [(1, 2)]);
             // Folded, the line's problems go under the lines its fold hides.
             e.folds.fold_rows(e.doc.read(cx), 1, 1);
-            assert_eq!(e.block_rows(cx), [(2, 2)]);
+            assert_eq!(*e.block_rows(cx), [(2, 2)]);
             e.folds.unfold_where(|_| true);
             // Two problems on the line: both.
             e.doc.as_mut(cx).set_lsp_diagnostics(vec![problem(0, "first"), problem(4, "second")]);
@@ -5297,6 +5653,21 @@ mod display_tests {
         }
     }
 
+    /// Restyling walks runs and ranges once; it cuts and restyles as
+    /// checking every range for every piece would.
+    #[test]
+    fn restyled_runs_are_cut_at_the_ranges() {
+        let run = |len: usize| TextRun { len, font: font("Test"), color: gpui::black(), background_color: None, underline: None, strikethrough: None };
+        let runs = vec![run(4), run(6), run(3), run(7)];
+        let ranges = [1..2, 3..5, 5..5, 9..13, 15..20];
+        let restyled = restyle_runs(runs, &ranges, |piece| piece.underline = Some(UnderlineStyle::default()));
+        let pieces: Vec<(usize, bool)> = restyled.iter().map(|r| (r.len, r.underline.is_some())).collect();
+        assert_eq!(
+            pieces,
+            [(1, false), (1, true), (1, false), (1, true), (1, true), (4, false), (1, true), (3, true), (2, false), (5, true)]
+        );
+    }
+
     #[test]
     fn symbols_map_to_their_one_character() {
         // A form feed, a line separator and a tab: "a␌bLSc  d".
@@ -5312,5 +5683,231 @@ mod display_tests {
         // Without tabs or control characters, the text is the line itself.
         let plain = DisplayLine::new("a — b", 4);
         assert!(plain.controls.is_empty() && plain.map.is_none());
+    }
+}
+
+/// What a frame does doesn't grow with the document: lists as long as the
+/// document (carets, matches, problems, lenses) are looked up for the rows
+/// on screen, or kept from frame to frame until they change, and a long
+/// line is built only where it shows.
+#[cfg(test)]
+mod frame_tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::{AnyView, AppContext, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    const LINES: usize = 10_000;
+    const LINE: &str = "let e = e + e * e - e / e; // e e e e e e e e e e e e e\n";
+
+    /// A view whose element lays the editor out (as `EditorElement` does,
+    /// which layout needs: it's in a view's draw) and keeps the frame.
+    struct Host {
+        editor: Entity<Editor>,
+        frame: Rc<RefCell<Option<FrameLayout>>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            Probe { editor: self.editor.clone(), frame: self.frame.clone() }
+        }
+    }
+
+    struct Probe {
+        editor: Entity<Editor>,
+        frame: Rc<RefCell<Option<FrameLayout>>>,
+    }
+
+    impl IntoElement for Probe {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Probe {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+            let mut style = Style::default();
+            style.size.width = relative(1.).into();
+            style.size.height = relative(1.).into();
+            (window.request_layout(style, [], cx), ())
+        }
+
+        fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) {
+            let frame = self.editor.update(cx, |e, cx| e.layout_frame(bounds, window, cx));
+            *self.frame.borrow_mut() = Some(frame);
+        }
+
+        fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window, _: &mut App) {}
+    }
+
+    /// An editor of `text`, focused, in a window 800 by 600, without soft
+    /// wrap (long lines break at a fixed column then).
+    fn editor(text: String, cx: &mut TestAppContext) -> (Entity<Editor>, Entity<Host>, &mut VisualTestContext) {
+        cx.update(|cx| cx.set_global(Theme::blank_for_tests()));
+        let editor = cx.new(|cx| {
+            let mut e = Editor::new(Document::from_text(text, None), cx);
+            e.soft_wrap = false;
+            e
+        });
+        let host = cx.new(|_| Host { editor: editor.clone(), frame: Rc::default() });
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            window.activate_window();
+            window.focus(&editor.focus_handle(cx));
+        });
+        cx.run_until_parked();
+        (editor, host, cx)
+    }
+
+    fn frame(host: &Entity<Host>, cx: &mut VisualTestContext) -> FrameLayout {
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), |_, _| AnyView::from(host.clone()));
+        host.update(cx, |h, _| h.frame.borrow_mut().take()).expect("laid out")
+    }
+
+    /// A file of `lines` lines with a caret, a problem and a code lens on
+    /// each, and 20 search matches on each (200k for `LINES`).
+    fn busy_editor(lines: usize, cx: &mut TestAppContext) -> (Entity<Editor>, Entity<Host>, &mut VisualTestContext) {
+        let (editor, host, cx) = editor(LINE.repeat(lines), cx);
+        editor.update(cx, |e, cx| {
+            let starts: Vec<usize> = (0..lines).map(|row| row * LINE.len()).collect();
+            e.set_selections(starts.iter().map(|&at| Selection::cursor(at + 4)).collect(), 0, cx);
+            let problem = |at: usize| lint::Diagnostic { range: at..at + 3, severity: Severity::Warning, message: "unused".into(), rule: "r".into() };
+            e.doc.as_mut(cx).set_lsp_diagnostics(starts.iter().map(|&at| problem(at + 4)).collect());
+            let lens = |line_start| crate::document::CodeLens {
+                id: 0,
+                line_start,
+                title: "1 reference".into(),
+                command: Arc::new(serde_json::Value::Null),
+                server: "s".into(),
+                unresolved: None,
+            };
+            let stamp = e.doc.read(cx).lens_stamp();
+            e.doc.as_mut(cx).set_code_lenses(starts.iter().map(|&at| lens(at)).collect(), stamp);
+            e.file_settings.code_lens = true;
+            let text = e.text(cx);
+            let ranges: Vec<Range<usize>> = text.match_indices('e').map(|(at, _)| at..at + 1).collect();
+            assert_eq!(ranges.len(), 20 * lines);
+            let matches = SearchMatches::new(ranges, e.doc.read(cx).rope());
+            e.set_search_highlights(matches, Some(0), cx);
+        });
+        (editor, host, cx)
+    }
+
+    #[gpui::test]
+    fn frames_keep_what_the_whole_document_gives(cx: &mut TestAppContext) {
+        let (editor, host, cx) = busy_editor(LINES, cx);
+        let first = frame(&host, cx);
+        let (rebuilds, blocks) = editor.update(cx, |e, cx| (e.markers.rebuilds(), e.blocks(cx)));
+        assert!(rebuilds > 0);
+        // The scrollbar: a marker per pixel row of its track at most, per
+        // kind (problems, changes, matches, carets), plus the thumb.
+        assert!(first.scrollbar.len() <= 4 * 600 + 1, "{} quads", first.scrollbar.len());
+        // A caret blink, then a scroll: what comes from the whole document
+        // stays as it was.
+        for _ in 0..2 {
+            editor.update(cx, |e, _| e.cursor_visible = !e.cursor_visible);
+            frame(&host, cx);
+        }
+        editor.update(cx, |e, _| e.scroll.y = px(20. * 5_000.));
+        let scrolled = frame(&host, cx);
+        editor.update(cx, |e, cx| {
+            assert_eq!(e.markers.rebuilds(), rebuilds);
+            assert!(Arc::ptr_eq(&e.blocks(cx), &blocks));
+        });
+        // A screen's worth drawn: a caret and its lens per line on it.
+        assert!(scrolled.cursors.len() <= 31 && !scrolled.cursors.is_empty(), "{}", scrolled.cursors.len());
+        assert!(scrolled.lens_bounds.len() <= 31 && !scrolled.lens_bounds.is_empty());
+        // An edit changes what the markers come from.
+        editor.update(cx, |e, cx| e.insert("x", cx));
+        frame(&host, cx);
+        editor.update(cx, |e, _| assert!(e.markers.rebuilds() > rebuilds));
+    }
+
+    /// `pieces` numbers with a tab and a control character each, on a line:
+    /// 1.6 MB for 100k.
+    fn long_line(pieces: usize) -> String {
+        (0..pieces).map(|i| format!("{i:06}\t\u{1}ab,")).collect()
+    }
+
+    #[gpui::test]
+    fn a_long_lines_rows_are_built_where_they_show(cx: &mut TestAppContext) {
+        let line = long_line(100_000);
+        let (editor, host, cx) = editor(format!("{line}\nend\n"), cx);
+        let shaped = |f: &FrameLayout| f.lines.iter().map(|(_, l)| l.text.len()).sum::<usize>();
+        let top = frame(&host, cx);
+        // A screen of rows, not the line.
+        assert!(shaped(&top) <= 31 * 512 * 3, "{} bytes shaped", shaped(&top));
+        // In the middle of it: the rows there, as the whole line shows them.
+        editor.update(cx, |e, _| e.scroll.y = px(20. * 1_000.));
+        let middle = frame(&host, cx);
+        let whole = DisplayLine::new(&line, 4);
+        let breaks = editor.update(cx, |e, _| e.line_breaks(0).to_vec());
+        assert_eq!(middle.lines.len(), 31);
+        for (i, (_, row)) in middle.lines.iter().enumerate() {
+            let (range, _) = wrap::segment(&breaks, 1_000 + i, whole.end());
+            assert_eq!(row.text.as_ref(), whole.slice(range), "row {}", 1_000 + i);
+        }
+        // A caret there shows where the whole line has it.
+        let at = line.len() / 2;
+        editor.update(cx, |e, cx| {
+            e.set_selections(vec![Selection::cursor(at)], 0, cx);
+            e.autoscroll = false;
+            let drow = e.display_row_of(at, cx);
+            assert_eq!(drow, wrap::segment_of(&breaks, whole.to_display(at)));
+            e.scroll.y = px(20. * drow as f32);
+        });
+        let caret = frame(&host, cx);
+        assert_eq!(caret.cursors.len(), 1);
+    }
+
+    /// The time per frame (the fastest of a few) of an editor `make` sets up.
+    fn frame_time(cx: &mut TestAppContext, make: impl FnOnce(&mut TestAppContext) -> (Entity<Editor>, Entity<Host>, &mut VisualTestContext)) -> std::time::Duration {
+        let (editor, host, cx) = make(cx);
+        frame(&host, cx);
+        (0..20)
+            .map(|i| {
+                // Blinks and scrolls, as frames go (within the smaller documents).
+                editor.update(cx, |e, _| {
+                    e.cursor_visible = i % 2 == 0;
+                    e.scroll.y = px(20. * (10 * (i / 2)) as f32);
+                });
+                let start = std::time::Instant::now();
+                frame(&host, cx);
+                start.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    /// `cargo test bench_frames -- --ignored --nocapture`: frames cost what's
+    /// on screen, whatever the document holds. A file with a caret, a problem,
+    /// a lens and 20 matches per line, and a long line, each at a tenth of
+    /// the size and at full size (10k carets, problems and lenses, 200k
+    /// matches; a 1.6 MB line): ten times the document, the same frame.
+    #[gpui::test]
+    #[ignore]
+    fn bench_frames(cx: &mut TestAppContext) {
+        let plain = frame_time(cx, |cx| editor(LINE.repeat(LINES), cx));
+        let busy = [LINES / 10, LINES].map(|lines| frame_time(cx, |cx| busy_editor(lines, cx)));
+        let long = [10_000, 100_000].map(|pieces| frame_time(cx, |cx| editor(long_line(pieces), cx)));
+        println!("frame: plain {plain:?}; carets, problems, lenses and matches: {:?} → {:?}; a long line: {:?} → {:?}", busy[0], busy[1], long[0], long[1]);
+        // Walking the document would make them ten times slower.
+        for [small, big] in [busy, long] {
+            assert!(big < small * 2, "{big:?} vs {small:?}");
+        }
     }
 }

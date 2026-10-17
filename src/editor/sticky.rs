@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use gpui::{Bounds, Context, Pixels, Point, SharedString, TextRun, fill, point, px, size};
 
-use super::{DisplayLine, Editor, FrameLayout};
+use super::{Editor, FrameLayout};
 use crate::{syntax::Symbol, theme::Theme};
 
 /// At most this many pinned lines (fewer in short editors).
@@ -23,30 +23,50 @@ impl Editor {
         self.outline.last()
     }
 
-    /// The definitions around the caret, outermost first: name and where it starts.
+    /// The definitions around the caret, outermost first: name and where it
+    /// starts. Kept for the outline and caret: the workspace draws them at
+    /// every frame, and a file can have thousands of symbols.
     pub fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Vec<(SharedString, usize)> {
         let head = self.primary_selection().head;
-        self.shown_outline(cx)
+        let outline = self.shown_outline(cx);
+        if let Some((o, h, crumbs)) = &self.breadcrumbs
+            && Arc::ptr_eq(o, &outline)
+            && *h == head
+        {
+            return crumbs.clone();
+        }
+        let crumbs: Vec<(SharedString, usize)> = outline
             .iter()
             .filter(|s| s.range.start <= head && head <= s.range.end)
             .map(|s| (SharedString::from(s.name.clone()), s.offset))
-            .collect()
+            .collect();
+        self.breadcrumbs = Some((outline, head, crumbs.clone()));
+        crumbs
+    }
+
+    /// The outline's symbols as (first row, last row, offset), for the
+    /// outline and version drawn: sticky scroll looks them up every frame.
+    fn outline_rows(&mut self, cx: &mut Context<Self>) -> Arc<Vec<(usize, usize, usize)>> {
+        let outline = self.shown_outline(cx);
+        let version = self.doc.read(cx).version();
+        if !self.sticky_spans.0.as_ref().is_some_and(|(o, v)| Arc::ptr_eq(o, &outline) && *v == version) {
+            let doc = self.doc.read(cx);
+            let rows = outline.iter().map(|s| (doc.row_of(s.offset), doc.row_of(s.range.end), s.offset)).collect();
+            self.sticky_spans = (Some((outline, version)), Arc::new(rows));
+        }
+        self.sticky_spans.1.clone()
     }
 
     /// The header rows to pin when `top_row` is the first visible row: scopes
     /// that start above it and continue past it, innermost last.
     fn sticky_headers(&mut self, top_row: usize, max: usize, cx: &mut Context<Self>) -> Vec<(usize, usize)> {
-        let outline = self.shown_outline(cx);
+        let outline = self.outline_rows(cx);
         let mut rows = Vec::new();
         // The pinned lines cover rows of their own, so look below them too.
         for _ in 0..3 {
             let top = top_row + rows.len();
-            let mut next: Vec<(usize, usize)> = outline
-                .iter()
-                .map(|s| (self.doc.read(cx).row_of(s.offset), s))
-                .filter(|(row, s)| *row < top && self.doc.read(cx).row_of(s.range.end) > top)
-                .map(|(row, s)| (row, s.offset))
-                .collect();
+            let mut next: Vec<(usize, usize)> =
+                outline.iter().filter(|&&(row, end, _)| row < top && end > top).map(|&(row, _, offset)| (row, offset)).collect();
             next.dedup_by_key(|(row, _)| *row);
             if next.len() > max {
                 next.drain(..next.len() - max);
@@ -94,8 +114,10 @@ impl Editor {
             self.sticky_rows.push((row_bounds, offset));
 
             let line_start = self.doc.read(cx).line_start(row);
-            let text = self.doc.read(cx).line_text(row);
-            let dl = DisplayLine::new(&text, self.tab_size);
+            // A long line's first row, as the text shows it (and no inlay hints).
+            let to = self.part_bounds(row, 0..=0, cx).1;
+            let text = self.doc.read(cx).slice(line_start..line_start + to);
+            let dl = super::DisplayLine::new(&text, self.tab_size);
             let highlights = self.doc.read(cx).syntax().highlights(self.doc.read(cx).rope(), line_start..line_start + text.len());
             // Highlighted like the line itself (without diagnostics).
             let mut runs = Vec::new();

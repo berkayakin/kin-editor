@@ -11,6 +11,8 @@ pub(super) enum TerminalPanelEvent {
     OpenFile { path: PathBuf, line: Option<u32>, column: Option<u32> },
     /// A Run tab's program ended (its output may report problems).
     RunExited(Entity<TerminalView>),
+    /// A Run tab started, ended or went (see `Workspace::running`).
+    RunsChanged,
     /// Close this tab (its close button, a middle click, its shell exited).
     Close(Entity<TerminalView>),
     /// A tab was right-clicked.
@@ -91,6 +93,7 @@ impl TerminalPanel {
         self.subscriptions.clear();
         self.active = 0;
         self.saved = None;
+        cx.emit(TerminalPanelEvent::RunsChanged);
         cx.notify();
     }
 
@@ -98,13 +101,21 @@ impl TerminalPanel {
     pub(super) fn add(&mut self, terminal: Entity<TerminalView>, place: TerminalPlace, cx: &mut Context<Self>) {
         let subscription = cx.subscribe(&terminal, |_, terminal, event: &TerminalEvent, cx| match event {
             TerminalEvent::TitleChanged => cx.notify(),
-            TerminalEvent::Exited if terminal.read(cx).run().is_some() => cx.emit(TerminalPanelEvent::RunExited(terminal)),
+            TerminalEvent::Exited if terminal.read(cx).run().is_some() => {
+                // Its tab's icon shows how it went, also when it isn't the current one.
+                cx.notify();
+                cx.emit(TerminalPanelEvent::RunExited(terminal));
+                cx.emit(TerminalPanelEvent::RunsChanged);
+            }
             TerminalEvent::Exited => cx.emit(TerminalPanelEvent::Close(terminal)),
             TerminalEvent::OpenFile { path, line, column } => {
                 cx.emit(TerminalPanelEvent::OpenFile { path: path.clone(), line: *line, column: *column })
             }
         });
         self.subscriptions.insert(terminal.entity_id(), subscription);
+        if terminal.read(cx).run().is_some() {
+            cx.emit(TerminalPanelEvent::RunsChanged);
+        }
         let (group, ix) = match place {
             TerminalPlace::Tab { group, ix } if group < self.groups.len() => {
                 let tabs = &mut self.groups[group].tabs;
@@ -132,6 +143,9 @@ impl TerminalPanel {
     pub(super) fn remove(&mut self, terminal: &Entity<TerminalView>, cx: &mut Context<Self>) -> Option<(usize, usize)> {
         let (g, ix) = self.position(terminal)?;
         self.subscriptions.remove(&terminal.entity_id());
+        if terminal.read(cx).run().is_some() {
+            cx.emit(TerminalPanelEvent::RunsChanged);
+        }
         let group = &mut self.groups[g];
         group.tabs.remove(ix);
         // The current tab stays current when another one closes.

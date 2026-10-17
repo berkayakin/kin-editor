@@ -41,7 +41,7 @@ use crate::{
     },
     image_view::ImageView,
     markdown_preview::MarkdownPreview,
-    pane_item::{PaneItem, Saving, TabIcon},
+    pane_item::{PaneItem, Saving, TabIcon, TabLook},
     git::{self, Change, FileStatus, RepoStatus},
     git_panel::{GitOp, GitPanel, GitPanelEvent},
     problems_panel::{ProblemsEvent, ProblemsPanel},
@@ -668,6 +668,13 @@ pub struct Workspace {
 
     /// For Rerun.
     last_run: Option<RunTarget>,
+    /// Run tabs still running: their configurations' names and commands.
+    /// Kept from the terminal panel's events, so drawing the run widget
+    /// reads no terminal: one printing would redraw the window at every
+    /// batch, its panel closed or its tab out of sight.
+    running: Vec<(String, String)>,
+    /// The debug session is on (not ended), kept from its events likewise.
+    debug_active: bool,
     /// The debug session (running or finished) whose panel shows in the bottom area.
     debug: Option<(Entity<DebugSession>, Subscription)>,
     last_debug: Option<RunTarget>,
@@ -777,6 +784,8 @@ pub struct Workspace {
     _subscriptions: Vec<Subscription>,
     /// Each tab's subscriptions, dropped with the tab (they'd pile up).
     tab_subscriptions: HashMap<gpui::EntityId, Vec<Subscription>>,
+    /// What each tab shows (see `TabLook`), updated when its item changes.
+    tab_looks: HashMap<gpui::EntityId, TabLook>,
 }
 
 impl Workspace {
@@ -833,6 +842,7 @@ impl Workspace {
         let terminals_subscription = cx.subscribe_in(&terminals, window, |ws, _, event: &TerminalPanelEvent, window, cx| match event {
             TerminalPanelEvent::OpenFile { path, line, column } => ws.open_at(path.clone(), *line, *column, window, cx),
             TerminalPanelEvent::RunExited(terminal) => ws.collect_run_problems(terminal, cx),
+            TerminalPanelEvent::RunsChanged => ws.update_running(cx),
             TerminalPanelEvent::Close(terminal) => ws.remove_terminal(terminal, window, cx),
             TerminalPanelEvent::TabMenu { terminal, position } => ws.open_terminal_tab_menu(terminal.clone(), *position, window, cx),
             TerminalPanelEvent::Overflow { terminals, position } => {
@@ -1021,6 +1031,8 @@ impl Workspace {
             // Closed unless it was open when the window last closed.
 
             last_run: None,
+            running: Vec::new(),
+            debug_active: false,
             debug: None,
             last_debug: None,
             welcome_scroll: gpui::ScrollHandle::new(),
@@ -1085,6 +1097,7 @@ impl Workspace {
             lsp,
             documents,
             tab_subscriptions: HashMap::new(),
+            tab_looks: HashMap::new(),
             _subscriptions: vec![
                 find_subscription,
                 git_subscription,
@@ -1219,18 +1232,19 @@ impl Workspace {
     /// Adds a tab to the active pane without showing it; returns its index.
     fn insert_tab(&mut self, item: PaneItem, window: &mut Window, cx: &mut Context<Self>) -> usize {
         // Tabs show titles, dirty dots and errors from what they hold; only
-        // a shown one wakes the window.
+        // a shown one, or a change to its tab, wakes the window.
         match &item {
             PaneItem::Editor(editor) => self.add_editor(editor, window, cx),
             PaneItem::Image(image) => {
-                let shown = cx.observe(image, |ws, image, cx| ws.notify_if_shown(image.entity_id(), cx));
+                let shown = cx.observe(image, |ws, image, cx| ws.tab_changed(PaneItem::Image(image), cx));
                 self.tab_subscriptions.insert(image.entity_id(), vec![shown]);
             }
             PaneItem::Preview(preview) => {
-                let shown = cx.observe(preview, |ws, preview, cx| ws.notify_if_shown(preview.entity_id(), cx));
+                let shown = cx.observe(preview, |ws, preview, cx| ws.tab_changed(PaneItem::Preview(preview), cx));
                 self.tab_subscriptions.insert(preview.entity_id(), vec![shown]);
             }
         }
+        self.tab_looks.insert(item.entity_id(), item.look(cx));
         let pane = &mut self.panes[self.active_pane];
         // After the current tab, but never among pinned ones.
         let pinned = pane.tabs.iter().filter(|t| self.pinned.contains(&t.entity_id())).count();
@@ -1244,8 +1258,9 @@ impl Workspace {
     fn add_editor(&mut self, editor: &Entity<Editor>, window: &mut Window, cx: &mut Context<Self>) {
         let mut subscriptions = Vec::new();
         // What a shown tab draws in the window (its title, the status bar,
-        // breadcrumbs) follows it; a tab out of sight doesn't wake the window.
-        subscriptions.push(cx.observe(editor, |ws, editor, cx| ws.notify_if_shown(editor.entity_id(), cx)));
+        // breadcrumbs) follows it; a tab out of sight wakes the window only
+        // when its tab changes.
+        subscriptions.push(cx.observe(editor, |ws, editor, cx| ws.tab_changed(PaneItem::Editor(editor), cx)));
         subscriptions.push(cx.subscribe(editor, |ws, editor, _: &EditorEvent, cx| {
             ws.schedule_auto_save(&editor, cx);
             ws.schedule_session_save(cx);
@@ -1290,9 +1305,37 @@ impl Workspace {
         self.sync_previewed(cx);
     }
 
-    /// Redraws the window for a change in a tab only when that tab shows.
-    fn notify_if_shown(&mut self, id: gpui::EntityId, cx: &mut Context<Self>) {
-        if self.panes.iter().any(|pane| pane.tabs.get(pane.active).is_some_and(|t| t.entity_id() == id)) {
+    /// Something in a tab changed: its look is kept (`tab_looks`), and the
+    /// window redraws when that changed or the tab shows.
+    fn tab_changed(&mut self, item: PaneItem, cx: &mut Context<Self>) {
+        let id = item.entity_id();
+        let look = item.look(cx);
+        let changed = self.tab_looks.get(&id) != Some(&look);
+        if changed {
+            self.tab_looks.insert(id, look);
+        }
+        if changed || self.panes.iter().any(|pane| pane.tabs.get(pane.active).is_some_and(|t| t.entity_id() == id)) {
+            cx.notify();
+        }
+    }
+
+    /// What `item`'s tab shows, as kept (read from it if it isn't yet).
+    fn tab_look(&self, item: &PaneItem, cx: &App) -> TabLook {
+        self.tab_looks.get(&item.entity_id()).cloned().unwrap_or_else(|| item.look(cx))
+    }
+
+    /// The Run tabs still running, from the terminal panel (see `running`).
+    fn update_running(&mut self, cx: &mut Context<Self>) {
+        let running: Vec<(String, String)> = self
+            .all_terminals(cx)
+            .iter()
+            .filter_map(|t| match t.read(cx).run() {
+                Some((target, RunState::Running)) => Some((target.name.clone(), target.command.clone())),
+                _ => None,
+            })
+            .collect();
+        if running != self.running {
+            self.running = running;
             cx.notify();
         }
     }

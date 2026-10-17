@@ -408,6 +408,7 @@ impl Workspace {
         let Some((pane_ix, tab_ix)) = self.locate(id) else { return };
         self.pinned.remove(&id);
         self.tab_subscriptions.remove(&id);
+        self.tab_looks.remove(&id);
         let was_active_pane = pane_ix == self.active_pane;
         let pane = &mut self.panes[pane_ix];
         pane.tabs.remove(tab_ix);

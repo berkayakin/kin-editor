@@ -28,10 +28,16 @@ impl EventEmitter<ProblemsEvent> for ProblemsPanel {}
 #[derive(Default)]
 pub struct ProblemsPanel {
     editor: Option<Entity<Editor>>,
-    /// Redraws when the editor's diagnostics change.
+    /// Redraws when the editor's document (its text, its diagnostics)
+    /// changes; not the editor, which notifies at every caret blink.
     _editor_observer: Option<Subscription>,
     /// The last Run's name and problems.
     run: Option<(String, Vec<OutputProblem>)>,
+    /// Counts `set_run` calls, for `run_counts`.
+    run_generation: u64,
+    /// `run_counts` for (document state, run generation): the status bar
+    /// asks every frame.
+    counts: std::cell::Cell<Option<((Option<(u64, u64, u64)>, u64), [usize; 4])>>,
     root: Option<PathBuf>,
     scroll: gpui::UniformListScrollHandle,
 }
@@ -46,7 +52,10 @@ impl ProblemsPanel {
         if self.editor == editor {
             return;
         }
-        self._editor_observer = editor.as_ref().map(|e| cx.observe(e, |_, _, cx| cx.notify()));
+        self._editor_observer = editor.as_ref().map(|e| {
+            let doc = e.read(cx).doc.clone();
+            cx.observe(&doc, |_, _, cx| cx.notify())
+        });
         self.editor = editor;
         cx.notify();
     }
@@ -54,6 +63,7 @@ impl ProblemsPanel {
     /// What the last Run printed (None: nothing, or a run without problems).
     pub fn set_run(&mut self, run: Option<(String, Vec<OutputProblem>)>, cx: &mut Context<Self>) {
         self.run = run;
+        self.run_generation += 1;
         cx.notify();
     }
 
@@ -69,11 +79,33 @@ impl ProblemsPanel {
         let Some((_, problems)) = &self.run else { return Vec::new() };
         let known = |p: &OutputProblem| {
             doc.is_some_and(|doc| {
-                doc.path.as_deref() == Some(p.path.as_path())
-                    && doc.diagnostics.iter().any(|d| d.severity == p.severity && doc.row_of(d.range.start) + 1 == p.line as usize)
+                doc.path.as_deref() == Some(p.path.as_path()) && (1..=doc.line_count()).contains(&(p.line as usize)) && {
+                    // Its line's diagnostics, by binary search (they're sorted).
+                    let row = p.line as usize - 1;
+                    let (start, end) = (doc.line_start(row), doc.line_end(row));
+                    let first = doc.diagnostics.partition_point(|d| d.range.start < start);
+                    doc.diagnostics[first..].iter().take_while(|d| d.range.start <= end).any(|d| d.severity == p.severity)
+                }
             })
         };
         problems.iter().filter(|p| !known(p)).collect()
+    }
+
+    /// How many of `run_shown` there are of each severity (by `Severity as
+    /// usize`), kept until the document or the Run's problems change.
+    pub fn run_counts(&self, doc: Option<&Document>) -> [usize; 4] {
+        let key = (doc.map(|d| (d.id(), d.version(), d.diagnostics_generation())), self.run_generation);
+        if let Some((k, counts)) = self.counts.get()
+            && k == key
+        {
+            return counts;
+        }
+        let mut counts = [0; 4];
+        for p in self.run_shown(doc) {
+            counts[p.severity as usize] += 1;
+        }
+        self.counts.set(Some((key, counts)));
+        counts
     }
 
     fn display_rel(&self, path: &Path) -> String {
@@ -88,9 +120,9 @@ impl Render for ProblemsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let doc = self.editor.as_ref().map(|e| e.read(cx).doc.read(cx));
-        let run_count = self.run_shown(doc).len();
+        let run_count = self.run_counts(doc).iter().sum::<usize>();
         // Hints aren't problems.
-        let diag_count = doc.map_or(0, |d| d.diagnostics.iter().filter(|d| d.severity.is_problem()).count());
+        let diag_count = doc.map_or(0, |d| d.diagnostics.len() - d.severity_count(Severity::Hint));
 
         let header = crate::ui::panel_header(&theme)
             .child(div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.text_muted).child("PROBLEMS"))

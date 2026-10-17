@@ -117,14 +117,12 @@ impl Workspace {
     pub(super) fn render_run_widget(&self, fit: BarFit, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
         let selected = self.last_run.clone();
-        let terminals = self.all_terminals(cx);
-        let running_selected = selected.as_ref().is_some_and(|target| {
-            terminals.iter().any(|t| {
-                t.read(cx).run().is_some_and(|(r, s)| *s == RunState::Running && r.name == target.name && r.command == target.command)
-            })
-        });
-        let running = self.debug.as_ref().is_some_and(|(s, _)| s.read(cx).is_active())
-            || terminals.iter().any(|t| t.read(cx).run().is_some_and(|(_, s)| *s == RunState::Running));
+        // From fields kept by events: reading terminals here would redraw the
+        // window whenever one prints.
+        let running_selected = selected
+            .as_ref()
+            .is_some_and(|target| self.running.iter().any(|(name, command)| *name == target.name && *command == target.command));
+        let running = self.debug_active || !self.running.is_empty();
         let debuggable = selected.as_ref().is_some_and(|t| t.debug.is_some());
 
         let run_tip = match (&selected, running_selected) {

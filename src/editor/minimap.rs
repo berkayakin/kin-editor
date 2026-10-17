@@ -25,15 +25,17 @@ const COLUMN: f32 = 1.;
 const PADDING: f32 = 6.;
 /// The markers' lane at the right edge.
 pub(super) const LANE: f32 = 10.;
-/// Highlights are computed this many lines at a time and kept while the text
-/// and its syntax tree stay the same, so scrolling reuses them.
+/// Highlights are computed this many display rows at a time and kept while
+/// the text, its syntax tree and the rows stay the same, so scrolling reuses
+/// them. Rows, not lines: a long line's rows are highlighted a chunk at a
+/// time too, not whole.
 const CHUNK: usize = 128;
 
-/// Highlights per chunk of lines, for the document version and syntax tree
-/// in `key`.
+/// Highlights per chunk of display rows, for the document version, syntax
+/// tree and display rows (the wrap map's generation) in `key`.
 #[derive(Default)]
 pub(super) struct MinimapCache {
-    key: (u64, u64),
+    key: (u64, u64, Option<u64>),
     chunks: HashMap<usize, Arc<Vec<(Range<usize>, Highlight)>>>,
 }
 
@@ -154,7 +156,7 @@ impl Editor {
                 None => (line_start, 0),
             };
             let to = breaks.get(seg).map_or(line_end, |b| line_start + b.byte as usize).max(from);
-            let highlights = self.minimap_highlights(line, cx);
+            let highlights = self.minimap_highlights(drow, cx);
             let mut span = highlights.partition_point(|(r, _)| r.end <= from);
             // Runs of non-space characters in one color: (first column, columns, color).
             let mut runs: Vec<(usize, usize, Hsla)> = Vec::new();
@@ -196,7 +198,7 @@ impl Editor {
                 ));
             }
             // Search matches on the row, over its blocks.
-            let matches = &self.search_matches;
+            let matches = &self.search_matches.ranges;
             let first_match = matches.partition_point(|m| m.end <= from);
             for m in matches[first_match..].iter().take_while(|m| m.start < to) {
                 let (start, end) = (self.minimap_column(from, m.start.max(from), indent, cx), self.minimap_column(from, m.end.min(to), indent, cx));
@@ -226,23 +228,38 @@ impl Editor {
         })
     }
 
-    /// The highlights of the chunk of lines holding `line`.
-    fn minimap_highlights(&mut self, line: usize, cx: &App) -> Arc<Vec<(Range<usize>, Highlight)>> {
+    /// The highlights of the chunk of display rows holding `drow`: of the
+    /// bytes its rows show (hidden lines left out).
+    fn minimap_highlights(&mut self, drow: usize, cx: &App) -> Arc<Vec<(Range<usize>, Highlight)>> {
         let doc = self.doc.read(cx);
-        let key = (doc.version(), doc.tree_version());
+        let key = (doc.version(), doc.tree_version(), self.wrap.as_ref().map(|w| w.generation()));
         if self.minimap_cache.key != key {
             self.minimap_cache = MinimapCache { key, chunks: HashMap::new() };
         }
-        let chunk = line / CHUNK;
-        self.minimap_cache
-            .chunks
-            .entry(chunk)
-            .or_insert_with(|| {
-                let last = ((chunk + 1) * CHUNK).min(doc.line_count()).saturating_sub(1);
-                let range = doc.line_start(chunk * CHUNK)..doc.line_end(last);
-                Arc::new(doc.syntax().highlights(doc.rope(), range))
-            })
-            .clone()
+        let chunk = drow / CHUNK;
+        if let Some(highlights) = self.minimap_cache.chunks.get(&chunk) {
+            return highlights.clone();
+        }
+        let rows = chunk * CHUNK..((chunk + 1) * CHUNK).min(self.display_row_count(cx));
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        for drow in rows {
+            if self.wrap.as_ref().is_some_and(|w| w.block_at(drow).is_some()) {
+                continue;
+            }
+            let (line, seg) = self.line_of_display_row(drow, cx);
+            let (line_start, line_end) = (doc.line_start(line), doc.line_end(line));
+            let breaks = self.line_breaks(line);
+            let from = seg.checked_sub(1).and_then(|s| breaks.get(s)).map_or(line_start, |b| line_start + b.from.byte as usize);
+            let to = breaks.get(seg).map_or(line_end, |b| line_start + b.byte as usize).max(from);
+            match ranges.last_mut() {
+                Some(r) if r.end + 1 >= from => r.end = r.end.max(to),
+                _ => ranges.push(from..to),
+            }
+        }
+        let syntax = doc.syntax();
+        let highlights: Arc<Vec<_>> = Arc::new(ranges.into_iter().flat_map(|r| syntax.highlights(doc.rope(), r)).collect());
+        self.minimap_cache.chunks.insert(chunk, highlights.clone());
+        highlights
     }
 }
 

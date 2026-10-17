@@ -120,8 +120,9 @@ pub struct Theme {
 
     pub syntax: SyntaxColors,
     /// Colors for capture names besides the base kinds ("keyword.control",
-    /// "string.regex"), from the theme's `syntax`.
-    pub syntax_names: HashMap<String, Rgba>,
+    /// "string.regex"), from the theme's `syntax`. Shared: views copy the
+    /// theme to draw, many times a frame.
+    pub syntax_names: Arc<HashMap<String, Rgba>>,
 }
 
 impl Global for Theme {}
@@ -300,7 +301,7 @@ impl Theme {
             terminal_bright_cyan: rgba(0x7ccbd4ff),
             terminal_bright_white: rgba(0xffffffff),
             syntax,
-            syntax_names: HashMap::new(),
+            syntax_names: Arc::default(),
         }
     }
 
@@ -680,7 +681,7 @@ fn resolve(
                     errors.push(format!("{}: unknown color \"{key}\"{hint}", file.name));
                 }
                 Some(color) => {
-                    theme.syntax_names.insert(name.to_string(), color);
+                    Arc::make_mut(&mut theme.syntax_names).insert(name.to_string(), color);
                 }
                 None => errors.push(format!("{}: invalid color \"{value}\" for \"{key}\"", file.name)),
             }

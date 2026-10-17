@@ -21,7 +21,6 @@ use crate::{
     editor::Editor,
     encoding::TextEncoding,
     image_view::ImageView,
-    lint::Severity,
     markdown_preview::MarkdownPreview,
     state::{TabKind, TabSession},
 };
@@ -40,6 +39,7 @@ pub enum Saving {
 }
 
 /// A tab's icon.
+#[derive(Clone, PartialEq)]
 pub enum TabIcon {
     /// The file type's icon (`ui::file_icon`).
     File(PathBuf),
@@ -93,7 +93,7 @@ impl Item for Editor {
     }
 
     fn has_errors(&self, cx: &App) -> bool {
-        self.doc.read(cx).diagnostics.iter().any(|d| d.severity == Severity::Error)
+        self.doc.read(cx).has_errors()
     }
 
     fn saving(&self) -> Saving {
@@ -170,6 +170,18 @@ impl Item for MarkdownPreview {
         let path = MarkdownPreview::path(self, cx)?;
         Some((TabSession { kind: TabKind::MarkdownPreview, path: Some(path), ..TabSession::default() }, None))
     }
+}
+
+/// What a tab bar shows of an item. The workspace keeps it and updates it
+/// when the item changes, so drawing the tab bars reads no item: one that
+/// changes (diagnostics arriving for a tab out of sight) would redraw the
+/// window, though nothing it shows changed.
+#[derive(Clone, PartialEq)]
+pub struct TabLook {
+    pub title: String,
+    pub icon: TabIcon,
+    pub dirty: bool,
+    pub errors: bool,
 }
 
 /// A pane's tab: the view it shows.
@@ -259,6 +271,12 @@ impl PaneItem {
 
     pub fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
+    }
+
+    /// What its tab shows now.
+    pub fn look(&self, cx: &App) -> TabLook {
+        let item = self.read(cx);
+        TabLook { title: item.tab_title(cx), icon: item.tab_icon(cx), dirty: item.is_dirty(cx), errors: item.has_errors(cx) }
     }
 
     /// A second view of the same thing, for a split: an editor of the same

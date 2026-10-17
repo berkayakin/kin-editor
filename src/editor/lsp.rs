@@ -1194,7 +1194,7 @@ impl Editor {
                     let mut gone = Vec::new();
                     for ((ix, ..), answer) in in_view.into_iter().zip(answers) {
                         match answer.ok().as_ref().and_then(lens_command) {
-                            Some((title, command)) => (lenses[ix].title, lenses[ix].command, lenses[ix].unresolved) = (title, command, None),
+                            Some((title, command)) => (lenses[ix].title, lenses[ix].command, lenses[ix].unresolved) = (title.into(), Arc::new(command), None),
                             None => gone.push(ix),
                         }
                     }
@@ -1276,7 +1276,14 @@ impl Editor {
                     None if resolves && lens.get("command").is_none_or(Value::is_null) => (String::new(), Value::Null, Some(lens)),
                     None => continue,
                 };
-                out.push(CodeLens { id: 0, line_start, title, command, server: server.id.clone(), unresolved });
+                out.push(CodeLens {
+                    id: 0,
+                    line_start,
+                    title: title.into(),
+                    command: Arc::new(command),
+                    server: server.id.as_str().into(),
+                    unresolved: unresolved.map(Arc::new),
+                });
             }
         }
         out.sort_by_key(|l| l.line_start);
@@ -1298,7 +1305,10 @@ impl Editor {
         let servers = self.lsp_servers(cx);
         wanted
             .into_iter()
-            .filter_map(|ix| Some((ix, servers.iter().find(|s| s.id == lenses[ix].server)?.clone(), lenses[ix].unresolved.clone()?)))
+            .filter_map(|ix| {
+                let server = servers.iter().find(|s| *s.id == *lenses[ix].server)?.clone();
+                Some((ix, server, Value::clone(lenses[ix].unresolved.as_deref()?)))
+            })
             .collect()
     }
 
@@ -1308,7 +1318,7 @@ impl Editor {
     pub(super) fn run_code_lens(&mut self, lens: CodeLens, cx: &mut Context<Self>) {
         let name = lens.command["command"].as_str().unwrap_or_default().to_string();
         let args = lens.command.get("arguments").cloned().unwrap_or(Value::Null);
-        let server = self.lsp_servers(cx).into_iter().find(|s| s.id == lens.server);
+        let server = self.lsp_servers(cx).into_iter().find(|s| *s.id == *lens.server);
         let row = self.doc.read(cx).row_of(lens.line_start);
         let navigate = |locations: Vec<protocol::Location>, server: Option<Arc<Server>>, cx: &mut Context<Self>| match server {
             Some(server) if !locations.is_empty() => {
@@ -1337,7 +1347,7 @@ impl Editor {
                 }
             }
             _ => match server.filter(|s| s.executes(&name)) {
-                Some(server) => cx.emit(EditorLspEvent::Command { server, command: lens.command.clone() }),
+                Some(server) => cx.emit(EditorLspEvent::Command { server, command: (*lens.command).clone() }),
                 None => cx.emit(EditorLspEvent::Message(format!("Kuana can't run “{}”", lens.title).into())),
             },
         }
@@ -1856,8 +1866,8 @@ mod tests {
             editor.read_with(cx, |e, cx| !e.doc.read(cx).code_lenses().is_empty())
         });
         let lens = editor.read_with(cx, |e, cx| e.doc.read(cx).code_lenses()[0].clone());
-        assert_eq!((lens.title.as_str(), lens.line_start), ("lens lens", 0));
-        editor.read_with(cx, |e, cx| assert_eq!(e.block_rows(cx), [(0, 1)]));
+        assert_eq!((&*lens.title, lens.line_start), ("lens lens", 0));
+        editor.update(cx, |e, cx| assert_eq!(*e.block_rows(cx), [(0, 1)]));
 
         // Clicked: a references lens opens the usages list.
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -2065,7 +2075,7 @@ mod tests {
             lenses(cx) == 10
         });
         assert_eq!(titled(cx), [0]);
-        assert_eq!(editor.read_with(cx, |e, cx| e.block_rows(cx).len()), 10);
+        assert_eq!(editor.update(cx, |e, cx| e.block_rows(cx).len()), 10);
         // Scrolled to line 500: its lens gets its title.
         editor.update(cx, |e, cx| e.lsp_view(500..550, cx));
         wait_for(cx, "the title in view", |cx| {

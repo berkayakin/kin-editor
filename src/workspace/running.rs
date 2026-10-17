@@ -95,6 +95,7 @@ impl Workspace {
         let session = cx.new(|cx| DebugSession::new(target.clone(), breakpoints, cx));
         let subscription = cx.subscribe_in(&session, window, |ws, _, event: &DebugEvent, window, cx| ws.on_debug_event(event, window, cx));
         self.debug = Some((session, subscription));
+        self.debug_active = true;
         // Debug… offers the last one again; a process attached to may be gone.
         // It's also the selected configuration (Run, the title bar's run widget), as in JetBrains.
         if !matches!(target.debug, Some(DebugSpec::Attach { .. })) {
@@ -107,6 +108,8 @@ impl Workspace {
     }
 
     pub(super) fn on_debug_event(&mut self, event: &DebugEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // For the run widget, which doesn't read the session (see `running`).
+        self.debug_active = self.debug.as_ref().is_some_and(|(s, _)| s.read(cx).is_active());
         match event {
             DebugEvent::Stopped { path, line } => {
                 self.clear_debug_location(cx);
