@@ -2891,6 +2891,10 @@ impl Editor {
         let last_row = if last_drow == 0 { 0 } else { (self.line_of_display_row(last_drow - 1, cx).0 + 1).min(line_count) };
         let range_start = self.doc.read(cx).line_start(first_row);
         let range_end = if last_row == 0 { 0 } else { self.doc.read(cx).line_end(last_row - 1) };
+        if !single {
+            // Inlay hints and lens titles are asked for by what's in view.
+            self.lsp_view(first_row..last_row, cx);
+        }
         self.fold_pills.clear();
         // Fold arrows show for folded headers, and for every foldable line
         // while the pointer is over the gutter.
@@ -2992,7 +2996,8 @@ impl Editor {
                         let indent = DisplayLine::new(&line[..line.len() - line.trim_start().len()], self.tab_size).text.len();
                         let caption = font_size * 0.85;
                         let mut x = text_left - self.scroll.x + char_width * indent as f32;
-                        for (i, lens) in lenses.iter().enumerate() {
+                        // One still without its title keeps its row empty until it comes.
+                        for (i, lens) in lenses.iter().filter(|l| l.unresolved.is_none()).enumerate() {
                             if i > 0 {
                                 let bar = text_system.shape_line(" | ".into(), caption, &[run(" | ", ui_font.clone(), Hsla::from(theme.text_dim).alpha(0.6))], None);
                                 let width = bar.width;

@@ -11,6 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use gpui::{App, 
@@ -24,7 +25,7 @@ use nucleo_matcher::{
 use serde_json::{Value, json};
 
 use super::{Editor, EditorEvent, EditorMode};
-use crate::document::CodeLens;
+use crate::document::{CodeLens, InlayHint};
 use crate::{
     assets::Icon,
     document::EditKind,
@@ -62,6 +63,19 @@ const MENU_ROW_HEIGHT: f32 = 22.;
 /// How many matches the menu keeps, the best: a server may send thousands of
 /// items, and only the best few are ever looked at.
 const MAX_MATCHES: usize = 1000;
+/// Inlay hints are asked for by chunks of this many lines, those in and
+/// around the view: a big file's hints all at once cost the server (and
+/// Kuana) for lines nobody looks at.
+const HINT_CHUNK: usize = 100;
+/// After an edit, hints are asked for once typing pauses this long.
+const EDIT_PAUSE: Duration = Duration::from_millis(350);
+/// After an edit, lenses are asked for once typing pauses this long.
+const LENS_EDIT_PAUSE: Duration = Duration::from_millis(400);
+/// After scrolling to lines without hints, they're asked for this soon.
+const SCROLL_PAUSE: Duration = Duration::from_millis(50);
+/// Lenses that came into view get their titles this soon: scrolling
+/// through doesn't resolve every lens it passes.
+const LENS_PAUSE: Duration = Duration::from_millis(100);
 
 pub(super) struct CompletionMenu {
     items: Arc<Vec<CompletionItem>>,
@@ -139,8 +153,15 @@ pub(super) struct EditorLsp {
     /// for the document version they were computed on.
     pub(super) symbol_highlights: (u64, Vec<std::ops::Range<usize>>),
     symbol_highlight_task: Option<Task<()>>,
-    inlay_task: Option<Task<()>>,
-    lens_task: Option<Task<()>>,
+    /// Asks for the inlay hints the view needs: the `hint_stamp` it was
+    /// scheduled at, and the task.
+    inlay_task: Option<((u64, u64), Task<()>)>,
+    /// Asks for the code lenses: the `lens_stamp` it was scheduled at, and the task.
+    lens_task: Option<((u64, u64), Task<()>)>,
+    /// Gives the lenses in view that have no title yet theirs.
+    lens_resolve: Option<Task<()>>,
+    /// The buffer lines shown last frame (None until the editor is drawn).
+    view: Option<Range<usize>>,
 }
 
 /// A server's name as a diagnostic source (sources are `&'static str`):
@@ -238,6 +259,41 @@ fn renew(slot: &mut Arc<AtomicBool>) -> Arc<AtomicBool> {
     slot.clone()
 }
 
+/// A request for the inlay hints of neighboring chunks of lines.
+struct HintRun {
+    chunks: Range<usize>,
+    /// Where their lines are: the hints at these offsets are theirs.
+    bytes: Range<usize>,
+    range: protocol::LspRange,
+}
+
+/// A server's inlay hints (`textDocument/inlayHint`) in `rope`, the ones in `bytes`.
+fn read_inlay_hints(answer: &Value, rope: &ropey::Rope, encoding: Encoding, bytes: &Range<usize>) -> Vec<InlayHint> {
+    let hints = answer.as_array().into_iter().flatten();
+    hints
+        .filter_map(|h| {
+            let position = protocol::Position::from_json(h.get("position")?)?;
+            // A string, or parts with a `value` each.
+            let label = match h.get("label")? {
+                Value::String(s) => s.trim().to_string(),
+                Value::Array(parts) => parts.iter().filter_map(|p| p.get("value")?.as_str()).collect::<String>().trim().to_string(),
+                _ => return None,
+            };
+            let offset = position_to_offset(rope, position, encoding);
+            let flag = |key: &str| h.get(key).and_then(Value::as_bool).unwrap_or(false);
+            (!label.is_empty() && bytes.contains(&offset)).then(|| InlayHint { offset, label, pad_left: flag("paddingLeft"), pad_right: flag("paddingRight") })
+        })
+        .collect()
+}
+
+/// A code lens's title and command, once it has them (a lens with an empty
+/// title shows nothing, and is dropped).
+fn lens_command(lens: &Value) -> Option<(String, Value)> {
+    let command = lens.get("command").filter(|c| !c.is_null())?;
+    let title = command.get("title")?.as_str()?.trim().to_string();
+    (!title.is_empty()).then(|| (title, command.clone()))
+}
+
 /// Whether `text` starts with `typed` ignoring case, and if so, whether
 /// that's all of it.
 fn starts_with_typed(text: &str, typed: &str) -> Option<bool> {
@@ -248,6 +304,13 @@ fn starts_with_typed(text: &str, typed: &str) -> Option<bool> {
 impl Editor {
     pub fn set_lsp(&mut self, store: WeakEntity<LspStore>) {
         self.lsp.store = Some(store);
+    }
+
+    /// A server opened this editor's document: its hints and lenses can be
+    /// asked for.
+    pub fn lsp_opened(&mut self, cx: &mut Context<Self>) {
+        self.schedule_inlay_hints(cx);
+        self.schedule_code_lenses(cx);
     }
 
     /// The document's servers that are up, the main one first.
@@ -310,9 +373,8 @@ impl Editor {
         let Some(mut diagnostics) = diagnostics else { return };
         diagnostics.sort_by_key(|d| d.range.start);
         self.doc.as_mut(cx).set_server_diagnostics(&source.id, diagnostics);
-        // The server has (re)analysed the file: its hints may have changed too.
-        self.schedule_inlay_hints(cx);
-        self.schedule_code_lenses(cx);
+        // Hints and lenses aren't asked for again here: a server whose
+        // change elsewhere changes them says so (`workspace/inlayHint/refresh`).
         if !self.lsp.active {
             self.lsp.active = true;
             // Re-run the built-in linter without its now-duplicate syntax check.
@@ -931,130 +993,311 @@ impl Editor {
         (start <= position.x && position.x <= end).then_some(word)
     }
 
+    // ---- What's in view ------------------------------------------------------------------
+
+    /// The buffer lines shown this frame. The inlay hints and lens titles
+    /// they and the lines around them need are asked for when they're
+    /// missing or out of date.
+    pub(super) fn lsp_view(&mut self, lines: Range<usize>, cx: &mut Context<Self>) {
+        self.lsp.view = Some(lines);
+        self.want_inlay_hints(cx);
+        self.want_code_lenses(cx);
+    }
+
+    /// The lines whose hints and lens titles are wanted: the ones shown and
+    /// as many again above and below, so scrolling a little finds them
+    /// there. Before the editor is drawn, the file's first lines.
+    fn wanted_lines(&self, cx: &App) -> Range<usize> {
+        let count = self.doc.read(cx).line_count();
+        match &self.lsp.view {
+            Some(view) => {
+                let margin = view.len().max(1);
+                view.start.saturating_sub(margin).min(count)..(view.end + margin).min(count)
+            }
+            None => 0..HINT_CHUNK.min(count),
+        }
+    }
+
     // ---- Inlay hints ---------------------------------------------------------------------
 
-    /// Asks for the file's inlay hints once typing pauses (they follow edits
-    /// in the meantime).
+    fn inlay_hints_on(&self, cx: &App) -> bool {
+        self.mode == EditorMode::Full && !self.doc.read(cx).large && self.file_settings.inlay_hints
+    }
+
+    /// After an edit (or a reload, or hints turned on): asks for the hints
+    /// in view once typing pauses (the ones there follow edits meanwhile).
     pub(super) fn schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
-        if self.mode != EditorMode::Full || self.doc.read(cx).large || !self.file_settings.inlay_hints {
+        if !self.inlay_hints_on(cx) {
             // Off here: another editor of the file may show the document's
             // hints, so they stay (this one just doesn't draw them).
             self.lsp.inlay_task = None;
             return;
         }
-        self.lsp.inlay_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(350)).await;
-            let Ok(Some((server, params, version))) = this.update(cx, |e, cx| {
+        self.fetch_inlay_hints_after(EDIT_PAUSE, cx);
+    }
+
+    /// Each frame: asks for the hints in view that aren't for today's text,
+    /// soon after scrolling, once typing pauses after an edit (another
+    /// editor's of the file, or a server saying they changed).
+    fn want_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        if !self.inlay_hints_on(cx) {
+            return;
+        }
+        let stamp = self.doc.read(cx).hint_stamp();
+        let pending = self.lsp.inlay_task.as_ref().map(|(stamp, _)| *stamp);
+        if pending == Some(stamp) || self.due_hint_chunks(cx).is_empty() || self.lsp_server_with("inlayHintProvider", cx).is_none() {
+            return;
+        }
+        // Edited since the last answer, or since one was scheduled (typing
+        // goes on): the pause starts again.
+        let edited = pending.is_some_and(|(version, _)| version != stamp.0) || !self.doc.read(cx).hints_current();
+        self.fetch_inlay_hints_after(if edited { EDIT_PAUSE } else { SCROLL_PAUSE }, cx);
+    }
+
+    /// The chunks of `HINT_CHUNK` lines in view whose hints weren't asked
+    /// for in today's text.
+    fn due_hint_chunks(&self, cx: &App) -> Vec<usize> {
+        let lines = self.wanted_lines(cx);
+        let doc = self.doc.read(cx);
+        (lines.start / HINT_CHUNK..lines.end.div_ceil(HINT_CHUNK)).filter(|&chunk| !doc.hints_fresh(chunk)).collect()
+    }
+
+    /// After `delay`, asks for the hints of the chunks in view that are due,
+    /// a request per run of neighboring chunks.
+    fn fetch_inlay_hints_after(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let stamp = self.doc.read(cx).hint_stamp();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let asked = this.update(cx, |e, cx| {
                 let server = e.lsp_server_with("inlayHintProvider", cx)?;
-                let rope = e.doc.read(cx).rope();
-                let end = offset_to_position(rope, rope.len_bytes(), server.encoding);
-                let params = json!({
-                    "textDocument": e.text_document(cx)?,
-                    "range": { "start": { "line": 0, "character": 0 }, "end": end.to_json() },
-                });
-                Some((server, params, e.doc.read(cx).version()))
+                let document = e.text_document(cx)?;
+                let runs = e.hint_runs(&e.due_hint_chunks(cx), server.encoding, cx);
+                (!runs.is_empty()).then(|| (server, document, runs, e.doc.read(cx).hint_stamp()))
+            });
+            let Ok(Some((server, document, runs, stamp))) = asked else {
+                this.update(cx, |e, _| e.lsp.inlay_task = None).ok();
+                return;
+            };
+            let answers = futures::future::join_all(runs.iter().map(|run| {
+                server.request("textDocument/inlayHint", json!({ "textDocument": document, "range": run.range.to_json() }))
+            }))
+            .await;
+            this.update(cx, |e, cx| {
+                e.lsp.inlay_task = None;
+                // Edited meanwhile (in another editor of the file): the next
+                // frame asks again. The server said they changed meanwhile:
+                // they're taken, and stay due.
+                if e.doc.read(cx).version() == stamp.0 {
+                    let fresh = e.doc.read(cx).hint_stamp() == stamp;
+                    for (run, answer) in runs.into_iter().zip(answers) {
+                        // No answer counts as asked too: asking again every
+                        // frame would flood a server that refuses (it says
+                        // when to ask again, `workspace/inlayHint/refresh`).
+                        let hints = answer.ok().map(|value| read_inlay_hints(&value, e.doc.read(cx).rope(), server.encoding, &run.bytes));
+                        e.doc.as_mut(cx).set_chunk_hints(run.bytes, if fresh { run.chunks } else { 0..0 }, hints);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.lsp.inlay_task = Some((stamp, task));
+    }
+
+    /// The requests for `chunks` (sorted): one per run of neighbors.
+    fn hint_runs(&self, chunks: &[usize], encoding: Encoding, cx: &App) -> Vec<HintRun> {
+        let doc = self.doc.read(cx);
+        let mut runs: Vec<Range<usize>> = Vec::new();
+        for &chunk in chunks {
+            match runs.last_mut() {
+                Some(run) if run.end == chunk => run.end += 1,
+                _ => runs.push(chunk..chunk + 1),
+            }
+        }
+        runs.into_iter()
+            .map(|chunks| {
+                let start = doc.line_start(chunks.start * HINT_CHUNK);
+                let to_end = chunks.end * HINT_CHUNK >= doc.line_count();
+                let end = if to_end { doc.len() } else { doc.line_start(chunks.end * HINT_CHUNK) };
+                // A hint at the very end of the file is the last chunk's.
+                HintRun { chunks, bytes: start..end + usize::from(to_end), range: offsets_to_range(doc.rope(), start..end, encoding) }
+            })
+            .collect()
+    }
+
+    // ---- Code lens ------------------------------------------------------------------------
+
+    fn code_lenses_on(&self, cx: &App) -> bool {
+        self.mode == EditorMode::Full && !self.doc.read(cx).large && self.file_settings.code_lens
+    }
+
+    /// After edits settle (or a reload, or lenses turned on), asks every
+    /// server that has them for the file's code lenses, shown above lines.
+    /// One sent without its command gets it, and its title, once it's in
+    /// view (`want_lens_titles`); the ones in view now get theirs before
+    /// they show, so their titles don't blink.
+    pub(super) fn schedule_code_lenses(&mut self, cx: &mut Context<Self>) {
+        if !self.code_lenses_on(cx) {
+            self.lsp.lens_task = None;
+            self.lsp.lens_resolve = None;
+            if !self.doc.read(cx).code_lenses().is_empty() {
+                let stamp = self.doc.read(cx).lens_stamp();
+                self.doc.as_mut(cx).set_code_lenses(Vec::new(), stamp);
+                cx.notify();
+            }
+            return;
+        }
+        let stamp = self.doc.read(cx).lens_stamp();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LENS_EDIT_PAUSE).await;
+            let asked = this.update(cx, |e, cx| {
+                let servers: Vec<Arc<Server>> = e.lsp_servers(cx).into_iter().filter(|s| s.capability("codeLensProvider")).collect();
+                if servers.is_empty() {
+                    return None;
+                }
+                Some((servers, json!({ "textDocument": e.text_document(cx)? }), e.doc.read(cx).lens_stamp()))
+            });
+            let Ok(Some((servers, params, stamp))) = asked else {
+                this.update(cx, |e, _| e.lsp.lens_task = None).ok();
+                return;
+            };
+            let mut found: Vec<(Arc<Server>, Vec<Value>)> = Vec::new();
+            for server in servers {
+                if let Ok(Value::Array(lenses)) = server.request("textDocument/codeLens", params.clone()).await {
+                    found.push((server, lenses));
+                }
+            }
+            // Read in the text they're for: edited meanwhile, the next frame
+            // asks again.
+            let read = this.update(cx, |e, cx| {
+                (e.doc.read(cx).version() == stamp.0).then(|| {
+                    let lenses = e.read_code_lenses(found, cx);
+                    let in_view = e.lenses_to_resolve(&lenses, cx);
+                    (lenses, in_view)
+                })
+            });
+            let Ok(Some((mut lenses, in_view))) = read else {
+                this.update(cx, |e, cx| {
+                    e.lsp.lens_task = None;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let answers = futures::future::join_all(in_view.iter().map(|(_, server, lens)| server.request("codeLens/resolve", lens.clone()))).await;
+            this.update(cx, |e, cx| {
+                e.lsp.lens_task = None;
+                // The server said they changed meanwhile: they're taken, and stay due.
+                if e.doc.read(cx).version() == stamp.0 {
+                    let mut gone = Vec::new();
+                    for ((ix, ..), answer) in in_view.into_iter().zip(answers) {
+                        match answer.ok().as_ref().and_then(lens_command) {
+                            Some((title, command)) => (lenses[ix].title, lenses[ix].command, lenses[ix].unresolved) = (title, command, None),
+                            None => gone.push(ix),
+                        }
+                    }
+                    let lenses = lenses.into_iter().enumerate().filter(|(ix, _)| !gone.contains(ix)).map(|(_, lens)| lens).collect();
+                    // Titles being asked for are for the lenses these replace.
+                    e.lsp.lens_resolve = None;
+                    e.doc.as_mut(cx).set_code_lenses(lenses, stamp);
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.lsp.lens_task = Some((stamp, task));
+    }
+
+    /// Each frame: asks for the lenses when they aren't for today's text (a
+    /// server said they changed, or another editor of the file edited it),
+    /// else for the titles of the ones in view that have none yet.
+    fn want_code_lenses(&mut self, cx: &mut Context<Self>) {
+        if !self.code_lenses_on(cx) {
+            return;
+        }
+        let pending = self.lsp.lens_task.as_ref().map(|(stamp, _)| *stamp);
+        if self.doc.read(cx).lenses_current() {
+            if pending.is_none() {
+                self.want_lens_titles(cx);
+            }
+            return;
+        }
+        // A server says they changed again (rust-analyzer does after every
+        // edit anywhere): the pause starts again.
+        if pending != Some(self.doc.read(cx).lens_stamp()) && self.lsp_servers(cx).iter().any(|s| s.capability("codeLensProvider")) {
+            self.schedule_code_lenses(cx);
+        }
+    }
+
+    /// The lenses in view without a title get theirs (`codeLens/resolve`)
+    /// a moment after they came into view, a batch at a time.
+    fn want_lens_titles(&mut self, cx: &mut Context<Self>) {
+        if self.lsp.lens_resolve.is_some() || self.lenses_to_resolve(self.doc.read(cx).code_lenses(), cx).is_empty() {
+            return;
+        }
+        self.lsp.lens_resolve = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LENS_PAUSE).await;
+            let Ok(asked) = this.update(cx, |e, cx| {
+                let lenses = e.doc.read(cx).code_lenses();
+                e.lenses_to_resolve(lenses, cx).into_iter().map(|(ix, server, lens)| (lenses[ix].id, server, lens)).collect::<Vec<_>>()
             }) else {
                 return;
             };
-            let result = server.request("textDocument/inlayHint", params).await;
+            let answers = futures::future::join_all(asked.iter().map(|(_, server, lens)| server.request("codeLens/resolve", lens.clone()))).await;
             this.update(cx, |e, cx| {
-                // Edited meanwhile: the next request answers for the new text.
-                if e.doc.read(cx).version() != version {
-                    return;
+                e.lsp.lens_resolve = None;
+                let mut doc = e.doc.as_mut(cx);
+                for ((id, ..), answer) in asked.into_iter().zip(answers) {
+                    // One that has no command, or no answer, goes.
+                    doc.resolve_code_lens(id, answer.ok().as_ref().and_then(lens_command));
                 }
-                let rope = e.doc.read(cx).rope();
-                let hints = result
-                    .ok()
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|h| {
-                        let position = protocol::Position::from_json(h.get("position")?)?;
-                        // A string, or parts with a `value` each.
-                        let label = match h.get("label")? {
-                            Value::String(s) => s.clone(),
-                            Value::Array(parts) => parts.iter().filter_map(|p| p.get("value")?.as_str()).collect(),
-                            _ => return None,
-                        };
-                        let flag = |key: &str| h.get(key).and_then(Value::as_bool).unwrap_or(false);
-                        Some(crate::document::InlayHint {
-                            offset: protocol::position_to_offset(rope, position, server.encoding),
-                            label: label.trim().to_string(),
-                            pad_left: flag("paddingLeft"),
-                            pad_right: flag("paddingRight"),
-                        })
-                    })
-                    .filter(|h| !h.label.is_empty())
-                    .collect();
-                e.doc.as_mut(cx).set_inlay_hints(hints);
+                drop(doc);
                 cx.notify();
             })
             .ok();
         }));
     }
 
-    // ---- Code lens ------------------------------------------------------------------------
-
-    /// After edits settle, asks every server that has them for code lenses
-    /// (resolving the ones sent without their command), shown above lines.
-    pub(super) fn schedule_code_lenses(&mut self, cx: &mut Context<Self>) {
-        if self.mode != EditorMode::Full || self.doc.read(cx).large || !self.file_settings.code_lens {
-            self.lsp.lens_task = None;
-            if !self.doc.read(cx).code_lenses().is_empty() {
-                self.doc.as_mut(cx).set_code_lenses(Vec::new());
-                cx.notify();
+    /// Servers' code lenses (`textDocument/codeLens`) in today's text,
+    /// sorted: ones with a command as they are, others to resolve (when
+    /// their server does; else they're dropped).
+    fn read_code_lenses(&self, found: Vec<(Arc<Server>, Vec<Value>)>, cx: &App) -> Vec<CodeLens> {
+        let doc = self.doc.read(cx);
+        let mut out = Vec::new();
+        for (server, lenses) in found {
+            let resolves = server.resolves("codeLensProvider");
+            for lens in lenses {
+                let Some(start) = lens.pointer("/range/start").and_then(protocol::Position::from_json) else { continue };
+                let line_start = doc.line_start(doc.row_of(position_to_offset(doc.rope(), start, server.encoding)));
+                let (title, command, unresolved) = match lens_command(&lens) {
+                    Some((title, command)) => (title, command, None),
+                    None if resolves && lens.get("command").is_none_or(Value::is_null) => (String::new(), Value::Null, Some(lens)),
+                    None => continue,
+                };
+                out.push(CodeLens { id: 0, line_start, title, command, server: server.id.clone(), unresolved });
             }
-            return;
         }
-        self.lsp.lens_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-            let Ok(Some((servers, params, version))) = this.update(cx, |e, cx| {
-                let servers: Vec<Arc<Server>> = e.lsp_servers(cx).into_iter().filter(|s| s.capability("codeLensProvider")).collect();
-                if servers.is_empty() {
-                    return None;
-                }
-                Some((servers, json!({ "textDocument": e.text_document(cx)? }), e.doc.read(cx).version()))
-            }) else {
-                return;
-            };
-            let mut found: Vec<(Arc<Server>, Value)> = Vec::new();
-            for server in servers {
-                let Ok(Value::Array(lenses)) = server.request("textDocument/codeLens", params.clone()).await else { continue };
-                let resolves = server.capability_value("codeLensProvider")["resolveProvider"] == Value::Bool(true);
-                let resolved = lenses.into_iter().map(|lens| {
-                    let server = server.clone();
-                    async move {
-                        if !resolves || lens.get("command").is_some_and(|c| !c.is_null()) {
-                            return lens;
-                        }
-                        server.request("codeLens/resolve", lens.clone()).await.unwrap_or(lens)
-                    }
-                });
-                for lens in futures::future::join_all(resolved).await {
-                    found.push((server.clone(), lens));
-                }
-            }
-            this.update(cx, |e, cx| {
-                // Edited meanwhile: the next request answers for the new text.
-                if e.doc.read(cx).version() != version {
-                    return;
-                }
-                let doc = e.doc.read(cx);
-                let lenses = found
-                    .into_iter()
-                    .filter_map(|(server, lens)| {
-                        let command = lens.get("command").filter(|c| !c.is_null())?.clone();
-                        let title = command.get("title")?.as_str()?.trim().to_string();
-                        let start = protocol::Position::from_json(lens.pointer("/range/start")?)?;
-                        let offset = protocol::position_to_offset(doc.rope(), start, server.encoding);
-                        (!title.is_empty()).then(|| CodeLens { line_start: doc.line_start(doc.row_of(offset)), title, command, server: server.id.clone() })
-                    })
-                    .collect();
-                e.doc.as_mut(cx).set_code_lenses(lenses);
-                cx.notify();
-            })
-            .ok();
-        }));
+        out.sort_by_key(|l| l.line_start);
+        out
+    }
+
+    /// The lenses among `lenses` (sorted) on the lines in view that have no
+    /// title yet: their index, their server and what to send it.
+    fn lenses_to_resolve(&self, lenses: &[CodeLens], cx: &App) -> Vec<(usize, Arc<Server>, Value)> {
+        let doc = self.doc.read(cx);
+        let lines = self.wanted_lines(cx);
+        let start = doc.line_start(lines.start);
+        let end = if lines.end < doc.line_count() { doc.line_start(lines.end) } else { doc.len() + 1 };
+        let in_view = lenses.partition_point(|l| l.line_start < start)..lenses.partition_point(|l| l.line_start < end);
+        let wanted: Vec<usize> = in_view.filter(|&ix| lenses[ix].unresolved.is_some()).collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let servers = self.lsp_servers(cx);
+        wanted
+            .into_iter()
+            .filter_map(|ix| Some((ix, servers.iter().find(|s| s.id == lenses[ix].server)?.clone(), lenses[ix].unresolved.clone()?)))
+            .collect()
     }
 
     /// Carries out a clicked code lens. References and locations open the
@@ -1669,6 +1912,113 @@ mod tests {
         wait_for(cx, "the server's check", |cx| {
             editor.read_with(cx, |e, cx| e.doc.read(cx).diagnostics.iter().any(|d| &*d.message == "hints checked // merged"))
         });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hints are asked for by chunks of lines around the view, never for the
+    /// whole file: scrolling asks for the ones it comes to, an edit or the
+    /// server saying they changed for the ones in view again.
+    #[gpui::test]
+    fn inlay_hints_come_for_the_lines_in_view(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-hint-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, (0..1000).map(|n| format!("line {n}\n")).collect::<String>()).unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("hints", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        // The rows with a hint, and the hints' labels (which count the server's answers).
+        let hints = |cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, cx| {
+                let doc = e.doc.read(cx);
+                doc.inlay_hints().iter().map(|h| (doc.row_of(h.offset), h.label.clone())).collect::<Vec<_>>()
+            })
+        };
+        let rows = |cx: &mut TestAppContext| hints(cx).into_iter().map(|(row, _)| row).collect::<Vec<_>>();
+        // Not drawn yet: the first lines'.
+        wait_for(cx, "the first hints", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            rows(cx) == [0]
+        });
+        // Scrolled to line 500: the chunks around it, and only those.
+        editor.update(cx, |e, cx| e.lsp_view(500..550, cx));
+        wait_for(cx, "the hints in view", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            rows(cx) == [0, 400, 500]
+        });
+        // An edit: they follow it, then the ones in view are asked for again.
+        editor.update(cx, |e, cx| e.edit_and_remap(vec![(0..0, "// top\n".into())], EditKind::Other, cx));
+        assert_eq!(rows(cx), [1, 401, 501]);
+        wait_for(cx, "the hints in view again", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            rows(cx) == [1, 400, 500]
+        });
+        // Saved, the server checks the file and says its hints changed: the
+        // ones in view are asked for again (by the next frame).
+        let before = hints(cx);
+        editor.update(cx, |e, cx| e.lsp_did_save(cx));
+        wait_for(cx, "the hints asked for again", |cx| {
+            editor.update(cx, |e, cx| e.lsp_view(500..550, cx));
+            cx.executor().advance_clock(Duration::from_millis(100));
+            hints(cx)[1..] != before[1..]
+        });
+        assert_eq!(rows(cx), [1, 400, 500]);
+        assert_eq!(hints(cx)[0], before[0], "out of view, not asked for");
+        store.update(cx, |s, _| s.shutdown_all());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The file's lenses are asked for all at once, but given their titles
+    /// (`codeLens/resolve`, a search each for some servers) only in view;
+    /// the others keep their rows meanwhile.
+    #[gpui::test]
+    fn code_lens_titles_come_for_the_lines_in_view(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-lens-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, (0..1000).map(|n| format!("line {n}\n")).collect::<String>()).unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("lenses", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let lenses = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| e.doc.read(cx).code_lenses().len());
+        let titled = |cx: &mut TestAppContext| {
+            editor.read_with(cx, |e, cx| {
+                let doc = e.doc.read(cx);
+                doc.code_lenses().iter().filter(|l| !l.title.is_empty()).map(|l| doc.row_of(l.line_start)).collect::<Vec<_>>()
+            })
+        };
+        // Not drawn yet: the first lines' lens has its title, the others their rows.
+        wait_for(cx, "the lenses", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(500));
+            lenses(cx) == 10
+        });
+        assert_eq!(titled(cx), [0]);
+        assert_eq!(editor.read_with(cx, |e, cx| e.block_rows(cx).len()), 10);
+        // Scrolled to line 500: its lens gets its title.
+        editor.update(cx, |e, cx| e.lsp_view(500..550, cx));
+        wait_for(cx, "the title in view", |cx| {
+            cx.executor().advance_clock(Duration::from_millis(200));
+            titled(cx) == [0, 500]
+        });
+        store.update(cx, |s, _| s.shutdown_all());
         std::fs::remove_dir_all(&dir).ok();
     }
 

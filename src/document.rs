@@ -197,11 +197,23 @@ pub struct Document {
     /// The language server's inlay hints (sorted); they follow edits until
     /// the next answer replaces them.
     inlay_hints: Vec<InlayHint>,
-    /// Counts `set_inlay_hints` calls (not hints following edits), so soft
+    /// Counts the hints' replacements (not hints following edits), so soft
     /// wrap knows when to look for lines whose hints changed.
     inlay_generation: u64,
+    /// The chunks of lines (the editor's `HINT_CHUNK`s) whose hints were
+    /// asked for as of a `hint_stamp`: the others, and all of them after an
+    /// edit or a server's word, are due (`hints_fresh`).
+    hint_chunks: ((u64, u64), Vec<usize>),
+    /// How many times a server said its hints changed.
+    hint_refreshes: u64,
     /// Language servers' code lenses, by line (shown above it).
     code_lenses: Vec<CodeLens>,
+    /// The `lens_stamp` they were read at.
+    lenses_read: Option<(u64, u64)>,
+    /// How many times a server said its lenses changed.
+    lens_refreshes: u64,
+    /// The last lens id given out (`CodeLens::id`).
+    last_lens: u64,
     /// Modification time of the file when it was last read or written, to
     /// notice changes made by other programs.
     disk_mtime: Option<SystemTime>,
@@ -323,7 +335,12 @@ impl Document {
             tree_version: 0,
             inlay_hints: Vec::new(),
             inlay_generation: 1,
+            hint_chunks: ((0, 0), Vec::new()),
+            hint_refreshes: 0,
             code_lenses: Vec::new(),
+            lenses_read: None,
+            lens_refreshes: 0,
+            last_lens: 0,
             disk_mtime: None,
         }
     }
@@ -884,19 +901,104 @@ impl Document {
         &self.code_lenses
     }
 
-    pub fn set_code_lenses(&mut self, mut lenses: Vec<CodeLens>) {
+    /// Replaces the code lenses (read in today's text, asked for at
+    /// `stamp`: see `lens_stamp`), giving each its id.
+    pub fn set_code_lenses(&mut self, mut lenses: Vec<CodeLens>, stamp: (u64, u64)) {
         lenses.sort_by_key(|l| l.line_start);
+        for lens in &mut lenses {
+            self.last_lens += 1;
+            lens.id = self.last_lens;
+        }
         self.code_lenses = lenses;
+        self.lenses_read = Some(stamp);
+    }
+
+    /// What the code lenses are read for: the version and how many times
+    /// servers said they changed. Lenses asked for at one stamp are taken
+    /// only while it holds.
+    pub fn lens_stamp(&self) -> (u64, u64) {
+        (self.version, self.lens_refreshes)
+    }
+
+    /// Whether the code lenses were read in today's text, since a server
+    /// last said they changed.
+    pub fn lenses_current(&self) -> bool {
+        self.lenses_read == Some(self.lens_stamp())
+    }
+
+    /// A server says its lenses changed: they're due again.
+    pub fn lenses_changed(&mut self) {
+        self.lens_refreshes += 1;
+    }
+
+    /// Lens `id`'s title and command came (`codeLens/resolve`); None: it
+    /// has none, and goes.
+    pub fn resolve_code_lens(&mut self, id: u64, resolved: Option<(String, serde_json::Value)>) {
+        match resolved {
+            Some((title, command)) => {
+                if let Some(lens) = self.code_lenses.iter_mut().find(|l| l.id == id) {
+                    (lens.title, lens.command, lens.unresolved) = (title, command, None);
+                }
+            }
+            None => self.code_lenses.retain(|l| l.id != id),
+        }
     }
 
     pub fn inlay_hints(&self) -> &[InlayHint] {
         &self.inlay_hints
     }
 
+    #[cfg(test)]
     pub fn set_inlay_hints(&mut self, mut hints: Vec<InlayHint>) {
         hints.sort_by_key(|h| h.offset);
         self.inlay_hints = hints;
         self.inlay_generation += 1;
+    }
+
+    /// What inlay hints are asked for at: the version and how many times
+    /// servers said they changed. An answer to a request made at one stamp
+    /// is taken only while it holds.
+    pub fn hint_stamp(&self) -> (u64, u64) {
+        (self.version, self.hint_refreshes)
+    }
+
+    /// Whether the hints of lines chunk `chunk` were asked for in today's
+    /// text, since a server last said they changed.
+    pub fn hints_fresh(&self, chunk: usize) -> bool {
+        self.hint_chunks.0 == self.hint_stamp() && self.hint_chunks.1.contains(&chunk)
+    }
+
+    /// Whether no edit came since hints were last asked for.
+    pub fn hints_current(&self) -> bool {
+        self.hint_chunks.0.0 == self.version
+    }
+
+    /// `chunks` had their hints asked for now (`hint_stamp`), which are
+    /// `hints` in `range` (bytes); None: they couldn't be had, and the ones
+    /// there stay (following edits) until the next answer.
+    pub fn set_chunk_hints(&mut self, range: Range<usize>, chunks: Range<usize>, hints: Option<Vec<InlayHint>>) {
+        if self.hint_chunks.0 != self.hint_stamp() {
+            self.hint_chunks = (self.hint_stamp(), Vec::new());
+        }
+        for chunk in chunks {
+            if !self.hint_chunks.1.contains(&chunk) {
+                self.hint_chunks.1.push(chunk);
+            }
+        }
+        let Some(mut hints) = hints else { return };
+        hints.retain(|h| range.contains(&h.offset));
+        hints.sort_by_key(|h| h.offset);
+        let first = self.inlay_hints.partition_point(|h| h.offset < range.start);
+        let last = self.inlay_hints.partition_point(|h| h.offset < range.end);
+        if self.inlay_hints[first..last] != hints[..] {
+            self.inlay_hints.splice(first..last, hints);
+            self.inlay_generation += 1;
+        }
+    }
+
+    /// A server says its hints changed: every chunk is due again.
+    pub fn hints_changed(&mut self) {
+        self.hint_refreshes += 1;
     }
 
     /// Changes when the hints are replaced (from 1; see `inlay_generation`).
@@ -1148,13 +1250,20 @@ pub struct InlayHint {
 /// line, which it keeps across edits (it goes with a line that does).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodeLens {
+    /// Tells it apart while its title is asked for (`set_code_lenses` gives it).
+    pub id: u64,
     /// The start of its line.
     pub line_start: usize,
+    /// Empty until it's resolved.
     pub title: String,
-    /// The LSP `Command` it runs.
+    /// The LSP `Command` it runs (null until it's resolved).
     pub command: serde_json::Value,
     /// The id of the server that sent it.
     pub server: String,
+    /// The lens as the server sent it, without its command: it's resolved
+    /// (`codeLens/resolve`, which gives it its title) once it comes into
+    /// view. Its row is there meanwhile, so lines don't move when it's done.
+    pub unresolved: Option<serde_json::Value>,
 }
 
 /// One replacement in LSP terms: where it was (as line plus UTF-8 and
@@ -1413,13 +1522,60 @@ mod tests {
     #[test]
     fn code_lenses_follow_their_lines() {
         let mut doc = Document::from_text("fn a() {}\nfn b() {}\nfn c() {}\n".into(), None);
-        let lens = |line_start: usize| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
-        doc.set_code_lenses(vec![lens(10), lens(20)]);
+        let lens = |line_start: usize| CodeLens { id: 0, line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into(), unresolved: None };
+        doc.set_code_lenses(vec![lens(10), lens(20)], doc.lens_stamp());
         // A line above pushes them down; deleting a lens's line drops it.
         doc.edit(vec![(0..0, "// top\n".into())], &[], EditKind::Other);
         assert_eq!(doc.code_lenses().iter().map(|l| l.line_start).collect::<Vec<_>>(), [17, 27]);
         doc.edit(vec![(17..27, String::new())], &[], EditKind::Other);
         assert_eq!(doc.code_lenses().iter().map(|l| l.line_start).collect::<Vec<_>>(), [17]);
+    }
+
+    #[test]
+    fn hints_come_by_chunk_and_lenses_are_resolved_by_id() {
+        let mut doc = Document::from_text("a\nb\nc\nd\n".into(), None);
+        let hint = |offset| InlayHint { offset, label: ": T".into(), pad_left: false, pad_right: false };
+        let offsets = |doc: &Document| doc.inlay_hints().iter().map(|h| h.offset).collect::<Vec<_>>();
+        assert!(!doc.hints_fresh(0));
+        // Two chunks' answers, each only within its lines.
+        doc.set_chunk_hints(0..4, 0..1, Some(vec![hint(1), hint(5)]));
+        doc.set_chunk_hints(4..9, 1..2, Some(vec![hint(5)]));
+        assert_eq!(offsets(&doc), [1, 5]);
+        assert!(doc.hints_fresh(0) && doc.hints_fresh(1) && !doc.hints_fresh(2));
+        // No answer: the hints there stay.
+        doc.set_chunk_hints(0..4, 0..1, None);
+        assert_eq!(offsets(&doc), [1, 5]);
+        // An edit makes every chunk due; the hints follow it meanwhile.
+        doc.edit(vec![(0..0, "x".into())], &[], EditKind::Other);
+        assert!(!doc.hints_fresh(0) && !doc.hints_current());
+        assert_eq!(offsets(&doc), [2, 6]);
+        doc.set_chunk_hints(0..5, 0..1, Some(Vec::new()));
+        assert_eq!(offsets(&doc), [6]);
+        assert!(doc.hints_fresh(0) && !doc.hints_fresh(1) && doc.hints_current());
+        // So does a server saying they changed.
+        doc.hints_changed();
+        assert!(!doc.hints_fresh(0) && doc.hints_current());
+
+        let lens = |line_start| CodeLens {
+            id: 0,
+            line_start,
+            title: String::new(),
+            command: serde_json::Value::Null,
+            server: "s".into(),
+            unresolved: Some(serde_json::json!({ "data": line_start })),
+        };
+        assert!(!doc.lenses_current());
+        doc.set_code_lenses(vec![lens(5), lens(0)], doc.lens_stamp());
+        assert!(doc.lenses_current());
+        let ids: Vec<u64> = doc.code_lenses().iter().map(|l| l.id).collect();
+        assert!(ids[0] != ids[1]);
+        // Due again after a server's word, as after an edit.
+        doc.lenses_changed();
+        assert!(!doc.lenses_current());
+        doc.resolve_code_lens(ids[1], Some(("1 reference".into(), serde_json::json!({ "title": "1 reference" }))));
+        doc.resolve_code_lens(ids[0], None);
+        let lenses = doc.code_lenses();
+        assert_eq!((lenses.len(), lenses[0].title.as_str(), lenses[0].unresolved.is_none()), (1, "1 reference", true));
     }
 
     use super::*;
@@ -1794,8 +1950,8 @@ mod tests {
         doc.set_lsp_diagnostics(vec![diagnostic(13..16), diagnostic(16..18), diagnostic(24..28), diagnostic(47..50)]);
         let hint = |offset| InlayHint { offset, label: ": T".into(), pad_left: false, pad_right: false };
         doc.set_inlay_hints(vec![hint(16), hint(28), hint(50)]);
-        let lens = |line_start| CodeLens { line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into() };
-        doc.set_code_lenses(vec![lens(0), lens(34)]);
+        let lens = |line_start| CodeLens { id: 0, line_start, title: "1 reference".into(), command: serde_json::Value::Null, server: "s".into(), unresolved: None };
+        doc.set_code_lenses(vec![lens(0), lens(34)], doc.lens_stamp());
         let condition = Some("x > 1".to_string());
         doc.set_breakpoints(&[Breakpoint::at(1), Breakpoint::at(2), Breakpoint::at(3), Breakpoint { condition: condition.clone(), ..Breakpoint::at(5) }]);
         doc.set_debug_row(Some(5));

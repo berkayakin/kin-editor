@@ -774,6 +774,24 @@ impl LspStore {
                     // Progress shows through `$/progress` (Kuana says it does: `workDoneProgress`);
                     // a message's choices aren't offered, so none was picked.
                     "window/workDoneProgress/create" | "window/showMessageRequest" => client.respond(id, Value::Null),
+                    // Its hints or lenses changed (it finished loading the
+                    // project, another file changed): its documents' are due
+                    // again, asked for by the editors that show them.
+                    "workspace/inlayHint/refresh" | "workspace/codeLens/refresh" => {
+                        client.respond(id, Value::Null);
+                        let hints = method == "workspace/inlayHint/refresh";
+                        let docs: Vec<Entity<Document>> = self.documents.values().filter(|d| d.opened(key)).filter_map(|d| d.doc.upgrade()).collect();
+                        for doc in docs {
+                            doc.update(cx, |d, cx| {
+                                if hints {
+                                    d.hints_changed();
+                                } else {
+                                    d.lenses_changed();
+                                }
+                                cx.notify();
+                            });
+                        }
+                    }
                     _ => client.respond_not_found(id, &method),
                 }
             }
@@ -904,7 +922,12 @@ impl LspStore {
             } }),
         );
         doc.set_opened(key, true);
+        let editor = doc.editor.as_ref().and_then(WeakEntity::upgrade);
         self.apply_diagnostics(path, key, cx);
+        // What else it knows of the file can be asked for now.
+        if let Some(editor) = editor {
+            editor.update(cx, |e, cx| e.lsp_opened(cx));
+        }
     }
 
     /// The running server for an open document.
@@ -1210,6 +1233,9 @@ fn initialize_params(root: &Path, initialization_options: Value) -> Value {
                 "configuration": true,
                 "workspaceFolders": true,
                 "didChangeWatchedFiles": { "dynamicRegistration": true, "relativePatternSupport": true },
+                // Hints and lenses are asked for again when it says they changed.
+                "inlayHint": { "refreshSupport": true },
+                "codeLens": { "refreshSupport": true },
             },
             "window": { "workDoneProgress": true },
             "textDocument": {
@@ -1326,8 +1352,10 @@ impl FileWatcher {
 /// by its initialization option `greeting` and the `mode` in its `fake`
 /// settings section when it has them), completes with "<name>-item", offers "<name> fix
 /// (<diagnostics sent>)", puts every declaration at line 0, column 3, and finds two usages.
-/// Named "hints", it also gives an inlay hint at the end of the first line, and on a
-/// save checks the file as rust-analyzer does: "hints checked <first line>".
+/// Named "hints", it also gives inlay hints (": hint <how many it was asked for>") at the
+/// end of the lines asked for whose number divides by 100, and on a save checks the file as
+/// rust-analyzer does ("hints checked <first line>") and says its hints changed.
+/// Named "lenses", its code lenses are on every 100th line.
 /// Named "respell", it names the file in its answers as other servers may.
 /// Named "goodbye", it notes being told to shut down: a `<file>.shutdown` beside its file.
 /// Named "asks", it sends a request Kuana doesn't handle and a progress token's, and
@@ -1365,11 +1393,20 @@ def send(msg):
     body = json.dumps(msg).encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
     sys.stdout.buffer.flush()
+# What came while it waited for an answer, handled after.
+held = []
+def answer_to(ids):
+    while True:
+        m = read()
+        if m.get("id") in ids and "method" not in m:
+            return m
+        held.append(m)
 init = {}
 last_uri = None
 text = ""
+hint_requests = 0
 while True:
-    m = read()
+    m = held.pop(0) if held else read()
     method, id = m.get("method"), m.get("id")
     if method is None:
         continue
@@ -1395,9 +1432,15 @@ while True:
     elif method == "textDocument/didSave" and last_uri:
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "message": name + " checked " + text.split("\n", 1)[0]}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
+        if name == "hints":
+            send({"jsonrpc": "2.0", "id": "refresh", "method": "workspace/inlayHint/refresh", "params": None})
     elif method == "textDocument/inlayHint":
-        first = text.split("\n", 1)[0]
-        send({"jsonrpc": "2.0", "id": id, "result": [{"position": {"line": 0, "character": len(first)}, "label": ": hint"}]})
+        hint_requests += 1
+        lines = text.split("\n")
+        asked = m["params"]["range"]
+        rows = range(asked["start"]["line"], min(asked["end"]["line"] + 1, len(lines)))
+        hints = [{"position": {"line": n, "character": len(lines[n])}, "label": ": hint %d" % hint_requests} for n in rows if n % 100 == 0]
+        send({"jsonrpc": "2.0", "id": id, "result": hints})
     elif method == "textDocument/didOpen":
         uri = m["params"]["textDocument"]["uri"]
         last_uri = uri
@@ -1405,10 +1448,7 @@ while True:
         # Asks for its whole section and reads `mode` in it, as basedpyright
         # asks for "basedpyright" and reads its "analysis".
         send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})
-        answer = read()
-        while answer.get("id") != "cfg":
-            answer = read()
-        section = answer["result"][0] or {}
+        section = answer_to(["cfg"])["result"][0] or {}
         extra = [str(v) for v in (init.get("greeting"), section.get("mode")) if v is not None]
         if name == "asks":
             # A request Kuana doesn't handle, and one it says it does.
@@ -1416,17 +1456,17 @@ while True:
             send({"jsonrpc": "2.0", "id": "wdp", "method": "window/workDoneProgress/create", "params": {"token": "t"}})
             answers = {}
             while len(answers) < 2:
-                answer = read()
-                if answer.get("id") in ("odd", "wdp"):
-                    answers[answer["id"]] = answer
+                answer = answer_to(["odd", "wdp"])
+                answers[answer["id"]] = answer
             extra += [str(answers["odd"].get("error", {}).get("code")), "progress " + ("refused" if "error" in answers["wdp"] else "ok")]
         message = " ".join([name + " problem"] + extra)
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 1, "message": message}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": spelled(uri), "diagnostics": [problem]}})
     elif method == "textDocument/codeLens":
         # Unresolved: the title comes with codeLens/resolve.
-        lens_range = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}
-        send({"jsonrpc": "2.0", "id": id, "result": [{"range": lens_range, "data": 1}]})
+        lines = range(0, len(text.split("\n")) - 1, 100) if name == "lenses" else [0]
+        lenses = [{"range": {"start": {"line": n, "character": 0}, "end": {"line": n, "character": 1}}, "data": n} for n in lines]
+        send({"jsonrpc": "2.0", "id": id, "result": lenses})
     elif method == "codeLens/resolve":
         lens = m["params"]
         uri = last_uri or ""
