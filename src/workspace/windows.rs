@@ -62,10 +62,33 @@ pub fn open_window(
 /// still connected (kept fully on screen), else centered with the same size.
 pub(super) fn saved_placement(cx: &App) -> Option<(WindowBounds, Option<gpui::DisplayId>)> {
     let saved = SessionState::load().window?;
+    Some(placement_bounds(&saved, size(px(480.), px(320.)), cx))
+}
+
+/// Where a window is now, to save (`placement_bounds` puts it back).
+pub fn placement_of(window: &Window, cx: &App) -> WindowPlacement {
+    let (bounds, fullscreen) = match window.window_bounds() {
+        WindowBounds::Fullscreen(bounds) => (bounds, true),
+        WindowBounds::Windowed(bounds) | WindowBounds::Maximized(bounds) => (bounds, false),
+    };
+    WindowPlacement {
+        display: window.display(cx).and_then(|d| d.uuid().ok()).map(|u| u.to_string()),
+        x: bounds.origin.x.into(),
+        y: bounds.origin.y.into(),
+        width: bounds.size.width.into(),
+        height: bounds.size.height.into(),
+        fullscreen,
+    }
+}
+
+/// A saved placement's bounds: on the same display when it's still connected
+/// (kept fully on screen), else centered with the same size; never smaller
+/// than `min`.
+pub fn placement_bounds(saved: &WindowPlacement, min: gpui::Size<Pixels>, cx: &App) -> (WindowBounds, Option<gpui::DisplayId>) {
     let display = saved.display.as_ref().and_then(|uuid| {
         cx.displays().into_iter().find(|d| d.uuid().ok().is_some_and(|u| u.to_string() == *uuid))
     });
-    let mut size = size(px(saved.width.max(480.)), px(saved.height.max(320.)));
+    let mut size = size(px(saved.width).max(min.width), px(saved.height).max(min.height));
     let bounds = match &display {
         Some(display) => {
             let area = display.bounds().size;
@@ -77,7 +100,7 @@ pub(super) fn saved_placement(cx: &App) -> Option<(WindowBounds, Option<gpui::Di
         None => Bounds::centered(None, size, cx),
     };
     let bounds = if saved.fullscreen { WindowBounds::Fullscreen(bounds) } else { WindowBounds::Windowed(bounds) };
-    Some((bounds, display.map(|d| d.id())))
+    (bounds, display.map(|d| d.id()))
 }
 
 

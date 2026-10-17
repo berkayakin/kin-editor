@@ -38,7 +38,10 @@ oxc_semantic = "0.139.0"
 oxc_span = "0.139.0"
 oxc_syntax = "0.139.0"
 regex = "1.13.1"
-ropey = "1.6"
+# Lines end only at LF, as tree-sitter, Git and folds count them (the default
+# `unicode_lines` also ends them at U+2028, NEL, VT, FF and CR; a lone CR is
+# read as LF, see `encoding::to_lf`).
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
 rumdl = { version = "0.2.79", default-features = false }
 # JSON schemas of settings.json (and so on) for the JSON language server.
 schemars = "1"
@@ -96,6 +99,17 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# What releases are built with (`--profile dist`, see .github/workflows/release.yml), as Zed
+# builds its own: slower to build, a smaller binary (thin LTO, one codegen unit), and line tables
+# for backtraces. Those (~260 MB) go to a file beside the binary (kuana.dSYM, .dwp, .pdb) that
+# isn't shipped; on Linux they'd be in the binary. `cargo build --release` stays as quick as it was.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+debug = "limited"
+split-debuginfo = "packed"
 
 [lints.clippy]
 # Requests and prompts started for their effect, their answers not needed.

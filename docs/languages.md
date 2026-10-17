@@ -40,6 +40,9 @@ server or turn one off, see `language_servers` in [Settings](settings.md); to co
 
 A problem shows at the end of its line, cut short when it's long. With the caret on that line, a
 problem that doesn't fit there (or several, or a multi-line message) shows in full in rows under it.
+**Next / Previous Problem** (F2 / ⇧F2 in the JetBrains keymap, F8 / ⇧F8 in VS Code's and Zed's)
+moves the caret through the file's problems, the language servers' and the built-in checks' alike.
+A server's hints are only underlined faintly: they aren't counted, listed in Problems or stepped through.
 
 A file can have several servers: Kuana's own and any an extension adds for its language (ESLint or
 Tailwind beside TypeScript). All of them get the file; their problems show together, completion

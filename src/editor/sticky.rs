@@ -117,6 +117,9 @@ impl Editor {
                 push(&mut runs, &mut at, e, theme.highlight_color(*kind));
             }
             push(&mut runs, &mut at, text.len(), theme.text.into());
+            if !dl.controls.is_empty() {
+                runs = super::restyle_runs(runs, &dl.controls, |piece| piece.color = theme.text_dim.into());
+            }
             let shaped = text_system.shape_line(SharedString::from(dl.text.clone()), font_size, &runs, None);
             frame.sticky_lines.push((point(text_left - self.scroll.x, y), shaped));
 

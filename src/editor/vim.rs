@@ -768,7 +768,7 @@ impl Editor {
     /// The clipboard, linewise when Vim put it there as lines (or it ends
     /// with a line break).
     fn vim_register(&self, cx: &mut Context<Self>) -> (String, bool) {
-        let clipboard = cx.read_from_clipboard().and_then(|c| c.text()).map(|t| t.replace("\r\n", "\n"));
+        let clipboard = cx.read_from_clipboard().and_then(|c| c.text()).map(crate::encoding::to_lf);
         let ours = self.vim.as_ref().and_then(|v| v.register.clone());
         match (clipboard, ours) {
             (Some(text), Some((ours, linewise))) if text == ours => (text, linewise),

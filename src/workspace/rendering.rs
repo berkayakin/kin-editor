@@ -46,7 +46,9 @@ impl Workspace {
                                 .flex()
                                 .flex_col()
                                 .gap_0p5()
-                                .flex_1()
+                                // Auto basis: a zero one (`flex_1`) can leave the text
+                                // wrapped as if it had no room, a letter per line.
+                                .flex_auto()
                                 .min_w_0()
                                 .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(t.message.clone()))
                                 .when_some(t.detail.clone(), |el, d| {
@@ -291,6 +293,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
+            .on_action(cx.listener(Self::recent_tab))
+            .on_action(cx.listener(Self::recent_tab_back))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_sidebar_position))
             .on_action(cx.listener(Self::toggle_problems))

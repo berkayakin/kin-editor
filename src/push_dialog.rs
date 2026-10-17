@@ -398,7 +398,8 @@ impl Render for PushDialog {
             .border_color(theme.border)
             .child(
                 div()
-                    .flex_1()
+                    // Auto basis: a zero one (`flex_1`) can wrap the note a letter per line.
+                    .flex_auto()
                     .min_w_0()
                     .text_size(px(12.))
                     .when_some(note, |el, (text, color)| el.text_color(color).child(text)),

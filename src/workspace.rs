@@ -20,7 +20,7 @@ use gpui::{
 use crate::{
     assets::{self, Icon},
     busy::Busy,
-    document::{Breakpoint, Document},
+    document::{BinaryFile, Breakpoint, Document},
     document_store::{DocumentStore, DocumentStoreEvent},
     branch_picker::{BranchPicker, BranchPickerEvent},
     clone_dialog::{self, CloneDialog, CloneDialogEvent},
@@ -66,7 +66,7 @@ use crate::{
     run::{self, DebugSpec, RunTarget},
     terminal::{RunState, TerminalEvent, TerminalView},
     theme::{self, Theme},
-    preferences::{self, Preferences, PreferencesEvent},
+    preferences,
     theme_picker::{ThemePicker, ThemePickerEvent},
     transition::{self, TransitionExt},
     ui::{Button, DragLabel, HoverFill, binding_label, icon_button, icon_el, kbd, switch, tooltip_view},
@@ -112,7 +112,8 @@ use self::{
 };
 pub use self::{
     sessions::update_recent_projects,
-    windows::{modal_max_height, open_window, quit},
+    title_bar::{window_controls, window_drag_area},
+    windows::{modal_max_height, open_window, placement_bounds, placement_of, quit},
 };
 
 actions!(
@@ -132,6 +133,10 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
+        /// Ctrl+Tab: the tab used before this one (see `TabSwitch`).
+        RecentTab,
+        /// Ctrl+Shift+Tab: the same order, the other way.
+        RecentTabBack,
         ToggleSidebar,
         ToggleSidebarPosition,
         ToggleProblems,
@@ -384,6 +389,34 @@ impl Pane {
     }
 }
 
+/// Ctrl+Tab going through a pane's tabs in the order they were last used,
+/// while Ctrl (any modifier of the shortcut) is held: each press takes the
+/// next one in the order the first press found.
+struct TabSwitch {
+    pane: usize,
+    order: Vec<PaneItem>,
+    at: usize,
+    /// `recent` when it started: only the tab it ends on counts as used.
+    recent: Vec<PathBuf>,
+}
+
+/// A pane's tabs, by index, in the order they were last used: the current
+/// one, then the others by their files' places in `recent` (newest first),
+/// then those it doesn't list (not shown yet, untitled) in pane order.
+fn tabs_by_use(paths: &[Option<PathBuf>], active: usize, recent: &[PathBuf]) -> Vec<usize> {
+    let rank = |ix: usize| {
+        let used = paths[ix].as_ref().and_then(|path| recent.iter().position(|r| r == path));
+        match used {
+            _ if ix == active => (0, 0),
+            Some(at) => (1, at),
+            None => (2, ix),
+        }
+    };
+    let mut order: Vec<usize> = (0..paths.len()).collect();
+    order.sort_by_key(|&ix| rank(ix));
+    order
+}
+
 /// Terminal tabs shown together in the bottom panel; splitting the terminal
 /// adds a group beside it, like a pane.
 struct TerminalGroup {
@@ -533,7 +566,6 @@ enum Modal {
     Branches(Entity<BranchPicker>),
     Input(Entity<InputDialog>),
     Clone(Entity<CloneDialog>),
-    Preferences(Entity<Preferences>),
     Push(Entity<PushDialog>),
     Remotes(Entity<RemotesDialog>),
     Trust(Entity<crate::trust_dialog::TrustDialog>),
@@ -668,6 +700,8 @@ pub struct Workspace {
     project_changes: Vec<PathBuf>,
     /// Most recently used files, newest first.
     recent: Vec<PathBuf>,
+    /// Ctrl+Tab held down, going through the tabs.
+    tab_switch: Option<TabSwitch>,
     actions: Arc<Vec<ActionEntry>>,
     shift_down: bool,
     last_shift_tap: Option<Instant>,
@@ -740,8 +774,6 @@ pub struct Workspace {
     /// This window's documents by path, with a tab or without (edited by a
     /// workspace edit or Replace in Files, and not saved yet).
     documents: Entity<DocumentStore>,
-    /// The Preferences page shown last, to reopen there.
-    preferences_page: preferences::Page,
     _subscriptions: Vec<Subscription>,
     /// Each tab's subscriptions, dropped with the tab (they'd pile up).
     tab_subscriptions: HashMap<gpui::EntityId, Vec<Subscription>>,
@@ -913,6 +945,9 @@ impl Workspace {
         });
         // An update finished downloading: show Restart to Update.
         let updater_observer = cx.observe_global::<updater::Updater>(|_, cx| cx.notify());
+        // The Preferences window opened, closed or changed page: the title
+        // bar's Settings and Extensions buttons light up for it.
+        let preferences_observer = cx.observe_global::<preferences::Shown>(|_, cx| cx.notify());
         // Extensions reloaded, or a grammar finished building.
         let extensions_observer =
             cx.observe_global_in::<extensions::ExtensionsChanged>(window, |ws, window, cx| ws.extensions_changed(window, cx));
@@ -1002,6 +1037,7 @@ impl Workspace {
             project_task: None,
             project_changes: Vec::new(),
             recent: Vec::new(),
+            tab_switch: None,
             actions: Arc::new(keymap::action_entries()),
             shift_down: false,
             last_shift_tap: None,
@@ -1045,7 +1081,6 @@ impl Workspace {
             symbol_task: None,
             lsp,
             documents,
-            preferences_page: preferences::Page::Appearance,
             tab_subscriptions: HashMap::new(),
             _subscriptions: vec![
                 find_subscription,
@@ -1058,6 +1093,7 @@ impl Workspace {
                 quit,
                 settings_observer,
                 updater_observer,
+                preferences_observer,
                 extensions_observer,
                 trust_observer,
                 lsp_subscription,
@@ -1087,6 +1123,11 @@ impl Workspace {
     }
 
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_path_as(path, false, window, cx);
+    }
+
+    /// `binary`: a file that looks binary opens as text too (Open Anyway).
+    fn open_path_as(&mut self, path: PathBuf, binary: bool, window: &mut Window, cx: &mut Context<Self>) {
         let path = path.canonicalize().unwrap_or(path);
         if path.is_dir() {
             self.set_root(path, window, cx);
@@ -1109,10 +1150,14 @@ impl Workspace {
         let opened = if crate::preview::is_image(&path) {
             std::fs::metadata(&path).map(|_| PaneItem::from(cx.new(|cx| ImageView::new(path.clone(), cx))))
         } else {
-            Document::open(&path).map(|doc| {
-                large = doc.large;
-                PaneItem::from(cx.new(|cx| Editor::new(doc, cx)))
-            })
+            let read = if binary { Document::open_anyway(&path) } else { Document::open(&path) };
+            match read {
+                Err(err) if BinaryFile::is(&err) => return self.ask_to_open_binary(path, window, cx),
+                read => read.map(|doc| {
+                    large = doc.large;
+                    PaneItem::from(cx.new(|cx| Editor::new(doc, cx)))
+                }),
+            }
         };
         match opened {
             Ok(item) => {
@@ -1128,6 +1173,21 @@ impl Workspace {
                 let _ = window.prompt(PromptLevel::Critical, &message, Some(&detail), &["OK"], cx);
             }
         }
+    }
+
+    /// A file that looks binary opens as text only when asked to (Open
+    /// Anyway), as in VS Code.
+    fn ask_to_open_binary(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let message = format!("“{name}” looks like a binary file");
+        let detail = "As text it may not show correctly, and saving it can damage it.";
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Open Anyway", "Cancel"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update_in(cx, |ws, window, cx| ws.open_path_as(path, true, window, cx)).ok();
+            }
+        })
+        .detach();
     }
 
     /// Opens a file at a 1-based line and column (from terminal output).
@@ -1482,6 +1542,19 @@ fn ellipsize(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::ellipsize;
+
+    #[test]
+    fn tabs_go_in_the_order_they_were_used() {
+        use std::path::PathBuf;
+        let path = |name: &str| Some(PathBuf::from(format!("/p/{name}")));
+        let paths = [path("a"), path("b"), path("c"), None, path("d")];
+        let recent: Vec<PathBuf> = ["c", "a", "x", "b"].iter().map(|n| PathBuf::from(format!("/p/{n}"))).collect();
+        // The current tab, then the last used before it; the untitled and
+        // the never shown come last.
+        assert_eq!(super::tabs_by_use(&paths, 2, &recent), [2, 0, 1, 3, 4]);
+        assert_eq!(super::tabs_by_use(&paths, 3, &recent), [3, 2, 0, 1, 4]);
+        assert_eq!(super::tabs_by_use(&[], 0, &recent), Vec::<usize>::new());
+    }
 
     #[cfg(unix)]
     #[test]

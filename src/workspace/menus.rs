@@ -928,7 +928,6 @@ impl Workspace {
             Modal::Branches(b) => b.clone().into_any_element(),
             Modal::Input(i) => i.clone().into_any_element(),
             Modal::Clone(c) => c.clone().into_any_element(),
-            Modal::Preferences(p) => p.clone().into_any_element(),
             Modal::Push(p) => p.clone().into_any_element(),
             Modal::Remotes(r) => r.clone().into_any_element(),
             Modal::Trust(t) => t.clone().into_any_element(),

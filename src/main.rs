@@ -39,6 +39,7 @@ mod lsp;
 mod markdown_preview;
 mod onboarding;
 mod pane_item;
+mod panic_log;
 mod picker;
 mod preview;
 mod problems_panel;
@@ -177,6 +178,10 @@ fn menus_for(mac: bool) -> Vec<Menu> {
                 MenuItem::action("Go to Implementation", GoToImplementation),
                 MenuItem::action("Go to Type Definition", GoToTypeDefinition),
                 MenuItem::action("Find Usages", FindUsages),
+                MenuItem::separator(),
+                MenuItem::action("Next Problem", NextProblem),
+                MenuItem::action("Previous Problem", PreviousProblem),
+                MenuItem::separator(),
                 MenuItem::action("Find Action…", FindAction),
             ],
         },
@@ -382,6 +387,9 @@ fn limit_window_zoom() {
 
 fn main() {
     theme::move_legacy_config();
+    if let Some(config) = theme::config_dir() {
+        panic_log::install(config.join("logs"));
+    }
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().is_some_and(|a| a == "extension") {
         std::process::exit(cli::extension_command(&raw[1..]));
@@ -389,6 +397,12 @@ fn main() {
     let args: Vec<PathBuf> = raw.into_iter().map(PathBuf::from).collect();
     // A Kuana already running takes the paths; this launch is done.
     let Ok(instance) = instance::claim(&args) else { return };
+    // Git, language servers and debug adapters run with the login shell's
+    // PATH (`search_path`); ask the shell while the window opens, not when
+    // the first Git status waits for it.
+    std::thread::spawn(|| {
+        lsp::servers::search_path();
+    });
 
     #[cfg(target_os = "macos")]
     set_app_name();
@@ -399,7 +413,7 @@ fn main() {
     // open-file events; they're handled once the app is running.
     let (open_tx, mut open_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
     let app = Application::new().with_assets(assets::Assets);
-    // Later launches' paths come the same way (none: just come to the front).
+    // Later launches' paths come the same way (none: see below).
     if let Some(instance) = instance {
         let open_tx = open_tx.clone();
         instance.serve(move |paths| {
@@ -416,8 +430,17 @@ fn main() {
             while let Some(urls) = open_rx.next().await {
                 let paths = cli::paths_from_urls(&urls);
                 let opened = match (urls.is_empty(), paths.is_empty()) {
-                    // A launch without paths: show the running Kuana.
-                    (true, _) => cx.update(|cx| cx.activate(true)),
+                    // A launch without paths on macOS: the running Kuana comes
+                    // to the front, as a click on its Dock icon does.
+                    (true, _) if cfg!(target_os = "macos") => cx.update(|cx| cx.activate(true)),
+                    // Elsewhere a new window, as VS Code opens: what the Start
+                    // menu and the taskbar's Shift+click / middle click mean.
+                    (true, _) => cx.update(|cx| {
+                        let front = cx.active_window().or_else(|| cx.windows().into_iter().next());
+                        let near = front.and_then(|w| w.update(cx, |_, window, _| window.bounds()).ok());
+                        workspace::open_window(near, cx, |_, _, _| {});
+                        cx.activate(true);
+                    }),
                     (false, true) => Ok(()),
                     (false, false) => cx.update(|cx| open_external(paths, cx)),
                 };
@@ -444,6 +467,9 @@ fn main() {
         // Quitting asks each window with unsaved edits in turn.
         cx.on_action(|_: &Quit, cx| cx.defer(workspace::quit));
         cx.on_action(|_: &about::About, cx| about::open(cx));
+        // Also from the Preferences window, which has no workspace to handle them.
+        cx.on_action(|_: &OpenSettings, cx| preferences::open(None, cx));
+        cx.on_action(|_: &OpenExtensions, cx| preferences::open(Some(preferences::Page::Extensions), cx));
         cx.on_action(|_: &NewWindow, cx| {
             workspace::open_window(None, cx, |_, _, _| {});
         });

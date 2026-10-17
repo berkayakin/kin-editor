@@ -258,6 +258,7 @@ impl Workspace {
             recent_projects: saved.recent_projects,
             trusted_folders: saved.trusted_folders,
             window: saved.window,
+            preferences_window: saved.preferences_window,
             welcome_done: saved.welcome_done,
             other: saved.other,
         };
@@ -269,18 +270,7 @@ impl Workspace {
     /// Saves where the window is (after moves and resizes settle), so the
     /// next launch opens it there.
     pub(super) fn remember_placement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (bounds, fullscreen) = match window.window_bounds() {
-            WindowBounds::Fullscreen(bounds) => (bounds, true),
-            WindowBounds::Windowed(bounds) | WindowBounds::Maximized(bounds) => (bounds, false),
-        };
-        let placement = WindowPlacement {
-            display: window.display(cx).and_then(|d| d.uuid().ok()).map(|u| u.to_string()),
-            x: bounds.origin.x.into(),
-            y: bounds.origin.y.into(),
-            width: bounds.size.width.into(),
-            height: bounds.size.height.into(),
-            fullscreen,
-        };
+        let placement = placement_of(window, cx);
         self.placement_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor().timer(Duration::from_millis(400)).await;
             let mut state = SessionState::load();

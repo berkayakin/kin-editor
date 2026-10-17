@@ -204,34 +204,14 @@ impl Workspace {
         self.lsp.update(cx, |s, cx| s.restart(&path, cx));
     }
 
-    pub(super) fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.modals.current, Some(Modal::Preferences(_))) {
-            self.close_modal(window, cx);
-            return;
-        }
-        self.close_modal(window, cx);
-        let preferences = cx.new(|cx| Preferences::new(self.preferences_page, window, cx));
-        let subscription = cx.subscribe_in(&preferences, window, |ws, _, event: &PreferencesEvent, window, cx| match event {
-            PreferencesEvent::OpenSettingsFile => {
-                ws.close_modal(window, cx);
-                ws.open_settings_file(&OpenSettingsFile, window, cx);
-            }
-            PreferencesEvent::OpenKeymapFile => {
-                ws.close_modal(window, cx);
-                ws.open_keymap(&OpenKeymap, window, cx);
-            }
-            PreferencesEvent::Problems(problems) => ws.report_config_problems(problems.clone(), cx),
-            PreferencesEvent::Dismissed => ws.close_modal(window, cx),
-        });
-        self.modals.open(Modal::Preferences(preferences), subscription);
-        cx.notify();
+    /// Settings… opens the Preferences window (or brings it forward).
+    pub(super) fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        cx.defer(|cx| preferences::open(None, cx));
     }
 
-    /// Extensions…: the Extensions page of Settings.
-    pub(super) fn open_extensions(&mut self, _: &OpenExtensions, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_modal(window, cx);
-        self.preferences_page = preferences::Page::Extensions;
-        self.open_settings(&OpenSettings, window, cx);
+    /// Extensions…: the Extensions page of Preferences.
+    pub(super) fn open_extensions(&mut self, _: &OpenExtensions, _: &mut Window, cx: &mut Context<Self>) {
+        cx.defer(|cx| preferences::open(Some(preferences::Page::Extensions), cx));
     }
 
     pub(super) fn reload_extensions(&mut self, _: &ReloadExtensions, _: &mut Window, cx: &mut Context<Self>) {

@@ -332,6 +332,266 @@ pub fn island(theme: &Theme) -> Div {
         .border_1()
         .border_color(island_edge(theme))
         .shadow(soft_shadow(theme, 1))
+        .when(theme.gradients, |el| el.child(edge_sheen(theme)))
+}
+
+/// Light catching islands' edges: a 1px line over the outline that brightens
+/// and fades back, like a glossy rim, on the sides and the bottom (the top is
+/// where the tabs join the island). One light for the window, above and to the
+/// left: a diagonal band from low on the left to high on the right sets where a
+/// side edge shines, so islands side by side shine at different heights; the
+/// farther right, the weaker, and edges facing away from the light (right,
+/// bottom) weaker still. Each sheen's length and shape vary from edge to edge
+/// (`wobble`) as a share of the edge's straight part between the rounded
+/// corners, so it scales with the island and has faded out before its corners.
+/// The pointer draws it: within `SHEEN_REACH` of an edge, that edge's sheen
+/// slides toward the nearest point and gathers there (`follow`). Each edge
+/// answers to its own distance, as to a light near it: the far side stays put,
+/// a corner moves both of its edges. Two gradient quads per edge (GPUI's
+/// gradients have two stops).
+fn edge_sheen(theme: &Theme) -> impl IntoElement {
+    // A light island can't get brighter than its edge (white would vanish
+    // into it), so there the glint is a darker touch of the text color.
+    let lit = match theme.appearance {
+        Appearance::Dark => Hsla::from(theme.text).alpha(0.55),
+        Appearance::Light => Hsla::from(theme.text).alpha(0.3),
+    };
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let view = window.viewport_size();
+            let width = f32::from(view.width).max(1.);
+            let edges = SheenEdge::of(bounds, width, f32::from(view.height));
+            let drawn = edges.map(|edge| edge.map(|edge| edge.shape(window.mouse_position(), width, lit.a)));
+            for (edge, shape) in edges.iter().zip(&drawn) {
+                let (Some(edge), Some(shape)) = (edge, shape) else { continue };
+                let color = lit.alpha(shape.alpha);
+                let off = color.alpha(0.);
+                let horizontal = edge.side == SheenSide::Bottom;
+                let angle = if horizontal { 90. } else { 180. };
+                let span = |a: f32, b: f32| {
+                    let (a, b) = if horizontal { ((a, edge.at), (b, edge.at + 1.)) } else { ((edge.at, a), (edge.at + 1., b)) };
+                    gpui::Bounds::from_corners(gpui::point(px(a.0), px(a.1)), gpui::point(px(b.0), px(b.1)))
+                };
+                let toward = |from: Hsla, to: Hsla| gpui::linear_gradient(angle, gpui::linear_color_stop(from, 0.), gpui::linear_color_stop(to, 1.));
+                window.paint_quad(gpui::fill(span(shape.from, shape.peak), toward(off, color)));
+                window.paint_quad(gpui::fill(span(shape.peak, shape.to), toward(color, off)));
+            }
+            // A pointer move draws the view this island is in again (not the
+            // whole window, whose cached editors would render too), and only
+            // when a sheen would look different: out of reach nothing moves, and
+            // a weak pull far from an edge moves it less than a device pixel.
+            let view_id = window.current_view();
+            let device_px = 1. / window.scale_factor();
+            window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                if phase != gpui::DispatchPhase::Capture {
+                    return;
+                }
+                let changed = edges.iter().zip(&drawn).any(|(edge, shape)| match (edge, shape) {
+                    (Some(edge), Some(shape)) => edge.shape(event.position, width, lit.a).differs(shape, device_px),
+                    _ => false,
+                });
+                if changed {
+                    request_sheen_frame(view_id, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    // Insets count from inside the border, so -1px covers it.
+    .top(px(-1.))
+    .bottom(px(-1.))
+    .left(px(-1.))
+    .right(px(-1.))
+}
+
+/// How near the pointer has to come to an edge to draw its sheen.
+const SHEEN_REACH: f32 = 96.;
+/// Sheens follow the pointer at up to 30 frames a second: smooth enough for a
+/// soft glow, at a fraction of the display's rate.
+const SHEEN_FRAME: Duration = Duration::from_millis(33);
+
+#[derive(Default)]
+struct SheenFrames {
+    last: Option<Instant>,
+    /// Views waiting for the next allowed frame (one timer for all of them).
+    waiting: Vec<gpui::EntityId>,
+}
+
+thread_local! {
+    static SHEEN_FRAMES: std::cell::RefCell<SheenFrames> = std::cell::RefCell::default();
+}
+
+/// Redraws `view` for a sheen, at most once per `SHEEN_FRAME`; a request
+/// meanwhile waits for the end of it, so the last pointer position is always drawn.
+fn request_sheen_frame(view: gpui::EntityId, cx: &mut App) {
+    let now = Instant::now();
+    enum Frame {
+        Now,
+        After(Duration),
+        /// A frame is already waiting; it draws this view too.
+        Waiting,
+    }
+    let frame = SHEEN_FRAMES.with_borrow_mut(|frames| {
+        let since = frames.last.map_or(SHEEN_FRAME, |last| now.duration_since(last));
+        let first = frames.waiting.is_empty();
+        if first && since >= SHEEN_FRAME {
+            frames.last = Some(now);
+            return Frame::Now;
+        }
+        if !frames.waiting.contains(&view) {
+            frames.waiting.push(view);
+        }
+        if first { Frame::After(SHEEN_FRAME.saturating_sub(since)) } else { Frame::Waiting }
+    });
+    match frame {
+        Frame::Now => cx.notify(view),
+        Frame::Waiting => {}
+        Frame::After(wait) => {
+            let timer = cx.background_executor().timer(wait);
+            cx.spawn(async move |cx| {
+                timer.await;
+                let _ = cx.update(|cx| {
+                    let views = SHEEN_FRAMES.with_borrow_mut(|frames| {
+                        frames.last = Some(Instant::now());
+                        std::mem::take(&mut frames.waiting)
+                    });
+                    for view in views {
+                        cx.notify(view);
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SheenSide {
+    Left,
+    Right,
+    Bottom,
+}
+
+/// An island edge's straight part, in window pixels: `at` across it (a side's
+/// x, the bottom's y), `start`–`end` along it, and where its sheen rests.
+#[derive(Clone, Copy)]
+struct SheenEdge {
+    side: SheenSide,
+    at: f32,
+    start: f32,
+    end: f32,
+    /// Varies the sheen's length and shape (`wobble`).
+    seed: f32,
+    salt: f32,
+    /// Where it rests along the edge, 0–1.
+    along: f32,
+    /// How much of the light the edge catches, before the pointer.
+    facing: f32,
+}
+
+/// A sheen as drawn: from, brightest, to (along its edge) and its peak alpha.
+#[derive(Clone, Copy)]
+struct SheenShape {
+    from: f32,
+    peak: f32,
+    to: f32,
+    alpha: f32,
+}
+
+impl SheenShape {
+    /// Whether drawing `self` in place of `other` would show.
+    fn differs(&self, other: &SheenShape, device_px: f32) -> bool {
+        (self.from - other.from).abs() >= device_px
+            || (self.peak - other.peak).abs() >= device_px
+            || (self.to - other.to).abs() >= device_px
+            || (self.alpha - other.alpha).abs() >= 2. / 255.
+    }
+}
+
+impl SheenEdge {
+    /// The edges of an island (its border box) that have a straight part, in
+    /// a window `width` × `height`.
+    fn of(bounds: gpui::Bounds<Pixels>, width: f32, height: f32) -> [Option<SheenEdge>; 3] {
+        let (left, top) = (f32::from(bounds.left()), f32::from(bounds.top()));
+        let (right, bottom) = (f32::from(bounds.right()), f32::from(bounds.bottom()));
+        let r = ISLAND_RADIUS;
+        // Seeded by the edge's place across its length (a side's x, the
+        // bottom's island left), which resizing along the edge leaves alone: a
+        // longer edge's sheen only stretches.
+        let side = |side, at: f32, salt: f32, facing: f32| {
+            let (start, end) = (top + r, bottom - r);
+            let band = height * (0.62 - 0.5 * (at / width).clamp(0., 1.));
+            let along = 0.7 * ((band - start) / (end - start)).clamp(0., 1.) + 0.3 * wobble(at, salt);
+            (end > start).then_some(SheenEdge { side, at, start, end, seed: at, salt, along, facing })
+        };
+        let (start, end) = (left + r, right - r);
+        [
+            side(SheenSide::Left, left, 0., 1.),
+            side(SheenSide::Right, right - 1., 5., 0.55),
+            (end > start).then_some(SheenEdge {
+                side: SheenSide::Bottom,
+                at: bottom - 1.,
+                start,
+                end,
+                seed: left,
+                salt: 9.,
+                along: 0.1 + 0.6 * wobble(left, 9.),
+                facing: 0.6,
+            }),
+        ]
+    }
+
+    /// The sheen with the pointer at `pointer`, in a window `width` wide, for
+    /// a light of alpha `lit`.
+    fn shape(&self, pointer: gpui::Point<Pixels>, width: f32, lit: f32) -> SheenShape {
+        let (pull, nearest) = self.pull(pointer);
+        let (from, peak, to) = follow(sheen_span(self.start, self.end, self.along, self.seed, self.salt), self.start, self.end, nearest, pull);
+        // Fainter toward the right, away from the light; brighter where the pointer draws it.
+        let across = if self.side == SheenSide::Bottom { peak } else { self.at };
+        let alpha = (lit * self.facing * (1. - 0.4 * (across / width).clamp(0., 1.)) * (1. + 0.6 * pull)).min(1.);
+        SheenShape { from, peak, to, alpha }
+    }
+
+    /// How strongly the pointer draws this edge's sheen (0 out of reach, 1 on
+    /// the edge, easing between) and the point along it nearest the pointer.
+    fn pull(&self, pointer: gpui::Point<Pixels>) -> (f32, f32) {
+        let (x, y) = (f32::from(pointer.x), f32::from(pointer.y));
+        let (along, across) = if self.side == SheenSide::Bottom { (x, y) } else { (y, x) };
+        let nearest = along.clamp(self.start, self.end);
+        let distance = (across - self.at).hypot(along - nearest);
+        let t = (1. - distance / SHEEN_REACH).clamp(0., 1.);
+        (t * t * (3. - 2. * t), nearest)
+    }
+}
+
+/// Where a sheen lies on an edge's straight part from `start` to `end`: from,
+/// brightest, to. Its length (45–85% of the part) and how soon it peaks vary
+/// with `seed`; `along` (0–1) slides it from one end to the other.
+fn sheen_span(start: f32, end: f32, along: f32, seed: f32, salt: f32) -> (f32, f32, f32) {
+    let length = end - start;
+    let size = length * (0.45 + 0.4 * wobble(seed, salt + 1.));
+    // Rising quicker than it falls, as a reflection does under a light above.
+    let rise = size * (0.28 + 0.22 * wobble(seed, salt + 2.));
+    let from = start + (length - size) * along.clamp(0., 1.);
+    (from, from + rise, from + size)
+}
+
+/// A sheen drawn by the pointer with `pull` (0–1): its peak slides most of the
+/// way to `nearest` and it gathers (shorter), still within `start`–`end`.
+fn follow((from, peak, to): (f32, f32, f32), start: f32, end: f32, nearest: f32, pull: f32) -> (f32, f32, f32) {
+    let gather = 1. - 0.35 * pull;
+    let (rise, fall) = ((peak - from) * gather, (to - peak) * gather);
+    let peak = (peak + (nearest - peak) * 0.85 * pull).clamp(start + rise, end - fall);
+    (peak - rise, peak, peak + fall)
+}
+
+/// A smooth stand-in for randomness, 0–1: varies over a few hundred pixels of
+/// `seed` (a position in the window), so a moved edge changes gradually rather
+/// than jumping, and differs per `salt`.
+fn wobble(seed: f32, salt: f32) -> f32 {
+    let t = seed / 480.;
+    0.5 + 0.3 * (t * 1.7 + salt * 2.1).sin() + 0.2 * (t * 3.1 - salt * 1.3 + 0.7).sin()
 }
 
 /// A card floating above the window: menus, completion, hover, toasts.

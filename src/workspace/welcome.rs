@@ -67,7 +67,8 @@ impl Workspace {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_1()
+                    // Auto basis: a zero one (`flex_1`) can wrap the tagline a letter per line.
+                    .flex_auto()
                     .min_w_0()
                     .child(
                         div()

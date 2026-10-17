@@ -15,6 +15,17 @@ pub enum Severity {
     Error,
     Warning,
     Info,
+    /// A language server's suggestion (LSP's Hint): drawn faintly in the
+    /// text, but not a problem (see `is_problem`).
+    Hint,
+}
+
+impl Severity {
+    /// Counted in the status bar, listed in Problems, marked in the gutter
+    /// and stepped through by Next Problem: all but hints.
+    pub fn is_problem(self) -> bool {
+        self != Severity::Hint
+    }
 }
 
 #[derive(Clone, Debug)]

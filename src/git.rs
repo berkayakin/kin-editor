@@ -188,6 +188,10 @@ fn command_in(root: &Path, args: &[&str], trusted: bool) -> Command {
         cmd.args(rest);
     }
     cmd.current_dir(root)
+        // What git runs needs the PATH a terminal has, which an app started
+        // from the Dock lacks: hooks (husky, npx), git-lfs, and credential
+        // helpers from Homebrew or nvm.
+        .env("PATH", crate::lsp::servers::search_path())
         // Never block on an interactive prompt: fail fast instead.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -274,7 +278,11 @@ fn error_text(stderr: &[u8], stdout: &[u8]) -> String {
 }
 
 pub fn is_available() -> bool {
-    crate::process::command("git").arg("--version").output().is_ok_and(|o| o.status.success())
+    crate::process::command("git")
+        .arg("--version")
+        .env("PATH", crate::lsp::servers::search_path())
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// The working-tree root of the repository containing `path`.
@@ -458,8 +466,7 @@ impl BlobText {
     pub fn new(bytes: &[u8], hint: Option<TextEncoding>) -> Self {
         let (text, encoding) = crate::encoding::decode(bytes, hint);
         let crlf = text.contains("\r\n");
-        let text = if crlf { text.replace("\r\n", "\n") } else { text };
-        BlobText { text, encoding, crlf }
+        BlobText { text: crate::encoding::to_lf(text), encoding, crlf }
     }
 
     /// `text` (with LF line ends) in this blob's line ends and encoding.
@@ -1272,7 +1279,7 @@ pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) ->
     // Compared with LF line ends, as editors hold text; written back in the
     // index's own line ends and encoding, so only the picked lines change.
     let index = index_blob_text(root, rel);
-    let staged = apply_hunks(&index.text, &current.replace("\r\n", "\n"), |h| rows_touch(&h.new_rows, &rows));
+    let staged = apply_hunks(&index.text, &crate::encoding::to_lf(current.to_string()), |h| rows_touch(&h.new_rows, &rows));
     write_index(root, rel, &index.encode(&staged)?)
 }
 
@@ -1281,7 +1288,7 @@ pub fn stage_lines(root: &Path, rel: &str, current: &str, rows: Range<usize>) ->
 pub fn unstage_lines(root: &Path, rel: &str, current: Option<&str>, rows: Range<usize>) -> Result<(), String> {
     let index = index_blob_text(root, rel);
     let rows = match current {
-        Some(current) => map_rows_to_base(&index.text, &current.replace("\r\n", "\n"), rows),
+        Some(current) => map_rows_to_base(&index.text, &crate::encoding::to_lf(current.to_string()), rows),
         None => rows,
     };
     let Some(head) = head_blob(root, rel) else {
@@ -1960,6 +1967,15 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         assert!(at("--no-ext-diff") < at("--"));
         assert!(!args(&command_in(untrusted, &["status"], false)).iter().any(|a| a == "--no-ext-diff"));
         assert!(!args(&command_in(untrusted, &["diff"], true)).iter().any(|a| a == "--no-ext-diff" || a == "credential.helper="));
+    }
+
+    #[test]
+    fn git_runs_with_the_path_language_servers_get() {
+        // Hooks, git-lfs and credential helpers find what a terminal finds,
+        // also when Kuana was started from the Dock.
+        let cmd = command_in(Path::new("/kuana-path-test"), &["status"], true);
+        let path = cmd.get_envs().find(|(name, _)| *name == "PATH").and_then(|(_, value)| value);
+        assert_eq!(path, Some(crate::lsp::servers::search_path().as_os_str()));
     }
 
     #[test]

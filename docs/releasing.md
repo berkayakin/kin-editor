@@ -16,6 +16,10 @@ The release gets a universal macOS `Kuana.app` (`.dmg` and `.zip`), a Windows in
 [`scripts/kuana.iss`](../scripts/kuana.iss)) and `.zip`, and a Linux `.tar.gz`, plus `latest.json`, which the workflow signs with
 [minisign](https://jedisct1.github.io/minisign/) using the `MINISIGN_SECRET_KEY` repository
 secret. Tags with a hyphen (`v0.3.0-beta.1`) become pre-releases, which the updater skips.
+The binaries are built with Cargo.toml's `dist` profile (thin LTO and one codegen unit, as Zed's
+releases), which takes longer than `cargo build --release`; to try one locally,
+`cargo build --profile dist` puts it in `target/dist/`. Its line tables for backtraces go to a file
+beside the binary (`kuana.dSYM`, `kuana.dwp`, `kuana.pdb`), which the releases don't include.
 The release notes come from [git-cliff](https://git-cliff.org) ([`cliff.toml`](../cliff.toml)):
 every commit and pull request since the previous tag, each change once (a pull request is one
 line, however it was merged), with authors @mentioned and first-time contributors listed.

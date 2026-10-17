@@ -166,6 +166,9 @@ pub struct LanguageDef {
     /// Queries for this built-in language (named like it, without a grammar
     /// of its own): its files replace the built-in ones of the same kind.
     builtin: Option<Language>,
+    /// A debugger can stop in it (breakpoints go in its files): its config
+    /// names `debuggers` (Zed's key), or its extension declares an adapter.
+    pub debuggable: bool,
     /// Set once the grammar's library is loaded (None: it failed to).
     loaded: OnceLock<Option<Loaded>>,
 }
@@ -747,7 +750,9 @@ fn read_extension(dir: &Path) -> Read {
     entries.sort();
     for language_dir in entries {
         match read_language(&language_dir, &grammars, &info.id) {
-            Ok(def) => {
+            Ok(mut def) => {
+                // An extension's debug adapter is for its languages.
+                def.debuggable |= !info.adapters.is_empty();
                 info.languages.push(def.name.to_string());
                 languages.push(def);
             }
@@ -800,6 +805,7 @@ fn read_language(dir: &Path, grammars: &HashMap<String, Grammar>, extension: &st
             .unwrap_or_default(),
         grammar,
         builtin: builtin.map(|def| def.language),
+        debuggable: !strings(config.get("debuggers")).is_empty(),
         loaded: OnceLock::new(),
     })
 }
@@ -1190,6 +1196,8 @@ formatter = ["gleam", "format", "--stdin"]
         assert!(gleam.matches(Path::new("src/app.gleam")) && gleam.matches(Path::new("Gleamfile")));
         assert!(!gleam.matches(Path::new("app.gleamx")) && !gleam.matches(Path::new("notgleam")));
         assert_eq!(gleam.highlights, "(identifier) @variable\n");
+        // Its extension's debug adapter stops in it.
+        assert!(gleam.debuggable);
 
         // Both servers, the first installed one runs: its command, else the id.
         let spec = servers["Gleam"];
@@ -1197,6 +1205,18 @@ formatter = ["gleam", "format", "--stdin"]
         let grammar = &grammars["gleam"];
         assert_eq!((grammar.repository.as_deref(), grammar.rev.as_deref()), (Some("https://example.com/tree-sitter-gleam"), Some("abc123")));
         assert!(grammar.src.ends_with("grammars/gleam/src"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn languages_naming_debuggers_take_breakpoints() {
+        let dir = temp_dir("debuggers");
+        write(dir.join("extension.toml"), "id = \"z\"\nname = \"Z\"\n");
+        write(dir.join("languages/zig/config.toml"), "name = \"Zig\"\npath_suffixes = [\"zig\"]\ndebuggers = [\"CodeLLDB\"]\n");
+        write(dir.join("languages/zon/config.toml"), "name = \"Zon\"\npath_suffixes = [\"zon\"]\n");
+        let (_, languages, _, _) = read_extension(&dir);
+        let debuggable: Vec<(&str, bool)> = languages.iter().map(|l| (l.name, l.debuggable)).collect();
+        assert_eq!(debuggable, [("Zig", true), ("Zon", false)]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

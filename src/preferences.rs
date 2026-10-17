@@ -1,9 +1,12 @@
-//! Preferences (JetBrains' Settings dialog): every option in `settings.json`
+//! Preferences (JetBrains' Settings, in a window of its own: `window.rs`): every option in `settings.json`
 //! and the key bindings in `keymap.json`, on pages with a search across all of
 //! them. It looks the same on every platform. Changes apply and save right
 //! away; the files stay the source of truth and keep their comments.
 
 mod keymap_page;
+mod window;
+
+pub use window::{Shown, open};
 
 use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
@@ -28,7 +31,7 @@ use crate::{
     workspace::Find,
     ui::{
         Button, HoverFill,
-        GAP, focus_glow, icon_button, icon_el, input_box, island, modal_panel, popover, switch, text_button,
+        GAP, focus_glow, icon_button, icon_el, input_box, island, popover, switch, text_button,
         tooltip_view,
     },
 };
@@ -421,16 +424,18 @@ enum LanguageOption {
     TrimWhitespace,
     FinalNewline,
     FormatOnSave,
+    SyntaxErrors,
 }
 
 impl LanguageOption {
-    const ALL: [LanguageOption; 6] = [
+    const ALL: [LanguageOption; 7] = [
         LanguageOption::TabSize,
         LanguageOption::HardTabs,
         LanguageOption::SoftWrap,
         LanguageOption::TrimWhitespace,
         LanguageOption::FinalNewline,
         LanguageOption::FormatOnSave,
+        LanguageOption::SyntaxErrors,
     ];
 
     fn key(self) -> &'static str {
@@ -441,6 +446,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => "trim_trailing_whitespace",
             LanguageOption::FinalNewline => "insert_final_newline",
             LanguageOption::FormatOnSave => "format_on_save",
+            LanguageOption::SyntaxErrors => "syntax_errors",
         }
     }
 
@@ -452,6 +458,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => "Trim trailing whitespace",
             LanguageOption::FinalNewline => "Insert final newline",
             LanguageOption::FormatOnSave => "Reformat on save",
+            LanguageOption::SyntaxErrors => "Show syntax errors",
         }
     }
 
@@ -463,6 +470,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => s.trim_trailing_whitespace.is_some(),
             LanguageOption::FinalNewline => s.insert_final_newline.is_some(),
             LanguageOption::FormatOnSave => s.format_on_save.is_some(),
+            LanguageOption::SyntaxErrors => s.syntax_errors.is_some(),
         }
     }
 
@@ -474,6 +482,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => s.trim_trailing_whitespace = None,
             LanguageOption::FinalNewline => s.insert_final_newline = None,
             LanguageOption::FormatOnSave => s.format_on_save = None,
+            LanguageOption::SyntaxErrors => s.syntax_errors = None,
         }
     }
 
@@ -485,6 +494,7 @@ impl LanguageOption {
             LanguageOption::TrimWhitespace => f.trim_trailing_whitespace,
             LanguageOption::FinalNewline => f.insert_final_newline,
             LanguageOption::FormatOnSave => f.format_on_save,
+            LanguageOption::SyntaxErrors => f.syntax_errors,
         }
     }
 }
@@ -507,6 +517,9 @@ pub struct Preferences {
     /// Whether this frame's page scrolls in `body` (so `scroll` tracks it and
     /// gets a scrollbar); the Keymap page scrolls on its own.
     body_shown: Cell<bool>,
+    /// The window is too narrow for a control beside its row's text: rows
+    /// stack it under (`setting_row`). Set each frame from the window's width.
+    stacked: Cell<bool>,
     fonts_scroll: gpui::UniformListScrollHandle,
     menu: Option<Menu>,
     font_filter: Entity<Editor>,
@@ -591,6 +604,7 @@ impl Preferences {
             search,
             scroll: ScrollHandle::new(),
             body_shown: Cell::new(false),
+            stacked: Cell::new(false),
             fonts_scroll: gpui::UniformListScrollHandle::new(),
             menu: None,
             font_filter,
@@ -983,12 +997,9 @@ impl Focusable for Preferences {
 impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        let viewport = window.viewport_size();
-        // Matches the modal layer's top offset, so the dialog fits below it.
-        let top = (viewport.height * 0.12).max(px(50.));
-        let height = (viewport.height - top - px(24.)).min(px(640.)).max(px(320.));
         let words = self.query_words(cx);
         self.overlay = None;
+        self.stacked.set(window.viewport_size().width < px(STACK_BELOW));
 
         self.body_shown.set(false);
         let content = if words.is_empty() {
@@ -1006,8 +1017,10 @@ impl Render for Preferences {
             .child(content)
             .when(self.body_shown.get(), |el| el.child(crate::ui::scrollbar("pref-body-scrollbar", &self.scroll, cx)));
 
-        let panel = modal_panel(cx)
+        // Fills its window (see `window.rs`), on the window's chrome.
+        let panel = div()
             .id("preferences")
+            .flex()
             .key_context("Preferences")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_cancel))
@@ -1018,9 +1031,7 @@ impl Render for Preferences {
                 this.search.update(cx, |e, cx| e.select_all_text(cx));
             }))
             .flex_row()
-            .w(px(940.))
-            .max_w(viewport.width - px(48.))
-            .h(height)
+            .size_full()
             .text_size(px(13.))
             .font_family(theme.ui_font.clone())
             // Like the main window: the nav on the chrome, the page on an island.
@@ -1036,10 +1047,9 @@ impl Render for Preferences {
                     .when_some(self.file_error.clone(), |el, error| el.child(self.render_file_error(error, cx)))
                     .child(content),
             );
-        // An open dropdown list goes beside the panel, not in it: the panel
-        // clips its content to its rounded shape, which would cut the list off
-        // at its edge.
-        div().relative().child(panel).children(self.overlay.take())
+        // An open dropdown list goes after the panel, so it paints over every
+        // part of it (the island clips its content to its rounded shape).
+        div().relative().size_full().child(panel).children(self.overlay.take())
     }
 }
 
@@ -1101,7 +1111,7 @@ impl Preferences {
             .flex_shrink_0()
             .w(px(212.))
             .h_full()
-            .child(div().p_2().pt_3().child(input_box(&self.search, Some(Icon::Search), window, cx)))
+            .child(div().flex().p_2().pt_3().child(input_box(&self.search, Some(Icon::Search), window, cx)))
             .child(div().flex().flex_col().gap_0p5().px_2().pt_1().flex_1().children(items))
             .child(
                 div()
@@ -1147,39 +1157,36 @@ impl Preferences {
                         .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::OpenKeymapFile))),
                 )
             })
-            .child(
-                icon_button("pref-close", Icon::X, theme.text_muted.into(), cx)
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::Dismissed))),
-            )
     }
 
     fn render_file_error(&self, error: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::get(cx).clone();
-        div()
-            .mx(px(28.))
-            .mb_3()
+        let text = div()
             .flex()
             .items_center()
             .gap_2()
+            .flex_auto()
+            .min_w_0()
+            .child(icon_el(Icon::TriangleAlert, px(14.), theme.warning.into()))
+            .child(
+                div()
+                    .flex_auto()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(theme.text)
+                    .child(format!("Changes can't be saved until settings.json is fixed: {error}")),
+            );
+        let open = text_button("pref-fix-settings", "Open", false, cx)
+            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::OpenSettingsFile)));
+        beside_or_under(text, open, self.stacked.get())
+            .mx(px(28.))
+            .mb_3()
             .px_3()
             .py_2()
             .rounded(px(8.))
             .bg(Hsla::from(theme.warning).alpha(0.1))
             .border_1()
             .border_color(Hsla::from(theme.warning).alpha(0.35))
-            .child(icon_el(Icon::TriangleAlert, px(14.), theme.warning.into()))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.))
-                    .text_color(theme.text)
-                    .child(format!("Changes can't be saved until settings.json is fixed: {error}")),
-            )
-            .child(
-                text_button("pref-fix-settings", "Open", false, cx)
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(PreferencesEvent::OpenSettingsFile))),
-            )
     }
 
     /// The scrolling area under the header.
@@ -1314,7 +1321,7 @@ impl Preferences {
             Setting::RunConfigurations => return self.render_runs(window, cx).into_any_element(),
             Setting::FontFamily => {
                 let (trigger, list) = self.render_font_menu(window, cx);
-                let row = setting_row(setting.label(), Some(setting.description().into()), trigger, reset, &theme);
+                let row = setting_row(setting.label(), Some(setting.description().into()), trigger, reset, self.stacked.get(), &theme);
                 return div().flex().flex_col().child(row).children(list).into_any_element();
             }
             Setting::FontSize => {
@@ -1475,7 +1482,7 @@ impl Preferences {
             }
             Setting::Shell => div().w(px(300.)).flex().child(input_box(&self.shell, None, window, cx)).into_any_element(),
         };
-        setting_row(setting.label(), Some(setting.description().into()), control, reset, &theme).into_any_element()
+        setting_row(setting.label(), Some(setting.description().into()), control, reset, self.stacked.get(), &theme).into_any_element()
     }
 
     fn bool_switch(&self, id: &'static str, key: &'static str, value: Option<bool>, cx: &mut Context<Self>) -> AnyElement {
@@ -2234,7 +2241,8 @@ impl Preferences {
                     .flex()
                     .flex_col()
                     .gap_0p5()
-                    .flex_1()
+                    // An auto basis, like a setting row's text (see `setting_row`).
+                    .flex_auto()
                     .min_w_0()
                     .child(div().text_color(theme.text).font_weight(FontWeight::MEDIUM).child(header))
                     .when(!extension.description.is_empty(), |el| {
@@ -2292,26 +2300,17 @@ impl Preferences {
             .flex()
             .flex_col()
             .children(rows)
+            // Laid out like a setting row (the button under the text when narrow).
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .px_4()
-                    .py_2p5()
-                    .when(!empty, |el| el.border_t_1().border_color(theme.border_subtle))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .text_color(theme.text_dim)
-                            .child(Setting::RunConfigurations.description()),
-                    )
-                    .child(
-                        text_button("pref-run-add", "Add Configuration", false, cx)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.new_run_row(window, cx))),
-                    ),
+                beside_or_under(
+                    div().flex_auto().min_w_0().text_size(px(12.)).text_color(theme.text_dim).child(Setting::RunConfigurations.description()),
+                    text_button("pref-run-add", "Add Configuration", false, cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.new_run_row(window, cx))),
+                    self.stacked.get(),
+                )
+                .px_4()
+                .py_2p5()
+                .when(!empty, |el| el.border_t_1().border_color(theme.border_subtle)),
             )
     }
 
@@ -2380,9 +2379,19 @@ impl Preferences {
                         .into_any_element()
                 }
             };
-            let note: SharedString =
-                if set { format!("Set for {}", language.name()).into() } else { "Same as the general setting".into() };
-            editor_rows.push(setting_row(option.label(), Some(note), control, reset, &theme).into_any_element());
+            // An extension's grammar may reject valid code, so its parse
+            // errors stay off unless asked for.
+            let extension_default = option == LanguageOption::SyntaxErrors
+                && language.extension().is_some()
+                && settings.editor.syntax_errors.is_none();
+            let note: SharedString = if set {
+                format!("Set for {}", language.name()).into()
+            } else if extension_default {
+                "Off for extension languages, whose grammars may reject valid code".into()
+            } else {
+                "Same as the general setting".into()
+            };
+            editor_rows.push(setting_row(option.label(), Some(note), control, reset, self.stacked.get(), &theme).into_any_element());
         }
 
         let tool_rows = |this: &mut Self, tool: Tool, window: &mut Window, cx: &mut Context<Self>| -> Vec<AnyElement> {
@@ -2403,7 +2412,7 @@ impl Preferences {
                 this.set_tool_mode(tool, modes[ix], window, cx)
             });
             let (label, description) = tool_description(tool, language, mode);
-            let mut rows = vec![setting_row(label, Some(description.into()), picker, None, &theme).into_any_element()];
+            let mut rows = vec![setting_row(label, Some(description.into()), picker, None, this.stacked.get(), &theme).into_any_element()];
             if mode == ToolMode::Custom {
                 let field = match tool {
                     Tool::Server => &this.server_command,
@@ -2718,41 +2727,53 @@ fn card(theme: &Theme) -> Div {
         .border_color(Hsla::from(theme.border).alpha(0.6))
 }
 
-/// Label and description on the left, the control on the right.
+/// Below this window width, a row's control goes under its text instead of
+/// beside it: beside, the text would get too little room (and a flex text
+/// squeezed far enough breaks a letter per line).
+const STACK_BELOW: f32 = 860.;
+
+/// Label and description on the left, the control on the right; `stacked`
+/// (a narrow window) puts the control under them, at the right edge.
 fn setting_row(
     label: impl Into<SharedString>,
     description: Option<SharedString>,
     control: AnyElement,
     reset: Option<AnyElement>,
+    stacked: bool,
     theme: &Theme,
 ) -> Div {
-    div()
+    let text = div()
         .flex()
-        .items_center()
-        .gap_4()
-        .min_h(px(ROW_HEIGHT))
-        .px_4()
-        .py_2p5()
+        .flex_col()
+        .gap_0p5()
+        // Measured at its own width, then shrunk to fit: with a zero flex
+        // basis (`flex_1`) GPUI can keep the text wrapped as if it had no
+        // room at all, a letter per line, at some widths.
+        .flex_auto()
+        .min_w_0()
+        // A changed option has a reset button right after its name.
         .child(
             div()
                 .flex()
-                .flex_col()
-                .gap_0p5()
-                .flex_1()
-                .min_w_0()
-                // A changed option has a reset button right after its name.
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .h(px(20.))
-                        .child(div().text_color(theme.text).child(label.into()))
-                        .children(reset),
-                )
-                .when_some(description, |el, d| el.child(div().text_size(px(12.)).text_color(theme.text_dim).child(d))),
+                .items_center()
+                .gap_1()
+                .min_h(px(20.))
+                .child(div().text_color(theme.text).child(label.into()))
+                .children(reset),
         )
-        .child(div().flex_shrink_0().child(control))
+        .when_some(description, |el, d| el.child(div().text_size(px(12.)).text_color(theme.text_dim).child(d)));
+    beside_or_under(text, control, stacked).min_h(px(ROW_HEIGHT)).px_4().py_2p5()
+}
+
+/// A row of text with a control at its right edge, or (`stacked`) the
+/// control under the text, still at the right.
+fn beside_or_under(text: impl IntoElement, control: impl IntoElement, stacked: bool) -> Div {
+    let control = div().flex_shrink_0().child(control);
+    if stacked {
+        div().flex().flex_col().gap_2().child(text).child(div().flex().justify_end().child(control))
+    } else {
+        div().flex().items_center().gap_4().child(text).child(control)
+    }
 }
 
 fn dropdown_trigger(id: impl Into<gpui::ElementId>, label: SharedString, width: Pixels, open: bool, theme: &Theme) -> Button {

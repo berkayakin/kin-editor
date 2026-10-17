@@ -34,11 +34,12 @@ bindings, colors, icons) are in the [contributing guide](../CONTRIBUTING.md).
 - `src/preview.rs`, `src/image_view.rs` — image files and their tab
 - `src/markdown_preview.rs`, `src/markdown_preview/view.rs` — the Markdown preview and its tab
 - `src/settings.rs`, `src/editorconfig.rs`, `src/preferences.rs`, `src/preferences/` —
-  `settings.json`, `.editorconfig` and the Settings dialog
+  `settings.json`, `.editorconfig` and the Settings window
 - `src/state.rs` — remembered UI state and per-project sessions
 - `src/theme.rs`, `src/theme_picker.rs`, `assets/themes/` — theme loading, picker and built-in themes
 - `src/updater.rs`, `.github/workflows/release.yml` — auto-update and the release build
 - `src/about.rs` — the About Kuana window
+- `src/panic_log.rs` — a crash's message, place and backtrace in `<config>/logs/panic-<time>.log`
 - `src/ui.rs`, `src/context_menu.rs`, `src/input_dialog.rs` — shared widgets, menus and prompts
 - `src/assets.rs`, `assets/icons/` — UI icons ([Material Symbols](https://fonts.google.com/icons), Rounded, filled; Apache 2.0) and the title font embedded into the binary
 - `assets/file-icons/`, `src/file_icons.rs` — file-type icons ([Charmed Icons](https://github.com/jmesrje/zed-charmed-icons)) and their file-name associations

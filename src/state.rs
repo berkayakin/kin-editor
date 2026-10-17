@@ -140,6 +140,9 @@ pub struct SessionState {
     /// Where the last moved or resized window was, for the next launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlacement>,
+    /// Where the Preferences window was last, to reopen it there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferences_window: Option<WindowPlacement>,
     /// Keys this version doesn't know (a newer Kuana wrote them), kept so that
     /// saving here doesn't drop them.
     #[serde(flatten)]
