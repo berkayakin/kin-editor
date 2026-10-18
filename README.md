@@ -28,7 +28,7 @@ tabs aren't read from disk until you look at them.
 
 **🎨 Beautiful out of the box.** A calm "islands" layout: the sidebar, editors and panels float
 as rounded cards. Tabs are browser-style, transitions are smooth and the chrome stays minimal.
-There are **30 built-in themes**, from Ember and Catppuccin to Tokyo Night and Rosé Pine,
+There are **50 built-in themes**, from Ember and Catppuccin to Tokyo Night and Rosé Pine,
 each previewed live as you pick it. Prefer something plainer? One setting tones down gradients,
 shadows and animations.
 

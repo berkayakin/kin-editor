@@ -6,9 +6,11 @@ Action). Moving through the list previews each theme live; Enter keeps it
 
 Built in: Ember (default: charcoal islands on a near-black chrome), Ember Soft, Clay Black (near-black with neutral grays), Onyx (graphite islands on black chrome), Clay Dark, One Dark, Dracula, Nord, Tokyo Night,
 Gruvbox Dark, Catppuccin Mocha, Rosé Pine, Solarized Dark, Everforest Dark, Kanagawa, Ayu Dark, Night Owl,
-Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2,
-and the light themes Clay Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light
-and One Light. Their sources in [`assets/themes/`](../assets/themes) use the same format as user themes.
+Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2, Sunset Fig, Campfire,
+Olive Grove, Lighthouse Night, Ultraviolet, Pistachio Night, Mulberry, Camellia, Firefly, Lagoon, Blue Hour,
+Merlot, and the light themes Camellia Light, Clay Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn,
+Gruvbox Light, One Light, Sherbet, Campfire Light, Peach Blossom, Lighthouse, Pistachio, Blue Hour Light
+and Merlot Light. Their sources in [`assets/themes/`](../assets/themes) use the same format as user themes.
 The ported ones keep their authors' MIT licenses ([credits](../assets/themes/LICENSE)).
 
 ### Making your own

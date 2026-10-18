@@ -399,6 +399,7 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/clay-black.json"),
     include_str!("../assets/themes/onyx.json"),
     include_str!("../assets/themes/clay-dark.json"),
+    include_str!("../assets/themes/camellia-light.json"),
     include_str!("../assets/themes/clay-light.json"),
     include_str!("../assets/themes/one-dark.json"),
     include_str!("../assets/themes/dracula.json"),
@@ -421,11 +422,30 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/horizon.json"),
     include_str!("../assets/themes/vitesse-dark.json"),
     include_str!("../assets/themes/cobalt2.json"),
+    include_str!("../assets/themes/sunset-fig.json"),
+    include_str!("../assets/themes/campfire.json"),
+    include_str!("../assets/themes/olive-grove.json"),
+    include_str!("../assets/themes/lighthouse-night.json"),
+    include_str!("../assets/themes/ultraviolet.json"),
+    include_str!("../assets/themes/pistachio-night.json"),
+    include_str!("../assets/themes/mulberry.json"),
+    include_str!("../assets/themes/camellia.json"),
+    include_str!("../assets/themes/firefly.json"),
+    include_str!("../assets/themes/lagoon.json"),
+    include_str!("../assets/themes/blue-hour.json"),
+    include_str!("../assets/themes/merlot.json"),
     include_str!("../assets/themes/solarized-light.json"),
     include_str!("../assets/themes/catppuccin-latte.json"),
     include_str!("../assets/themes/rose-pine-dawn.json"),
     include_str!("../assets/themes/gruvbox-light.json"),
     include_str!("../assets/themes/one-light.json"),
+    include_str!("../assets/themes/sherbet.json"),
+    include_str!("../assets/themes/campfire-light.json"),
+    include_str!("../assets/themes/peach-blossom.json"),
+    include_str!("../assets/themes/lighthouse.json"),
+    include_str!("../assets/themes/pistachio.json"),
+    include_str!("../assets/themes/blue-hour-light.json"),
+    include_str!("../assets/themes/merlot-light.json"),
 ];
 
 /// The theme used when settings name none.
@@ -1070,7 +1090,7 @@ mod tests {
     #[test]
     fn builtins_are_complete() {
         let all = builtins();
-        assert_eq!(all.len(), 30);
+        assert_eq!(all.len(), 50);
         for file in all.values() {
             let mut errors = Vec::new();
             resolve(file, &all, &mut Vec::new(), &mut errors).unwrap();
@@ -1079,7 +1099,7 @@ mod tests {
             assert_eq!(defined, COLOR_KEYS.len(), "{} is missing keys", file.name);
         }
         let light = all.values().filter(|f| f.appearance() == Some(Appearance::Light)).count();
-        assert_eq!(light, 6);
+        assert_eq!(light, 14);
     }
 
     #[test]
