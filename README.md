@@ -12,7 +12,7 @@ JetBrains-style comfort, native speed, works with Zed extensions. Free and open 
 [Documentation](docs/README.md) ·
 [Contributing](CONTRIBUTING.md)
 
-![Kuana with the file tree and a Rust file open, in the Monokai Pro Contrast theme](docs/screenshots/default.png)
+![Kuana with the file tree and a Rust file open, in the Ember theme](docs/screenshots/default.png)
 
 ## Why Kuana
 
@@ -28,7 +28,7 @@ tabs aren't read from disk until you look at them.
 
 **🎨 Beautiful out of the box.** A calm "islands" layout: the sidebar, editors and panels float
 as rounded cards. Tabs are browser-style, transitions are smooth and the chrome stays minimal.
-There are **33 built-in themes**, from Monokai Pro and Catppuccin to Tokyo Night and Rosé Pine,
+There are **30 built-in themes**, from Ember and Catppuccin to Tokyo Night and Rosé Pine,
 each previewed live as you pick it. Prefer something plainer? One setting tones down gradients,
 shadows and animations.
 
@@ -126,8 +126,9 @@ dual licensed as above, without any additional terms or conditions.
 
 Bundled third-party assets keep their own licenses: file-type icons from
 [Charmed Icons](https://github.com/littensy/charmed-icons) by littensy and jmesrje (MIT,
-[`assets/file-icons/LICENSE`](assets/file-icons/LICENSE)) and the Vidaloka font (SIL Open Font
-License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)).
+[`assets/file-icons/LICENSE`](assets/file-icons/LICENSE)), the Vidaloka font (SIL Open Font
+License, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)) and the ported color themes (MIT, each
+author credited in [`assets/themes/LICENSE`](assets/themes/LICENSE)).
 
 Zed, JetBrains, Visual Studio Code and Sublime Text are trademarks of their respective owners.
 Kuana is an independent project, not affiliated with or endorsed by any of them; it mentions them

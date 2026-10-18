@@ -4,11 +4,12 @@ Pick a theme with **Select Theme** (Ctrl+\` like JetBrains' Quick Switch Scheme,
 Action). Moving through the list previews each theme live; Enter keeps it
 (saved to `settings.json`), Escape restores the previous one.
 
-Built in: Monokai Pro Contrast (default: Monokai Pro's islands on a near-black chrome), Monokai Pro, Clay Black (near-black with neutral grays), Onyx (graphite islands on black chrome), Clay Dark, One Dark, Dracula, Nord, Tokyo Night,
+Built in: Ember (default: charcoal islands on a near-black chrome), Ember Soft, Clay Black (near-black with neutral grays), Onyx (graphite islands on black chrome), Clay Dark, One Dark, Dracula, Nord, Tokyo Night,
 Gruvbox Dark, Catppuccin Mocha, Rosé Pine, Solarized Dark, Everforest Dark, Kanagawa, Ayu Dark, Night Owl,
-Material Palenight, GitHub Dark, Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2,
-and the light themes Clay Light, GitHub Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light
+Poimandres, Oxocarbon, SynthWave '84, Vesper, Horizon, Vitesse Dark, Cobalt2,
+and the light themes Clay Light, Solarized Light, Catppuccin Latte, Rosé Pine Dawn, Gruvbox Light
 and One Light. Their sources in [`assets/themes/`](../assets/themes) use the same format as user themes.
+The ported ones keep their authors' MIT licenses ([credits](../assets/themes/LICENSE)).
 
 ### Making your own
 
@@ -56,4 +57,4 @@ of the theme picker, with a "did you mean" hint for misspelled keys.
 the longest part of its name the theme sets (`keyword.control.return` → `keyword.control` →
 `keyword`). Zed themes keep all their syntax colors. Set `"italic_comments": false` for
 upright comments. Dark themes' chrome (`panel`) is kept within a few steps of lightness from the
-islands (`background`); set `"deep_chrome": true` to keep a darker chrome as written (Onyx and Monokai Pro Contrast do).
+islands (`background`); set `"deep_chrome": true` to keep a darker chrome as written (Onyx and Ember do).

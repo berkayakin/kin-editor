@@ -400,7 +400,6 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/onyx.json"),
     include_str!("../assets/themes/clay-dark.json"),
     include_str!("../assets/themes/clay-light.json"),
-    include_str!("../assets/themes/github-light.json"),
     include_str!("../assets/themes/one-dark.json"),
     include_str!("../assets/themes/dracula.json"),
     include_str!("../assets/themes/nord.json"),
@@ -409,14 +408,12 @@ static BUILTIN: &[&str] = &[
     include_str!("../assets/themes/catppuccin-mocha.json"),
     include_str!("../assets/themes/rose-pine.json"),
     include_str!("../assets/themes/solarized-dark.json"),
-    include_str!("../assets/themes/monokai-pro.json"),
-    include_str!("../assets/themes/monokai-pro-contrast.json"),
+    include_str!("../assets/themes/ember-soft.json"),
+    include_str!("../assets/themes/ember.json"),
     include_str!("../assets/themes/everforest-dark.json"),
     include_str!("../assets/themes/kanagawa.json"),
     include_str!("../assets/themes/ayu-dark.json"),
     include_str!("../assets/themes/night-owl.json"),
-    include_str!("../assets/themes/material-palenight.json"),
-    include_str!("../assets/themes/github-dark.json"),
     include_str!("../assets/themes/poimandres.json"),
     include_str!("../assets/themes/oxocarbon.json"),
     include_str!("../assets/themes/synthwave-84.json"),
@@ -432,7 +429,7 @@ static BUILTIN: &[&str] = &[
 ];
 
 /// The theme used when settings name none.
-pub const DEFAULT_THEME: &str = "Monokai Pro Contrast";
+pub const DEFAULT_THEME: &str = "Ember";
 /// What themes without `extends` fill missing colors from, per appearance.
 pub const DEFAULT_DARK: &str = "Clay Black";
 pub const DEFAULT_LIGHT: &str = "Clay Light";
@@ -1073,7 +1070,7 @@ mod tests {
     #[test]
     fn builtins_are_complete() {
         let all = builtins();
-        assert_eq!(all.len(), 33);
+        assert_eq!(all.len(), 30);
         for file in all.values() {
             let mut errors = Vec::new();
             resolve(file, &all, &mut Vec::new(), &mut errors).unwrap();
@@ -1082,7 +1079,7 @@ mod tests {
             assert_eq!(defined, COLOR_KEYS.len(), "{} is missing keys", file.name);
         }
         let light = all.values().filter(|f| f.appearance() == Some(Appearance::Light)).count();
-        assert_eq!(light, 7);
+        assert_eq!(light, 6);
     }
 
     #[test]

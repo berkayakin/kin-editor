@@ -26,7 +26,7 @@ and theme colors.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `theme` | `"Monokai Pro Contrast"` | see [Themes](themes.md) |
+| `theme` | `"Ember"` | see [Themes](themes.md) |
 | `base_keymap` | `"JetBrains"` | `"JetBrains"`, `"VSCode"`, `"SublimeText"` or `"Zed"`; see [Key bindings](keybindings.md) |
 | `auto_save` | `"after_delay"` | `"off"`, `"after_delay"`, `"on_focus_change"`, `"on_window_change"` |
 | `auto_save_delay` | `1000` | milliseconds |
