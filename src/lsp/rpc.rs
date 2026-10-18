@@ -77,8 +77,17 @@ type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>
 /// What the writer thread does: send a frame, or note when a request it
 /// sent times out.
 enum Outgoing {
+    /// A request or notification: it waits while a request is held.
     Frame(Vec<u8>),
+    /// An answer to one of the server's requests: never held, the server
+    /// may be waiting for it.
+    Answer(Vec<u8>),
     Deadline(Instant, i64),
+    /// What's sent after request `id` waits for its answer, until the
+    /// instant given (`Client::request_first`).
+    Hold(i64, Instant),
+    /// The held request `id` was answered (from the reader thread).
+    Answered(i64),
 }
 
 pub struct Client {
@@ -86,6 +95,8 @@ pub struct Client {
     writer: mpsc::Sender<Outgoing>,
     next_id: AtomicI64,
     pending: Pending,
+    /// The request what's sent after it waits for (`request_first`); 0: none.
+    held: Arc<AtomicI64>,
 }
 
 impl Client {
@@ -115,9 +126,10 @@ impl Client {
         let stderr = child.stderr.take().ok_or_else(|| std::io::Error::other("no stderr"))?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let held = Arc::new(AtomicI64::new(0));
         let (writer, to_write) = mpsc::channel::<Outgoing>();
-        let timeouts = pending.clone();
-        std::thread::Builder::new().name("lsp-writer".into()).spawn(move || write_loop(stdin, to_write, timeouts))?;
+        let (timeouts, writer_held) = (pending.clone(), held.clone());
+        std::thread::Builder::new().name("lsp-writer".into()).spawn(move || write_loop(stdin, to_write, timeouts, writer_held))?;
 
         // Keep the end of stderr to explain a crash.
         let stderr_tail = Arc::new(Mutex::new(String::new()));
@@ -136,12 +148,12 @@ impl Client {
         })?;
 
         let (incoming_tx, incoming) = async_mpsc::unbounded();
-        let reader_pending = pending.clone();
+        let reader = Answers { pending: pending.clone(), held: held.clone(), writer: writer.clone() };
         std::thread::Builder::new()
             .name("lsp-reader".into())
-            .spawn(move || read_loop(stdout, reader_pending, incoming_tx, stderr_tail))?;
+            .spawn(move || read_loop(stdout, reader, incoming_tx, stderr_tail))?;
 
-        let client = Arc::new(Client { child: Mutex::new(child), writer, next_id: AtomicI64::new(1), pending });
+        let client = Arc::new(Client { child: Mutex::new(child), writer, next_id: AtomicI64::new(1), pending, held });
         Ok((client, incoming))
     }
 
@@ -149,10 +161,30 @@ impl Client {
     /// before the answer comes tells the server to stop working on it, and
     /// one unanswered after `REQUEST_TIMEOUT` fails with `TIMED_OUT`.
     pub fn request(&self, method: &str, params: Value) -> Request {
+        self.request_held(method, params, None)
+    }
+
+    /// Sends a request the server answers before anything sent after it
+    /// reaches it: requests and notifications sent meanwhile wait (answers to
+    /// the server's own requests don't). Unanswered after `wait`, it fails
+    /// with `TIMED_OUT` and they go. For `completionItem/resolve` after an
+    /// edit: rust-analyzer resolves an item only in the text it made it for,
+    /// and drops the work when a change comes in. One request at a time is
+    /// held; another sent meanwhile is an ordinary one.
+    pub fn request_first(&self, method: &str, params: Value, wait: Duration) -> Request {
+        self.request_held(method, params, Some(wait))
+    }
+
+    fn request_held(&self, method: &str, params: Value, wait: Option<Duration>) -> Request {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
+        // Before it's sent, so its answer can't come first.
+        let held = wait.filter(|_| self.held.compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire).is_ok());
         self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+        if let Some(wait) = held {
+            self.writer.send(Outgoing::Hold(id, Instant::now() + wait)).ok();
+        }
         self.writer.send(Outgoing::Deadline(Instant::now() + REQUEST_TIMEOUT, id)).ok();
         Request { id, rx, pending: self.pending.clone(), writer: self.writer.clone() }
     }
@@ -163,14 +195,14 @@ impl Client {
 
     /// Answers a request from the server.
     pub fn respond(&self, id: Value, result: Value) {
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        self.writer.send(Outgoing::Answer(frame(&json!({ "jsonrpc": "2.0", "id": id, "result": result })))).ok();
     }
 
     /// Answers a request Kuana doesn't handle with JSON-RPC's MethodNotFound,
     /// so the server knows it went unanswered (a `null` result reads as done).
     pub fn respond_not_found(&self, id: Value, method: &str) {
         let error = json!({ "code": METHOD_NOT_FOUND, "message": format!("Unhandled method {method}") });
-        self.send(json!({ "jsonrpc": "2.0", "id": id, "error": error }));
+        self.writer.send(Outgoing::Answer(frame(&json!({ "jsonrpc": "2.0", "id": id, "error": error })))).ok();
     }
 
     fn send(&self, message: Value) {
@@ -274,31 +306,64 @@ impl Drop for Client {
     }
 }
 
-/// Writes frames to the server and fails requests unanswered by their
-/// deadline (telling the server to stop working on them too).
-fn write_loop(mut stdin: impl Write, outgoing: mpsc::Receiver<Outgoing>, pending: Pending) {
+/// Writes frames to the server, holding what follows a held request until
+/// it's answered, and fails requests unanswered by their deadline (telling
+/// the server to stop working on them too).
+fn write_loop(mut stdin: impl Write, outgoing: mpsc::Receiver<Outgoing>, pending: Pending, held: Arc<AtomicI64>) {
     let mut write = |frame: &[u8]| stdin.write_all(frame).and_then(|_| stdin.flush()).is_ok();
     // Requests by deadline: they all get the same timeout, so in order.
     let mut deadlines: VecDeque<(Instant, i64)> = VecDeque::new();
+    // The held request, until when, and the frames waiting for its answer.
+    let mut hold: Option<(i64, Instant, Vec<Vec<u8>>)> = None;
+    // A frame goes now, or waits for the held request's answer.
+    let send = |frame: Vec<u8>, hold: &mut Option<(i64, Instant, Vec<Vec<u8>>)>, write: &mut dyn FnMut(&[u8]) -> bool| match hold {
+        Some((.., waiting)) => {
+            waiting.push(frame);
+            true
+        }
+        None => write(&frame),
+    };
     loop {
-        let next = match deadlines.front() {
-            Some(&(at, _)) => outgoing.recv_timeout(at.saturating_duration_since(Instant::now())),
+        let wake = deadlines.front().map(|&(at, _)| at).into_iter().chain(hold.as_ref().map(|&(_, until, _)| until)).min();
+        let next = match wake {
+            Some(at) => outgoing.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => outgoing.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
         };
+        let mut release = false;
         match next {
             Ok(Outgoing::Frame(frame)) => {
+                if !send(frame, &mut hold, &mut write) {
+                    return;
+                }
+            }
+            Ok(Outgoing::Answer(frame)) => {
                 if !write(&frame) {
                     return;
                 }
             }
+            Ok(Outgoing::Hold(id, until)) => hold = Some((id, until, Vec::new())),
+            Ok(Outgoing::Answered(id)) => release = hold.as_ref().is_some_and(|&(held, ..)| held == id),
             Ok(Outgoing::Deadline(at, id)) => deadlines.push_back((at, id)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
+                // The held request took too long: it fails (its answer would
+                // be for whatever the server had by then), and the rest goes.
+                if let Some(&(id, until, _)) = hold.as_ref()
+                    && until <= now
+                {
+                    if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(Err(RpcError::new(TIMED_OUT)));
+                        if !write(&frame(&cancel(id))) {
+                            return;
+                        }
+                    }
+                    release = true;
+                }
                 while let Some(&(_, id)) = deadlines.front().filter(|(at, _)| *at <= now) {
                     deadlines.pop_front();
                     // Answered (or dropped) meanwhile: nothing to do.
                     let Some(tx) = pending.lock().unwrap().remove(&id) else { continue };
-                    let written = write(&frame(&cancel(id)));
+                    let written = send(frame(&cancel(id)), &mut hold, &mut write);
                     let _ = tx.send(Err(RpcError::new(TIMED_OUT)));
                     if !written {
                         return;
@@ -307,18 +372,34 @@ fn write_loop(mut stdin: impl Write, outgoing: mpsc::Receiver<Outgoing>, pending
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+        if release && let Some((_, _, waiting)) = hold.take() {
+            held.store(0, Ordering::Release);
+            for frame in waiting {
+                if !write(&frame) {
+                    return;
+                }
+            }
+        }
     }
 }
 
-fn read_loop(
-    stdout: impl Read,
+/// What the reader thread needs to deliver answers: the requests waiting
+/// for theirs, and to tell the writer when the held one's came.
+struct Answers {
     pending: Pending,
-    incoming: async_mpsc::UnboundedSender<Incoming>,
-    stderr_tail: Arc<Mutex<String>>,
-) {
+    held: Arc<AtomicI64>,
+    writer: mpsc::Sender<Outgoing>,
+}
+
+fn read_loop(stdout: impl Read, answers: Answers, incoming: async_mpsc::UnboundedSender<Incoming>, stderr_tail: Arc<Mutex<String>>) {
+    let Answers { pending, held, writer } = answers;
     let mut reader = BufReader::new(stdout);
     while let Some(message) = read_message(&mut reader) {
+        let answer = message.get("method").is_none().then(|| message.get("id").and_then(Value::as_i64)).flatten();
         dispatch(message, &pending, &incoming);
+        if let Some(id) = answer.filter(|&id| held.load(Ordering::Acquire) == id) {
+            writer.send(Outgoing::Answered(id)).ok();
+        }
     }
     // Whatever is still waiting will never get an answer.
     for (_, tx) in pending.lock().unwrap().drain() {
@@ -443,7 +524,7 @@ mod tests {
         let (writer, outgoing) = mpsc::channel();
         let written = Written::default();
         let (out, timeouts) = (written.clone(), pending.clone());
-        let thread = std::thread::spawn(move || write_loop(out, outgoing, timeouts));
+        let thread = std::thread::spawn(move || write_loop(out, outgoing, timeouts, Arc::new(AtomicI64::new(0))));
         let (incoming, _) = async_mpsc::unbounded();
         let request = |id: i64| {
             let (tx, rx) = oneshot::channel();
@@ -461,6 +542,60 @@ mod tests {
         let text = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
         assert!(text.ends_with(r#"{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}"#), "{text}");
         assert!(!text.contains(r#""id":1}"#), "{text}");
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    /// What's sent after a held request waits for its answer (answers to
+    /// the server's own requests don't); unanswered in time, it fails, the
+    /// server is told to stop working on it, and the rest goes.
+    #[test]
+    fn what_follows_a_held_request_waits_for_its_answer() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let held = Arc::new(AtomicI64::new(0));
+        let (writer, outgoing) = mpsc::channel();
+        let written = Written::default();
+        let (out, timeouts, writer_held) = (written.clone(), pending.clone(), held.clone());
+        let thread = std::thread::spawn(move || write_loop(out, outgoing, timeouts, writer_held));
+        let text = || String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
+        let wait_until = |what: &str, done: &dyn Fn(&str) -> bool| {
+            let started = Instant::now();
+            while !done(&text()) {
+                assert!(started.elapsed() < Duration::from_secs(5), "{what} wasn't sent: {}", text());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // As `Client::request_first` sends one.
+        let held_request = |id: i64, wait: Duration| {
+            let (tx, rx) = oneshot::channel();
+            pending.lock().unwrap().insert(id, tx);
+            held.store(id, Ordering::Release);
+            send(&writer, json!({ "jsonrpc": "2.0", "id": id, "method": "completionItem/resolve", "params": {} }));
+            writer.send(Outgoing::Hold(id, Instant::now() + wait)).unwrap();
+            Request { id, rx, pending: pending.clone(), writer: writer.clone() }
+        };
+
+        // Answered: what was sent meanwhile goes after its answer.
+        let first = held_request(1, Duration::from_secs(10));
+        send(&writer, json!({ "jsonrpc": "2.0", "method": "textDocument/didChange", "params": {} }));
+        writer.send(Outgoing::Answer(frame(&json!({ "jsonrpc": "2.0", "id": "cfg", "result": null })))).unwrap();
+        wait_until("the answer to the server", &|t| t.contains(r#""id":"cfg""#));
+        assert!(!text().contains("didChange"), "{}", text());
+        let (incoming, _) = async_mpsc::unbounded();
+        dispatch(json!({ "jsonrpc": "2.0", "id": 1, "result": 1 }), &pending, &incoming);
+        writer.send(Outgoing::Answered(1)).unwrap();
+        wait_until("the change", &|t| t.contains("didChange"));
+        assert_eq!(futures::executor::block_on(first).unwrap(), 1);
+        assert_eq!(held.load(Ordering::Acquire), 0);
+
+        // Not answered in time.
+        let second = held_request(2, Duration::from_millis(30));
+        send(&writer, json!({ "jsonrpc": "2.0", "method": "textDocument/didSave", "params": {} }));
+        assert_eq!(futures::executor::block_on(second).unwrap_err().message, TIMED_OUT);
+        wait_until("the save", &|t| t.contains("didSave"));
+        let text = text();
+        let cancel = text.find(r#""method":"$/cancelRequest","params":{"id":2}"#).expect("a cancel");
+        assert!(cancel < text.find("didSave").unwrap(), "{text}");
         drop(writer);
         thread.join().unwrap();
     }

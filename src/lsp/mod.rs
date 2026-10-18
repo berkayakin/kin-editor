@@ -1394,11 +1394,13 @@ impl FileWatcher {
 /// Named "goodbye", it notes being told to shut down: a `<file>.shutdown` beside its file.
 /// Named "asks", it sends a request Kuana doesn't handle and a progress token's, and
 /// adds the first's error code and whether the second was accepted to its problem.
-/// Named "resolve", it completes with "foo", whose import (`use foo;` on the first
-/// line) comes only on `completionItem/resolve`, which it answers after a pause.
+/// Named "resolve", it completes with "foo", whose edits besides (`use foo;` on the first
+/// line, ` // end` at the end of the completion's line) come only on `completionItem/resolve`,
+/// which it answers after a pause. Like rust-analyzer, it gives them only while the text is
+/// the version the item was made for, and when no change came while it worked.
 #[cfg(test)]
 pub(crate) const FAKE_SERVER: &str = r#"
-import sys, json, time
+import sys, json, time, queue, threading
 from urllib.parse import unquote, urlparse
 name = sys.argv[1]
 triggers = [t for t in sys.argv[2].split(",") if t] if len(sys.argv) > 2 else []
@@ -1411,18 +1413,32 @@ def spelled(uri):
     if uri[8:9].isalpha() and uri[9:10] == ":":
         uri = uri[:8] + uri[8].lower() + "%3A" + uri[10:]
     return uri
-def read():
-    headers = {}
+# Messages are read as they come, so a handler can see what came meanwhile.
+inbox = queue.Queue()
+def reader():
     while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            sys.exit(0)
-        line = line.strip()
-        if not line:
-            break
-        k, v = line.split(b":", 1)
-        headers[k.lower()] = v.strip()
-    return json.loads(sys.stdin.buffer.read(int(headers[b"content-length"])))
+        headers = {}
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                inbox.put(None)
+                return
+            line = line.strip()
+            if not line:
+                break
+            k, v = line.split(b":", 1)
+            headers[k.lower()] = v.strip()
+        inbox.put(json.loads(sys.stdin.buffer.read(int(headers[b"content-length"]))))
+threading.Thread(target=reader, daemon=True).start()
+def read():
+    m = inbox.get()
+    if m is None:
+        sys.exit(0)
+    return m
+def changed_meanwhile():
+    with inbox.mutex:
+        waiting = list(inbox.queue)
+    return any(m and m.get("method") == "textDocument/didChange" for m in waiting + held)
 def send(msg):
     body = json.dumps(msg).encode()
     sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
@@ -1438,6 +1454,7 @@ def answer_to(ids):
 init = {}
 last_uri = None
 text = ""
+version = 0
 hint_requests = 0
 while True:
     m = held.pop(0) if held else read()
@@ -1463,6 +1480,7 @@ while True:
         send({"jsonrpc": "2.0", "id": id, "result": {"capabilities": caps}})
     elif method == "textDocument/didChange":
         text = m["params"]["contentChanges"][-1]["text"]
+        version = m["params"]["textDocument"]["version"]
     elif method == "textDocument/didSave" and last_uri:
         problem = {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "message": name + " checked " + text.split("\n", 1)[0]}
         send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": last_uri, "diagnostics": [problem]}})
@@ -1479,6 +1497,7 @@ while True:
         uri = m["params"]["textDocument"]["uri"]
         last_uri = uri
         text = m["params"]["textDocument"]["text"]
+        version = m["params"]["textDocument"]["version"]
         # Asks for its whole section and reads `mode` in it, as basedpyright
         # asks for "basedpyright" and reads its "analysis".
         send({"jsonrpc": "2.0", "id": "cfg", "method": "workspace/configuration", "params": {"items": [{"section": "fake"}]}})
@@ -1519,13 +1538,19 @@ while True:
         at = lambda line, ch: {"uri": uri, "range": {"start": {"line": line, "character": ch}, "end": {"line": line, "character": ch + 1}}}
         send({"jsonrpc": "2.0", "id": id, "result": [at(0, 3), at(1, 9)]})
     elif method == "textDocument/completion":
-        items = [{"label": "foo", "data": 1}] if name == "resolve" else [{"label": name + "-item"}]
+        line = m["params"]["position"]["line"]
+        items = [{"label": "foo", "data": {"version": version, "line": line}}] if name == "resolve" else [{"label": name + "-item"}]
         send({"jsonrpc": "2.0", "id": id, "result": items})
     elif method == "completionItem/resolve" and name == "resolve":
-        time.sleep(0.4)
         item = m["params"]
-        start = {"line": 0, "character": 0}
-        item["additionalTextEdits"] = [{"range": {"start": start, "end": start}, "newText": "use foo;\n"}]
+        if item["data"]["version"] == version:
+            time.sleep(0.4)
+        # A change that came meanwhile spoils the work, as in rust-analyzer.
+        if item["data"]["version"] == version and not changed_meanwhile():
+            top = {"line": 0, "character": 0}
+            line = item["data"]["line"]
+            end = {"line": line, "character": len(text.split("\n")[line])}
+            item["additionalTextEdits"] = [{"range": {"start": top, "end": top}, "newText": "use foo;\n"}, {"range": {"start": end, "end": end}, "newText": " // end"}]
         send({"jsonrpc": "2.0", "id": id, "result": item})
     elif method == "textDocument/codeAction":
         sent = len(m["params"]["context"]["diagnostics"])

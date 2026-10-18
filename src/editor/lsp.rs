@@ -25,7 +25,7 @@ use nucleo_matcher::{
 use serde_json::{Value, json};
 
 use super::{Editor, EditorEvent, EditorMode};
-use crate::document::{CodeLens, InlayHint};
+use crate::document::{CodeLens, Document, InlayHint};
 use crate::{
     assets::Icon,
     document::EditKind,
@@ -33,7 +33,7 @@ use crate::{
     lsp::{
         LspStore, Server,
         protocol::{
-            self, CodeAction, CompletionItem, Encoding, HoverBlock, Location, Position, offset_to_position,
+            self, CodeAction, CompletionItem, Encoding, HoverBlock, Location, Position, TextEdit, offset_to_position,
             offsets_to_range, path_to_uri, position_to_offset,
         },
     },
@@ -63,6 +63,12 @@ const MENU_ROW_HEIGHT: f32 = 22.;
 /// How many matches the menu keeps, the best: a server may send thousands of
 /// items, and only the best few are ever looked at.
 const MAX_MATCHES: usize = 1000;
+/// The selected completion is resolved this long after it's selected (not
+/// for every item passed on the way).
+const RESOLVE_PAUSE: Duration = Duration::from_millis(100);
+/// How long an accepted completion's resolve may hold back what follows it
+/// (see `accept_completion`); later, the edits it would bring are given up.
+const RESOLVE_WAIT: Duration = Duration::from_secs(1);
 /// Inlay hints are asked for by chunks of this many lines, those in and
 /// around the view: a big file's hints all at once cost the server (and
 /// Kuana) for lines nobody looks at.
@@ -95,6 +101,19 @@ pub(super) struct CompletionMenu {
     sources: Vec<usize>,
     /// The server's list depends on the prefix; ask again as it grows.
     incomplete: bool,
+    /// Items resolved while the menu was open (the selected one, after a
+    /// pause): the item, the document version the server answered for, and
+    /// the edits it brings besides its text (an auto-import), in that text.
+    resolved: Vec<(usize, u64, Vec<TextEdit>)>,
+}
+
+/// A `completionItem/resolve` request under way for the menu's selected item.
+struct Resolving {
+    /// The list and the item.
+    items: Arc<Vec<CompletionItem>>,
+    item: usize,
+    /// Waits for the answer and puts it in the menu's `resolved`.
+    _task: Task<()>,
 }
 
 pub(super) struct HoverPopover {
@@ -124,6 +143,10 @@ pub(super) struct EditorLsp {
     rank_task: Option<Task<()>>,
     /// Stops a ranking that a newer one replaced.
     rank_cancel: Arc<AtomicBool>,
+    /// Resolves the menu's selected item a moment after it's selected
+    /// (`resolve_selected_soon`).
+    resolve_task: Option<Task<()>>,
+    resolving: Option<Resolving>,
     pub(super) hover: Option<HoverPopover>,
     hover_task: Option<Task<()>>,
     /// The word a pending hover request is for.
@@ -249,6 +272,20 @@ fn rank_completions(items: &[CompletionItem], typed: &str, cancel: &AtomicBool) 
         .position(|&(.., i)| items[i].preselect)
         .unwrap_or(0);
     Some((ranked.into_iter().map(|(.., i)| i).collect(), selected))
+}
+
+/// Whether an item's other edits (auto-imports) may come only from
+/// `completionItem/resolve`: it has none, isn't the user's snippet, and its
+/// server resolves items.
+fn needs_resolve(item: &CompletionItem, server: &Server) -> bool {
+    item.additional_edits.is_empty() && item.raw.get("kuanaUserSnippet").is_none() && server.resolves("completionProvider")
+}
+
+/// Where `range` of the text of `version` is now, if what it holds wasn't
+/// edited since (only moved); None when it was, or that text is too old.
+fn range_since(doc: &Document, version: u64, range: &Range<usize>) -> Option<Range<usize>> {
+    let moved = doc.offset_since(version, range.start)?..doc.offset_since(version, range.end)?;
+    (moved.len() == range.len()).then_some(moved)
 }
 
 /// A fresh flag in `slot`, setting the one it replaces: whatever works
@@ -490,6 +527,7 @@ impl Editor {
                     return;
                 }
                 e.stop_ranking();
+                e.stop_resolving();
                 e.lsp.completion = Some(CompletionMenu {
                     items,
                     scroll: selected.saturating_sub(MENU_ROWS - 1),
@@ -500,9 +538,11 @@ impl Editor {
                     servers,
                     sources,
                     incomplete,
+                    resolved: Vec::new(),
                 });
                 // Typed on (or moved away) while the list was read.
                 e.refilter_completion(cx);
+                e.resolve_selected_soon(cx);
                 cx.notify();
             })
             .ok();
@@ -574,6 +614,7 @@ impl Editor {
         menu.ranked_for = typed;
         menu.selected = selected;
         menu.scroll = selected.saturating_sub(MENU_ROWS - 1);
+        self.resolve_selected_soon(cx);
         cx.notify();
     }
 
@@ -596,9 +637,62 @@ impl Editor {
 
     fn close_completion(&mut self, cx: &mut Context<Self>) {
         self.stop_ranking();
+        self.stop_resolving();
         if self.lsp.completion.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// The menu's list goes (or another replaces it): resolving its
+    /// selection stops.
+    fn stop_resolving(&mut self) {
+        self.lsp.resolve_task = None;
+        self.lsp.resolving = None;
+    }
+
+    /// Resolves the selected item a moment after it's selected, so the
+    /// edits it brings besides its text (auto-imports often come only on
+    /// `completionItem/resolve`) are there when it's accepted, and go in
+    /// with it.
+    fn resolve_selected_soon(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.lsp.completion.as_ref() else { return };
+        let Some(&i) = menu.matches.get(menu.selected) else { return };
+        let Some(server) = menu.servers.get(menu.sources[i]).cloned() else { return };
+        let under_way = self.lsp.resolving.as_ref().is_some_and(|r| Arc::ptr_eq(&r.items, &menu.items) && r.item == i);
+        // Nothing to ask (or asked already): what was to be asked for an
+        // item selected before isn't.
+        if under_way || !needs_resolve(&menu.items[i], &server) || menu.resolved.iter().any(|(ix, ..)| *ix == i) {
+            self.lsp.resolve_task = None;
+            return;
+        }
+        let items = menu.items.clone();
+        self.lsp.resolve_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESOLVE_PAUSE).await;
+            this.update(cx, |e, cx| e.send_resolve(items, i, &server, cx)).ok();
+        }));
+    }
+
+    /// Asks `server` to resolve item `i` of `items`, the menu's selection:
+    /// the answer, for the text of now, goes into the menu's `resolved`.
+    fn send_resolve(&mut self, items: Arc<Vec<CompletionItem>>, i: usize, server: &Server, cx: &mut Context<Self>) {
+        self.lsp.resolve_task = None;
+        let request = server.client.request("completionItem/resolve", items[i].raw.clone());
+        let version = self.doc.read(cx).version();
+        let list = items.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let resolved = request.await;
+            this.update(cx, |e, cx| {
+                e.lsp.resolving = None;
+                // Edited meanwhile: the answer may be for the new text (rust-analyzer
+                // starts over when a change comes in), so it isn't kept.
+                let menu = e.lsp.completion.as_mut().filter(|m| Arc::ptr_eq(&m.items, &list));
+                if let (Ok(resolved), Some(menu), true) = (resolved, menu, e.doc.read(cx).version() == version) {
+                    menu.resolved.push((i, version, protocol::text_edits(resolved.get("additionalTextEdits"))));
+                }
+            })
+            .ok();
+        });
+        self.lsp.resolving = Some(Resolving { items, item: i, _task: task });
     }
 
     /// Up/Down/Enter/Tab while the menu is open. Returns whether it took the key.
@@ -617,6 +711,7 @@ impl Editor {
                 } else if menu.selected >= menu.scroll + MENU_ROWS {
                     menu.scroll = menu.selected + 1 - MENU_ROWS;
                 }
+                self.resolve_selected_soon(cx);
                 cx.notify();
             }
             CompletionKey::Accept { replace } => {
@@ -630,86 +725,103 @@ impl Editor {
     fn accept_completion(&mut self, ix: usize, replace: bool, cx: &mut Context<Self>) {
         let Some(menu) = self.lsp.completion.take() else { return };
         self.stop_ranking();
+        self.stop_resolving();
         cx.notify();
         let Some(&i) = menu.matches.get(ix) else { return };
         let item = &menu.items[i];
         // Positioned in the encoding of, and resolved by, the server it came from.
         let Some(server) = menu.servers.get(menu.sources[i]).cloned() else { return };
-        // The text goes in now, so keys typed next follow it. What the server
-        // adds on resolve (auto-imports often come only then) goes in once it
-        // answers.
+        let encoding = server.encoding;
+        // Its other edits (an auto-import) in today's text: sent with it, or
+        // found while it was selected; they go in with it. Else they're asked
+        // for now, and the server answers before it hears of anything sent
+        // after (`request_first`): rust-analyzer resolves an item only in the
+        // text it was made for, and drops the work when a change comes in.
+        // The text goes in now, so keys typed next follow it; the edits once
+        // the server answers.
+        let resolved = menu.resolved.iter().find(|(ix, ..)| *ix == i);
+        let (extra, to_come) = if !needs_resolve(item, &server) {
+            (protocol::resolve_edits(self.doc.read(cx).rope(), &item.additional_edits, encoding), None)
+        } else if let Some(edits) = resolved.and_then(|(_, version, edits)| self.edits_since(edits, encoding, *version, cx)) {
+            (edits, None)
+        } else {
+            let version = self.doc.read(cx).version();
+            (Vec::new(), Some((version, server.client.request_first("completionItem/resolve", item.raw.clone(), RESOLVE_WAIT))))
+        };
         let mark = self.doc.read(cx).undo_mark();
-        let inserted = self.apply_completion(item, menu.start, server.encoding, replace, cx);
-        let own = item.raw.get("kuanaUserSnippet").is_some();
-        if item.additional_edits.is_empty() && !own && server.resolves("completionProvider") {
-            self.resolve_completion(item, server, inserted, mark, cx);
-        }
-    }
-
-    /// Asks the server for the rest of an accepted completion, in a task of
-    /// its own (typing on, which asks for completion again, doesn't cancel
-    /// it), and adds the edits it brings besides the text already in at
-    /// `inserted`. `mark`: the undo history before the completion.
-    fn resolve_completion(&mut self, item: &CompletionItem, server: Arc<Server>, inserted: Range<usize>, mark: usize, cx: &mut Context<Self>) {
-        // The server was sent the text with the completion in (`edited`), so
-        // it answers for this version: the request goes now, before the
-        // changes of keys typed next.
-        let version = self.doc.read(cx).version();
-        let request = server.client.request("completionItem/resolve", item.raw.clone());
+        let inserted = self.apply_completion(item, menu.start, encoding, replace, extra, cx);
+        let Some((version, answer)) = to_come else { return };
+        let after = (self.doc.read(cx).version(), inserted);
+        // A task of its own: typing on, which asks for completion again, doesn't cancel it.
         cx.spawn(async move |this, cx| {
-            let Ok(resolved) = request.await else { return };
+            let Ok(resolved) = answer.await else { return };
             let edits = protocol::text_edits(resolved.get("additionalTextEdits"));
-            if edits.is_empty() {
-                return;
+            if !edits.is_empty() {
+                this.update(cx, |e, cx| e.add_resolved_edits(&edits, encoding, version, after, mark, cx)).ok();
             }
-            this.update(cx, |e, cx| e.add_resolved_edits(&edits, server.encoding, version, inserted, mark, cx)).ok();
         })
         .detach();
     }
 
-    /// A resolved completion's other edits, for the text of `version`, moved
-    /// through the edits made since. None go in once the completion's own
-    /// text changed (undone, say); one whose text was edited, or that
-    /// overlaps the completion, is left out. With nothing done in between,
-    /// one undo takes them with the completion.
+    /// A server's `edits` for the text of `version`, where they go in
+    /// today's text: one whose text was edited since is left out. None when
+    /// that text isn't known any more.
+    fn edits_since(&self, edits: &[TextEdit], encoding: Encoding, version: u64, cx: &App) -> Option<Vec<(Range<usize>, String)>> {
+        let doc = self.doc.read(cx);
+        let text = doc.text_at_lsp_version(version)?;
+        let edits = protocol::resolve_edits(text, edits, encoding);
+        Some(edits.into_iter().filter_map(|(range, new_text)| Some((range_since(doc, version, &range)?, new_text))).collect())
+    }
+
+    /// An accepted completion's other edits, which came after its text went
+    /// in (`after`: the version and where its text was then), for the text
+    /// of `version`: moved through the edits made since. None go in once
+    /// the completion was undone (the history is back at `mark`); one whose
+    /// text was edited, or that overlaps the completion (typed into or not:
+    /// a snippet's stop), is left out. With nothing done after the
+    /// completion, one undo takes them with it.
     fn add_resolved_edits(
         &mut self,
-        edits: &[protocol::TextEdit],
+        edits: &[TextEdit],
         encoding: Encoding,
         version: u64,
-        inserted: Range<usize>,
+        (after, inserted): (u64, Range<usize>),
         mark: usize,
         cx: &mut Context<Self>,
     ) {
         let doc = self.doc.read(cx);
-        let Some(text) = doc.text_at_lsp_version(version) else { return };
-        // Where a range of that text is now, if what it holds wasn't edited.
-        let now = |range: &Range<usize>| {
-            let moved = doc.offset_since(version, range.start)?..doc.offset_since(version, range.end)?;
-            (moved.len() == range.len()).then_some(moved)
-        };
-        if now(&inserted).is_none() {
+        if doc.undo_mark() <= mark {
             return;
         }
-        let moved: Vec<(Range<usize>, String)> = protocol::resolve_edits(text, edits, encoding)
-            .into_iter()
-            .filter(|(range, _)| range.end <= inserted.start || range.start >= inserted.end)
-            .filter_map(|(range, new_text)| Some((now(&range)?, new_text)))
-            .collect();
+        let Some(completion) = doc.offset_since(after, inserted.start).zip(doc.offset_since(after, inserted.end)).map(|(start, end)| start..end) else {
+            return;
+        };
+        let Some(moved) = self.edits_since(edits, encoding, version, cx) else { return };
+        let moved: Vec<(Range<usize>, String)> =
+            moved.into_iter().filter(|(range, _)| range.end <= completion.start || range.start >= completion.end).collect();
         if moved.is_empty() {
             return;
         }
-        let untouched = doc.version() == version;
+        let untouched = self.doc.read(cx).version() == after;
         self.edit_and_remap(moved, EditKind::Other, cx);
         if untouched {
             self.doc.as_mut(cx).merge_undo_since(mark);
         }
     }
 
-    /// Inserts a completion at the caret and returns where its text went.
-    /// Enter inserts; Tab also replaces the rest of the word after the caret
-    /// (as in JetBrains).
-    fn apply_completion(&mut self, item: &CompletionItem, start: usize, encoding: Encoding, replace: bool, cx: &mut Context<Self>) -> Range<usize> {
+    /// Inserts a completion at the caret, with `extra` edits (in today's
+    /// text) in the same step, and returns where its text went. Enter
+    /// inserts; Tab also replaces the rest of the word after the caret (as
+    /// in JetBrains).
+    fn apply_completion(
+        &mut self,
+        item: &CompletionItem,
+        start: usize,
+        encoding: Encoding,
+        replace: bool,
+        extra: Vec<(Range<usize>, String)>,
+        cx: &mut Context<Self>,
+    ) -> Range<usize> {
         let head = self.primary_selection().head;
         let rope = self.doc.read(cx).rope().clone();
         let from = item.edit.as_ref().map(|e| position_to_offset(&rope, e.range.start, encoding)).unwrap_or(start).min(head);
@@ -724,12 +836,8 @@ impl Editor {
             false => (item.raw_text().to_string(), Vec::new()),
         };
         let mut edits = vec![(from..to, text.clone())];
-        for (range, new_text) in protocol::resolve_edits(&rope, &item.additional_edits, encoding) {
-            // An extra edit overlapping the main one is a server bug; skip it.
-            if range.end <= from || range.start >= to {
-                edits.push((range, new_text));
-            }
-        }
+        // An extra edit overlapping the main one is a server bug; skip it.
+        edits.extend(extra.into_iter().filter(|(range, _)| range.end <= from || range.start >= to));
         // Where the inserted text starts once earlier extra edits apply.
         let shift: isize = edits[1..]
             .iter()
@@ -785,6 +893,7 @@ impl Editor {
     /// anything was open.
     pub(super) fn dismiss_lsp_popovers(&mut self, cx: &mut Context<Self>) -> bool {
         self.stop_ranking();
+        self.stop_resolving();
         let open = self.lsp.completion.take().is_some() | self.lsp.signature.take().is_some() | self.lsp.hover.take().is_some();
         if open {
             cx.notify();
@@ -2214,8 +2323,10 @@ mod tests {
     }
 
     /// Accepting a completion puts its text in at once. What resolving it
-    /// brings (an import) comes later, after keys typed meanwhile, and goes
-    /// where the server meant it without touching them.
+    /// brings (an import, and here an edit at the end of its line) comes
+    /// later, after keys typed meanwhile, and goes where the server meant it
+    /// without touching them. The server, like rust-analyzer, answers only
+    /// for the text the item was made for: it's asked before the text goes in.
     #[gpui::test]
     fn keys_typed_while_a_completion_resolves_stay(cx: &mut TestAppContext) {
         if crate::lsp::servers::which("python3").is_none() {
@@ -2226,7 +2337,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kuana-lsp-resolve-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.rs");
-        std::fs::write(&path, "fn main() {\n    fo\n}\n").unwrap();
+        std::fs::write(&path, "fn main() {\n    fo; // tail\n}\n").unwrap();
         let store = cx.new(|_| {
             let mut store = LspStore::new();
             store.test_specs = Some(vec![fake_server("resolve", "")]);
@@ -2252,19 +2363,169 @@ mod tests {
             e.insert("(", cx);
             e.insert("x", cx);
         });
-        assert_eq!(text(cx), "fn main() {\n    foo(x)\n}\n");
+        assert_eq!(text(cx), "fn main() {\n    foo(x); // tail\n}\n");
         wait_for(cx, "the import", |cx| text(cx).starts_with("use "));
-        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo(x)\n}\n");
+        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo(x); // tail // end\n}\n");
         editor.read_with(cx, |e, _| assert_eq!(e.primary_selection().head, "use foo;\nfn main() {\n    foo(x".len()));
 
-        // Nothing typed meanwhile: one undo takes the completion and its import.
+        // Nothing typed meanwhile: one undo takes the completion and its edits.
         let end = text(cx).len();
         editor.update(cx, |e, cx| e.edit_and_remap(vec![(end..end, "fo".into())], EditKind::Other, cx));
         complete(end + 2, cx);
         editor.update(cx, |e, cx| assert!(e.completion_key(CompletionKey::Accept { replace: false }, cx)));
         wait_for(cx, "the second import", |cx| text(cx).starts_with("use foo;\nuse foo;\n"));
-        editor.update(cx, |e, cx| e.doc.update(cx, |d, _| d.undo()));
-        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo(x)\n}\nfo");
+        assert_eq!(text(cx), "use foo;\nuse foo;\nfn main() {\n    foo(x); // tail // end\n}\nfoo // end");
+        editor.update(cx, |e, cx| e.undo_step(cx));
+        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo(x); // tail // end\n}\nfo");
+        store.update(cx, |s, _| s.shutdown_all());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The selected item is resolved a moment after it's selected: what it
+    /// brings besides its text then goes in with it, in one step, also after
+    /// typing on (moved from the text the server answered for). Accepted
+    /// while that request is under way, it's asked again, and the server
+    /// answers before it hears of the completion or keys typed after it.
+    #[gpui::test]
+    fn a_resolved_selection_goes_in_with_its_imports(cx: &mut TestAppContext) {
+        if crate::lsp::servers::which("python3").is_none() {
+            return;
+        }
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-lsp-resolved-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.rs");
+        std::fs::write(&path, "fn main() {\n    f; // tail\n}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.test_specs = Some(vec![fake_server("resolve", "")]);
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        wait_for(cx, "the server", |cx| editor.read_with(cx, |e, cx| !e.doc.read(cx).diagnostics.is_empty()));
+        let text = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| e.doc.read(cx).rope().to_string());
+        let complete = |at: usize, cx: &mut TestAppContext| {
+            editor.update(cx, |e, cx| {
+                e.select_range(at..at, cx);
+                e.request_completion(None, cx);
+            });
+            wait_for(cx, "completion", |cx| editor.read_with(cx, |e, _| e.lsp.completion.as_ref().is_some_and(|m| !m.matches.is_empty())));
+        };
+
+        // After `f`: once the pause is over the selection is resolved (the
+        // server takes a while); typed on, then accepted.
+        complete(17, cx);
+        wait_for(cx, "the selection resolved", |cx| {
+            cx.executor().advance_clock(RESOLVE_PAUSE);
+            editor.read_with(cx, |e, _| e.lsp.completion.as_ref().is_some_and(|m| !m.resolved.is_empty()))
+        });
+        editor.update(cx, |e, cx| {
+            e.insert("o", cx);
+            assert!(e.completion_key(CompletionKey::Accept { replace: false }, cx));
+        });
+        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo; // tail // end\n}\n");
+        // One undo takes all of it; what was typed stays.
+        editor.update(cx, |e, cx| e.undo_step(cx));
+        assert_eq!(text(cx), "fn main() {\n    fo; // tail\n}\n");
+
+        // Accepted while that request is under way, and a key typed at once.
+        complete(18, cx);
+        cx.executor().advance_clock(RESOLVE_PAUSE);
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |e, _| e.lsp.resolving.is_some()));
+        editor.update(cx, |e, cx| {
+            assert!(e.completion_key(CompletionKey::Accept { replace: false }, cx));
+            e.insert("(", cx);
+        });
+        assert_eq!(text(cx), "fn main() {\n    foo(); // tail\n}\n");
+        wait_for(cx, "the import", |cx| text(cx).starts_with("use "));
+        assert_eq!(text(cx), "use foo;\nfn main() {\n    foo(); // tail // end\n}\n");
+        store.update(cx, |s, _| s.shutdown_all());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rust-analyzer gives an item's import only on `completionItem/resolve`,
+    /// and only while the text is the version it made the item for. Accepted
+    /// with a key typed at once, `HashSet` gets `use std::collections::HashSet`;
+    /// resolved while selected, `HashMap` gets its import as it goes in.
+    #[gpui::test]
+    #[ignore = "needs rust-analyzer and the standard library's sources (rust-src); run with --ignored"]
+    fn rust_analyzer_imports_what_it_completes(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        crate::trust::set_trust_all(true);
+        let dir = std::env::temp_dir().join(format!("kuana-ra-imports-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let path = dir.join("src/main.rs");
+        std::fs::write(&path, "fn main() {\n    let set: HashSe\n}\n").unwrap();
+        let store = cx.new(|_| {
+            let mut store = LspStore::new();
+            store.set_root(Some(dir.clone()));
+            store
+        });
+        let editor: Entity<Editor> = cx.new(|cx| Editor::new(Document::open(&path).unwrap(), cx));
+        store.update(cx, |s, cx| s.register(&editor, cx));
+        let text = |cx: &mut TestAppContext| editor.read_with(cx, |e, cx| e.doc.read(cx).rope().to_string());
+        let wait = |cx: &mut TestAppContext, what: &str, seconds: u64, done: &dyn Fn(&mut TestAppContext) -> bool| {
+            let started = Instant::now();
+            while !done(cx) {
+                assert!(started.elapsed() < Duration::from_secs(seconds), "timed out waiting for {what}: {:?}", text(cx));
+                std::thread::sleep(Duration::from_millis(20));
+                cx.run_until_parked();
+            }
+        };
+        // The menu's index of the first item `label` starts, once the menu has one.
+        let offered = |cx: &mut TestAppContext, label: &str| {
+            editor.read_with(cx, |e, _| {
+                let menu = e.lsp.completion.as_ref()?;
+                menu.matches.iter().position(|&i| menu.items[i].label.starts_with(label))
+            })
+        };
+        // Asked until offered: rust-analyzer loads the project and the standard library first.
+        let complete = |cx: &mut TestAppContext, at: usize, label: &str| {
+            let started = Instant::now();
+            loop {
+                editor.update(cx, |e, cx| {
+                    e.select_range(at..at, cx);
+                    e.request_completion(None, cx);
+                });
+                let asked = Instant::now();
+                while asked.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    cx.run_until_parked();
+                    if let Some(ix) = offered(cx, label) {
+                        return ix;
+                    }
+                }
+                assert!(started.elapsed() < Duration::from_secs(180), "rust-analyzer never offered {label}");
+            }
+        };
+
+        // Accepted, and a key typed at once (inside `HashSet<>`).
+        let ix = complete(cx, "fn main() {\n    let set: HashSe".len(), "HashSet");
+        editor.update(cx, |e, cx| {
+            e.accept_completion(ix, false, cx);
+            e.insert("u8", cx);
+        });
+        wait(cx, "HashSet's import", 30, &|cx| text(cx).contains("use std::collections::HashSet;"));
+        assert!(text(cx).contains("let set: HashSet<u8>"), "{}", text(cx));
+
+        // Resolved while selected, then accepted: in with it.
+        let end = text(cx).rfind('}').unwrap();
+        editor.update(cx, |e, cx| e.edit_and_remap(vec![(end..end, "    let map: HashMa\n".into())], EditKind::Other, cx));
+        let ix = complete(cx, end + "    let map: HashMa".len(), "HashMap");
+        editor.update(cx, |e, cx| {
+            e.lsp.completion.as_mut().unwrap().selected = ix;
+            e.resolve_selected_soon(cx);
+        });
+        cx.executor().advance_clock(RESOLVE_PAUSE);
+        wait(cx, "HashMap resolved", 30, &|cx| editor.read_with(cx, |e, _| e.lsp.completion.as_ref().is_some_and(|m| !m.resolved.is_empty())));
+        editor.update(cx, |e, cx| e.accept_completion(ix, false, cx));
+        let imports = text(cx).lines().filter(|l| l.starts_with("use ") && l.contains("HashMap")).count();
+        assert_eq!(imports, 1, "{}", text(cx));
         store.update(cx, |s, _| s.shutdown_all());
         std::fs::remove_dir_all(&dir).ok();
     }
