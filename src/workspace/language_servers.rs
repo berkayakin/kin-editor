@@ -41,7 +41,7 @@ impl Workspace {
         if let Some(tab) = self.editors.iter().find(|t| path_of(t).as_deref() == Some(path)) {
             return Some(tab.clone());
         }
-        let wanted = path.canonicalize().ok()?;
+        let wanted = crate::paths::canonicalize(path).ok()?;
         let mut real_paths = self.real_paths.borrow_mut();
         if real_paths.len() > 2 * self.editors.len() {
             let open: HashSet<EntityId> = self.editors.iter().map(|t| t.entity_id()).collect();
@@ -53,7 +53,7 @@ impl Workspace {
                 let Some(path) = path_of(tab) else { return false };
                 let (known, real) = real_paths.entry(tab.entity_id()).or_insert_with(|| (PathBuf::new(), None));
                 if *known != path {
-                    *real = path.canonicalize().ok();
+                    *real = crate::paths::canonicalize(&path).ok();
                     *known = path;
                 }
                 real.as_deref() == Some(wanted.as_path())

@@ -139,9 +139,12 @@ mod tests {
         let first = claim_in(&dir, &[]).unwrap().expect("first launch runs");
         let (tx, rx) = std::sync::mpsc::channel();
         first.serve(move |paths| tx.send(paths).unwrap());
-        // The second one forwards and is told to exit.
-        assert!(claim_in(&dir, &[PathBuf::from("/work/a.rs")]).is_err());
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), [PathBuf::from("/work/a.rs")]);
+        // The second one forwards and is told to exit. (An absolute path on
+        // every system: `/work/a.rs` has no drive on Windows, so it gets the
+        // current one.)
+        let file = std::env::temp_dir().join("work").join("a.rs");
+        assert!(claim_in(&dir, std::slice::from_ref(&file)).is_err());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), [file]);
         // A wrong token is ignored, and the launch starts on its own.
         let record: Record = serde_json::from_str(&std::fs::read_to_string(dir.join("instance.json")).unwrap()).unwrap();
         assert!(forward(&Record { token: "guess".into(), ..record }, &[]).is_err());

@@ -76,7 +76,7 @@ impl Workspace {
     /// Opens a project folder. A folder that's already open in another
     /// window brings that window to the front instead.
     pub(super) fn open_project(&mut self, path: PathBuf, target: OpenIn, window: &mut Window, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = crate::paths::canonicalize(&path).unwrap_or(path);
         if !path.is_dir() {
             self.toast(ToastKind::Error, "Folder not found", Some(clone_dialog::display_path(&path)), cx);
             self.update_recent_projects(|list| list.retain(|p| p != &path), cx);

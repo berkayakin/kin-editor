@@ -337,7 +337,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 /// What gets replaced: `Kuana.app` on macOS, the executable elsewhere.
 fn installed_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe = exe.canonicalize().unwrap_or(exe);
+    let exe = crate::paths::canonicalize(&exe).unwrap_or(exe);
     if cfg!(target_os = "macos") {
         let app = exe
             .ancestors()

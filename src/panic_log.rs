@@ -99,7 +99,9 @@ mod tests {
         let logs: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
         let [log] = logs.as_slice() else { panic!("{logs:?}") };
         let log = std::fs::read_to_string(log).unwrap();
-        assert!(log.contains("thread 'panic_log::tests::panics_with_the_hook' panicked at src/panic_log.rs:"), "{log}");
+        // The location as the platform writes it (`src\panic_log.rs` on Windows).
+        let location = std::path::Path::new("src").join("panic_log.rs");
+        assert!(log.contains(&format!("thread 'panic_log::tests::panics_with_the_hook' panicked at {}:", location.display())), "{log}");
         assert!(log.contains("on purpose\n\nBacktrace:\n"), "{log}");
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -291,7 +291,7 @@ pub fn discover(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() { path } else { path.parent()? };
     let out = run(dir, &["rev-parse", "--show-toplevel"]).ok()?;
     let root = PathBuf::from(out.trim());
-    Some(root.canonicalize().unwrap_or(root))
+    Some(crate::paths::canonicalize(&root).unwrap_or(root))
 }
 
 pub fn init(dir: &Path) -> Result<(), String> {
@@ -2151,7 +2151,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let dir = std::env::temp_dir().join(format!("kuana-git-batch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com")] {
             run(&dir, &["config", k, v]).unwrap();
         }
@@ -2201,7 +2201,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let dir = std::env::temp_dir().join(format!("kuana-git-crlf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com"), ("core.autocrlf", "false")] {
             run(&dir, &["config", k, v]).unwrap();
         }
@@ -2247,7 +2247,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("target/debug")).unwrap();
         std::fs::create_dir_all(dir.join("sub")).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         // Not the machine's own global excludes.
         let excludes = std::env::temp_dir().join(format!("kuana-git-excludes-{}", std::process::id()));
         std::fs::write(&excludes, "").unwrap();
@@ -2274,7 +2274,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let dir = std::env::temp_dir().join(format!("kuana-git-hunks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         for (k, v) in [("user.name", "Test"), ("user.email", "t@example.com")] {
             run(&dir, &["config", k, v]).unwrap();
         }
@@ -2342,7 +2342,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let dir = std::env::temp_dir().join(format!("kuana-git-actions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         run(&dir, &["config", "user.name", "Test"]).unwrap();
         run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
         let root = discover(&dir).unwrap();
@@ -2504,12 +2504,20 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// `git init`, with the files Git writes kept byte for byte: Git for
+    /// Windows' `core.autocrlf=true` (the CI runners' default) would check
+    /// out `\r\n` where the tests wrote `\n`.
+    fn test_init(dir: &Path) {
+        init(dir).unwrap();
+        run(dir, &["config", "core.autocrlf", "false"]).unwrap();
+    }
+
     /// A repository in a fresh temp folder, with a committer and `main` checked out.
     fn test_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kuana-git-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         run(&dir, &["config", "user.name", "Test"]).unwrap();
         run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
         run(&dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
@@ -2608,7 +2616,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         };
         commit_in(&ours, "a.txt", "one\n");
         push(&ours, Some(("origin", "main")), false).unwrap();
-        run(&ours, &["clone", "--quiet", remote.to_str().unwrap(), theirs.to_str().unwrap()]).unwrap();
+        run(&ours, &["clone", "--quiet", "--config", "core.autocrlf=false", remote.to_str().unwrap(), theirs.to_str().unwrap()]).unwrap();
         run(&theirs, &["config", "user.name", "Them"]).unwrap();
         run(&theirs, &["config", "user.email", "them@example.com"]).unwrap();
         let publish = |rel: &str, text: &str| {
@@ -2666,7 +2674,7 @@ u UU N... 100644 100644 100644 100644 f g h conflict.js\0\
         let dir = std::env::temp_dir().join(format!("kuana-git-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        init(&dir).unwrap();
+        test_init(&dir);
         run(&dir, &["config", "user.name", "Test"]).unwrap();
         run(&dir, &["config", "user.email", "test@example.com"]).unwrap();
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();

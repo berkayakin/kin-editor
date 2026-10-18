@@ -47,7 +47,7 @@ pub struct DocumentStore {
 /// The key a path is stored under: its real path (servers may report
 /// `/tmp/…` for `/private/tmp/…`), or the path itself for one that doesn't exist.
 pub fn key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    crate::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 impl DocumentStore {

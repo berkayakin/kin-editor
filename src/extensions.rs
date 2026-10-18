@@ -958,7 +958,7 @@ fn native(grammar: &Grammar) -> bool {
             .checkout
             .parent()
             .and_then(Path::parent)
-            .and_then(|extension| std::fs::canonicalize(extension).ok())
+            .and_then(|extension| crate::paths::canonicalize(extension).ok())
             .is_some_and(|extension| crate::trust::is_trusted(&extension))
 }
 

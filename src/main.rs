@@ -39,6 +39,7 @@ mod lsp;
 mod markdown_preview;
 mod onboarding;
 mod pane_item;
+mod paths;
 mod panic_log;
 mod picker;
 mod preview;
@@ -491,7 +492,7 @@ fn main() {
         // files open in the first one. Without paths, reopen the last project.
         let (dirs, files): (Vec<PathBuf>, Vec<PathBuf>) = args
             .into_iter()
-            .map(|p| p.canonicalize().unwrap_or(p))
+            .map(|p| paths::canonicalize(&p).unwrap_or(p))
             .partition(|p| p.is_dir());
         let mut dirs = dirs.into_iter();
         let first_dir = dirs.next();

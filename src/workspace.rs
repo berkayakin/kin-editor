@@ -1153,7 +1153,7 @@ impl Workspace {
 
     /// `binary`: a file that looks binary opens as text too (Open Anyway).
     fn open_path_as(&mut self, path: PathBuf, binary: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = crate::paths::canonicalize(&path).unwrap_or(path);
         if path.is_dir() {
             self.set_root(path, window, cx);
             return;
@@ -1217,7 +1217,7 @@ impl Workspace {
 
     /// Opens a file at a 1-based line and column (from terminal output).
     fn open_at(&mut self, path: PathBuf, line: Option<u32>, column: Option<u32>, window: &mut Window, cx: &mut Context<Self>) {
-        let path = path.canonicalize().unwrap_or(path);
+        let path = crate::paths::canonicalize(&path).unwrap_or(path);
         self.open_path(path.clone(), window, cx);
         let (Some(line), Some(editor)) = (line, self.tab_for(&path, cx)) else { return };
         editor.update(cx, |e, cx| {
