@@ -17,6 +17,7 @@ mod vim;
 
 pub use lsp::EditorLspEvent;
 pub use run::{EditorBreakpointMenu, EditorBreakpointsChanged, EditorRunEvent};
+pub use sticky::Crumb;
 pub use unloaded::{EditorLoaded, Unloaded};
 
 use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
@@ -412,7 +413,7 @@ pub struct Editor {
     /// Pinned lines of sticky scroll, as last painted: bounds and where to go.
     sticky_rows: Vec<(Bounds<Pixels>, usize)>,
     /// `breadcrumbs` for an outline and caret.
-    breadcrumbs: Option<(Arc<Vec<crate::syntax::Symbol>>, usize, Vec<(SharedString, usize)>)>,
+    breadcrumbs: Option<(Arc<Vec<crate::syntax::Symbol>>, usize, Vec<Crumb>)>,
     /// The outline's rows for an outline and version (see `outline_rows`).
     sticky_spans: (Option<(Arc<Vec<crate::syntax::Symbol>>, u64)>, Arc<Vec<(usize, usize, usize)>>),
     /// The pointer is over the gutter, so fold arrows show.

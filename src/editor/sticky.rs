@@ -26,7 +26,7 @@ impl Editor {
     /// The definitions around the caret, outermost first: name and where it
     /// starts. Kept for the outline and caret: the workspace draws them at
     /// every frame, and a file can have thousands of symbols.
-    pub fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Vec<(SharedString, usize)> {
+    pub fn breadcrumbs(&mut self, cx: &mut Context<Self>) -> Vec<Crumb> {
         let head = self.primary_selection().head;
         let outline = self.shown_outline(cx);
         if let Some((o, h, crumbs)) = &self.breadcrumbs
@@ -35,10 +35,16 @@ impl Editor {
         {
             return crumbs.clone();
         }
-        let crumbs: Vec<(SharedString, usize)> = outline
+        let doc = self.doc.read(cx);
+        let crumbs: Vec<Crumb> = outline
             .iter()
             .filter(|s| s.range.start <= head && head <= s.range.end)
-            .map(|s| (SharedString::from(s.name.clone()), s.offset))
+            .map(|s| Crumb {
+                name: SharedString::from(s.name.clone()),
+                offset: s.offset,
+                // The color the name has in the code (a function's, a type's…).
+                highlight: name_highlight(doc, s.offset, s.name.len()),
+            })
             .collect();
         self.breadcrumbs = Some((outline, head, crumbs.clone()));
         crumbs
@@ -159,4 +165,25 @@ impl Editor {
     pub(super) fn sticky_at(&self, position: Point<Pixels>) -> Option<usize> {
         self.sticky_rows.iter().find(|(b, _)| b.contains(&position)).map(|(_, offset)| *offset)
     }
+}
+
+/// A breadcrumb: a definition around the caret.
+#[derive(Clone)]
+pub struct Crumb {
+    pub name: SharedString,
+    /// Where its name starts, to go to.
+    pub offset: usize,
+    /// How the editor highlights its name, if it does.
+    pub highlight: Option<crate::syntax::Highlight>,
+}
+
+/// The highlight at the start of a definition's name (its first highlighted
+/// span there), as the editor draws it.
+fn name_highlight(doc: &crate::document::Document, offset: usize, len: usize) -> Option<crate::syntax::Highlight> {
+    let end = (offset + len.max(1)).min(doc.rope().len_bytes());
+    doc.syntax()
+        .highlights(doc.rope(), offset..end)
+        .into_iter()
+        .find(|(range, h)| range.start <= offset && offset < range.end && *h != crate::syntax::Highlight::None)
+        .map(|(_, h)| h)
 }

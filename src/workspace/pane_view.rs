@@ -540,8 +540,15 @@ impl Workspace {
         );
         let symbols = symbols.unwrap_or_default();
         let last = symbols.len().saturating_sub(1);
-        for (ix, (name, offset)) in symbols.into_iter().enumerate() {
+        for (ix, crumb) in symbols.into_iter().enumerate() {
             let Some(editor) = item.editor().cloned() else { break };
+            let offset = crumb.offset;
+            // Colored like the names in the code; plain ones as before.
+            let color: Hsla = match crumb.highlight {
+                Some(h) => theme.highlight_color(h),
+                None if ix == last => theme.text.into(),
+                None => theme.text_muted.into(),
+            };
             row = row.child(chevron()).child(
                 div()
                     .id(("breadcrumb", ix))
@@ -549,13 +556,13 @@ impl Workspace {
                     .px_1()
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .text_color(if ix == last { theme.text } else { theme.text_muted })
+                    .text_color(color)
                     .hover_bg(theme.hover)
                     .on_click(move |_, window, cx| {
                         editor.update(cx, |e, cx| e.go_to(offset, window, cx));
                         window.focus(&editor.focus_handle(cx));
                     })
-                    .child(name),
+                    .child(crumb.name),
             );
         }
         Some(row.into_any_element())
