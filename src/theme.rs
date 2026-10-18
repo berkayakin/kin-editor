@@ -1095,7 +1095,9 @@ mod tests {
             let mut errors = Vec::new();
             resolve(file, &all, &mut Vec::new(), &mut errors).unwrap();
             assert!(errors.is_empty(), "{errors:?}");
-            let defined = file.colors.len() + file.syntax.len();
+            // Capture names ("type.builtin") are optional extras on top of the base keys.
+            let base = file.syntax.keys().filter(|k| COLOR_KEYS.contains(&format!("syntax.{k}").as_str())).count();
+            let defined = file.colors.len() + base;
             assert_eq!(defined, COLOR_KEYS.len(), "{} is missing keys", file.name);
         }
         let light = all.values().filter(|f| f.appearance() == Some(Appearance::Light)).count();
